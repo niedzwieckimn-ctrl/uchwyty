@@ -1,27 +1,11 @@
- (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
-diff --git a/netlify.toml b/netlify.toml
-index a9563a93ea79fb616bc54d2ee0dfb1e39d52a737..9b7d13a6b3d4fc8104d636436c177d37ead81773 100644
---- a/netlify.toml
-+++ b/netlify.toml
-@@ -1,6 +1,11 @@
--[build]
--  publish = "."
--
--[functions]
--  directory = "netlify/functions"
--  node_bundler = "esbuild"
-\ No newline at end of file
-+[build]
-+  publish = "."
-+
-+[functions]
-+  directory = "netlify/functions"
-+  node_bundler = "esbuild"
-+
-+[[redirects]]
-+  from = "/*"
-+  to = "/.netlify/functions/flask_api"
-+  status = 200
- 
-EOF
-)
+[build]
+  publish = "."
+
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
+
+[[redirects]]
+  from = "/*"
+  to = "/.netlify/functions/flask_api"
+  status = 200
