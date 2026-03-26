@@ -3488,6 +3488,24 @@ def cloud_supabase_pull():
         return jsonify(supabase_pull_to_sqlite())
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+      SUPABASE_READ_PRIMARY = os.getenv("SUPABASE_READ_PRIMARY", "0") == "1"
+LAST_PULL_TS = 0.0
+
+@app.before_request
+def _pull_supabase_before_get():
+    global LAST_PULL_TS
+    try:
+        if not SUPABASE_READ_PRIMARY:
+            return
+        if request.method != "GET":
+            return
+        now = time.time()
+        if now - LAST_PULL_TS < 15:
+            return
+        supabase_pull_to_sqlite()
+        LAST_PULL_TS = now
+    except Exception:
+        pass  
 # =========================
 # RUN
 # =========================
