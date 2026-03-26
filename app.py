@@ -36,7 +36,16 @@ from reportlab.pdfbase.ttfonts import TTFont
 BASE_URL = "http://192.168.68.103:5000"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(APP_DIR, "data")
+
+
+def _default_data_dir() -> str:
+    # Netlify Functions mają tylko /tmp jako katalog zapisywalny.
+    if os.getenv("NETLIFY") == "true":
+        return os.path.join("/tmp", "clinical-app-data")
+    return os.path.join(APP_DIR, "data")
+
+
+DATA_DIR = _default_data_dir()
 DB_PATH = os.path.join(DATA_DIR, "app.db")
 
 os.makedirs(DATA_DIR, exist_ok=True)
