@@ -368,6 +368,8 @@ SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "").strip().rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
 SUPABASE_AUTO_SYNC_ON_WRITE = (os.environ.get("SUPABASE_AUTO_SYNC_ON_WRITE") or "1").strip().lower() in ("1", "true", "yes", "on")
 SUPABASE_MIN_SYNC_INTERVAL_SEC = float((os.environ.get("SUPABASE_MIN_SYNC_INTERVAL_SEC") or "2").strip())
+SUPABASE_READ_PRIMARY = (os.environ.get("SUPABASE_READ_PRIMARY") or "0").strip().lower() in ("1", "true", "yes", "on")
+SUPABASE_PULL_MIN_INTERVAL_SEC = float((os.environ.get("SUPABASE_PULL_MIN_INTERVAL_SEC") or "15").strip())
 
 SUPABASE_SYNC_TABLES = [
     ("products", "id"),
@@ -385,6 +387,10 @@ SUPABASE_SYNC_TABLES = [
 _supabase_sync_lock = threading.Lock()
 _supabase_sync_state = {
     "running": False,
+    "last_started_ts": 0.0,
+    "last_result": None,
+}
+_supabase_pull_state = {
     "last_started_ts": 0.0,
     "last_result": None,
 }
@@ -414,6 +420,47 @@ def supabase_upsert_rows(table: str, rows: list, on_conflict: str):
         if resp.status >= 300:
             raise RuntimeError(f"Supabase HTTP {resp.status}")
 
+def supabase_fetch_rows(table: str):
+    if not supabase_enabled():
+        raise RuntimeError("Brak konfiguracji SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY")
+
+    qs = urllib.parse.urlencode({"select": "*"})
+    url = f"{SUPABASE_URL}/rest/v1/{table}?{qs}"
+    req = urllib.request.Request(url, method="GET")
+    req.add_header("apikey", SUPABASE_SERVICE_ROLE_KEY)
+    req.add_header("Authorization", f"Bearer {SUPABASE_SERVICE_ROLE_KEY}")
+    req.add_header("Accept", "application/json")
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        payload = resp.read().decode("utf-8")
+        return json.loads(payload) if payload else []
+
+def sqlite_upsert_rows(table: str, rows: list, conflict_col: str):
+    if not rows:
+        return
+    c = conn()
+    cur = c.cursor()
+    try:
+        cur.execute(f"PRAGMA table_info({table})")
+        cols = [r["name"] for r in cur.fetchall()]
+        allowed = set(cols)
+        for row in rows:
+            data = {k: row[k] for k in row.keys() if k in allowed}
+            if not data:
+                continue
+            keys = list(data.keys())
+            placeholders = ",".join(["?"] * len(keys))
+            insert_cols = ",".join(keys)
+            update_cols = [k for k in keys if k != conflict_col]
+            update_sql = ", ".join([f"{k}=excluded.{k}" for k in update_cols]) if update_cols else f"{conflict_col}=excluded.{conflict_col}"
+            sql = (
+                f"INSERT INTO {table}({insert_cols}) VALUES ({placeholders}) "
+                f"ON CONFLICT({conflict_col}) DO UPDATE SET {update_sql}"
+            )
+            cur.execute(sql, tuple(data[k] for k in keys))
+        c.commit()
+    finally:
+        c.close()
+
 def sqlite_table_rows(table: str):
     c = conn()
     cur = c.cursor()
@@ -421,6 +468,22 @@ def sqlite_table_rows(table: str):
     rows = [dict(r) for r in cur.fetchall()]
     c.close()
     return rows
+
+def pull_all_from_supabase():
+    if not supabase_enabled():
+        return {"ok": False, "error": "Brak konfiguracji SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY"}
+
+    out = {"ok": True, "tables": {}, "pulled_at": now_iso()}
+    # kolejność ważna przez FK
+    for table, conflict_col in SUPABASE_SYNC_TABLES:
+        try:
+            rows = supabase_fetch_rows(table)
+            sqlite_upsert_rows(table, rows, conflict_col)
+            out["tables"][table] = {"rows": len(rows), "status": "ok"}
+        except Exception as e:
+            out["ok"] = False
+            out["tables"][table] = {"status": "error", "error": str(e)}
+    return out
 
 def sync_all_to_supabase():
     if not supabase_enabled():
@@ -1080,12 +1143,16 @@ def cloud_supabase():
         <div><b>Status konfiguracji:</b> {% if enabled %}<span class="badge">AKTYWNA</span>{% else %}<span class="badge">BRAK</span>{% endif %}</div>
         <div class="muted" style="margin-top:8px;">Wymagane zmienne środowiskowe: <code>SUPABASE_URL</code>, <code>SUPABASE_SERVICE_ROLE_KEY</code>.</div>
         <div class="muted" style="margin-top:6px;">Auto sync po zapisie: <b>{{ "ON" if auto_sync else "OFF" }}</b> (co najmniej co {{ min_interval }} s).</div>
+        <div class="muted" style="margin-top:6px;">Odczyt z Supabase jako źródło główne: <b>{{ "ON" if read_primary else "OFF" }}</b> (co najmniej co {{ pull_interval }} s).</div>
       </div>
 
       <div class="card">
         <h2>Ręczna synchronizacja</h2>
         <form method="post" action="{{ url_for('cloud_supabase_sync') }}">
           <button class="btn primary" type="submit">Synchronizuj teraz</button>
+        </form>
+        <form method="post" action="{{ url_for('cloud_supabase_pull') }}" style="margin-top:10px;">
+          <button class="btn" type="submit">Pobierz z chmury</button>
         </form>
       </div>
     {% endblock %}
@@ -1097,7 +1164,9 @@ def cloud_supabase():
         db_path=DB_PATH,
         enabled=supabase_enabled(),
         auto_sync=SUPABASE_AUTO_SYNC_ON_WRITE,
-        min_interval=SUPABASE_MIN_SYNC_INTERVAL_SEC
+        min_interval=SUPABASE_MIN_SYNC_INTERVAL_SEC,
+        read_primary=SUPABASE_READ_PRIMARY,
+        pull_interval=SUPABASE_PULL_MIN_INTERVAL_SEC
     )
 
 
@@ -1105,6 +1174,33 @@ def cloud_supabase():
 def cloud_supabase_sync():
     result = sync_all_to_supabase()
     return jsonify(result), (200 if result.get("ok") else 500)
+
+
+@app.post("/cloud/supabase/pull")
+def cloud_supabase_pull():
+    result = pull_all_from_supabase()
+    return jsonify(result), (200 if result.get("ok") else 500)
+
+
+@app.before_request
+def pull_before_read_when_supabase_primary():
+    try:
+        if not SUPABASE_READ_PRIMARY:
+            return
+        if request.method != "GET":
+            return
+        # pomiń assety i healthcheck funkcji
+        if request.path.startswith("/.netlify/"):
+            return
+        now_ts = time.time()
+        with _supabase_sync_lock:
+            if (now_ts - float(_supabase_pull_state["last_started_ts"])) < SUPABASE_PULL_MIN_INTERVAL_SEC:
+                return
+            _supabase_pull_state["last_started_ts"] = now_ts
+        result = pull_all_from_supabase()
+        _supabase_pull_state["last_result"] = result
+    except Exception as e:
+        _supabase_pull_state["last_result"] = {"ok": False, "error": str(e), "pulled_at": now_iso()}
 
 
 @app.after_request
@@ -3329,187 +3425,10 @@ def china_item_delete(package_id, item_id):
     c.close()
     return redirect(url_for("china_package", package_id=package_id))
 
-# --- Supabase as read source (pull -> SQLite) ---
-def _supabase_get_rows(table_name: str):
-    base = (SUPABASE_URL or "").rstrip("/")
-    if not base or not SUPABASE_SERVICE_ROLE_KEY:
-        raise RuntimeError("Brak SUPABASE_URL lub SUPABASE_SERVICE_ROLE_KEY")
 
-    url = f"{base}/rest/v1/{table_name}?select=*"
-    req = urllib.request.Request(url, method="GET")
-    req.add_header("apikey", SUPABASE_SERVICE_ROLE_KEY)
-    req.add_header("Authorization", f"Bearer {SUPABASE_SERVICE_ROLE_KEY}")
-    req.add_header("Accept", "application/json")
-
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        payload = resp.read().decode("utf-8")
-        return json.loads(payload) if payload else []
-
-
-def supabase_pull_to_sqlite():
-    order = [
-        "products", "customers", "pricing", "company_profile",
-        "china_packages", "orders", "stock",
-        "china_items", "order_items", "invoices"
-    ]
-    imported = {}
-
-    c = conn()
-    cur = c.cursor()
-    try:
-        for t in order:
-            rows = _supabase_get_rows(t)
-            imported[t] = len(rows)
-
-            if t == "products":
-                for r in rows:
-                    cur.execute("""
-                        INSERT INTO products(id, sku, model, ean, name, created_at)
-                        VALUES(?,?,?,?,?,?)
-                        ON CONFLICT(id) DO UPDATE SET
-                          sku=excluded.sku, model=excluded.model, ean=excluded.ean,
-                          name=excluded.name, created_at=excluded.created_at
-                    """, (r["id"], r["sku"], r.get("model"), r.get("ean"), r.get("name"), r["created_at"]))
-
-            elif t == "customers":
-                for r in rows:
-                    cur.execute("""
-                        INSERT INTO customers(id, name, address, phone, email, nip, created_at)
-                        VALUES(?,?,?,?,?,?,?)
-                        ON CONFLICT(id) DO UPDATE SET
-                          name=excluded.name, address=excluded.address, phone=excluded.phone,
-                          email=excluded.email, nip=excluded.nip, created_at=excluded.created_at
-                    """, (r["id"], r["name"], r.get("address"), r.get("phone"), r.get("email"), r.get("nip"), r["created_at"]))
-
-            elif t == "pricing":
-                for r in rows:
-                    cur.execute("""
-                        INSERT INTO pricing(model, net_price, gross_price, created_at)
-                        VALUES(?,?,?,?)
-                        ON CONFLICT(model) DO UPDATE SET
-                          net_price=excluded.net_price,
-                          gross_price=excluded.gross_price,
-                          created_at=excluded.created_at
-                    """, (r["model"], r.get("net_price", 0), r.get("gross_price", 0), r["created_at"]))
-
-            elif t == "company_profile":
-                for r in rows:
-                    cur.execute("""
-                        INSERT INTO company_profile(id, company_name, address, nip, phone, email, bank_account, updated_at)
-                        VALUES(?,?,?,?,?,?,?,?)
-                        ON CONFLICT(id) DO UPDATE SET
-                          company_name=excluded.company_name, address=excluded.address, nip=excluded.nip,
-                          phone=excluded.phone, email=excluded.email, bank_account=excluded.bank_account,
-                          updated_at=excluded.updated_at
-                    """, (r["id"], r.get("company_name"), r.get("address"), r.get("nip"),
-                          r.get("phone"), r.get("email"), r.get("bank_account"), r["updated_at"]))
-
-            elif t == "china_packages":
-                for r in rows:
-                    cur.execute("""
-                        INSERT INTO china_packages(id, package_no, status, tracking, note, created_at)
-                        VALUES(?,?,?,?,?,?)
-                        ON CONFLICT(id) DO UPDATE SET
-                          package_no=excluded.package_no, status=excluded.status, tracking=excluded.tracking,
-                          note=excluded.note, created_at=excluded.created_at
-                    """, (r["id"], r["package_no"], r["status"], r.get("tracking"), r.get("note"), r["created_at"]))
-
-            elif t == "orders":
-                for r in rows:
-                    cur.execute("""
-                        INSERT INTO orders(id, order_no, customer_id, customer_name, customer_address, customer_phone, customer_email, status, note, created_at)
-                        VALUES(?,?,?,?,?,?,?,?,?,?)
-                        ON CONFLICT(id) DO UPDATE SET
-                          order_no=excluded.order_no, customer_id=excluded.customer_id, customer_name=excluded.customer_name,
-                          customer_address=excluded.customer_address, customer_phone=excluded.customer_phone,
-                          customer_email=excluded.customer_email, status=excluded.status, note=excluded.note, created_at=excluded.created_at
-                    """, (r["id"], r["order_no"], r.get("customer_id"), r["customer_name"], r.get("customer_address"),
-                          r.get("customer_phone"), r.get("customer_email"), r["status"], r.get("note"), r["created_at"]))
-
-            elif t == "stock":
-                for r in rows:
-                    cur.execute("""
-                        INSERT INTO stock(product_id, qty)
-                        VALUES(?,?)
-                        ON CONFLICT(product_id) DO UPDATE SET qty=excluded.qty
-                    """, (r["product_id"], r.get("qty", 0)))
-
-            elif t == "china_items":
-                for r in rows:
-                    cur.execute("""
-                        INSERT INTO china_items(id, package_id, product_id, sku, qty, created_at)
-                        VALUES(?,?,?,?,?,?)
-                        ON CONFLICT(id) DO UPDATE SET
-                          package_id=excluded.package_id, product_id=excluded.product_id, sku=excluded.sku,
-                          qty=excluded.qty, created_at=excluded.created_at
-                    """, (r["id"], r["package_id"], r["product_id"], r["sku"], r["qty"], r["created_at"]))
-
-            elif t == "order_items":
-                for r in rows:
-                    cur.execute("""
-                        INSERT INTO order_items(id, order_id, product_id, sku, qty, created_at)
-                        VALUES(?,?,?,?,?,?)
-                        ON CONFLICT(id) DO UPDATE SET
-                          order_id=excluded.order_id, product_id=excluded.product_id, sku=excluded.sku,
-                          qty=excluded.qty, created_at=excluded.created_at
-                    """, (r["id"], r["order_id"], r["product_id"], r["sku"], r["qty"], r["created_at"]))
-
-            elif t == "invoices":
-                for r in rows:
-                    cur.execute("""
-                        INSERT INTO invoices(
-                          id, order_id, invoice_no, issue_date, sell_date, payment_type, payment_to,
-                          buyer_name, buyer_tax_no, buyer_street, buyer_post_code, buyer_city, buyer_country,
-                          buyer_email, buyer_phone, total_net, total_gross, created_at
-                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                        ON CONFLICT(id) DO UPDATE SET
-                          order_id=excluded.order_id, invoice_no=excluded.invoice_no, issue_date=excluded.issue_date,
-                          sell_date=excluded.sell_date, payment_type=excluded.payment_type, payment_to=excluded.payment_to,
-                          buyer_name=excluded.buyer_name, buyer_tax_no=excluded.buyer_tax_no, buyer_street=excluded.buyer_street,
-                          buyer_post_code=excluded.buyer_post_code, buyer_city=excluded.buyer_city, buyer_country=excluded.buyer_country,
-                          buyer_email=excluded.buyer_email, buyer_phone=excluded.buyer_phone,
-                          total_net=excluded.total_net, total_gross=excluded.total_gross, created_at=excluded.created_at
-                    """, (
-                        r["id"], r["order_id"], r["invoice_no"], r["issue_date"], r["sell_date"], r["payment_type"],
-                        r.get("payment_to"), r.get("buyer_name"), r.get("buyer_tax_no"), r.get("buyer_street"),
-                        r.get("buyer_post_code"), r.get("buyer_city"), r.get("buyer_country"), r.get("buyer_email"),
-                        r.get("buyer_phone"), r.get("total_net", 0), r.get("total_gross", 0), r["created_at"]
-                    ))
-
-        c.commit()
-        return {"ok": True, "imported": imported}
-    finally:
-        c.close()
-
-
-@app.post("/cloud/supabase/pull")
-def cloud_supabase_pull():
-    try:
-        return jsonify(supabase_pull_to_sqlite())
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-      SUPABASE_READ_PRIMARY = os.getenv("SUPABASE_READ_PRIMARY", "0") == "1"
-LAST_PULL_TS = 0.0
-
-@app.before_request
-def _pull_supabase_before_get():
-    global LAST_PULL_TS
-    try:
-        if not SUPABASE_READ_PRIMARY:
-            return
-        if request.method != "GET":
-            return
-        now = time.time()
-        if now - LAST_PULL_TS < 15:
-            return
-        supabase_pull_to_sqlite()
-        LAST_PULL_TS = now
-    except Exception:
-        pass  
 # =========================
 # RUN
 # =========================
 if __name__ == "__main__":
     # debug=True możesz zostawić na czas budowy
     app.run(host="0.0.0.0", port=5000, debug=True)
-
