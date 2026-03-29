@@ -374,6 +374,20 @@ SUPABASE_SYNC_TABLES = [
     ("invoices", "id"),
 ]
 
+# Kolejność PULL jest ważna: najpierw rodzice, potem dzieci.
+SUPABASE_PULL_TABLES = [
+    ("company_profile", "id"),
+    ("pricing", "model"),
+    ("customers", "id"),
+    ("products", "id"),
+    ("orders", "id"),
+    ("china_packages", "id"),
+    ("stock", "product_id"),
+    ("order_items", "id"),
+    ("china_items", "id"),
+    ("invoices", "id"),
+]
+
 _supabase_sync_lock = threading.Lock()
 _supabase_sync_state = {
     "running": False,
@@ -582,6 +596,32 @@ def sqlite_upsert_rows(table: str, rows: list, conflict_col: str):
     return cnt
 
 
+def sqlite_delete_missing_rows(table: str, conflict_col: str, remote_keys: list):
+    c = conn()
+    cur = c.cursor()
+    if not remote_keys:
+        cur.execute(f"DELETE FROM {table}")
+        deleted = cur.rowcount if cur.rowcount is not None else 0
+        c.commit()
+        c.close()
+        return deleted
+
+    cur.execute(f"SELECT {conflict_col} FROM {table}")
+    local_keys = [r[0] for r in cur.fetchall()]
+    remote_set = {str(x) for x in remote_keys}
+    to_delete = [x for x in local_keys if str(x) not in remote_set]
+    deleted = 0
+    if to_delete:
+        for i in range(0, len(to_delete), 800):
+            pack = to_delete[i:i+800]
+            ph = ",".join(["?"] * len(pack))
+            cur.execute(f"DELETE FROM {table} WHERE {conflict_col} IN ({ph})", tuple(pack))
+            deleted += cur.rowcount if cur.rowcount is not None else 0
+    c.commit()
+    c.close()
+    return deleted
+
+
 def pull_shared_tables_from_supabase(force: bool = False):
     if not supabase_enabled():
         return {"ok": False, "error": "not_configured"}
@@ -594,15 +634,56 @@ def pull_shared_tables_from_supabase(force: bool = False):
         _supabase_sync_state["last_pull_started_ts"] = now_ts
 
     result = {"ok": True, "tables": {}, "pulled_at": now_iso()}
-    for table, conflict_col in [("customers", "id"), ("orders", "id"), ("order_items", "id")]:
+    fetched = {}
+
+    # 1) pobierz wszystko z Supabase
+    for table, conflict_col in SUPABASE_PULL_TABLES:
         try:
-            remote_rows = supabase_select_rows(table, order_by=conflict_col)
-            sqlite_upsert_rows(table, remote_rows, conflict_col)
-            result["tables"][table] = {"rows": len(remote_rows), "status": "ok"}
+            fetched[(table, conflict_col)] = supabase_select_rows(table, order_by=conflict_col)
         except Exception as e:
             result["ok"] = False
-            result["tables"][table] = {"status": "error", "error": str(e)}
+            result["tables"][table] = {"status": "error", "stage": "fetch", "error": str(e)}
+
+    # 2) upsert do lokalnego SQLite
+    for table, conflict_col in SUPABASE_PULL_TABLES:
+        if (table, conflict_col) not in fetched:
+            continue
+        try:
+            remote_rows = fetched[(table, conflict_col)]
+            sqlite_upsert_rows(table, remote_rows, conflict_col)
+            result["tables"].setdefault(table, {})["rows"] = len(remote_rows)
+            result["tables"][table]["upsert"] = "ok"
+        except Exception as e:
+            result["ok"] = False
+            result["tables"].setdefault(table, {})
+            result["tables"][table].update({"status": "error", "stage": "upsert", "error": str(e)})
+
+    # 3) usuń lokalne rekordy, których już nie ma w Supabase
+    for table, conflict_col in reversed(SUPABASE_PULL_TABLES):
+        if (table, conflict_col) not in fetched:
+            continue
+        try:
+            remote_rows = fetched[(table, conflict_col)]
+            remote_keys = [row.get(conflict_col) for row in remote_rows if row.get(conflict_col) is not None]
+            deleted = sqlite_delete_missing_rows(table, conflict_col, remote_keys)
+            result["tables"].setdefault(table, {})
+            result["tables"][table]["deleted_local"] = deleted
+            if result["tables"][table].get("upsert") == "ok":
+                result["tables"][table]["status"] = "ok"
+        except Exception as e:
+            result["ok"] = False
+            result["tables"].setdefault(table, {})
+            result["tables"][table].update({"status": "error", "stage": "cleanup", "error": str(e)})
+
     return result
+
+
+def maybe_pull_shared_from_supabase(force: bool = False):
+    try:
+        if request.method == "GET":
+            pull_shared_tables_from_supabase(force=force)
+    except Exception:
+        pass
 
 
 def sync_local_rows_to_supabase(table: str, conflict_col: str, ids: list):
@@ -630,14 +711,6 @@ def sync_order_to_supabase(order_id: int):
     c.close()
     if item_ids:
         sync_local_rows_to_supabase("order_items", "id", item_ids)
-
-
-def maybe_pull_shared_from_supabase():
-    try:
-        if request.method == "GET":
-            pull_shared_tables_from_supabase(force=False)
-    except Exception:
-        pass
 
 
 def remote_first_create_customer(name: str, address: str, phone: str, email: str, nip: str):
@@ -1292,7 +1365,7 @@ def home():
       <div class="card">
         <h2>Zamówienia i paczki (aktualne)</h2>
         <div class="kpi start-kpi">
-          <div class="pill">Zamówienia aktualne (new/packed): <b>{{ n_orders_current }}</b></div>
+          <div class="pill">Zamówienia aktualne (new/packed/confirmed/in_delivery): <b>{{ n_orders_current }}</b></div>
           <div class="pill">Paczki Chiny aktywne (planned/ordered/shipped): <b>{{ n_china_active }}</b></div>
         </div>
       </div>
@@ -1332,9 +1405,14 @@ def cloud_supabase():
 
       <div class="card">
         <h2>Ręczna synchronizacja</h2>
-        <form method="post" action="{{ url_for('cloud_supabase_sync') }}">
-          <button class="btn primary" type="submit">Synchronizuj teraz</button>
-        </form>
+        <div class="flex">
+          <form method="post" action="{{ url_for('cloud_supabase_sync') }}">
+            <button class="btn primary" type="submit">Push do Supabase</button>
+          </form>
+          <form method="post" action="{{ url_for('cloud_supabase_pull') }}">
+            <button class="btn" type="submit">Pull z Supabase</button>
+          </form>
+        </div>
       </div>
     {% endblock %}
     """
@@ -1352,6 +1430,12 @@ def cloud_supabase():
 @app.post("/cloud/supabase/sync")
 def cloud_supabase_sync():
     result = sync_all_to_supabase()
+    return jsonify(result), (200 if result.get("ok") else 500)
+
+
+@app.post("/cloud/supabase/pull")
+def cloud_supabase_pull():
+    result = pull_shared_tables_from_supabase(force=True)
     return jsonify(result), (200 if result.get("ok") else 500)
 
 
@@ -1377,6 +1461,7 @@ def auto_sync_after_write(response):
 
 @app.get("/company")
 def company():
+    maybe_pull_shared_from_supabase()
     c = conn()
     cur = c.cursor()
     cur.execute("SELECT * FROM company_profile WHERE id=1")
@@ -1440,6 +1525,7 @@ def company_save():
 
 @app.get("/pricing")
 def pricing():
+    maybe_pull_shared_from_supabase()
     q = norm(request.args.get("q"))
     c = conn()
     cur = c.cursor()
@@ -1801,6 +1887,7 @@ def customers_delete(customer_id):
 
 @app.get("/products")
 def products():
+    maybe_pull_shared_from_supabase()
     q = norm(request.args.get("q"))
     c = conn()
     cur = c.cursor()
@@ -1962,6 +2049,7 @@ def products_import():
 
 @app.get("/stock")
 def stock():
+    maybe_pull_shared_from_supabase()
     q = norm(request.args.get("q"))
     c = conn()
     cur = c.cursor()
@@ -2973,6 +3061,7 @@ def order_issue(order_id):
 
 @app.route("/orders/<int:order_id>/invoice", methods=["GET", "POST"])
 def order_invoice(order_id):
+    maybe_pull_shared_from_supabase()
     c = conn()
     cur = c.cursor()
     cur.execute("SELECT * FROM orders WHERE id=?", (order_id,))
@@ -3320,6 +3409,7 @@ def order_label(order_id):
 
 @app.get("/china")
 def china():
+    maybe_pull_shared_from_supabase()
     c = conn()
     cur = c.cursor()
     cur.execute("SELECT * FROM china_packages ORDER BY id DESC LIMIT 200")
@@ -3499,6 +3589,7 @@ def china_tracking(package_id):
 
 @app.get("/china/<int:package_id>")
 def china_package(package_id):
+    maybe_pull_shared_from_supabase()
     c = conn()
     cur = c.cursor()
     cur.execute("SELECT * FROM china_packages WHERE id=?", (package_id,))
