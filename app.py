@@ -481,7 +481,7 @@ def order_status_label(status: str) -> str:
         "confirmed": "Potwierdzone",
         "packed": "W dostawie",
         "in_delivery": "W dostawie",
-        "issued": "Wydane",
+        "issued": "Zrealizowane",
     }
     return mapping.get(v, status or "-")
 
@@ -3003,6 +3003,7 @@ def order_view(order_id):
                   <option value="new" {% if o['status'] in ['new','pending','unconfirmed'] %}selected{% endif %}>Niepotwierdzone</option>
                   <option value="confirmed" {% if o['status']=='confirmed' %}selected{% endif %}>Potwierdzone</option>
                   <option value="in_delivery" {% if o['status'] in ['packed','in_delivery'] %}selected{% endif %}>W dostawie</option>
+                  <option value="issued" {% if o['status']=='issued' %}selected{% endif %}>Zrealizowane</option>
                 </select>
                 <button class="btn" type="submit">Zmień status</button>
               </form>
