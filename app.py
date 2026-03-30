@@ -3180,8 +3180,10 @@ def order_status_update(order_id):
         c.close()
         return "Zamówienie wydane z magazynu jest tylko do podglądu", 400
 
-    qr_data_url = o["qr_data_url"] or ""
-    if new_status == "confirmed" and not qr_data_url:
+    qr_data_url = (o["qr_data_url"] or "").strip()
+    if new_status == "confirmed":
+        # Zawsze nadpisuj QR aktualnym kodem zamówienia.
+        # To naprawia stare etykiety/QR-y zapisane kiedy numer był jeszcze TEMP.
         qr_data_url = make_qr_data_url(canonical_order_no(o["id"], o["created_at"], o["order_no"]))
 
     cur.execute("UPDATE orders SET status=?, qr_data_url=? WHERE id=?", (new_status, qr_data_url, order_id))
@@ -3509,23 +3511,20 @@ def order_label(order_id):
     if not o:
         abort(404)
 
-    qr_data_url = (o["qr_data_url"] or "").strip()
+    # Etykieta 30x50 ma zawsze używać aktualnego QR z poprawnym numerem ZAM-...
+    # i nadpisywać stare QR-y wygenerowane kiedy zamówienie miało jeszcze TEMP.
+    qr_data_url = make_qr_data_url(canonical_order_no(o["id"], o["created_at"], o["order_no"]))
 
-    # Etykieta 30x50 ma używać dokładnie tego samego QR,
-    # który jest przypisany do zamówienia po potwierdzeniu.
-    # Jeśli jeszcze go nie ma, wygeneruj identyczny QR z numeru zamówienia i zapisz.
-    if not qr_data_url:
-        qr_data_url = make_qr_data_url(canonical_order_no(o["id"], o["created_at"], o["order_no"]))
-        c = conn()
-        cur = c.cursor()
-        cur.execute("UPDATE orders SET qr_data_url=? WHERE id=?", (qr_data_url, order_id))
-        c.commit()
-        c.close()
-        if supabase_enabled():
-            try:
-                supabase_update_rows("orders", {"qr_data_url": qr_data_url}, {"id": order_id})
-            except Exception:
-                pass
+    c = conn()
+    cur = c.cursor()
+    cur.execute("UPDATE orders SET qr_data_url=? WHERE id=?", (qr_data_url, order_id))
+    c.commit()
+    c.close()
+    if supabase_enabled():
+        try:
+            supabase_update_rows("orders", {"qr_data_url": qr_data_url}, {"id": order_id})
+        except Exception:
+            pass
 
     # PDF 30x50 mm
     w = 30 * mm
