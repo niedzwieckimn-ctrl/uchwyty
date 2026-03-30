@@ -3848,6 +3848,7 @@ def order_scan():
             <button id="closeQrScanner" class="btn" type="button">Zamknij</button>
           </div>
           <div class="muted" style="margin-bottom:8px;">Uruchamia się tylko tylny aparat.</div>
+          <div id="scannerStatus" class="muted" style="margin-bottom:8px;"></div>
           <div id="reader" style="width:100%;min-height:280px;"></div>
         </div>
       </div>
@@ -3880,7 +3881,13 @@ def order_scan():
         let orderQrScannerRunning = false;
 
         async function startOrderQrScanner(){
-          if(!window.Html5Qrcode) return;
+          const statusEl = document.getElementById('scannerStatus');
+          if(statusEl) statusEl.innerText = 'Uruchamianie aparatu...';
+
+          if(!window.Html5Qrcode){
+            if(statusEl) statusEl.innerText = 'Brak biblioteki skanera.';
+            return;
+          }
           if(!orderQrScanner){
             orderQrScanner = new Html5Qrcode('reader');
           }
@@ -3894,26 +3901,55 @@ def order_scan():
             openOrderByCode(parsedCode || decodedText);
           };
 
+          const config = { fps: 10, qrbox: 220, aspectRatio: 1.0 };
+
           try {
-            await orderQrScanner.start(
-              { facingMode: { exact: 'environment' } },
-              { fps: 10, qrbox: 220, aspectRatio: 1.0 },
-              onSuccess,
-              function(){}
-            );
-            orderQrScannerRunning = true;
-          } catch (e1) {
-            try {
+            const cameras = await Html5Qrcode.getCameras();
+            let pickedCameraId = null;
+
+            if(Array.isArray(cameras) && cameras.length){
+              const backCam = cameras.find(c => /back|rear|environment|tył|tylny/i.test(String(c.label || '')));
+              pickedCameraId = (backCam || cameras[cameras.length - 1] || cameras[0]).id;
+            }
+
+            if(pickedCameraId){
+              if(statusEl) statusEl.innerText = 'Uruchamianie tylnego aparatu...';
               await orderQrScanner.start(
-                { facingMode: 'environment' },
-                { fps: 10, qrbox: 220, aspectRatio: 1.0 },
+                pickedCameraId,
+                config,
                 onSuccess,
                 function(){}
               );
               orderQrScannerRunning = true;
+              if(statusEl) statusEl.innerText = '';
+              return;
+            }
+          } catch (e0) {
+          }
+
+          try {
+            await orderQrScanner.start(
+              { facingMode: { exact: 'environment' } },
+              config,
+              onSuccess,
+              function(){}
+            );
+            orderQrScannerRunning = true;
+            if(statusEl) statusEl.innerText = '';
+          } catch (e1) {
+            try {
+              await orderQrScanner.start(
+                { facingMode: 'environment' },
+                config,
+                onSuccess,
+                function(){}
+              );
+              orderQrScannerRunning = true;
+              if(statusEl) statusEl.innerText = '';
             } catch (e2) {
-              document.getElementById('scanMsg').innerText = 'Nie udało się uruchomić tylnego aparatu.';
-              document.getElementById('qrScannerModal').classList.add('hidden');
+              const msg = (e2 && e2.message) ? e2.message : 'Nie udało się uruchomić tylnego aparatu.';
+              if(statusEl) statusEl.innerText = msg;
+              document.getElementById('scanMsg').innerText = msg;
             }
           }
         }
@@ -3930,7 +3966,7 @@ def order_scan():
 
         document.getElementById('openQrScanner').onclick = async function(){
           document.getElementById('qrScannerModal').classList.remove('hidden');
-          await startOrderQrScanner();
+          setTimeout(function(){ startOrderQrScanner(); }, 120);
         };
 
         document.getElementById('closeQrScanner').onclick = async function(){
