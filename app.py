@@ -301,6 +301,81 @@ def normalize_temp_order_numbers():
                 pass
     return len(changed)
 
+def _email_key(value: str) -> str:
+    return norm(value).strip().lower()
+
+def _order_name_is_fallback(order_name: str, email_value: str) -> bool:
+    email_key = _email_key(email_value)
+    if not email_key:
+        return False
+    local_part = email_key.split("@")[0]
+    current = norm(order_name).strip().lower()
+    return current in {"", email_key, local_part}
+
+def link_orders_to_customers_by_email(sync_remote: bool = True):
+    c = conn()
+    cur = c.cursor()
+
+    cur.execute("""
+      SELECT id, name, address, phone, email
+      FROM customers
+      WHERE TRIM(COALESCE(email, '')) <> ''
+      ORDER BY id
+    """)
+    customer_rows = [dict(r) for r in cur.fetchall()]
+    customers_by_email = {_email_key(r["email"]): r for r in customer_rows if _email_key(r.get("email"))}
+
+    cur.execute("""
+      SELECT id, customer_id, customer_name, customer_address, customer_phone, customer_email
+      FROM orders
+      WHERE TRIM(COALESCE(customer_email, '')) <> ''
+      ORDER BY id
+    """)
+    order_rows = [dict(r) for r in cur.fetchall()]
+
+    changed = []
+    for order_row in order_rows:
+        email_key = _email_key(order_row.get("customer_email"))
+        customer = customers_by_email.get(email_key)
+        if not customer:
+            continue
+
+        updates = {}
+        if int(order_row.get("customer_id") or 0) != int(customer["id"]):
+            updates["customer_id"] = int(customer["id"])
+
+        if _order_name_is_fallback(order_row.get("customer_name"), order_row.get("customer_email")) and norm(customer.get("name")):
+            updates["customer_name"] = norm(customer.get("name"))
+
+        if not norm(order_row.get("customer_address")) and norm(customer.get("address")):
+            updates["customer_address"] = norm(customer.get("address"))
+
+        if not norm(order_row.get("customer_phone")) and norm(customer.get("phone")):
+            updates["customer_phone"] = norm(customer.get("phone"))
+
+        if not norm(order_row.get("customer_email")) and norm(customer.get("email")):
+            updates["customer_email"] = norm(customer.get("email"))
+
+        if not updates:
+            continue
+
+        sets = ", ".join([f"{k}=?" for k in updates.keys()])
+        values = list(updates.values()) + [int(order_row["id"])]
+        cur.execute(f"UPDATE orders SET {sets} WHERE id=?", values)
+        changed.append((int(order_row["id"]), updates))
+
+    c.commit()
+    c.close()
+
+    if sync_remote and supabase_enabled():
+        for order_id, updates in changed:
+            try:
+                supabase_update_rows("orders", updates, {"id": order_id})
+            except Exception:
+                pass
+
+    return len(changed)
+
 
 def make_qr_data_url(value: str) -> str:
     raw_value = norm(value)
@@ -770,6 +845,7 @@ def pull_shared_tables_from_supabase(force: bool = False):
 
     try:
         normalize_temp_order_numbers()
+        link_orders_to_customers_by_email(sync_remote=True)
     except Exception:
         pass
     return result
@@ -1899,6 +1975,11 @@ def customers_create():
         )
         c.commit()
         c.close()
+
+    try:
+        link_orders_to_customers_by_email(sync_remote=True)
+    except Exception:
+        pass
     return redirect(url_for("customers"))
 
 @app.get("/customers/<int:customer_id>/edit")
@@ -1980,6 +2061,10 @@ def customers_update(customer_id):
             "nip": nip,
         }, {"id": customer_id})
 
+    try:
+        link_orders_to_customers_by_email(sync_remote=True)
+    except Exception:
+        pass
     return redirect(url_for("customers"))
 
 @app.post("/customers/<int:customer_id>/delete")
@@ -2383,6 +2468,10 @@ def api_product(product_id):
 @app.get("/orders")
 def orders():
     maybe_pull_shared_from_supabase()
+    try:
+        link_orders_to_customers_by_email(sync_remote=True)
+    except Exception:
+        pass
     q = norm(request.args.get("q"))
     tab = norm(request.args.get("tab")) or "new"
     if tab not in {"new", "issued", "all"}:
@@ -2787,6 +2876,10 @@ def order_create():
 @app.get("/orders/<int:order_id>")
 def order_view(order_id):
     maybe_pull_shared_from_supabase()
+    try:
+        link_orders_to_customers_by_email(sync_remote=True)
+    except Exception:
+        pass
     c = conn()
     cur = c.cursor()
     cur.execute("SELECT * FROM orders WHERE id=?", (order_id,))
