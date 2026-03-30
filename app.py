@@ -2933,13 +2933,7 @@ def order_view(order_id):
           <div class="muted">Email: {{ o['customer_email'] or "-" }}</div>
           <div class="line"></div>
           <div class="muted small">Kod zamówienia do skanowania: <b>{{ canonical_order_no(o['id'], o['created_at'], o['order_no']) }}</b></div>
-          {% if o['qr_data_url'] %}
-            <div style="margin-top:10px;">
-              <img src="{{ o['qr_data_url'] }}" alt="QR zamówienia" style="width:180px;height:180px;border:1px solid #eee;border-radius:12px;padding:8px;background:#fff;">
-            </div>
-          {% else %}
-            <div class="muted small" style="margin-top:10px;">QR wygeneruje się po ustawieniu statusu na <b>Potwierdzone</b>.</div>
-          {% endif %}
+          <div class="muted small" style="margin-top:10px;">QR jest używany do etykiety 30x50 i skanowania zamówienia.</div>
         </div>
 
         <div class="card">
