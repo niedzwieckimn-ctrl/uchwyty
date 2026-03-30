@@ -1556,14 +1556,14 @@ def cloud_supabase_pull():
 @app.after_request
 def auto_sync_after_write(response):
     try:
-        if response.status_code >= 400:
-            return response
-        if request.method not in ("POST", "PUT", "PATCH", "DELETE"):
-            return response
-        # endpoint syncu manualnego nie powinien odpalać sam siebie
-        if request.path.startswith("/cloud/supabase"):
-            return response
-        trigger_background_supabase_sync(reason=f"{request.method} {request.path}")
+        if request.path.startswith("/api/"):
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+
+        if response.status_code < 400 and request.method in ("POST", "PUT", "PATCH", "DELETE"):
+            if not request.path.startswith("/cloud/supabase"):
+                trigger_background_supabase_sync(reason=f"{request.method} {request.path}")
     except Exception:
         pass
     return response
@@ -3625,6 +3625,35 @@ def order_label(order_id):
 
     fname = safe_filename(canonical_order_no(o["id"], o["created_at"], o["order_no"])) + "_label_30x50.pdf"
     return send_file(buf, mimetype="application/pdf", as_attachment=True, download_name=fname)
+
+
+@app.get("/api/client_stock_catalog")
+def api_client_stock_catalog():
+    maybe_pull_shared_from_supabase()
+
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+      SELECT
+        p.id AS product_id,
+        p.sku,
+        p.model,
+        p.name,
+        COALESCE(s.qty, 0) AS qty_on_stock,
+        COALESCE(pr.net_price, 0) AS net_price,
+        COALESCE(pr.gross_price, 0) AS gross_price
+      FROM products p
+      LEFT JOIN stock s ON s.product_id = p.id
+      LEFT JOIN pricing pr
+        ON (TRIM(LOWER(pr.model)) = TRIM(LOWER(p.model))
+            OR TRIM(LOWER(pr.model)) = TRIM(LOWER(p.sku)))
+      ORDER BY p.sku
+      LIMIT 5000
+    """)
+    rows = [dict(r) for r in cur.fetchall()]
+    c.close()
+
+    return jsonify(ok=True, rows=rows)
 
 
 @app.get("/api/order_lookup")
