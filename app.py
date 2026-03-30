@@ -807,7 +807,7 @@ def remote_first_create_order(customer_id, customer_name, customer_address, cust
 
     order_id = int(created_order["id"])
     order_no = make_order_no(order_id)
-    qr_data_url = make_qr_data_url(order_no)
+    qr_data_url = ""
     supabase_update_rows("orders", {"order_no": order_no, "qr_data_url": qr_data_url}, {"id": order_id})
 
     c = conn()
@@ -2708,7 +2708,7 @@ def order_create():
         oid = cur.lastrowid
 
         order_no = make_order_no(oid)
-        qr_data_url = make_qr_data_url(order_no)
+        qr_data_url = ""
         cur.execute("UPDATE orders SET order_no=?, qr_data_url=? WHERE id=?", (order_no, qr_data_url, oid))
 
         for pid, qty in items:
@@ -2848,6 +2848,14 @@ def order_view(order_id):
             <a class="btn" href="{{ url_for('order_print', order_id=o['id']) }}">Drukuj zamówienie</a>
             <a class="btn primary" href="{{ url_for('order_invoice', order_id=o['id']) }}">Faktura</a>
             {% if not locked %}
+              <form method="post" action="{{ url_for('order_status_update', order_id=o['id']) }}" class="flex">
+                <select name="status" style="width:190px;">
+                  <option value="new" {% if o['status'] in ['new','pending','unconfirmed'] %}selected{% endif %}>Niepotwierdzone</option>
+                  <option value="confirmed" {% if o['status']=='confirmed' %}selected{% endif %}>Potwierdzone</option>
+                  <option value="in_delivery" {% if o['status'] in ['packed','in_delivery'] %}selected{% endif %}>W dostawie</option>
+                </select>
+                <button class="btn" type="submit">Zmień status</button>
+              </form>
               <a class="btn primary" href="{{ url_for('order_label', order_id=o['id']) }}">Etykieta 30x50</a>
               <a class="btn ok" href="{{ url_for('order_issue', order_id=o['id']) }}">Wydaj z magazynu</a>
               <form method="post" action="{{ url_for('order_delete', order_id=o['id']) }}" onsubmit="return confirm('Usunąć zamówienie?')">
@@ -2872,6 +2880,8 @@ def order_view(order_id):
             <div style="margin-top:10px;">
               <img src="{{ o['qr_data_url'] }}" alt="QR zamówienia" style="width:180px;height:180px;border:1px solid #eee;border-radius:12px;padding:8px;background:#fff;">
             </div>
+          {% else %}
+            <div class="muted small" style="margin-top:10px;">QR wygeneruje się po ustawieniu statusu na <b>Potwierdzone</b>.</div>
           {% endif %}
         </div>
 
@@ -3100,6 +3110,38 @@ def order_delete(order_id):
     c.commit()
     c.close()
     return redirect(url_for("orders"))
+
+@app.post("/orders/<int:order_id>/status")
+def order_status_update(order_id):
+    new_status = norm(request.form.get("status")).lower()
+    allowed = {"new", "confirmed", "in_delivery"}
+    if new_status not in allowed:
+        return "Nieprawidłowy status", 400
+
+    c = conn()
+    cur = c.cursor()
+    cur.execute("SELECT id, order_no, qr_data_url, status FROM orders WHERE id=?", (order_id,))
+    o = cur.fetchone()
+    if not o:
+        c.close()
+        abort(404)
+    if o["status"] == "issued":
+        c.close()
+        return "Zamówienie wydane z magazynu jest tylko do podglądu", 400
+
+    qr_data_url = o["qr_data_url"] or ""
+    if new_status == "confirmed" and not qr_data_url:
+        qr_data_url = make_qr_data_url(o["order_no"])
+
+    cur.execute("UPDATE orders SET status=?, qr_data_url=? WHERE id=?", (new_status, qr_data_url, order_id))
+    c.commit()
+    c.close()
+
+    if supabase_enabled():
+        supabase_update_rows("orders", {"status": new_status, "qr_data_url": qr_data_url}, {"id": order_id})
+
+    return redirect(url_for("order_view", order_id=order_id))
+
 
 @app.get("/orders/<int:order_id>/issue")
 def order_issue(order_id):
