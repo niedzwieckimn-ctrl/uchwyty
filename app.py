@@ -3458,18 +3458,23 @@ def order_label(order_id):
     if not o:
         abort(404)
 
-    # QR ma prowadzić do szczegółów zamówienia
-    url = build_public_url(url_for("order_view", order_id=order_id))
+    qr_data_url = (o["qr_data_url"] or "").strip()
 
-    qr = qrcode.QRCode(
-        version=None,
-        error_correction=qrcode.constants.ERROR_CORRECT_M,
-        box_size=10,
-        border=1
-    )
-    qr.add_data(url)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
+    # Etykieta 30x50 ma używać dokładnie tego samego QR,
+    # który jest przypisany do zamówienia po potwierdzeniu.
+    # Jeśli jeszcze go nie ma, wygeneruj identyczny QR z numeru zamówienia i zapisz.
+    if not qr_data_url:
+        qr_data_url = make_qr_data_url(o["order_no"])
+        c = conn()
+        cur = c.cursor()
+        cur.execute("UPDATE orders SET qr_data_url=? WHERE id=?", (qr_data_url, order_id))
+        c.commit()
+        c.close()
+        if supabase_enabled():
+            try:
+                supabase_update_rows("orders", {"qr_data_url": qr_data_url}, {"id": order_id})
+            except Exception:
+                pass
 
     # PDF 30x50 mm
     w = 30 * mm
@@ -3479,9 +3484,19 @@ def order_label(order_id):
     cpdf = canvas.Canvas(buf, pagesize=(w, h))
 
     # Umieszczenie QR
-    qr_buf = io.BytesIO()
-    img.save(qr_buf, format="PNG")
-    qr_buf.seek(0)
+    qr_bytes = b""
+    if qr_data_url.startswith("data:image"):
+        try:
+            qr_bytes = base64.b64decode(qr_data_url.split(",", 1)[1])
+        except Exception:
+            qr_bytes = b""
+
+    if not qr_bytes:
+        fallback_qr = make_qr_data_url(o["order_no"])
+        if fallback_qr.startswith("data:image"):
+            qr_bytes = base64.b64decode(fallback_qr.split(",", 1)[1])
+
+    qr_buf = io.BytesIO(qr_bytes)
     qr_img = ImageReader(qr_buf)
 
     # QR na górze (większy), dane poniżej
