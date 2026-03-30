@@ -726,6 +726,10 @@ def pull_shared_tables_from_supabase(force: bool = False):
             result["tables"].setdefault(table, {})
             result["tables"][table].update({"status": "error", "stage": "cleanup", "error": str(e)})
 
+    try:
+        normalize_temp_order_numbers()
+    except Exception:
+        pass
     return result
 
 
@@ -838,6 +842,10 @@ def remote_first_create_order(customer_id, customer_name, customer_address, cust
 
     c.commit()
     c.close()
+    try:
+        normalize_temp_order_numbers()
+    except Exception:
+        pass
     return order_id
 
 
@@ -950,7 +958,7 @@ def get_pdf_font_names():
 
 def generate_sales_invoice(order_row, items):
     customer_dir = invoice_dir_for_customer(order_row["customer_name"])
-    fname = f"FV_{safe_filename(order_row['order_no'])}.pdf"
+    fname = f"FV_{safe_filename(canonical_order_no(order_row['id'] if 'id' in order_row.keys() else None, order_row['created_at'] if 'created_at' in order_row.keys() else '', order_row['order_no']))}.pdf"
     fpath = os.path.join(customer_dir, fname)
 
     c = conn()
@@ -971,7 +979,7 @@ def generate_sales_invoice(order_row, items):
 
     y = h - 18 * mm
     cpdf.setFont(pdf_font_bold, 14)
-    cpdf.drawString(15 * mm, y, f"Faktura sprzedażowa: {order_row['order_no']}")
+    cpdf.drawString(15 * mm, y, f"Faktura sprzedażowa: {canonical_order_no(order_row['id'] if 'id' in order_row.keys() else None, order_row['created_at'] if 'created_at' in order_row.keys() else '', order_row['order_no'])}")
 
     y -= 8 * mm
     cpdf.setFont(pdf_font, 10)
@@ -2491,7 +2499,7 @@ def orders():
           <tbody>
             {% for r in rows %}
               <tr {% if r['has_shortage'] or r['status'] in ['new','pending','unconfirmed'] %}style="background:#ffe7e7;"{% endif %}>
-                <td><b>{{ r['order_no'] }}</b></td>
+                <td><b>{{ canonical_order_no(r['id'], r['created_at'], r['order_no']) }}</b></td>
                 <td>{{ r['customer_name'] }}</td>
                 <td><span class="badge {{ order_status_css(r['status']) }}">{{ order_status_label(r['status']) }}</span></td>
                 <td><span class="badge">{{ "%.2f"|format(r['order_value_net']) }} PLN</span></td>
@@ -2517,7 +2525,7 @@ def orders():
       </div>
     {% endblock %}
     """
-    return render_template_string(tpl, title="Zamówienia", base_url=BASE_URL, db_path=DB_PATH, rows=rows, q=q, tab=tab, order_status_label=order_status_label, order_status_css=order_status_css)
+    return render_template_string(tpl, title="Zamówienia", base_url=BASE_URL, db_path=DB_PATH, rows=rows, q=q, tab=tab, order_status_label=order_status_label, order_status_css=order_status_css, canonical_order_no=canonical_order_no)
 
 @app.get("/orders/new")
 def order_new():
@@ -2725,6 +2733,10 @@ def order_create():
         c.commit()
         c.close()
 
+    try:
+        normalize_temp_order_numbers()
+    except Exception:
+        pass
     return redirect(url_for("order_view", order_id=oid))
 
 @app.get("/orders/<int:order_id>")
@@ -2841,7 +2853,7 @@ def order_view(order_id):
     {% block content %}
       <div class="card">
         <div class="flex">
-          <h1 style="margin:0;">{{ o['order_no'] }}</h1>
+          <h1 style="margin:0;">{{ canonical_order_no(o['id'], o['created_at'], o['order_no']) }}</h1>
           <span class="badge {{ order_status_css(o['status']) }}">{{ order_status_label(o['status']) }}</span>
           <div class="right flex">
             <a class="btn" href="{{ url_for('orders') }}">← Lista</a>
@@ -2875,7 +2887,7 @@ def order_view(order_id):
           <div class="muted" style="margin-top:6px;">Tel: {{ o['customer_phone'] or "-" }}</div>
           <div class="muted">Email: {{ o['customer_email'] or "-" }}</div>
           <div class="line"></div>
-          <div class="muted small">Kod zamówienia do skanowania: <b>{{ o['order_no'] }}</b></div>
+          <div class="muted small">Kod zamówienia do skanowania: <b>{{ canonical_order_no(o['id'], o['created_at'], o['order_no']) }}</b></div>
           {% if o['qr_data_url'] %}
             <div style="margin-top:10px;">
               <img src="{{ o['qr_data_url'] }}" alt="QR zamówienia" style="width:180px;height:180px;border:1px solid #eee;border-radius:12px;padding:8px;background:#fff;">
@@ -2991,7 +3003,7 @@ def order_view(order_id):
       </div>
     {% endblock %}
     """
-    return render_template_string(tpl, title=o["order_no"], base_url=BASE_URL, db_path=DB_PATH, o=o, items=items, order_url=order_url, products=products_rows, locked=(o["status"]=="issued"), order_status_label=order_status_label, order_status_css=order_status_css)
+    return render_template_string(tpl, title=canonical_order_no(o["id"], o["created_at"], o["order_no"]), base_url=BASE_URL, db_path=DB_PATH, o=o, items=items, order_url=order_url, products=products_rows, locked=(o["status"]=="issued"), order_status_label=order_status_label, order_status_css=order_status_css, canonical_order_no=canonical_order_no)
 
 @app.post("/orders/<int:order_id>/items/add")
 def order_item_add(order_id):
@@ -3131,7 +3143,7 @@ def order_status_update(order_id):
 
     qr_data_url = o["qr_data_url"] or ""
     if new_status == "confirmed" and not qr_data_url:
-        qr_data_url = make_qr_data_url(o["order_no"])
+        qr_data_url = make_qr_data_url(canonical_order_no(o["id"], o["created_at"], o["order_no"]))
 
     cur.execute("UPDATE orders SET status=?, qr_data_url=? WHERE id=?", (new_status, qr_data_url, order_id))
     c.commit()
@@ -3304,7 +3316,7 @@ def order_invoice(order_id):
     {% block content %}
       <div class="card">
         <div class="flex">
-          <h1 style="margin:0;">Faktura do zamówienia {{ o['order_no'] }}</h1>
+          <h1 style="margin:0;">Faktura do zamówienia {{ canonical_order_no(o['id'], o['created_at'], o['order_no']) }}</h1>
           <a class="btn right" href="{{ url_for('order_view', order_id=o['id']) }}">← Szczegóły</a>
         </div>
       </div>
@@ -3393,7 +3405,7 @@ def order_print(order_id):
 
     y = h - 18 * mm
     cpdf.setFont(pdf_font_bold, 14)
-    cpdf.drawString(15 * mm, y, f"Wydruk zamówienia: {o['order_no']}")
+    cpdf.drawString(15 * mm, y, f"Wydruk zamówienia: {canonical_order_no(o['id'], o['created_at'], o['order_no'])}")
     y -= 7 * mm
     cpdf.setFont(pdf_font, 10)
     cpdf.drawString(15 * mm, y, f"Klient: {o['customer_name']}")
@@ -3440,7 +3452,7 @@ def order_print(order_id):
     cpdf.showPage()
     cpdf.save()
     buf.seek(0)
-    fname = safe_filename(o["order_no"]) + "_druk_zamowienia.pdf"
+    fname = safe_filename(canonical_order_no(o["id"], o["created_at"], o["order_no"])) + "_druk_zamowienia.pdf"
     return send_file(buf, mimetype="application/pdf", as_attachment=True, download_name=fname)
 
 
@@ -3464,7 +3476,7 @@ def order_label(order_id):
     # który jest przypisany do zamówienia po potwierdzeniu.
     # Jeśli jeszcze go nie ma, wygeneruj identyczny QR z numeru zamówienia i zapisz.
     if not qr_data_url:
-        qr_data_url = make_qr_data_url(o["order_no"])
+        qr_data_url = make_qr_data_url(canonical_order_no(o["id"], o["created_at"], o["order_no"]))
         c = conn()
         cur = c.cursor()
         cur.execute("UPDATE orders SET qr_data_url=? WHERE id=?", (qr_data_url, order_id))
@@ -3492,7 +3504,7 @@ def order_label(order_id):
             qr_bytes = b""
 
     if not qr_bytes:
-        fallback_qr = make_qr_data_url(o["order_no"])
+        fallback_qr = make_qr_data_url(canonical_order_no(o["id"], o["created_at"], o["order_no"]))
         if fallback_qr.startswith("data:image"):
             qr_bytes = base64.b64decode(fallback_qr.split(",", 1)[1])
 
@@ -3511,7 +3523,7 @@ def order_label(order_id):
     cpdf.drawString(margin, text_y, (o["customer_name"] or "")[:40])
 
     cpdf.setFont(pdf_font_bold, 6.3)
-    cpdf.drawString(margin, text_y - 3.2*mm, f"Nr: {o['order_no']}")
+    cpdf.drawString(margin, text_y - 3.2*mm, f"Nr: {canonical_order_no(o['id'], o['created_at'], o['order_no'])}")
 
     cpdf.setFont(pdf_font, 6.3)
     addr = (o["customer_address"] or "").strip()
@@ -3540,7 +3552,7 @@ def order_label(order_id):
     cpdf.save()
     buf.seek(0)
 
-    fname = safe_filename(o["order_no"]) + "_label_30x50.pdf"
+    fname = safe_filename(canonical_order_no(o["id"], o["created_at"], o["order_no"])) + "_label_30x50.pdf"
     return send_file(buf, mimetype="application/pdf", as_attachment=True, download_name=fname)
 
 
@@ -3555,6 +3567,13 @@ def api_order_lookup():
     cur = c.cursor()
     cur.execute("SELECT * FROM orders WHERE order_no=? LIMIT 1", (token,))
     o = cur.fetchone()
+    if not o:
+        cur.execute("SELECT * FROM orders ORDER BY id DESC")
+        all_orders = cur.fetchall()
+        for row in all_orders:
+            if canonical_order_no(row["id"], row["created_at"], row["order_no"]) == norm(token):
+                o = row
+                break
     if not o:
         c.close()
         return jsonify(ok=False, error="Nie znaleziono zamówienia"), 404
