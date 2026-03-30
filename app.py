@@ -355,6 +355,32 @@ def norm(s):
         return ""
     return str(s).strip()
 
+def order_status_label(status: str) -> str:
+    v = norm(status).lower()
+    mapping = {
+        "new": "Niepotwierdzone",
+        "pending": "Niepotwierdzone",
+        "unconfirmed": "Niepotwierdzone",
+        "confirmed": "Potwierdzone",
+        "packed": "W dostawie",
+        "in_delivery": "W dostawie",
+        "issued": "Wydane",
+    }
+    return mapping.get(v, status or "-")
+
+def order_status_css(status: str) -> str:
+    v = norm(status).lower()
+    mapping = {
+        "new": "st-unconfirmed",
+        "pending": "st-unconfirmed",
+        "unconfirmed": "st-unconfirmed",
+        "confirmed": "st-confirmed",
+        "packed": "st-delivery",
+        "in_delivery": "st-delivery",
+        "issued": "st-issued",
+    }
+    return mapping.get(v, "")
+
 def guess_col(headers, candidates):
     h = [x.strip().lower() for x in headers]
     for cand in candidates:
@@ -1420,6 +1446,13 @@ def cloud_supabase():
     tpl = r"""
     {% extends "base.html" %}
     {% block content %}
+      <style>
+        .st-unconfirmed{background:#ef4444;color:#fff;border-color:#ef4444;}
+        .st-confirmed{background:#16a34a;color:#fff;border-color:#16a34a;}
+        .st-delivery{background:#2563eb;color:#fff;border-color:#2563eb;}
+        .st-issued{background:#6b7280;color:#fff;border-color:#6b7280;}
+      </style>
+
       <div class="card">
         <h1>Supabase Cloud Sync</h1>
         <div class="muted">Przerzucanie danych z lokalnego SQLite do tabel w Supabase (REST upsert).</div>
@@ -2443,6 +2476,13 @@ def orders():
         </form>
       </div>
 
+      <style>
+        .st-unconfirmed{background:#ef4444;color:#fff;border-color:#ef4444;}
+        .st-confirmed{background:#16a34a;color:#fff;border-color:#16a34a;}
+        .st-delivery{background:#2563eb;color:#fff;border-color:#2563eb;}
+        .st-issued{background:#6b7280;color:#fff;border-color:#6b7280;}
+      </style>
+
       <div class="card">
         <table>
           <thead>
@@ -2450,10 +2490,10 @@ def orders():
           </thead>
           <tbody>
             {% for r in rows %}
-              <tr {% if r['has_shortage'] %}style="background:#ffe7e7;"{% endif %}>
+              <tr {% if r['has_shortage'] or r['status'] in ['new','pending','unconfirmed'] %}style="background:#ffe7e7;"{% endif %}>
                 <td><b>{{ r['order_no'] }}</b></td>
                 <td>{{ r['customer_name'] }}</td>
-                <td><span class="badge">{{ r['status'] }}</span></td>
+                <td><span class="badge {{ order_status_css(r['status']) }}">{{ order_status_label(r['status']) }}</span></td>
                 <td><span class="badge">{{ "%.2f"|format(r['order_value_net']) }} PLN</span></td>
                 <td class="muted">{{ r['created_at'] }}</td>
                 <td class="flex">
@@ -2477,7 +2517,7 @@ def orders():
       </div>
     {% endblock %}
     """
-    return render_template_string(tpl, title="Zamówienia", base_url=BASE_URL, db_path=DB_PATH, rows=rows, q=q, tab=tab)
+    return render_template_string(tpl, title="Zamówienia", base_url=BASE_URL, db_path=DB_PATH, rows=rows, q=q, tab=tab, order_status_label=order_status_label, order_status_css=order_status_css)
 
 @app.get("/orders/new")
 def order_new():
@@ -2802,7 +2842,7 @@ def order_view(order_id):
       <div class="card">
         <div class="flex">
           <h1 style="margin:0;">{{ o['order_no'] }}</h1>
-          <span class="badge">{{ o['status'] }}</span>
+          <span class="badge {{ order_status_css(o['status']) }}">{{ order_status_label(o['status']) }}</span>
           <div class="right flex">
             <a class="btn" href="{{ url_for('orders') }}">← Lista</a>
             <a class="btn" href="{{ url_for('order_print', order_id=o['id']) }}">Drukuj zamówienie</a>
@@ -2941,7 +2981,7 @@ def order_view(order_id):
       </div>
     {% endblock %}
     """
-    return render_template_string(tpl, title=o["order_no"], base_url=BASE_URL, db_path=DB_PATH, o=o, items=items, order_url=order_url, products=products_rows, locked=(o["status"]=="issued"))
+    return render_template_string(tpl, title=o["order_no"], base_url=BASE_URL, db_path=DB_PATH, o=o, items=items, order_url=order_url, products=products_rows, locked=(o["status"]=="issued"), order_status_label=order_status_label, order_status_css=order_status_css)
 
 @app.post("/orders/<int:order_id>/items/add")
 def order_item_add(order_id):
