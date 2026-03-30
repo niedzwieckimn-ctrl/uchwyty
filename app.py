@@ -3558,13 +3558,45 @@ def order_label(order_id):
     # Dane zamawiającego + nr zamówienia
     pdf_font, pdf_font_bold = get_pdf_font_names()
     text_y = h - margin - qr_size - 2*mm
-    cpdf.setFont(pdf_font_bold, 6.8)
-    cpdf.drawString(margin, text_y, (o["customer_name"] or "")[:40])
+    max_text_width = w - (2 * margin)
 
-    cpdf.setFont(pdf_font_bold, 6.3)
-    cpdf.drawString(margin, text_y - 3.2*mm, f"Nr: {canonical_order_no(o['id'], o['created_at'], o['order_no'])}")
+    def wrap_pdf_text(value, font_name, font_size, max_width):
+        words = str(value or "").split()
+        if not words:
+            return []
+        lines = []
+        current = words[0]
+        for word in words[1:]:
+            test = current + " " + word
+            if pdfmetrics.stringWidth(test, font_name, font_size) <= max_width:
+                current = test
+            else:
+                lines.append(current)
+                current = word
+        lines.append(current)
+        return lines
 
-    cpdf.setFont(pdf_font, 6.3)
+    customer_lines = wrap_pdf_text((o["customer_name"] or "")[:60], pdf_font_bold, 6.2, max_text_width)
+    if not customer_lines:
+        customer_lines = [""]
+
+    cpdf.setFont(pdf_font_bold, 6.2)
+    cpdf.drawString(margin, text_y, customer_lines[0][:60])
+
+    order_no_value = canonical_order_no(o['id'], o['created_at'], o['order_no'])
+    order_no_lines = [f"Nr: {order_no_value}"]
+
+    if pdfmetrics.stringWidth(order_no_lines[0], pdf_font_bold, 5.1) > max_text_width:
+        order_no_lines = [f"Nr: {order_no_value[:13]}", order_no_value[13:]]
+
+    cpdf.setFont(pdf_font_bold, 5.1)
+    cpdf.drawString(margin, text_y - 3.2*mm, order_no_lines[0])
+    extra_offset_mm = 0
+    if len(order_no_lines) > 1 and order_no_lines[1].strip():
+        cpdf.drawString(margin, text_y - 6.0*mm, order_no_lines[1].strip())
+        extra_offset_mm = 2.8
+
+    cpdf.setFont(pdf_font, 6.0)
     addr = (o["customer_address"] or "").strip()
     phone = (o["customer_phone"] or "").strip()
 
@@ -3582,7 +3614,7 @@ def order_label(order_id):
     if phone:
         lines.append(f"Tel: {phone}")
 
-    y = text_y - 6.8*mm
+    y = text_y - (6.8 + extra_offset_mm)*mm
     for ln in lines[:6]:
         cpdf.drawString(margin, y, ln)
         y -= 3.2*mm
