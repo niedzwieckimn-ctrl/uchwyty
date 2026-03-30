@@ -260,6 +260,48 @@ def make_order_no(order_id: int) -> str:
     return f"ZAM-{d}-{order_id:06d}"
 
 
+def canonical_order_no(order_id: int | None, created_at: str | None = "", raw_order_no: str | None = "") -> str:
+    raw = norm(raw_order_no)
+    if raw and raw.upper() != "TEMP":
+        if raw.startswith("ORD-"):
+            return "ZAM-" + raw[4:]
+        return raw
+
+    created = norm(created_at)
+    if len(created) >= 10 and created[4:5] == "-" and created[7:8] == "-":
+        date_part = created[:10].replace("-", "")
+    else:
+        date_part = datetime.now().strftime("%Y%m%d")
+
+    oid = int(order_id or 0)
+    if oid > 0:
+        return f"ZAM-{date_part}-{oid:06d}"
+    return f"ZAM-{date_part}-000000"
+
+
+def normalize_temp_order_numbers():
+    c = conn()
+    cur = c.cursor()
+    cur.execute("SELECT id, order_no, created_at FROM orders ORDER BY id")
+    rows = cur.fetchall()
+    changed = []
+    for r in rows:
+        new_no = canonical_order_no(r["id"], r["created_at"], r["order_no"])
+        if new_no != (r["order_no"] or ""):
+            cur.execute("UPDATE orders SET order_no=? WHERE id=?", (new_no, r["id"]))
+            changed.append((int(r["id"]), new_no))
+    c.commit()
+    c.close()
+
+    if supabase_enabled():
+        for oid, ono in changed:
+            try:
+                supabase_update_rows("orders", {"order_no": ono}, {"id": oid})
+            except Exception:
+                pass
+    return len(changed)
+
+
 def make_qr_data_url(value: str) -> str:
     raw_value = norm(value)
     if not raw_value:
@@ -1357,6 +1399,9 @@ function removeRow(btn){
 
 # loader: BASE dostępny jako "base.html"
 app.jinja_loader = DictLoader({"base.html": BASE})
+app.jinja_env.globals["canonical_order_no"] = canonical_order_no
+app.jinja_env.globals["order_status_label"] = order_status_label if "order_status_label" in globals() else None
+app.jinja_env.globals["order_status_css"] = order_status_css if "order_status_css" in globals() else None
 
 
 # =========================
