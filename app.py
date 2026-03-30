@@ -3849,11 +3849,11 @@ def order_scan():
           </div>
           <div class="muted" style="margin-bottom:8px;">Uruchamia się tylko tylny aparat.</div>
           <div id="scannerStatus" class="muted" style="margin-bottom:8px;"></div>
-          <div id="reader" style="width:100%;min-height:280px;"></div>
+          <video id="qrVideo" autoplay playsinline muted style="width:100%;min-height:280px;border-radius:12px;background:#000;"></video>
+          <canvas id="qrCanvas" style="display:none;"></canvas>
         </div>
       </div>
 
-      <script src="https://unpkg.com/html5-qrcode" type="text/javascript"></script>
       <script>
         function parseOrderCode(value){
           const raw = String(value || '').trim();
@@ -3877,91 +3877,75 @@ def order_scan():
           window.location.href = '/orders/by-code/' + encodeURIComponent(value);
         }
 
-        let orderQrScanner = null;
-        let orderQrScannerRunning = false;
-
-        async function startOrderQrScanner(){
-          const statusEl = document.getElementById('scannerStatus');
-          if(statusEl) statusEl.innerText = 'Uruchamianie aparatu...';
-
-          if(!window.Html5Qrcode){
-            if(statusEl) statusEl.innerText = 'Brak biblioteki skanera.';
-            return;
-          }
-          if(!orderQrScanner){
-            orderQrScanner = new Html5Qrcode('reader');
-          }
-          if(orderQrScannerRunning) return;
-
-          const onSuccess = async (decodedText) => {
-            const parsedCode = parseOrderCode(decodedText);
-            document.getElementById('manualToken').value = parsedCode || decodedText;
-            await stopOrderQrScanner();
-            document.getElementById('qrScannerModal').classList.add('hidden');
-            openOrderByCode(parsedCode || decodedText);
-          };
-
-          const config = { fps: 10, qrbox: 220, aspectRatio: 1.0 };
-
-          try {
-            const cameras = await Html5Qrcode.getCameras();
-            let pickedCameraId = null;
-
-            if(Array.isArray(cameras) && cameras.length){
-              const backCam = cameras.find(c => /back|rear|environment|tył|tylny/i.test(String(c.label || '')));
-              pickedCameraId = (backCam || cameras[cameras.length - 1] || cameras[0]).id;
-            }
-
-            if(pickedCameraId){
-              if(statusEl) statusEl.innerText = 'Uruchamianie tylnego aparatu...';
-              await orderQrScanner.start(
-                pickedCameraId,
-                config,
-                onSuccess,
-                function(){}
-              );
-              orderQrScannerRunning = true;
-              if(statusEl) statusEl.innerText = '';
-              return;
-            }
-          } catch (e0) {
-          }
-
-          try {
-            await orderQrScanner.start(
-              { facingMode: { exact: 'environment' } },
-              config,
-              onSuccess,
-              function(){}
-            );
-            orderQrScannerRunning = true;
-            if(statusEl) statusEl.innerText = '';
-          } catch (e1) {
-            try {
-              await orderQrScanner.start(
-                { facingMode: 'environment' },
-                config,
-                onSuccess,
-                function(){}
-              );
-              orderQrScannerRunning = true;
-              if(statusEl) statusEl.innerText = '';
-            } catch (e2) {
-              const msg = (e2 && e2.message) ? e2.message : 'Nie udało się uruchomić tylnego aparatu.';
-              if(statusEl) statusEl.innerText = msg;
-              document.getElementById('scanMsg').innerText = msg;
-            }
-          }
-        }
+        let qrStream = null;
+        let qrScanTimer = null;
+        let qrDetector = null;
 
         async function stopOrderQrScanner(){
           try {
-            if(orderQrScanner && orderQrScannerRunning){
-              await orderQrScanner.stop();
-              await orderQrScanner.clear();
+            if(qrScanTimer){
+              clearInterval(qrScanTimer);
+              qrScanTimer = null;
             }
-          } catch(e) {}
-          orderQrScannerRunning = false;
+            if(qrStream){
+              qrStream.getTracks().forEach(t => t.stop());
+              qrStream = null;
+            }
+            const video = document.getElementById('qrVideo');
+            if(video) video.srcObject = null;
+          } catch(e){}
+        }
+
+        async function startOrderQrScanner(){
+          const statusEl = document.getElementById('scannerStatus');
+          const video = document.getElementById('qrVideo');
+          if(statusEl) statusEl.innerText = 'Uruchamianie aparatu...';
+
+          try {
+            qrStream = await navigator.mediaDevices.getUserMedia({
+              audio: false,
+              video: {
+                facingMode: { ideal: 'environment' },
+                width: { ideal: 1280 },
+                height: { ideal: 720 }
+              }
+            });
+
+            video.srcObject = qrStream;
+            await video.play();
+
+            if(statusEl) statusEl.innerText = 'Skanuję kod QR...';
+
+            if ('BarcodeDetector' in window) {
+              qrDetector = new BarcodeDetector({ formats: ['qr_code'] });
+              const canvas = document.getElementById('qrCanvas');
+              const ctx = canvas.getContext('2d');
+
+              qrScanTimer = setInterval(async () => {
+                try {
+                  if (!video.videoWidth || !video.videoHeight) return;
+                  canvas.width = video.videoWidth;
+                  canvas.height = video.videoHeight;
+                  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                  const barcodes = await qrDetector.detect(canvas);
+                  if (barcodes && barcodes.length) {
+                    const raw = barcodes[0].rawValue || '';
+                    const parsed = parseOrderCode(raw);
+                    document.getElementById('manualToken').value = parsed || raw;
+                    await stopOrderQrScanner();
+                    document.getElementById('qrScannerModal').classList.add('hidden');
+                    openOrderByCode(parsed || raw);
+                  }
+                } catch(e) {}
+              }, 350);
+            } else {
+              if(statusEl) statusEl.innerText = 'Ta przeglądarka nie obsługuje skanowania QR w tym widoku. Wklej kod ręcznie.';
+            }
+          } catch (e) {
+            const msg = (e && e.message) ? e.message : 'Nie udało się uruchomić tylnego aparatu.';
+            if(statusEl) statusEl.innerText = msg;
+            document.getElementById('scanMsg').innerText = msg;
+          }
         }
 
         document.getElementById('openQrScanner').onclick = async function(){
