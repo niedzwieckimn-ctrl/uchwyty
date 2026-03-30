@@ -3259,13 +3259,13 @@ def order_delete(order_id):
 @app.post("/orders/<int:order_id>/status")
 def order_status_update(order_id):
     new_status = norm(request.form.get("status")).lower()
-    allowed = {"new", "confirmed", "in_delivery"}
+    allowed = {"new", "confirmed", "in_delivery", "issued"}
     if new_status not in allowed:
         return "Nieprawidłowy status", 400
 
     c = conn()
     cur = c.cursor()
-    cur.execute("SELECT id, order_no, qr_data_url, status FROM orders WHERE id=?", (order_id,))
+    cur.execute("SELECT id, order_no, qr_data_url, status, created_at FROM orders WHERE id=?", (order_id,))
     o = cur.fetchone()
     if not o:
         c.close()
