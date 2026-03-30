@@ -2,6 +2,7 @@
 import os
 import io
 import csv
+import base64
 import re
 import json
 import glob
@@ -230,6 +231,12 @@ def init_db():
     if "nip" not in customer_cols:
         cur.execute("ALTER TABLE customers ADD COLUMN nip TEXT")
 
+    # migracja: QR zamówień
+    cur.execute("PRAGMA table_info(orders)")
+    order_cols = {r[1] for r in cur.fetchall()}
+    if "qr_data_url" not in order_cols:
+        cur.execute("ALTER TABLE orders ADD COLUMN qr_data_url TEXT")
+
     # Ułatwia agregowanie "w dostawie" po statusach paczek
     cur.execute("CREATE INDEX IF NOT EXISTS idx_china_items_package_id ON china_items(package_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_china_items_product_id ON china_items(product_id)")
@@ -248,9 +255,27 @@ def now_iso():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def make_order_no(order_id: int) -> str:
-    # np. ORD-20260220-000123
+    # np. ZAM-20260220-000123
     d = datetime.now().strftime("%Y%m%d")
-    return f"ORD-{d}-{order_id:06d}"
+    return f"ZAM-{d}-{order_id:06d}"
+
+
+def make_qr_data_url(value: str) -> str:
+    raw_value = norm(value)
+    if not raw_value:
+        return ""
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=8,
+        border=1
+    )
+    qr.add_data(raw_value)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 
 def next_invoice_no(issue_date: str) -> str:
@@ -749,19 +774,21 @@ def remote_first_create_order(customer_id, customer_name, customer_address, cust
         "status": "new",
         "note": note,
         "created_at": created_at,
+        "qr_data_url": "",
     })
     if not created_order or "id" not in created_order:
         raise RuntimeError("Supabase nie zwrócił ID dla zamówienia")
 
     order_id = int(created_order["id"])
     order_no = make_order_no(order_id)
-    supabase_update_rows("orders", {"order_no": order_no}, {"id": order_id})
+    qr_data_url = make_qr_data_url(order_no)
+    supabase_update_rows("orders", {"order_no": order_no, "qr_data_url": qr_data_url}, {"id": order_id})
 
     c = conn()
     cur = c.cursor()
     cur.execute(
-        "INSERT INTO orders(id, order_no, customer_id, customer_name, customer_address, customer_phone, customer_email, status, note, created_at) VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET order_no=excluded.order_no, customer_id=excluded.customer_id, customer_name=excluded.customer_name, customer_address=excluded.customer_address, customer_phone=excluded.customer_phone, customer_email=excluded.customer_email, status=excluded.status, note=excluded.note, created_at=excluded.created_at",
-        (order_id, order_no, customer_id if customer_id else None, customer_name, customer_address, customer_phone, customer_email, "new", note, created_at)
+        "INSERT INTO orders(id, order_no, customer_id, customer_name, customer_address, customer_phone, customer_email, status, note, created_at, qr_data_url) VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET order_no=excluded.order_no, customer_id=excluded.customer_id, customer_name=excluded.customer_name, customer_address=excluded.customer_address, customer_phone=excluded.customer_phone, customer_email=excluded.customer_email, status=excluded.status, note=excluded.note, created_at=excluded.created_at, qr_data_url=excluded.qr_data_url",
+        (order_id, order_no, customer_id if customer_id else None, customer_name, customer_address, customer_phone, customer_email, "new", note, created_at, qr_data_url)
     )
 
     for pid, qty in items:
@@ -1258,6 +1285,7 @@ BASE = r"""
       <a href="{{ url_for('company') }}">Dane mojej firmy</a>
       <a href="{{ url_for('stock') }}">Magazyn</a>
       <a href="{{ url_for('china') }}">Chiny (P/O)</a>
+      <a href="{{ url_for('order_scan') }}">Skan QR</a>
       <a href="{{ url_for('cloud_supabase') }}">Chmura</a>
     </div>
     <div class="right muted">Lokalnie • {{ base_url }}</div>
@@ -2634,13 +2662,14 @@ def order_create():
         c = conn()
         cur = c.cursor()
         cur.execute("""
-          INSERT INTO orders(order_no, customer_id, customer_name, customer_address, customer_phone, customer_email, status, note, created_at)
-          VALUES(?,?,?,?,?,?,?,?,?)
-        """, ("TEMP", customer_id if customer_id > 0 else None, customer_name, customer_address, customer_phone, customer_email, "new", note, now_iso()))
+          INSERT INTO orders(order_no, customer_id, customer_name, customer_address, customer_phone, customer_email, status, note, created_at, qr_data_url)
+          VALUES(?,?,?,?,?,?,?,?,?,?)
+        """, ("TEMP", customer_id if customer_id > 0 else None, customer_name, customer_address, customer_phone, customer_email, "new", note, now_iso(), ""))
         oid = cur.lastrowid
 
         order_no = make_order_no(oid)
-        cur.execute("UPDATE orders SET order_no=? WHERE id=?", (order_no, oid))
+        qr_data_url = make_qr_data_url(order_no)
+        cur.execute("UPDATE orders SET order_no=?, qr_data_url=? WHERE id=?", (order_no, qr_data_url, oid))
 
         for pid, qty in items:
             cur.execute("SELECT sku FROM products WHERE id=?", (pid,))
@@ -2672,7 +2701,9 @@ def order_view(order_id):
     cur.execute("""
       SELECT oi.*, p.model, p.ean, p.name,
              COALESCE(pr.net_price, 0) AS net_price,
+             COALESCE(pr.gross_price, 0) AS gross_price,
              (oi.qty * COALESCE(pr.net_price, 0)) AS line_value_net,
+             (oi.qty * COALESCE(pr.gross_price, 0)) AS line_value_gross,
              COALESCE(s.qty,0) AS stock,
              COALESCE((
                 SELECT SUM(ci.qty)
@@ -2796,7 +2827,12 @@ def order_view(order_id):
           <div class="muted" style="margin-top:6px;">Tel: {{ o['customer_phone'] or "-" }}</div>
           <div class="muted">Email: {{ o['customer_email'] or "-" }}</div>
           <div class="line"></div>
-          <div class="muted small">QR prowadzi do: <b>{{ order_url }}</b></div>
+          <div class="muted small">Kod zamówienia do skanowania: <b>{{ o['order_no'] }}</b></div>
+          {% if o['qr_data_url'] %}
+            <div style="margin-top:10px;">
+              <img src="{{ o['qr_data_url'] }}" alt="QR zamówienia" style="width:180px;height:180px;border:1px solid #eee;border-radius:12px;padding:8px;background:#fff;">
+            </div>
+          {% endif %}
         </div>
 
         <div class="card">
@@ -2836,12 +2872,13 @@ def order_view(order_id):
         <h2>Pozycje</h2>
         <table>
           <thead>
-            <tr><th>SKU</th><th>Model / Nazwa</th><th>Ilość</th><th>Cena netto</th><th>Wartość netto</th><th>Stan teraz</th><th>W dostawie (dostępne)</th><th>Realizacja</th><th>Akcje</th></tr>
+            <tr><th>SKU</th><th>Model / Nazwa</th><th>Ilość</th><th>Cena netto</th><th>Cena brutto</th><th>Wartość netto</th><th>Wartość brutto</th><th>Stan teraz</th><th>W dostawie (dostępne)</th><th>Realizacja</th><th>Akcje</th></tr>
           </thead>
           <tbody>
-            {% set ns = namespace(total_net=0) %}
+            {% set ns = namespace(total_net=0, total_gross=0) %}
             {% for it in items %}
               {% set ns.total_net = ns.total_net + it['line_value_net'] %}
+              {% set ns.total_gross = ns.total_gross + it['line_value_gross'] %}
               <tr>
                 <td><b>{{ it['sku'] }}</b></td>
                 <td>
@@ -2860,7 +2897,9 @@ def order_view(order_id):
                   {% endif %}
                 </td>
                 <td><span class="badge">{{ "%.2f"|format(it['net_price']) }} PLN</span></td>
+                <td><span class="badge">{{ "%.2f"|format(it['gross_price']) }} PLN</span></td>
                 <td><span class="badge">{{ "%.2f"|format(it['line_value_net']) }} PLN</span></td>
+                <td><span class="badge">{{ "%.2f"|format(it['line_value_gross']) }} PLN</span></td>
                 <td><span class="badge">{{ it['stock'] }}</span></td>
                 <td><span class="badge">{{ it['in_delivery_available'] }}</span></td>
                 <td>
@@ -2885,12 +2924,17 @@ def order_view(order_id):
             {% endfor %}
             {% if items %}
               <tr>
-                <td colspan="4" style="text-align:right;"><b>Suma netto:</b></td>
+                <td colspan="5" style="text-align:right;"><b>Suma netto:</b></td>
                 <td><span class="badge"><b>{{ "%.2f"|format(ns.total_net) }} PLN</b></span></td>
+                <td colspan="5"></td>
+              </tr>
+              <tr>
+                <td colspan="6" style="text-align:right;"><b>Suma brutto:</b></td>
+                <td><span class="badge"><b>{{ "%.2f"|format(ns.total_gross) }} PLN</b></span></td>
                 <td colspan="4"></td>
               </tr>
             {% else %}
-              <tr><td colspan="9" class="muted">Brak pozycji w zamówieniu.</td></tr>
+              <tr><td colspan="11" class="muted">Brak pozycji w zamówieniu.</td></tr>
             {% endif %}
           </tbody>
         </table>
@@ -3401,6 +3445,131 @@ def order_label(order_id):
 
     fname = safe_filename(o["order_no"]) + "_label_30x50.pdf"
     return send_file(buf, mimetype="application/pdf", as_attachment=True, download_name=fname)
+
+
+@app.get("/api/order_lookup")
+def api_order_lookup():
+    maybe_pull_shared_from_supabase()
+    token = norm(request.args.get("token"))
+    if not token:
+        return jsonify(ok=False, error="Brak tokenu"), 400
+
+    c = conn()
+    cur = c.cursor()
+    cur.execute("SELECT * FROM orders WHERE order_no=? LIMIT 1", (token,))
+    o = cur.fetchone()
+    if not o:
+        c.close()
+        return jsonify(ok=False, error="Nie znaleziono zamówienia"), 404
+
+    cur.execute("""
+      SELECT oi.*, p.model, p.ean, p.name,
+             COALESCE(pr.net_price, 0) AS net_price,
+             COALESCE(pr.gross_price, 0) AS gross_price,
+             (oi.qty * COALESCE(pr.net_price, 0)) AS line_value_net,
+             (oi.qty * COALESCE(pr.gross_price, 0)) AS line_value_gross
+      FROM order_items oi
+      JOIN products p ON p.id=oi.product_id
+      LEFT JOIN pricing pr ON (TRIM(LOWER(pr.model)) = TRIM(LOWER(p.model)) OR TRIM(LOWER(pr.model)) = TRIM(LOWER(p.sku)))
+      WHERE oi.order_id=?
+      ORDER BY oi.id
+    """, (o["id"],))
+    items = [dict(r) for r in cur.fetchall()]
+    c.close()
+
+    total_net = round(sum(float(it.get("line_value_net") or 0) for it in items), 2)
+    total_gross = round(sum(float(it.get("line_value_gross") or 0) for it in items), 2)
+
+    return jsonify(
+        ok=True,
+        order={
+            "id": o["id"],
+            "order_no": o["order_no"],
+            "status": o["status"],
+            "created_at": o["created_at"],
+            "customer_name": o["customer_name"],
+            "customer_address": o["customer_address"],
+            "customer_phone": o["customer_phone"],
+            "customer_email": o["customer_email"],
+            "note": o["note"],
+            "qr_data_url": o["qr_data_url"] or "",
+            "total_net": total_net,
+            "total_gross": total_gross,
+        },
+        items=items
+    )
+
+
+@app.get("/orders/by-code/<path:token>")
+def order_by_code(token):
+    maybe_pull_shared_from_supabase()
+    c = conn()
+    cur = c.cursor()
+    cur.execute("SELECT id FROM orders WHERE order_no=? LIMIT 1", (norm(token),))
+    row = cur.fetchone()
+    c.close()
+    if not row:
+        return "Nie znaleziono zamówienia", 404
+    return redirect(url_for("order_view", order_id=row["id"]))
+
+
+@app.get("/orders/scan")
+def order_scan():
+    tpl = r"""
+    {% extends "base.html" %}
+    {% block content %}
+      <div class="card">
+        <h1>Skan QR zamówienia</h1>
+        <div class="muted">Zeskanuj kod aparatem albo wklej numer zamówienia ZAM-...</div>
+      </div>
+
+      <div class="card">
+        <div class="row">
+          <div>
+            <label class="muted small">Numer / kod zamówienia</label>
+            <input id="manualToken" placeholder="np. ZAM-20260329-000018">
+          </div>
+          <div class="flex" style="align-items:flex-end;">
+            <button class="btn primary" onclick="openOrderByCode(); return false;">Pokaż zamówienie</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Kamera</h2>
+        <div id="reader" style="width:100%;max-width:520px;"></div>
+        <div class="muted" id="scanMsg" style="margin-top:8px;"></div>
+      </div>
+
+      <script src="https://unpkg.com/html5-qrcode" type="text/javascript"></script>
+      <script>
+        function openOrderByCode(raw){
+          const value = (raw || document.getElementById('manualToken').value || '').trim();
+          if(!value){
+            document.getElementById('scanMsg').innerText = 'Wpisz albo zeskanuj kod.';
+            return;
+          }
+          window.location.href = '/orders/by-code/' + encodeURIComponent(value);
+        }
+
+        function onScanSuccess(decodedText){
+          document.getElementById('scanMsg').innerText = 'Odczytano: ' + decodedText;
+          openOrderByCode(decodedText);
+        }
+
+        window.addEventListener('load', function(){
+          if(window.Html5QrcodeScanner){
+            const scanner = new Html5QrcodeScanner('reader', { fps: 10, qrbox: 220 });
+            scanner.render(onScanSuccess, function(){});
+          } else {
+            document.getElementById('scanMsg').innerText = 'Brak biblioteki skanera.';
+          }
+        });
+      </script>
+    {% endblock %}
+    """
+    return render_template_string(tpl, title="Skan QR", base_url=BASE_URL, db_path=DB_PATH)
+
 
 
 # -------------------------
