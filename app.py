@@ -3826,33 +3826,49 @@ def order_scan():
     tpl = r"""
     {% extends "base.html" %}
     {% block content %}
-      <div class="card">
-        <h1>Skan QR zamówienia</h1>
-        <div class="muted">Zeskanuj kod aparatem albo wklej numer zamówienia ZAM-...</div>
-      </div>
-
-      <div class="card">
-        <div class="row">
+      <div class="card" id="scanSection">
+        <h1 id="openQrScanner" style="cursor:pointer;text-decoration:underline;">Skanuj QR zamówienia</h1>
+        <div class="muted">Kliknij napis powyżej, aby otworzyć aparat. Używany jest tylko tylny aparat.</div>
+        <div class="row" style="margin-top:10px;">
           <div>
-            <label class="muted small">Numer / kod zamówienia</label>
+            <label class="muted small">Kod zamówienia</label>
             <input id="manualToken" placeholder="np. ZAM-20260329-000018">
           </div>
           <div class="flex" style="align-items:flex-end;">
             <button class="btn primary" onclick="openOrderByCode(); return false;">Pokaż zamówienie</button>
           </div>
         </div>
+        <div id="scanMsg" class="muted" style="margin-top:10px;"></div>
       </div>
 
-      <div class="card">
-        <h2>Kamera</h2>
-        <div id="reader" style="width:100%;max-width:520px;"></div>
-        <div class="muted" id="scanMsg" style="margin-top:8px;"></div>
+      <div id="qrScannerModal" class="hidden" style="position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:9999;padding:16px;box-sizing:border-box;">
+        <div style="max-width:420px;margin:4vh auto;background:#fff;border-radius:16px;padding:12px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px;">
+            <b>Skanuj QR</b>
+            <button id="closeQrScanner" class="btn" type="button">Zamknij</button>
+          </div>
+          <div class="muted" style="margin-bottom:8px;">Uruchamia się tylko tylny aparat.</div>
+          <div id="reader" style="width:100%;min-height:280px;"></div>
+        </div>
       </div>
 
       <script src="https://unpkg.com/html5-qrcode" type="text/javascript"></script>
       <script>
+        function parseOrderCode(value){
+          const raw = String(value || '').trim();
+          if(!raw) return '';
+          const match = raw.match(/ZAM-[0-9]{8}-[A-Z0-9-]+/i);
+          if(match) return match[0].toUpperCase();
+          try {
+            const url = new URL(raw);
+            const fromPath = url.pathname.match(/ZAM-[0-9]{8}-[A-Z0-9-]+/i);
+            if(fromPath) return fromPath[0].toUpperCase();
+          } catch(e) {}
+          return raw.toUpperCase();
+        }
+
         function openOrderByCode(raw){
-          const value = (raw || document.getElementById('manualToken').value || '').trim();
+          const value = parseOrderCode(raw || document.getElementById('manualToken').value || '');
           if(!value){
             document.getElementById('scanMsg').innerText = 'Wpisz albo zeskanuj kod.';
             return;
@@ -3860,18 +3876,77 @@ def order_scan():
           window.location.href = '/orders/by-code/' + encodeURIComponent(value);
         }
 
-        function onScanSuccess(decodedText){
-          document.getElementById('scanMsg').innerText = 'Odczytano: ' + decodedText;
-          openOrderByCode(decodedText);
+        let orderQrScanner = null;
+        let orderQrScannerRunning = false;
+
+        async function startOrderQrScanner(){
+          if(!window.Html5Qrcode) return;
+          if(!orderQrScanner){
+            orderQrScanner = new Html5Qrcode('reader');
+          }
+          if(orderQrScannerRunning) return;
+
+          const onSuccess = async (decodedText) => {
+            const parsedCode = parseOrderCode(decodedText);
+            document.getElementById('manualToken').value = parsedCode || decodedText;
+            await stopOrderQrScanner();
+            document.getElementById('qrScannerModal').classList.add('hidden');
+            openOrderByCode(parsedCode || decodedText);
+          };
+
+          try {
+            await orderQrScanner.start(
+              { facingMode: { exact: 'environment' } },
+              { fps: 10, qrbox: 220, aspectRatio: 1.0 },
+              onSuccess,
+              function(){}
+            );
+            orderQrScannerRunning = true;
+          } catch (e1) {
+            try {
+              await orderQrScanner.start(
+                { facingMode: 'environment' },
+                { fps: 10, qrbox: 220, aspectRatio: 1.0 },
+                onSuccess,
+                function(){}
+              );
+              orderQrScannerRunning = true;
+            } catch (e2) {
+              document.getElementById('scanMsg').innerText = 'Nie udało się uruchomić tylnego aparatu.';
+              document.getElementById('qrScannerModal').classList.add('hidden');
+            }
+          }
         }
 
-        window.addEventListener('load', function(){
-          if(window.Html5QrcodeScanner){
-            const scanner = new Html5QrcodeScanner('reader', { fps: 10, qrbox: 220 });
-            scanner.render(onScanSuccess, function(){});
-          } else {
-            document.getElementById('scanMsg').innerText = 'Brak biblioteki skanera.';
+        async function stopOrderQrScanner(){
+          try {
+            if(orderQrScanner && orderQrScannerRunning){
+              await orderQrScanner.stop();
+              await orderQrScanner.clear();
+            }
+          } catch(e) {}
+          orderQrScannerRunning = false;
+        }
+
+        document.getElementById('openQrScanner').onclick = async function(){
+          document.getElementById('qrScannerModal').classList.remove('hidden');
+          await startOrderQrScanner();
+        };
+
+        document.getElementById('closeQrScanner').onclick = async function(){
+          await stopOrderQrScanner();
+          document.getElementById('qrScannerModal').classList.add('hidden');
+        };
+
+        document.getElementById('qrScannerModal').onclick = async function(e){
+          if(e.target && e.target.id === 'qrScannerModal'){
+            await stopOrderQrScanner();
+            document.getElementById('qrScannerModal').classList.add('hidden');
           }
+        };
+
+        window.addEventListener('beforeunload', function(){
+          stopOrderQrScanner();
         });
       </script>
     {% endblock %}
