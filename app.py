@@ -2536,7 +2536,7 @@ def orders():
         pass
     q = norm(request.args.get("q"))
     tab = norm(request.args.get("tab")) or "new"
-    if tab not in {"new", "issued", "all"}:
+    if tab not in {"new", "issued", "realized", "all"}:
         tab = "new"
 
     c = conn()
@@ -2548,7 +2548,9 @@ def orders():
     if tab == "new":
         where_parts.append("COALESCE(o.warehouse_issued,0)=0")
     elif tab == "issued":
-        where_parts.append("COALESCE(o.warehouse_issued,0)=1")
+        where_parts.append("COALESCE(o.warehouse_issued,0)=1 AND LOWER(COALESCE(o.status,'')) <> 'issued'")
+    elif tab == "realized":
+        where_parts.append("COALESCE(o.warehouse_issued,0)=1 AND LOWER(COALESCE(o.status,'')) = 'issued'")
 
     if q:
         where_parts.append("(order_no LIKE ? OR customer_name LIKE ?)")
@@ -2669,7 +2671,8 @@ def orders():
         </div>
         <div class="flex" style="margin-top:10px;">
           <a class="btn {% if tab=='new' %}primary{% endif %}" href="{{ url_for('orders', tab='new', q=q) }}">Do wydania</a>
-          <a class="btn {% if tab=='issued' %}primary{% endif %}" href="{{ url_for('orders', tab='issued', q=q) }}">Wydane z magazynu</a>
+          <a class="btn {% if tab=='issued' %}primary{% endif %}" href="{{ url_for('orders', tab='issued', q=q) }}">Wydane</a>
+          <a class="btn {% if tab=='realized' %}primary{% endif %}" href="{{ url_for('orders', tab='realized', q=q) }}">Zrealizowane</a>
           <a class="btn {% if tab=='all' %}primary{% endif %}" href="{{ url_for('orders', tab='all', q=q) }}">Wszystkie</a>
         </div>
         <form method="get" class="grid3" style="margin-top:10px;">
@@ -3387,7 +3390,7 @@ def order_issue(order_id):
 
     if int(o["warehouse_issued"] or 0) == 1:
         c.close()
-        return redirect(url_for("orders", tab="issued"))
+        return redirect(url_for("orders", tab=("realized" if norm(o["status"]).lower()=="issued" else "issued")))
 
     cur.execute("""
       SELECT oi.*, p.model, p.name
@@ -3406,7 +3409,7 @@ def order_issue(order_id):
         cur.execute("UPDATE stock SET qty = qty - ? WHERE product_id=?", (qty, pid))
         changed_product_ids.append(int(pid))
 
-    cur.execute("UPDATE orders SET warehouse_issued=1 WHERE id=?", (order_id,))
+    cur.execute("UPDATE orders SET warehouse_issued=1, status='in_delivery' WHERE id=?", (order_id,))
     c.commit()
     c.close()
 
