@@ -2698,7 +2698,7 @@ def orders():
           </thead>
           <tbody>
             {% for r in rows %}
-              <tr {% if r['has_shortage'] or r['status'] in ['new','pending','unconfirmed'] %}style="background:#ffe7e7;"{% endif %}>
+              <tr {% if tab == 'new' and (r['has_shortage'] or r['status'] in ['new','pending','unconfirmed']) %}style="background:#ffe7e7;"{% endif %}>
                 <td><b>{{ canonical_order_no(r['id'], r['created_at'], r['order_no']) }}</b></td>
                 <td>{{ r['customer_name'] }}</td>
                 <td><span class="badge {{ order_status_css(r['status']) }}">{{ order_status_label(r['status']) }}</span></td>
