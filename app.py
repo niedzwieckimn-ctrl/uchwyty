@@ -2712,7 +2712,7 @@ def orders():
                       <button class="btn danger" type="submit">Usuń</button>
                     </form>
                   {% else %}
-                    <span class="muted">Podgląd</span>
+                    <a class="btn" href="{{ url_for('order_invoice', order_id=r['id']) }}">Faktura</a>
                   {% endif %}
                 </td>
               </tr>
