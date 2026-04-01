@@ -136,6 +136,7 @@ def init_db():
         status TEXT NOT NULL DEFAULT 'new', -- new/packed/shipped/cancelled
         note TEXT,
         created_at TEXT NOT NULL,
+        warehouse_issued INTEGER NOT NULL DEFAULT 0,
         FOREIGN KEY(customer_id) REFERENCES customers(id)
     )
     """)
@@ -225,6 +226,17 @@ def init_db():
     )
     """)
 
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS invoice_meta(
+        invoice_id INTEGER PRIMARY KEY,
+        pdf_path TEXT,
+        invoice_items_json TEXT,
+        sent_to_client INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(invoice_id) REFERENCES invoices(id)
+    )
+    """)
+
     # migracja: starsze bazy mogą nie mieć kolumny NIP u klientów
     cur.execute("PRAGMA table_info(customers)")
     customer_cols = {r[1] for r in cur.fetchall()}
@@ -236,6 +248,8 @@ def init_db():
     order_cols = {r[1] for r in cur.fetchall()}
     if "qr_data_url" not in order_cols:
         cur.execute("ALTER TABLE orders ADD COLUMN qr_data_url TEXT")
+    if "warehouse_issued" not in order_cols:
+        cur.execute("ALTER TABLE orders ADD COLUMN warehouse_issued INTEGER NOT NULL DEFAULT 0")
 
     # Ułatwia agregowanie "w dostawie" po statusach paczek
     cur.execute("CREATE INDEX IF NOT EXISTS idx_china_items_package_id ON china_items(package_id)")
@@ -1376,6 +1390,54 @@ def generate_order_invoice_pdf(order_row, items, meta):
     return fpath, round(total_net,2), round(total_gross,2)
 
 
+def invoice_pdf_relpath(abs_path: str) -> str:
+    try:
+        return os.path.relpath(abs_path, DATA_DIR)
+    except Exception:
+        return abs_path
+
+def invoice_pdf_abspath(rel_path: str) -> str:
+    return os.path.join(DATA_DIR, rel_path)
+
+def load_invoice_meta(invoice_id: int):
+    c = conn()
+    cur = c.cursor()
+    cur.execute("SELECT * FROM invoice_meta WHERE invoice_id=?", (invoice_id,))
+    row = cur.fetchone()
+    c.close()
+    return dict(row) if row else None
+
+def upsert_invoice_meta(invoice_id: int, pdf_path: str = "", invoice_items_json: str = "", sent_to_client: int | None = None):
+    current = load_invoice_meta(invoice_id) or {}
+    if sent_to_client is None:
+        sent_to_client = int(current.get("sent_to_client") or 0)
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+      INSERT INTO invoice_meta(invoice_id, pdf_path, invoice_items_json, sent_to_client, updated_at)
+      VALUES(?,?,?,?,?)
+      ON CONFLICT(invoice_id) DO UPDATE SET
+        pdf_path=excluded.pdf_path,
+        invoice_items_json=excluded.invoice_items_json,
+        sent_to_client=excluded.sent_to_client,
+        updated_at=excluded.updated_at
+    """, (invoice_id, pdf_path, invoice_items_json, int(sent_to_client), now_iso()))
+    c.commit()
+    c.close()
+
+def prepare_invoice_items(order_items: list[dict], form):
+    prepared = []
+    for it in order_items:
+        qty = to_int(form.get(f"invoice_qty_{it['id']}"), int(it.get("qty") or 0))
+        if qty <= 0:
+            continue
+        row = dict(it)
+        row["qty"] = qty
+        row["line_value_net"] = round(float(row.get("net_price") or 0) * qty, 2)
+        row["line_value_gross"] = round(float(row.get("gross_price") or 0) * qty, 2)
+        prepared.append(row)
+    return prepared
+
 
 # =========================
 # TEMPLATES (BASE as "file")
@@ -2484,9 +2546,9 @@ def orders():
     params = []
 
     if tab == "new":
-        where_parts.append("status IN ('new', 'packed', 'confirmed', 'in_delivery')")
+        where_parts.append("COALESCE(o.warehouse_issued,0)=0")
     elif tab == "issued":
-        where_parts.append("status='issued'")
+        where_parts.append("COALESCE(o.warehouse_issued,0)=1")
 
     if q:
         where_parts.append("(order_no LIKE ? OR customer_name LIKE ?)")
@@ -2526,9 +2588,9 @@ def orders():
     cur.execute(sql, tuple(params))
     rows = [dict(r) for r in cur.fetchall()]
 
-    visible_open_ids = sorted([r["id"] for r in rows if r["status"] in ("new", "packed", "confirmed", "in_delivery")])
+    visible_open_ids = sorted([r["id"] for r in rows if int(r.get("warehouse_issued") or 0) == 0 and r["status"] in ("new", "packed", "confirmed", "in_delivery")])
     if visible_open_ids:
-        cur.execute("SELECT id FROM orders WHERE status IN ('new','packed','confirmed','in_delivery') AND id<=? ORDER BY id", (visible_open_ids[-1],))
+        cur.execute("SELECT id FROM orders WHERE COALESCE(warehouse_issued,0)=0 AND status IN ('new','packed','confirmed','in_delivery') AND id<=? ORDER BY id", (visible_open_ids[-1],))
         open_order_ids = [int(r["id"]) for r in cur.fetchall()]
 
         ph = ",".join(["?"] * len(open_order_ids))
@@ -2997,8 +3059,7 @@ def order_view(order_id):
             <a class="btn" href="{{ url_for('orders') }}">← Lista</a>
             <a class="btn" href="{{ url_for('order_print', order_id=o['id']) }}">Drukuj zamówienie</a>
             <a class="btn primary" href="{{ url_for('order_invoice', order_id=o['id']) }}">Faktura</a>
-            {% if not locked %}
-              <form method="post" action="{{ url_for('order_status_update', order_id=o['id']) }}" class="flex">
+            <form method="post" action="{{ url_for('order_status_update', order_id=o['id']) }}" class="flex">
                 <select name="status" style="width:190px;">
                   <option value="new" {% if o['status'] in ['new','pending','unconfirmed'] %}selected{% endif %}>Niepotwierdzone</option>
                   <option value="confirmed" {% if o['status']=='confirmed' %}selected{% endif %}>Potwierdzone</option>
@@ -3008,11 +3069,14 @@ def order_view(order_id):
                 <button class="btn" type="submit">Zmień status</button>
               </form>
               <a class="btn primary" href="{{ url_for('order_label', order_id=o['id']) }}">Etykieta 30x50</a>
-              <a class="btn ok" href="{{ url_for('order_issue', order_id=o['id']) }}">Wydaj z magazynu</a>
+              {% if not locked %}
+                <a class="btn ok" href="{{ url_for('order_issue', order_id=o['id']) }}">Wydaj z magazynu</a>
+              {% else %}
+                <span class="badge">Wydane z magazynu</span>
+              {% endif %}
               <form method="post" action="{{ url_for('order_delete', order_id=o['id']) }}" onsubmit="return confirm('Usunąć zamówienie?')">
                 <button class="btn danger" type="submit">Usuń zamówienie</button>
               </form>
-            {% endif %}
           </div>
         </div>
         <div class="muted" style="margin-top:6px;">{{ o['created_at'] }}</div>
@@ -3035,7 +3099,7 @@ def order_view(order_id):
           <div>{{ o['note'] or "-" }}</div>
           <div class="line"></div>
           <div class="hint">
-            <b>Wydaj z magazynu</b> odejmie ilości z magazynu (przycisk zielony).<br>
+            <b>Wydaj z magazynu</b> odejmie ilości z magazynu, ale nie zmieni automatycznie statusu klienta na „Zrealizowane”.<br>
             Jeśli brakuje stanu, pozycja może być realizowana z <b>towaru w drodze z Chin</b> (kolumna „W dostawie” poniżej).
           </div>
         </div>
@@ -3136,7 +3200,7 @@ def order_view(order_id):
       </div>
     {% endblock %}
     """
-    return render_template_string(tpl, title=canonical_order_no(o["id"], o["created_at"], o["order_no"]), base_url=BASE_URL, db_path=DB_PATH, o=o, items=items, order_url=order_url, products=products_rows, locked=(o["status"]=="issued"), order_status_label=order_status_label, order_status_css=order_status_css, canonical_order_no=canonical_order_no)
+    return render_template_string(tpl, title=canonical_order_no(o["id"], o["created_at"], o["order_no"]), base_url=BASE_URL, db_path=DB_PATH, o=o, items=items, order_url=order_url, products=products_rows, locked=(int(o["warehouse_issued"] or 0)==1), order_status_label=order_status_label, order_status_css=order_status_css, canonical_order_no=canonical_order_no)
 
 @app.post("/orders/<int:order_id>/items/add")
 def order_item_add(order_id):
@@ -3147,12 +3211,12 @@ def order_item_add(order_id):
 
     c = conn()
     cur = c.cursor()
-    cur.execute("SELECT status FROM orders WHERE id=?", (order_id,))
+    cur.execute("SELECT status, warehouse_issued FROM orders WHERE id=?", (order_id,))
     o = cur.fetchone()
     if not o:
         c.close()
         abort(404)
-    if o["status"] == "issued":
+    if int(o["warehouse_issued"] or 0) == 1:
         c.close()
         return "Zamówienie wydane z magazynu jest tylko do podglądu", 400
 
@@ -3193,12 +3257,12 @@ def order_item_update(order_id, item_id):
         return "Ilość musi być > 0", 400
     c = conn()
     cur = c.cursor()
-    cur.execute("SELECT status FROM orders WHERE id=?", (order_id,))
+    cur.execute("SELECT status, warehouse_issued FROM orders WHERE id=?", (order_id,))
     o = cur.fetchone()
     if not o:
         c.close()
         abort(404)
-    if o["status"] == "issued":
+    if int(o["warehouse_issued"] or 0) == 1:
         c.close()
         return "Zamówienie wydane z magazynu jest tylko do podglądu", 400
     cur.execute("UPDATE order_items SET qty=? WHERE id=? AND order_id=?", (qty, item_id, order_id))
@@ -3215,12 +3279,12 @@ def order_item_update(order_id, item_id):
 def order_item_delete(order_id, item_id):
     c = conn()
     cur = c.cursor()
-    cur.execute("SELECT status FROM orders WHERE id=?", (order_id,))
+    cur.execute("SELECT status, warehouse_issued FROM orders WHERE id=?", (order_id,))
     o = cur.fetchone()
     if not o:
         c.close()
         abort(404)
-    if o["status"] == "issued":
+    if int(o["warehouse_issued"] or 0) == 1:
         c.close()
         return "Zamówienie wydane z magazynu jest tylko do podglądu", 400
 
@@ -3237,23 +3301,45 @@ def order_item_delete(order_id, item_id):
 def order_delete(order_id):
     c = conn()
     cur = c.cursor()
-    cur.execute("SELECT status FROM orders WHERE id=?", (order_id,))
+    cur.execute("SELECT id, warehouse_issued FROM orders WHERE id=?", (order_id,))
     o = cur.fetchone()
     if not o:
         c.close()
         abort(404)
-    if o["status"] == "issued":
-        c.close()
-        return "Zamówienie wydane z magazynu jest tylko do podglądu", 400
 
-    if supabase_enabled():
-        supabase_delete_rows("order_items", {"order_id": order_id})
-        supabase_delete_rows("orders", {"id": order_id})
+    cur.execute("SELECT product_id, qty FROM order_items WHERE order_id=?", (order_id,))
+    items = [dict(r) for r in cur.fetchall()]
+    cur.execute("SELECT id FROM invoices WHERE order_id=?", (order_id,))
+    invoice_ids = [int(r["id"]) for r in cur.fetchall()]
 
+    changed_product_ids = []
+    if int(o["warehouse_issued"] or 0) == 1:
+        for it in items:
+            pid = int(it["product_id"])
+            qty = int(it["qty"])
+            cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (pid,))
+            cur.execute("UPDATE stock SET qty = qty + ? WHERE product_id=?", (qty, pid))
+            changed_product_ids.append(pid)
+
+    if invoice_ids:
+        cur.execute("DELETE FROM invoice_meta WHERE invoice_id IN (" + ",".join(["?"] * len(invoice_ids)) + ")", tuple(invoice_ids))
+    cur.execute("DELETE FROM invoices WHERE order_id=?", (order_id,))
     cur.execute("DELETE FROM order_items WHERE order_id=?", (order_id,))
     cur.execute("DELETE FROM orders WHERE id=?", (order_id,))
     c.commit()
     c.close()
+
+    if supabase_enabled():
+        try:
+            for iid in invoice_ids:
+                supabase_delete_rows("invoices", {"id": iid})
+            supabase_delete_rows("order_items", {"order_id": order_id})
+            supabase_delete_rows("orders", {"id": order_id})
+            if changed_product_ids:
+                sync_local_rows_to_supabase("stock", "product_id", changed_product_ids)
+        except Exception:
+            pass
+
     return redirect(url_for("orders"))
 
 @app.post("/orders/<int:order_id>/status")
@@ -3270,14 +3356,9 @@ def order_status_update(order_id):
     if not o:
         c.close()
         abort(404)
-    if o["status"] == "issued":
-        c.close()
-        return "Zamówienie wydane z magazynu jest tylko do podglądu", 400
 
     qr_data_url = (o["qr_data_url"] or "").strip()
     if new_status == "confirmed":
-        # Zawsze nadpisuj QR aktualnym kodem zamówienia.
-        # To naprawia stare etykiety/QR-y zapisane kiedy numer był jeszcze TEMP.
         qr_data_url = make_qr_data_url(canonical_order_no(o["id"], o["created_at"], o["order_no"]))
 
     cur.execute("UPDATE orders SET status=?, qr_data_url=? WHERE id=?", (new_status, qr_data_url, order_id))
@@ -3285,14 +3366,17 @@ def order_status_update(order_id):
     c.close()
 
     if supabase_enabled():
-        supabase_update_rows("orders", {"status": new_status, "qr_data_url": qr_data_url}, {"id": order_id})
+        try:
+            supabase_update_rows("orders", {"status": new_status, "qr_data_url": qr_data_url}, {"id": order_id})
+        except Exception:
+            pass
 
     return redirect(url_for("order_view", order_id=order_id))
 
 
 @app.get("/orders/<int:order_id>/issue")
 def order_issue(order_id):
-    # odejmij z magazynu wg pozycji i oznacz jako wydane
+    # odejmij z magazynu wg pozycji i oznacz jako wydane z magazynu (bez zmiany statusu klienta)
     c = conn()
     cur = c.cursor()
     cur.execute("SELECT * FROM orders WHERE id=?", (order_id,))
@@ -3301,9 +3385,39 @@ def order_issue(order_id):
         c.close()
         abort(404)
 
-    if o["status"] == "issued":
+    if int(o["warehouse_issued"] or 0) == 1:
         c.close()
         return redirect(url_for("orders", tab="issued"))
+
+    cur.execute("""
+      SELECT oi.*, p.model, p.name
+      FROM order_items oi
+      JOIN products p ON p.id=oi.product_id
+      WHERE oi.order_id=?
+      ORDER BY oi.id
+    """, (order_id,))
+    its = cur.fetchall()
+
+    changed_product_ids = []
+    for it in its:
+        pid = it["product_id"]
+        qty = int(it["qty"])
+        cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (pid,))
+        cur.execute("UPDATE stock SET qty = qty - ? WHERE product_id=?", (qty, pid))
+        changed_product_ids.append(int(pid))
+
+    cur.execute("UPDATE orders SET warehouse_issued=1 WHERE id=?", (order_id,))
+    c.commit()
+    c.close()
+
+    if supabase_enabled():
+        try:
+            supabase_update_rows("orders", {"warehouse_issued": 1}, {"id": order_id})
+            sync_local_rows_to_supabase("stock", "product_id", changed_product_ids)
+        except Exception:
+            pass
+
+    return redirect(url_for("orders", tab="issued"))
 
     cur.execute("""
       SELECT oi.*, p.model, p.name
@@ -3344,9 +3458,14 @@ def order_invoice(order_id):
         abort(404)
 
     cur.execute("""
-      SELECT oi.*, p.model, p.name
+      SELECT oi.*, p.model, p.name,
+             COALESCE(pr.net_price, 0) AS net_price,
+             COALESCE(pr.gross_price, 0) AS gross_price,
+             (oi.qty * COALESCE(pr.net_price, 0)) AS line_value_net,
+             (oi.qty * COALESCE(pr.gross_price, 0)) AS line_value_gross
       FROM order_items oi
       JOIN products p ON p.id=oi.product_id
+      LEFT JOIN pricing pr ON (TRIM(LOWER(pr.model)) = TRIM(LOWER(p.model)) OR TRIM(LOWER(pr.model)) = TRIM(LOWER(p.sku)))
       WHERE oi.order_id=?
       ORDER BY oi.id
     """, (order_id,))
@@ -3362,20 +3481,28 @@ def order_invoice(order_id):
     if not customer_row:
         cur.execute("SELECT * FROM customers WHERE name=? ORDER BY id DESC LIMIT 1", (o["customer_name"],))
         customer_row = cur.fetchone()
+
+    cur.execute("""
+      SELECT i.*, m.pdf_path, m.sent_to_client, m.invoice_items_json
+      FROM invoices i
+      LEFT JOIN invoice_meta m ON m.invoice_id = i.id
+      WHERE i.order_id=?
+      ORDER BY i.id DESC
+    """, (order_id,))
+    invoice_rows = [dict(r) for r in cur.fetchall()]
     c.close()
 
     default_issue = datetime.now().strftime("%Y-%m-%d")
-    # adres na fakturze zawsze preferuj z kartoteki klienta
-    buyer_address_source = ""
-    if customer_row:
-        buyer_address_source = customer_row["address"] or ""
-    if not buyer_address_source:
-        buyer_address_source = (o["customer_address"] or "")
+    buyer_address_source = customer_row["address"] if customer_row and customer_row["address"] else (o["customer_address"] or "")
     st, pc, city = split_address(buyer_address_source)
-    buyer_tax_no = ""
-    if customer_row:
-        buyer_tax_no = customer_row["nip"] or ""
+    buyer_tax_no = customer_row["nip"] if customer_row and customer_row["nip"] else ""
     buyer_address_default = "\n".join([x for x in [st, f"{pc} {city}".strip()] if x]).strip()
+
+    msg = ""
+    if request.args.get("generated") == "1":
+        msg = "Faktura została zapisana."
+    if request.args.get("sent") == "1":
+        msg = "Faktura została udostępniona klientowi."
 
     if request.method == "GET":
         data = {
@@ -3410,41 +3537,54 @@ def order_invoice(order_id):
         if not data["sell_date"]:
             data["sell_date"] = data["issue_date"]
 
-        pdf_path, total_net, total_gross = generate_order_invoice_pdf(o, items, data)
-
-        c = conn()
-        cur = c.cursor()
-        cur.execute("""
-          INSERT INTO invoices(order_id, invoice_no, issue_date, sell_date, payment_type, payment_to,
-                               buyer_name, buyer_tax_no, buyer_street, buyer_post_code, buyer_city, buyer_country,
-                               buyer_email, buyer_phone, total_net, total_gross, created_at)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-          ON CONFLICT(invoice_no) DO UPDATE SET
-            order_id=excluded.order_id,
-            issue_date=excluded.issue_date,
-            sell_date=excluded.sell_date,
-            payment_type=excluded.payment_type,
-            payment_to=excluded.payment_to,
-            buyer_name=excluded.buyer_name,
-            buyer_tax_no=excluded.buyer_tax_no,
-            buyer_street=excluded.buyer_street,
-            buyer_post_code=excluded.buyer_post_code,
-            buyer_city=excluded.buyer_city,
-            buyer_country=excluded.buyer_country,
-            buyer_email=excluded.buyer_email,
-            buyer_phone=excluded.buyer_phone,
-            total_net=excluded.total_net,
-            total_gross=excluded.total_gross,
-            created_at=excluded.created_at
-        """, (
-            order_id, data["invoice_no"], data["issue_date"], data["sell_date"], data["payment_type"], data["payment_to"],
-            data["buyer_name"], data["buyer_tax_no"], data["buyer_street"], data["buyer_post_code"], data["buyer_city"], data["buyer_country"],
-            data["buyer_email"], data["buyer_phone"], total_net, total_gross, now_iso()
-        ))
-        c.commit()
-        c.close()
-
-        return send_file(pdf_path, mimetype="application/pdf", as_attachment=True, download_name=os.path.basename(pdf_path))
+        invoice_items = prepare_invoice_items(items, request.form)
+        if not invoice_items:
+            msg = "Faktura musi zawierać co najmniej jedną pozycję."
+        else:
+            pdf_path, total_net, total_gross = generate_order_invoice_pdf(o, invoice_items, data)
+            c = conn()
+            cur = c.cursor()
+            cur.execute("""
+              INSERT INTO invoices(order_id, invoice_no, issue_date, sell_date, payment_type, payment_to,
+                                   buyer_name, buyer_tax_no, buyer_street, buyer_post_code, buyer_city, buyer_country,
+                                   buyer_email, buyer_phone, total_net, total_gross, created_at)
+              VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+              ON CONFLICT(invoice_no) DO UPDATE SET
+                order_id=excluded.order_id,
+                issue_date=excluded.issue_date,
+                sell_date=excluded.sell_date,
+                payment_type=excluded.payment_type,
+                payment_to=excluded.payment_to,
+                buyer_name=excluded.buyer_name,
+                buyer_tax_no=excluded.buyer_tax_no,
+                buyer_street=excluded.buyer_street,
+                buyer_post_code=excluded.buyer_post_code,
+                buyer_city=excluded.buyer_city,
+                buyer_country=excluded.buyer_country,
+                buyer_email=excluded.buyer_email,
+                buyer_phone=excluded.buyer_phone,
+                total_net=excluded.total_net,
+                total_gross=excluded.total_gross,
+                created_at=excluded.created_at
+            """, (
+                order_id, data["invoice_no"], data["issue_date"], data["sell_date"], data["payment_type"], data["payment_to"],
+                data["buyer_name"], data["buyer_tax_no"], data["buyer_street"], data["buyer_post_code"], data["buyer_city"], data["buyer_country"],
+                data["buyer_email"], data["buyer_phone"], total_net, total_gross, now_iso()
+            ))
+            invoice_id = cur.lastrowid
+            if not invoice_id:
+                cur.execute("SELECT id FROM invoices WHERE invoice_no=? LIMIT 1", (data["invoice_no"],))
+                rr = cur.fetchone()
+                invoice_id = int(rr["id"]) if rr else 0
+            c.commit()
+            c.close()
+            upsert_invoice_meta(invoice_id, invoice_pdf_relpath(pdf_path), json.dumps(invoice_items, ensure_ascii=False), sent_to_client=0)
+            if supabase_enabled():
+                try:
+                    sync_local_rows_to_supabase("invoices", "id", [invoice_id])
+                except Exception:
+                    pass
+            return redirect(url_for("order_invoice", order_id=order_id, generated="1", invoice_id=invoice_id))
 
     tpl = r"""
     {% extends "base.html" %}
@@ -3454,6 +3594,9 @@ def order_invoice(order_id):
           <h1 style="margin:0;">Faktura do zamówienia {{ canonical_order_no(o['id'], o['created_at'], o['order_no']) }}</h1>
           <a class="btn right" href="{{ url_for('order_view', order_id=o['id']) }}">← Szczegóły</a>
         </div>
+        {% if msg %}
+          <div class="hint" style="margin-top:10px;">{{ msg }}</div>
+        {% endif %}
       </div>
 
       <div class="card">
@@ -3479,14 +3622,68 @@ def order_invoice(order_id):
           <div><label class="muted small">Email</label><input name="buyer_email" value="{{ d['buyer_email'] }}"></div>
           <div><label class="muted small">Telefon</label><input name="buyer_phone" value="{{ d['buyer_phone'] }}"></div>
 
+          <div style="grid-column:1/-1;">
+            <h2>Pozycje faktury — możesz skorygować ilości przed wystawieniem</h2>
+            <table>
+              <thead><tr><th>SKU</th><th>Model / Nazwa</th><th>Ilość w zamówieniu</th><th>Ilość na fakturze</th><th>Netto/szt</th><th>Brutto/szt</th></tr></thead>
+              <tbody>
+                {% for it in items %}
+                <tr>
+                  <td><b>{{ it['sku'] }}</b></td>
+                  <td>{{ it['model'] or '' }}{% if it['name'] %}<div class="muted small">{{ it['name'] }}</div>{% endif %}</td>
+                  <td>{{ it['qty'] }}</td>
+                  <td><input name="invoice_qty_{{ it['id'] }}" value="{{ it['qty'] }}" style="width:110px;"></td>
+                  <td>{{ "%.2f"|format(it['net_price']) }}</td>
+                  <td>{{ "%.2f"|format(it['gross_price']) }}</td>
+                </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+
           <div class="flex" style="align-items:flex-end;">
-            <button class="btn primary" type="submit">Generuj fakturę PDF</button>
+            <button class="btn primary" type="submit">Zapisz fakturę PDF</button>
           </div>
         </form>
       </div>
+
+      <div class="card">
+        <h2>Zapisane faktury</h2>
+        <table>
+          <thead><tr><th>Numer</th><th>Data</th><th>Netto</th><th>Brutto</th><th>Status klienta</th><th>Akcje</th></tr></thead>
+          <tbody>
+            {% for inv in invoice_rows %}
+              <tr>
+                <td><b>{{ inv['invoice_no'] }}</b></td>
+                <td>{{ inv['issue_date'] }}</td>
+                <td>{{ "%.2f"|format(inv['total_net']) }}</td>
+                <td>{{ "%.2f"|format(inv['total_gross']) }}</td>
+                <td>{{ "Udostępniona" if inv['sent_to_client'] else "Tylko wewnętrzna" }}</td>
+                <td>
+                  <div class="flex">
+                    {% if inv['pdf_path'] %}
+                      <a class="btn" href="{{ url_for('api_invoice_download', invoice_id=inv['id']) }}" target="_blank">Pobierz PDF</a>
+                    {% endif %}
+                    {% if not inv['sent_to_client'] %}
+                      <form method="post" action="{{ url_for('order_invoice_send', order_id=o['id'], invoice_id=inv['id']) }}">
+                        <button class="btn primary" type="submit">Wyślij fakturę klientowi</button>
+                      </form>
+                    {% else %}
+                      <span class="badge">Widoczna w panelu klienta</span>
+                    {% endif %}
+                  </div>
+                </td>
+              </tr>
+            {% endfor %}
+            {% if not invoice_rows %}
+              <tr><td colspan="6" class="muted">Brak wystawionych faktur.</td></tr>
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
     {% endblock %}
     """
-    return render_template_string(tpl, title="Faktura", base_url=BASE_URL, db_path=DB_PATH, o=o, d=data, company=company)
+    return render_template_string(tpl, title="Faktura", base_url=BASE_URL, db_path=DB_PATH, o=o, d=data, company=company, items=items, invoice_rows=invoice_rows, msg=msg, canonical_order_no=canonical_order_no)
 
 
 @app.get("/orders/<int:order_id>/print")
@@ -3802,6 +3999,7 @@ def api_order_lookup():
             "customer_email": o["customer_email"],
             "note": o["note"],
             "qr_data_url": o["qr_data_url"] or "",
+            "warehouse_issued": int(o["warehouse_issued"] or 0),
             "total_net": total_net,
             "total_gross": total_gross,
         },
@@ -3809,13 +4007,76 @@ def api_order_lookup():
     )
 
 
+@app.get("/api/client_invoices")
+def api_client_invoices():
+    email = _email_key(request.args.get("email"))
+    if not email:
+        return jsonify(ok=False, error="Brak email"), 400
+
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+      SELECT i.*, m.pdf_path, m.sent_to_client
+      FROM invoices i
+      JOIN invoice_meta m ON m.invoice_id = i.id
+      WHERE COALESCE(m.sent_to_client,0)=1
+        AND LOWER(COALESCE(i.buyer_email,'')) = ?
+      ORDER BY i.issue_date DESC, i.id DESC
+    """, (email,))
+    rows = [dict(r) for r in cur.fetchall()]
+    c.close()
+    return jsonify(ok=True, invoices=rows)
+
+@app.get("/api/invoices/<int:invoice_id>/download")
+def api_invoice_download(invoice_id):
+    email = _email_key(request.args.get("email"))
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+      SELECT i.*, m.pdf_path, m.sent_to_client
+      FROM invoices i
+      JOIN invoice_meta m ON m.invoice_id = i.id
+      WHERE i.id=?
+      LIMIT 1
+    """, (invoice_id,))
+    row = cur.fetchone()
+    c.close()
+    if not row:
+        return "Nie znaleziono faktury", 404
+    if email and _email_key(row["buyer_email"]) != email:
+        return "Brak dostępu", 403
+    abs_path = invoice_pdf_abspath(row["pdf_path"] or "")
+    if not os.path.exists(abs_path):
+        return "Brak pliku PDF", 404
+    return send_file(abs_path, mimetype="application/pdf", as_attachment=True, download_name=os.path.basename(abs_path))
+
+@app.post("/orders/<int:order_id>/invoice/<int:invoice_id>/send")
+def order_invoice_send(order_id, invoice_id):
+    c = conn()
+    cur = c.cursor()
+    cur.execute("SELECT id FROM invoices WHERE id=? AND order_id=?", (invoice_id, order_id))
+    row = cur.fetchone()
+    c.close()
+    if not row:
+        abort(404)
+    meta = load_invoice_meta(invoice_id) or {}
+    upsert_invoice_meta(invoice_id, meta.get("pdf_path",""), meta.get("invoice_items_json",""), sent_to_client=1)
+    return redirect(url_for("order_invoice", order_id=order_id, sent="1", invoice_id=invoice_id))
+
 @app.get("/orders/by-code/<path:token>")
 def order_by_code(token):
     maybe_pull_shared_from_supabase()
     c = conn()
     cur = c.cursor()
-    cur.execute("SELECT id FROM orders WHERE order_no=? LIMIT 1", (norm(token),))
+    cur.execute("SELECT id, order_no, created_at FROM orders WHERE order_no=? LIMIT 1", (norm(token),))
     row = cur.fetchone()
+    if not row:
+        cur.execute("SELECT id, order_no, created_at FROM orders ORDER BY id DESC")
+        all_rows = cur.fetchall()
+        for r in all_rows:
+            if canonical_order_no(r["id"], r["created_at"], r["order_no"]) == norm(token):
+                row = r
+                break
     c.close()
     if not row:
         return "Nie znaleziono zamówienia", 404
