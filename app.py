@@ -1642,6 +1642,8 @@ def cloud_supabase():
         .st-confirmed{background:#16a34a;color:#fff;border-color:#16a34a;}
         .st-delivery{background:#2563eb;color:#fff;border-color:#2563eb;}
         .st-issued{background:#6b7280;color:#fff;border-color:#6b7280;}
+        tr.row-alert td{background:#ffe7e7;}
+        tr.row-ok td{background:#e9f9ee;}
       </style>
 
       <div class="card">
@@ -2548,9 +2550,11 @@ def orders():
     if tab == "new":
         where_parts.append("COALESCE(o.warehouse_issued,0)=0")
     elif tab == "issued":
-        where_parts.append("COALESCE(o.warehouse_issued,0)=1 AND LOWER(COALESCE(o.status,'')) <> 'issued'")
+        where_parts.append("COALESCE(o.warehouse_issued,0)=1")
+        where_parts.append("LOWER(COALESCE(o.status,'')) <> 'issued'")
     elif tab == "realized":
-        where_parts.append("COALESCE(o.warehouse_issued,0)=1 AND LOWER(COALESCE(o.status,'')) = 'issued'")
+        where_parts.append("COALESCE(o.warehouse_issued,0)=1")
+        where_parts.append("LOWER(COALESCE(o.status,'')) = 'issued'")
 
     if q:
         where_parts.append("(order_no LIKE ? OR customer_name LIKE ?)")
@@ -2697,7 +2701,7 @@ def orders():
           </thead>
           <tbody>
             {% for r in rows %}
-              <tr {% if r['has_shortage'] or r['status'] in ['new','pending','unconfirmed'] %}style="background:#ffe7e7;"{% endif %}>
+              <tr class="{% if r['has_shortage'] or r['status'] in ['new','pending','unconfirmed'] %}row-alert{% elif r['status'] in ['confirmed','packed','in_delivery','issued'] or r['warehouse_issued'] %}row-ok{% endif %}">
                 <td><b>{{ canonical_order_no(r['id'], r['created_at'], r['order_no']) }}</b></td>
                 <td>{{ r['customer_name'] }}</td>
                 <td><span class="badge {{ order_status_css(r['status']) }}">{{ order_status_label(r['status']) }}</span></td>
@@ -3379,7 +3383,11 @@ def order_status_update(order_id):
 
 @app.get("/orders/<int:order_id>/issue")
 def order_issue(order_id):
-    # odejmij z magazynu wg pozycji i oznacz jako wydane z magazynu (bez zmiany statusu klienta)
+    # wydanie z magazynu:
+    # - zdejmuje ilości ze stocku
+    # - ustawia warehouse_issued=1
+    # - automatycznie zmienia status na in_delivery
+    # - przekierowuje do kafelka "Wydane"
     c = conn()
     cur = c.cursor()
     cur.execute("SELECT * FROM orders WHERE id=?", (order_id,))
@@ -3390,7 +3398,7 @@ def order_issue(order_id):
 
     if int(o["warehouse_issued"] or 0) == 1:
         c.close()
-        return redirect(url_for("orders", tab=("realized" if norm(o["status"]).lower()=="issued" else "issued")))
+        return redirect(url_for("orders", tab=("realized" if norm(o["status"]).lower() == "issued" else "issued")))
 
     cur.execute("""
       SELECT oi.*, p.model, p.name
@@ -3403,11 +3411,11 @@ def order_issue(order_id):
 
     changed_product_ids = []
     for it in its:
-        pid = it["product_id"]
+        pid = int(it["product_id"])
         qty = int(it["qty"])
         cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (pid,))
         cur.execute("UPDATE stock SET qty = qty - ? WHERE product_id=?", (qty, pid))
-        changed_product_ids.append(int(pid))
+        changed_product_ids.append(pid)
 
     cur.execute("UPDATE orders SET warehouse_issued=1, status='in_delivery' WHERE id=?", (order_id,))
     c.commit()
@@ -3415,37 +3423,13 @@ def order_issue(order_id):
 
     if supabase_enabled():
         try:
-            supabase_update_rows("orders", {"warehouse_issued": 1}, {"id": order_id})
+            supabase_update_rows("orders", {"warehouse_issued": 1, "status": "in_delivery"}, {"id": order_id})
+        except Exception:
+            pass
+        try:
             sync_local_rows_to_supabase("stock", "product_id", changed_product_ids)
         except Exception:
             pass
-
-    return redirect(url_for("orders", tab="issued"))
-
-    cur.execute("""
-      SELECT oi.*, p.model, p.name
-      FROM order_items oi
-      JOIN products p ON p.id=oi.product_id
-      WHERE oi.order_id=?
-      ORDER BY oi.id
-    """, (order_id,))
-    its = cur.fetchall()
-
-    changed_product_ids = []
-    for it in its:
-        pid = it["product_id"]
-        qty = int(it["qty"])
-        cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (pid,))
-        cur.execute("UPDATE stock SET qty = qty - ? WHERE product_id=?", (qty, pid))
-        changed_product_ids.append(int(pid))
-
-    cur.execute("UPDATE orders SET status='issued' WHERE id=?", (order_id,))
-    c.commit()
-    c.close()
-
-    if supabase_enabled():
-        supabase_update_rows("orders", {"status": "issued"}, {"id": order_id})
-        sync_local_rows_to_supabase("stock", "product_id", changed_product_ids)
 
     return redirect(url_for("orders", tab="issued"))
 
