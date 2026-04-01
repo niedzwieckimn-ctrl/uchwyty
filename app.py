@@ -1642,8 +1642,6 @@ def cloud_supabase():
         .st-confirmed{background:#16a34a;color:#fff;border-color:#16a34a;}
         .st-delivery{background:#2563eb;color:#fff;border-color:#2563eb;}
         .st-issued{background:#6b7280;color:#fff;border-color:#6b7280;}
-        tr.row-alert td{background:#ffe7e7;}
-        tr.row-ok td{background:#e9f9ee;}
       </style>
 
       <div class="card">
@@ -2531,8 +2529,7 @@ def api_product(product_id):
 
 @app.get("/orders")
 def orders():
-    if norm(request.args.get("skip_pull")) != "1":
-        maybe_pull_shared_from_supabase()
+    maybe_pull_shared_from_supabase()
     try:
         link_orders_to_customers_by_email(sync_remote=True)
     except Exception:
@@ -2550,12 +2547,11 @@ def orders():
 
     if tab == "new":
         where_parts.append("COALESCE(o.warehouse_issued,0)=0")
+        where_parts.append("LOWER(COALESCE(o.status,'')) NOT IN ('in_delivery','issued')")
     elif tab == "issued":
-        where_parts.append("COALESCE(o.warehouse_issued,0)=1")
-        where_parts.append("LOWER(COALESCE(o.status,'')) <> 'issued'")
+        where_parts.append("(LOWER(COALESCE(o.status,''))='in_delivery' OR (COALESCE(o.warehouse_issued,0)=1 AND LOWER(COALESCE(o.status,''))<>'issued'))")
     elif tab == "realized":
-        where_parts.append("COALESCE(o.warehouse_issued,0)=1")
-        where_parts.append("LOWER(COALESCE(o.status,'')) = 'issued'")
+        where_parts.append("LOWER(COALESCE(o.status,''))='issued'")
 
     if q:
         where_parts.append("(order_no LIKE ? OR customer_name LIKE ?)")
@@ -2702,7 +2698,7 @@ def orders():
           </thead>
           <tbody>
             {% for r in rows %}
-              <tr class="{% if r['has_shortage'] or r['status'] in ['new','pending','unconfirmed'] %}row-alert{% elif r['status'] in ['confirmed','packed','in_delivery','issued'] or r['warehouse_issued'] %}row-ok{% endif %}">
+              <tr {% if r['has_shortage'] or r['status'] in ['new','pending','unconfirmed'] %}style="background:#ffe7e7;"{% endif %}>
                 <td><b>{{ canonical_order_no(r['id'], r['created_at'], r['order_no']) }}</b></td>
                 <td>{{ r['customer_name'] }}</td>
                 <td><span class="badge {{ order_status_css(r['status']) }}">{{ order_status_label(r['status']) }}</span></td>
@@ -2945,8 +2941,7 @@ def order_create():
 
 @app.get("/orders/<int:order_id>")
 def order_view(order_id):
-    if norm(request.args.get("skip_pull")) != "1":
-        maybe_pull_shared_from_supabase()
+    maybe_pull_shared_from_supabase()
     try:
         link_orders_to_customers_by_email(sync_remote=True)
     except Exception:
@@ -3349,7 +3344,7 @@ def order_delete(order_id):
         except Exception:
             pass
 
-    return redirect(url_for("orders", skip_pull=1))
+    return redirect(url_for("orders"))
 
 @app.post("/orders/<int:order_id>/status")
 def order_status_update(order_id):
@@ -3376,11 +3371,11 @@ def order_status_update(order_id):
 
     if supabase_enabled():
         try:
-            sync_local_rows_to_supabase("orders", "id", [order_id])
+            supabase_update_rows("orders", {"status": new_status, "qr_data_url": qr_data_url}, {"id": order_id})
         except Exception:
             pass
 
-    return redirect(url_for("order_view", order_id=order_id, skip_pull=1))
+    return redirect(url_for("order_view", order_id=order_id))
 
 
 @app.get("/orders/<int:order_id>/issue")
@@ -3388,8 +3383,8 @@ def order_issue(order_id):
     # wydanie z magazynu:
     # - zdejmuje ilości ze stocku
     # - ustawia warehouse_issued=1
-    # - automatycznie zmienia status na in_delivery
-    # - przekierowuje do kafelka "Wydane"
+    # - zmienia status na "in_delivery"
+    # - przerzuca zamówienie do kafelka "Wydane"
     c = conn()
     cur = c.cursor()
     cur.execute("SELECT * FROM orders WHERE id=?", (order_id,))
@@ -3400,7 +3395,8 @@ def order_issue(order_id):
 
     if int(o["warehouse_issued"] or 0) == 1:
         c.close()
-        return redirect(url_for("orders", tab=("realized" if norm(o["status"]).lower() == "issued" else "issued"), skip_pull=1))
+        current_status = norm(o["status"]).lower()
+        return redirect(url_for("orders", tab=("realized" if current_status == "issued" else "issued")))
 
     cur.execute("""
       SELECT oi.*, p.model, p.name
@@ -3425,7 +3421,7 @@ def order_issue(order_id):
 
     if supabase_enabled():
         try:
-            sync_local_rows_to_supabase("orders", "id", [order_id])
+            supabase_update_rows("orders", {"warehouse_issued": 1, "status": "in_delivery"}, {"id": order_id})
         except Exception:
             pass
         try:
@@ -3433,7 +3429,7 @@ def order_issue(order_id):
         except Exception:
             pass
 
-    return redirect(url_for("orders", tab="issued", skip_pull=1))
+    return redirect(url_for("orders", tab="issued"))
 
 @app.route("/orders/<int:order_id>/invoice", methods=["GET", "POST"])
 def order_invoice(order_id):
