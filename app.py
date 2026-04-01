@@ -2531,7 +2531,8 @@ def api_product(product_id):
 
 @app.get("/orders")
 def orders():
-    maybe_pull_shared_from_supabase()
+    if norm(request.args.get("skip_pull")) != "1":
+        maybe_pull_shared_from_supabase()
     try:
         link_orders_to_customers_by_email(sync_remote=True)
     except Exception:
@@ -2944,7 +2945,8 @@ def order_create():
 
 @app.get("/orders/<int:order_id>")
 def order_view(order_id):
-    maybe_pull_shared_from_supabase()
+    if norm(request.args.get("skip_pull")) != "1":
+        maybe_pull_shared_from_supabase()
     try:
         link_orders_to_customers_by_email(sync_remote=True)
     except Exception:
@@ -3347,7 +3349,7 @@ def order_delete(order_id):
         except Exception:
             pass
 
-    return redirect(url_for("orders"))
+    return redirect(url_for("orders", skip_pull=1))
 
 @app.post("/orders/<int:order_id>/status")
 def order_status_update(order_id):
@@ -3374,11 +3376,11 @@ def order_status_update(order_id):
 
     if supabase_enabled():
         try:
-            supabase_update_rows("orders", {"status": new_status, "qr_data_url": qr_data_url}, {"id": order_id})
+            sync_local_rows_to_supabase("orders", "id", [order_id])
         except Exception:
             pass
 
-    return redirect(url_for("order_view", order_id=order_id))
+    return redirect(url_for("order_view", order_id=order_id, skip_pull=1))
 
 
 @app.get("/orders/<int:order_id>/issue")
@@ -3398,7 +3400,7 @@ def order_issue(order_id):
 
     if int(o["warehouse_issued"] or 0) == 1:
         c.close()
-        return redirect(url_for("orders", tab=("realized" if norm(o["status"]).lower() == "issued" else "issued")))
+        return redirect(url_for("orders", tab=("realized" if norm(o["status"]).lower() == "issued" else "issued"), skip_pull=1))
 
     cur.execute("""
       SELECT oi.*, p.model, p.name
@@ -3423,7 +3425,7 @@ def order_issue(order_id):
 
     if supabase_enabled():
         try:
-            supabase_update_rows("orders", {"warehouse_issued": 1, "status": "in_delivery"}, {"id": order_id})
+            sync_local_rows_to_supabase("orders", "id", [order_id])
         except Exception:
             pass
         try:
@@ -3431,7 +3433,7 @@ def order_issue(order_id):
         except Exception:
             pass
 
-    return redirect(url_for("orders", tab="issued"))
+    return redirect(url_for("orders", tab="issued", skip_pull=1))
 
 @app.route("/orders/<int:order_id>/invoice", methods=["GET", "POST"])
 def order_invoice(order_id):
