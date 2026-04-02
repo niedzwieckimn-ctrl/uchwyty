@@ -2712,7 +2712,7 @@ def orders():
                       <button class="btn danger" type="submit">Usuń</button>
                     </form>
                   {% else %}
-                    <a class="btn" href="{{ url_for('order_invoice', order_id=r['id']) }}">Faktura</a>
+                    <span class="muted">Podgląd</span>
                   {% endif %}
                 </td>
               </tr>
@@ -4001,13 +4001,22 @@ def api_client_invoices():
     c = conn()
     cur = c.cursor()
     cur.execute("""
-      SELECT i.*, m.pdf_path, m.sent_to_client
+      SELECT
+        i.*,
+        m.pdf_path,
+        m.sent_to_client,
+        o.order_no,
+        o.customer_email AS order_customer_email
       FROM invoices i
       JOIN invoice_meta m ON m.invoice_id = i.id
+      LEFT JOIN orders o ON o.id = i.order_id
       WHERE COALESCE(m.sent_to_client,0)=1
-        AND LOWER(COALESCE(i.buyer_email,'')) = ?
+        AND (
+          LOWER(COALESCE(i.buyer_email,'')) = ?
+          OR LOWER(COALESCE(o.customer_email,'')) = ?
+        )
       ORDER BY i.issue_date DESC, i.id DESC
-    """, (email,))
+    """, (email, email))
     rows = [dict(r) for r in cur.fetchall()]
     c.close()
     return jsonify(ok=True, invoices=rows)
@@ -4018,9 +4027,14 @@ def api_invoice_download(invoice_id):
     c = conn()
     cur = c.cursor()
     cur.execute("""
-      SELECT i.*, m.pdf_path, m.sent_to_client
+      SELECT
+        i.*,
+        m.pdf_path,
+        m.sent_to_client,
+        o.customer_email AS order_customer_email
       FROM invoices i
       JOIN invoice_meta m ON m.invoice_id = i.id
+      LEFT JOIN orders o ON o.id = i.order_id
       WHERE i.id=?
       LIMIT 1
     """, (invoice_id,))
@@ -4028,8 +4042,13 @@ def api_invoice_download(invoice_id):
     c.close()
     if not row:
         return "Nie znaleziono faktury", 404
-    if email and _email_key(row["buyer_email"]) != email:
-        return "Brak dostępu", 403
+
+    if email:
+        buyer_ok = _email_key(row["buyer_email"]) == email
+        order_ok = _email_key(row["order_customer_email"]) == email
+        if int(row["sent_to_client"] or 0) != 1 or not (buyer_ok or order_ok):
+            return "Brak dostępu", 403
+
     abs_path = invoice_pdf_abspath(row["pdf_path"] or "")
     if not os.path.exists(abs_path):
         return "Brak pliku PDF", 404
@@ -4039,11 +4058,25 @@ def api_invoice_download(invoice_id):
 def order_invoice_send(order_id, invoice_id):
     c = conn()
     cur = c.cursor()
-    cur.execute("SELECT id FROM invoices WHERE id=? AND order_id=?", (invoice_id, order_id))
+    cur.execute("""
+      SELECT i.id, i.buyer_email, o.customer_email
+      FROM invoices i
+      JOIN orders o ON o.id = i.order_id
+      WHERE i.id=? AND i.order_id=?
+      LIMIT 1
+    """, (invoice_id, order_id))
     row = cur.fetchone()
-    c.close()
     if not row:
+        c.close()
         abort(404)
+
+    buyer_email = _email_key(row["buyer_email"])
+    order_email = _email_key(row["customer_email"])
+    if not buyer_email and order_email:
+        cur.execute("UPDATE invoices SET buyer_email=? WHERE id=?", (order_email, invoice_id))
+        c.commit()
+    c.close()
+
     meta = load_invoice_meta(invoice_id) or {}
     upsert_invoice_meta(invoice_id, meta.get("pdf_path",""), meta.get("invoice_items_json",""), sent_to_client=1)
     return redirect(url_for("order_invoice", order_id=order_id, sent="1", invoice_id=invoice_id))
