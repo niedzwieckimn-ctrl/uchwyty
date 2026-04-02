@@ -3073,9 +3073,7 @@ def order_view(order_id):
                 <button class="btn" type="submit">Zmień status</button>
               </form>
               <a class="btn primary" href="{{ url_for('order_label', order_id=o['id']) }}">Etykieta 30x50</a>
-              {% if not locked %}
-                <a class="btn ok" href="{{ url_for('order_issue', order_id=o['id']) }}">Wydaj z magazynu</a>
-              {% else %}
+              {% if locked %}
                 <span class="badge">Wydane z magazynu</span>
               {% endif %}
               <form method="post" action="{{ url_for('order_delete', order_id=o['id']) }}" onsubmit="return confirm('Usunąć zamówienie?')">
@@ -3355,7 +3353,7 @@ def order_status_update(order_id):
 
     c = conn()
     cur = c.cursor()
-    cur.execute("SELECT id, order_no, qr_data_url, status, created_at FROM orders WHERE id=?", (order_id,))
+    cur.execute("SELECT id, order_no, qr_data_url, status, created_at, warehouse_issued FROM orders WHERE id=?", (order_id,))
     o = cur.fetchone()
     if not o:
         c.close()
@@ -3365,71 +3363,60 @@ def order_status_update(order_id):
     if new_status == "confirmed":
         qr_data_url = make_qr_data_url(canonical_order_no(o["id"], o["created_at"], o["order_no"]))
 
-    cur.execute("UPDATE orders SET status=?, qr_data_url=? WHERE id=?", (new_status, qr_data_url, order_id))
+    changed_product_ids = []
+    warehouse_issued = int(o["warehouse_issued"] or 0)
+
+    # Jedyny moment zdjęcia stanu:
+    # przy przejściu na "in_delivery" i tylko jeśli jeszcze nie było wydane.
+    if new_status == "in_delivery" and warehouse_issued == 0:
+        cur.execute("""
+          SELECT oi.product_id, oi.qty
+          FROM order_items oi
+          WHERE oi.order_id=?
+          ORDER BY oi.id
+        """, (order_id,))
+        items = cur.fetchall()
+
+        for it in items:
+            pid = int(it["product_id"])
+            qty = int(it["qty"])
+            cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (pid,))
+            cur.execute("UPDATE stock SET qty = qty - ? WHERE product_id=?", (qty, pid))
+            changed_product_ids.append(pid)
+
+        warehouse_issued = 1
+
+    cur.execute(
+        "UPDATE orders SET status=?, qr_data_url=?, warehouse_issued=? WHERE id=?",
+        (new_status, qr_data_url, warehouse_issued, order_id)
+    )
     c.commit()
     c.close()
 
     if supabase_enabled():
         try:
-            supabase_update_rows("orders", {"status": new_status, "qr_data_url": qr_data_url}, {"id": order_id})
+            supabase_update_rows(
+                "orders",
+                {"status": new_status, "qr_data_url": qr_data_url, "warehouse_issued": warehouse_issued},
+                {"id": order_id}
+            )
         except Exception:
             pass
+
+        if changed_product_ids:
+            try:
+                sync_local_rows_to_supabase("stock", "product_id", changed_product_ids)
+            except Exception:
+                pass
 
     return redirect(url_for("order_view", order_id=order_id))
 
 
 @app.get("/orders/<int:order_id>/issue")
 def order_issue(order_id):
-    # wydanie z magazynu:
-    # - zdejmuje ilości ze stocku
-    # - ustawia warehouse_issued=1
-    # - zmienia status na "in_delivery"
-    # - przerzuca zamówienie do kafelka "Wydane"
-    c = conn()
-    cur = c.cursor()
-    cur.execute("SELECT * FROM orders WHERE id=?", (order_id,))
-    o = cur.fetchone()
-    if not o:
-        c.close()
-        abort(404)
+    # Stara akcja wyłączona. Wydanie dzieje się teraz przy zmianie statusu na "W dostawie".
+    return redirect(url_for("order_view", order_id=order_id))
 
-    if int(o["warehouse_issued"] or 0) == 1:
-        c.close()
-        current_status = norm(o["status"]).lower()
-        return redirect(url_for("orders", tab=("realized" if current_status == "issued" else "issued")))
-
-    cur.execute("""
-      SELECT oi.*, p.model, p.name
-      FROM order_items oi
-      JOIN products p ON p.id=oi.product_id
-      WHERE oi.order_id=?
-      ORDER BY oi.id
-    """, (order_id,))
-    its = cur.fetchall()
-
-    changed_product_ids = []
-    for it in its:
-        pid = int(it["product_id"])
-        qty = int(it["qty"])
-        cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (pid,))
-        cur.execute("UPDATE stock SET qty = qty - ? WHERE product_id=?", (qty, pid))
-        changed_product_ids.append(pid)
-
-    cur.execute("UPDATE orders SET warehouse_issued=1, status='in_delivery' WHERE id=?", (order_id,))
-    c.commit()
-    c.close()
-
-    if supabase_enabled():
-        try:
-            supabase_update_rows("orders", {"warehouse_issued": 1, "status": "in_delivery"}, {"id": order_id})
-        except Exception:
-            pass
-        try:
-            sync_local_rows_to_supabase("stock", "product_id", changed_product_ids)
-        except Exception:
-            pass
-
-    return redirect(url_for("orders", tab="issued"))
 
 @app.route("/orders/<int:order_id>/invoice", methods=["GET", "POST"])
 def order_invoice(order_id):
