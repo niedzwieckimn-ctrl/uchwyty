@@ -1410,6 +1410,18 @@ def find_invoice_pdf_fallback(invoice_no: str) -> str:
                 return os.path.join(dirpath, fn)
     return ""
 
+def invoice_pdf_exists(pdf_path: str, invoice_no: str = "") -> tuple[bool, str]:
+    abs_path = ""
+    raw_pdf = norm(pdf_path)
+    if raw_pdf:
+        abs_path = raw_pdf if os.path.isabs(raw_pdf) else invoice_pdf_abspath(raw_pdf)
+    if abs_path and os.path.exists(abs_path):
+        return True, abs_path
+    fallback = find_invoice_pdf_fallback(invoice_no)
+    if fallback and os.path.exists(fallback):
+        return True, fallback
+    return False, ""
+
 
 def load_invoice_meta(invoice_id: int):
     c = conn()
@@ -4016,9 +4028,135 @@ def api_client_invoices():
         )
       ORDER BY i.issue_date DESC, i.id DESC
     """, (email, email))
-    rows = [dict(r) for r in cur.fetchall()]
+    rows = []
+    for r in cur.fetchall():
+        d = dict(r)
+        ok_pdf, found_path = invoice_pdf_exists(d.get("pdf_path", ""), d.get("invoice_no", ""))
+        if ok_pdf:
+            d["pdf_exists"] = 1
+            rows.append(d)
     c.close()
     return jsonify(ok=True, invoices=rows)
+
+
+def load_invoice_with_meta(invoice_id: int):
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+      SELECT i.*, COALESCE(m.pdf_path,'') AS pdf_path, COALESCE(m.sent_to_client,0) AS sent_to_client
+      FROM invoices i
+      LEFT JOIN invoice_meta m ON m.invoice_id = i.id
+      WHERE i.id=?
+      LIMIT 1
+    """, (invoice_id,))
+    row = cur.fetchone()
+    c.close()
+    return dict(row) if row else None
+
+def invoice_meta_payload(invoice_row: dict):
+    buyer_address = "\n".join([x for x in [
+        invoice_row.get("buyer_street") or "",
+        f"{invoice_row.get('buyer_post_code') or ''} {invoice_row.get('buyer_city') or ''}".strip()
+    ] if x]).strip()
+
+    return {
+        "invoice_no": invoice_row.get("invoice_no") or "",
+        "place": "Kotuszów",
+        "issue_date": invoice_row.get("issue_date") or datetime.now().strftime("%Y-%m-%d"),
+        "sell_date": invoice_row.get("sell_date") or datetime.now().strftime("%Y-%m-%d"),
+        "payment_type": invoice_row.get("payment_type") or "przelew",
+        "payment_to": invoice_row.get("payment_to") or "",
+        "buyer_name": invoice_row.get("buyer_name") or "",
+        "buyer_tax_no": invoice_row.get("buyer_tax_no") or "",
+        "buyer_address": buyer_address,
+        "buyer_country": invoice_row.get("buyer_country") or "PL",
+        "buyer_email": invoice_row.get("buyer_email") or "",
+        "buyer_phone": invoice_row.get("buyer_phone") or "",
+        "discount_percent": "0",
+    }
+
+def invoice_items_from_saved_json(invoice_id: int):
+    meta = load_invoice_meta(invoice_id) or {}
+    raw = meta.get("invoice_items_json") or ""
+    if raw:
+        try:
+            data = json.loads(raw)
+            if isinstance(data, list) and data:
+                return data
+        except Exception:
+            pass
+
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+      SELECT oi.*, p.model, p.name,
+             COALESCE(pr.net_price, 0) AS net_price,
+             COALESCE(pr.gross_price, 0) AS gross_price,
+             (oi.qty * COALESCE(pr.net_price, 0)) AS line_value_net,
+             (oi.qty * COALESCE(pr.gross_price, 0)) AS line_value_gross
+      FROM order_items oi
+      JOIN products p ON p.id=oi.product_id
+      LEFT JOIN pricing pr ON (TRIM(LOWER(pr.model)) = TRIM(LOWER(p.model)) OR TRIM(LOWER(pr.model)) = TRIM(LOWER(p.sku)))
+      WHERE oi.order_id=(SELECT order_id FROM invoices WHERE id=?)
+      ORDER BY oi.id
+    """, (invoice_id,))
+    items = [dict(r) for r in cur.fetchall()]
+    c.close()
+    return items
+
+@app.get("/invoices/<int:invoice_id>/download")
+def invoice_download_admin(invoice_id):
+    row = load_invoice_with_meta(invoice_id)
+    if not row:
+        return "Nie znaleziono faktury", 404
+
+    ok_pdf, abs_path = invoice_pdf_exists(row.get("pdf_path", ""), row.get("invoice_no", ""))
+    if not ok_pdf:
+        return "Brak pliku PDF", 404
+    return send_file(abs_path, mimetype="application/pdf", as_attachment=True, download_name=os.path.basename(abs_path))
+
+@app.post("/invoices/<int:invoice_id>/regenerate")
+def invoice_regenerate_admin(invoice_id):
+    inv = load_invoice_with_meta(invoice_id)
+    if not inv:
+        return "Nie znaleziono faktury", 404
+
+    c = conn()
+    cur = c.cursor()
+    cur.execute("SELECT * FROM orders WHERE id=?", (inv["order_id"],))
+    o = cur.fetchone()
+    c.close()
+    if not o:
+        return "Brak powiązanego zamówienia", 404
+
+    items = invoice_items_from_saved_json(invoice_id)
+    if not items:
+        return "Brak pozycji faktury", 400
+
+    meta = invoice_meta_payload(inv)
+    pdf_path, total_net, total_gross = generate_order_invoice_pdf(o, items, meta)
+
+    c = conn()
+    cur = c.cursor()
+    cur.execute("UPDATE invoices SET total_net=?, total_gross=? WHERE id=?", (total_net, total_gross, invoice_id))
+    c.commit()
+    c.close()
+
+    current_meta = load_invoice_meta(invoice_id) or {}
+    upsert_invoice_meta(
+        invoice_id,
+        invoice_pdf_relpath(pdf_path),
+        current_meta.get("invoice_items_json") or json.dumps(items, ensure_ascii=False),
+        sent_to_client=int(current_meta.get("sent_to_client") or 0)
+    )
+
+    if supabase_enabled():
+        try:
+            sync_local_rows_to_supabase("invoices", "id", [invoice_id])
+        except Exception:
+            pass
+
+    return redirect(request.referrer or url_for("orders"))
 
 @app.get("/api/invoices/<int:invoice_id>/download")
 def api_invoice_download(invoice_id):
@@ -4048,15 +4186,8 @@ def api_invoice_download(invoice_id):
         if int(row["sent_to_client"] or 0) != 1 or not (buyer_ok or order_ok):
             return "Brak dostępu", 403
 
-    abs_path = ""
-    raw_pdf = norm(row["pdf_path"])
-    if raw_pdf:
-        abs_path = raw_pdf if os.path.isabs(raw_pdf) else invoice_pdf_abspath(raw_pdf)
-
-    if not abs_path or not os.path.exists(abs_path):
-        abs_path = find_invoice_pdf_fallback(row["invoice_no"])
-
-    if not abs_path or not os.path.exists(abs_path):
+    ok_pdf, abs_path = invoice_pdf_exists(row["pdf_path"], row["invoice_no"])
+    if not ok_pdf:
         return "Brak pliku PDF", 404
 
     try:
