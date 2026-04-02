@@ -232,10 +232,19 @@ def init_db():
         pdf_path TEXT,
         invoice_items_json TEXT,
         sent_to_client INTEGER NOT NULL DEFAULT 0,
+        seen_by_client INTEGER NOT NULL DEFAULT 0,
+        seen_at TEXT,
         updated_at TEXT NOT NULL,
         FOREIGN KEY(invoice_id) REFERENCES invoices(id)
     )
     """)
+
+    cur.execute("PRAGMA table_info(invoice_meta)")
+    invoice_meta_cols = {r[1] for r in cur.fetchall()}
+    if "seen_by_client" not in invoice_meta_cols:
+        cur.execute("ALTER TABLE invoice_meta ADD COLUMN seen_by_client INTEGER NOT NULL DEFAULT 0")
+    if "seen_at" not in invoice_meta_cols:
+        cur.execute("ALTER TABLE invoice_meta ADD COLUMN seen_at TEXT")
 
     # migracja: starsze bazy mogą nie mieć kolumny NIP u klientów
     cur.execute("PRAGMA table_info(customers)")
@@ -1431,21 +1440,35 @@ def load_invoice_meta(invoice_id: int):
     c.close()
     return dict(row) if row else None
 
-def upsert_invoice_meta(invoice_id: int, pdf_path: str = "", invoice_items_json: str = "", sent_to_client: int | None = None):
+def upsert_invoice_meta(
+    invoice_id: int,
+    pdf_path: str = "",
+    invoice_items_json: str = "",
+    sent_to_client: int | None = None,
+    seen_by_client: int | None = None,
+    seen_at: str | None = None
+):
     current = load_invoice_meta(invoice_id) or {}
     if sent_to_client is None:
         sent_to_client = int(current.get("sent_to_client") or 0)
+    if seen_by_client is None:
+        seen_by_client = int(current.get("seen_by_client") or 0)
+    if seen_at is None:
+        seen_at = current.get("seen_at")
+
     c = conn()
     cur = c.cursor()
     cur.execute("""
-      INSERT INTO invoice_meta(invoice_id, pdf_path, invoice_items_json, sent_to_client, updated_at)
-      VALUES(?,?,?,?,?)
+      INSERT INTO invoice_meta(invoice_id, pdf_path, invoice_items_json, sent_to_client, seen_by_client, seen_at, updated_at)
+      VALUES(?,?,?,?,?,?,?)
       ON CONFLICT(invoice_id) DO UPDATE SET
         pdf_path=excluded.pdf_path,
         invoice_items_json=excluded.invoice_items_json,
         sent_to_client=excluded.sent_to_client,
+        seen_by_client=excluded.seen_by_client,
+        seen_at=excluded.seen_at,
         updated_at=excluded.updated_at
-    """, (invoice_id, pdf_path, invoice_items_json, int(sent_to_client), now_iso()))
+    """, (invoice_id, pdf_path, invoice_items_json, int(sent_to_client), int(seen_by_client), seen_at, now_iso()))
     c.commit()
     c.close()
 
@@ -4024,6 +4047,8 @@ def api_client_invoices():
         i.*,
         COALESCE(m.pdf_path,'') AS pdf_path,
         COALESCE(m.sent_to_client,0) AS sent_to_client,
+        COALESCE(m.seen_by_client,0) AS seen_by_client,
+        COALESCE(m.seen_at,'') AS seen_at,
         o.order_no,
         o.customer_email AS order_customer_email
       FROM invoices i
@@ -4050,7 +4075,7 @@ def api_client_invoices():
         latest_by_order[order_id] = d
         rows.append(d)
     c.close()
-    rows.sort(key=lambda x: ((x.get("issue_date") or ""), int(x.get("id") or 0)), reverse=True)
+    rows.sort(key=lambda x: ((x.get("seen_by_client") or 0), (x.get("issue_date") or ""), int(x.get("id") or 0)), reverse=True)
     return jsonify(ok=True, invoices=rows)
 
 
@@ -4173,6 +4198,52 @@ def invoice_regenerate_admin(invoice_id):
 
     return redirect(request.referrer or url_for("orders"))
 
+@app.post("/api/invoices/<int:invoice_id>/seen")
+def api_invoice_seen(invoice_id):
+    email = _email_key(request.args.get("email"))
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+      SELECT
+        i.id,
+        i.buyer_email,
+        o.customer_email AS order_customer_email,
+        COALESCE(m.pdf_path,'') AS pdf_path,
+        COALESCE(m.sent_to_client,0) AS sent_to_client,
+        i.invoice_no
+      FROM invoices i
+      LEFT JOIN invoice_meta m ON m.invoice_id = i.id
+      LEFT JOIN orders o ON o.id = i.order_id
+      WHERE i.id=?
+      LIMIT 1
+    """, (invoice_id,))
+    row = cur.fetchone()
+    c.close()
+    if not row:
+        return jsonify(ok=False, error="Nie znaleziono faktury"), 404
+
+    if email:
+        buyer_ok = _email_key(row["buyer_email"]) == email
+        order_ok = _email_key(row["order_customer_email"]) == email
+        if int(row["sent_to_client"] or 0) != 1 or not (buyer_ok or order_ok):
+            return jsonify(ok=False, error="Brak dostępu"), 403
+
+    ok_pdf, _ = invoice_pdf_exists(row["pdf_path"], row["invoice_no"])
+    if not ok_pdf:
+        return jsonify(ok=False, error="Brak pliku PDF"), 404
+
+    meta = load_invoice_meta(invoice_id) or {}
+    ts = now_iso()
+    upsert_invoice_meta(
+        invoice_id,
+        meta.get("pdf_path",""),
+        meta.get("invoice_items_json",""),
+        sent_to_client=int(meta.get("sent_to_client") or 0),
+        seen_by_client=1,
+        seen_at=ts
+    )
+    return jsonify(ok=True, seen_at=ts)
+
 @app.get("/api/invoices/<int:invoice_id>/download")
 def api_invoice_download(invoice_id):
     email = _email_key(request.args.get("email"))
@@ -4277,7 +4348,7 @@ def order_invoice_send(order_id, invoice_id):
         if fallback:
             pdf_path = invoice_pdf_relpath(fallback)
 
-    upsert_invoice_meta(invoice_id, pdf_path, meta.get("invoice_items_json",""), sent_to_client=1)
+    upsert_invoice_meta(invoice_id, pdf_path, meta.get("invoice_items_json",""), sent_to_client=1, seen_by_client=0, seen_at=None)
     return redirect(url_for("order_invoice", order_id=order_id, sent="1", invoice_id=invoice_id))
 
 @app.get("/orders/by-code/<path:token>")
