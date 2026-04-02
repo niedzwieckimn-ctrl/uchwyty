@@ -3659,10 +3659,9 @@ def order_invoice(order_id):
                 <td>{{ "Udostępniona" if inv['sent_to_client'] else "Tylko wewnętrzna" }}</td>
                 <td>
                   <div class="flex">
-                    <a class="btn" href="{{ url_for('invoice_download_admin', invoice_id=inv['id']) }}" target="_blank">Pobierz PDF</a>
-                    <form method="post" action="{{ url_for('invoice_regenerate_admin', invoice_id=inv['id']) }}">
-                      <button class="btn" type="submit">Regeneruj PDF</button>
-                    </form>
+                    {% if inv['pdf_path'] %}
+                      <a class="btn" href="{{ url_for('api_invoice_download', invoice_id=inv['id']) }}" target="_blank">Pobierz PDF</a>
+                    {% endif %}
                     {% if not inv['sent_to_client'] %}
                       <form method="post" action="{{ url_for('order_invoice_send', order_id=o['id'], invoice_id=inv['id']) }}">
                         <button class="btn primary" type="submit">Wyślij fakturę klientowi</button>
@@ -3670,9 +3669,6 @@ def order_invoice(order_id):
                     {% else %}
                       <span class="badge">Widoczna w panelu klienta</span>
                     {% endif %}
-                    <form method="post" action="{{ url_for('order_invoice_delete', order_id=o['id'], invoice_id=inv['id']) }}" onsubmit="return confirm('Usunąć fakturę?')">
-                      <button class="btn danger" type="submit">Usuń fakturę</button>
-                    </form>
                   </div>
                 </td>
               </tr>
@@ -4230,11 +4226,11 @@ def order_invoice_delete(order_id, invoice_id):
 
     if supabase_enabled():
         try:
-            sync_local_table_to_supabase("invoice_meta", "invoice_id")
+            supabase_delete_rows("invoice_meta", {"invoice_id": invoice_id})
         except Exception:
             pass
         try:
-            sync_local_table_to_supabase("invoices", "id")
+            supabase_delete_rows("invoices", {"id": invoice_id})
         except Exception:
             pass
 
