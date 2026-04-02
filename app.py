@@ -3499,6 +3499,8 @@ def order_invoice(order_id):
         msg = "Faktura została zapisana."
     if request.args.get("sent") == "1":
         msg = "Faktura została udostępniona klientowi."
+    if request.args.get("deleted") == "1":
+        msg = "Faktura została usunięta."
 
     if request.method == "GET":
         data = {
@@ -4026,16 +4028,23 @@ def api_client_invoices():
           LOWER(COALESCE(i.buyer_email,'')) = ?
           OR LOWER(COALESCE(o.customer_email,'')) = ?
         )
-      ORDER BY i.issue_date DESC, i.id DESC
+      ORDER BY i.order_id DESC, i.id DESC
     """, (email, email))
     rows = []
+    latest_by_order = {}
     for r in cur.fetchall():
         d = dict(r)
-        ok_pdf, found_path = invoice_pdf_exists(d.get("pdf_path", ""), d.get("invoice_no", ""))
-        if ok_pdf:
-            d["pdf_exists"] = 1
-            rows.append(d)
+        ok_pdf, _ = invoice_pdf_exists(d.get("pdf_path", ""), d.get("invoice_no", ""))
+        if not ok_pdf:
+            continue
+        order_id = int(d.get("order_id") or 0)
+        if order_id in latest_by_order:
+            continue
+        d["pdf_exists"] = 1
+        latest_by_order[order_id] = d
+        rows.append(d)
     c.close()
+    rows.sort(key=lambda x: ((x.get("issue_date") or ""), int(x.get("id") or 0)), reverse=True)
     return jsonify(ok=True, invoices=rows)
 
 
@@ -4194,6 +4203,38 @@ def api_invoice_download(invoice_id):
         return send_file(abs_path, mimetype="application/pdf", as_attachment=True, download_name=os.path.basename(abs_path))
     except Exception as e:
         return f"Błąd pobierania PDF: {e}", 500
+
+@app.post("/orders/<int:order_id>/invoice/<int:invoice_id>/delete")
+def order_invoice_delete(order_id, invoice_id):
+    inv = load_invoice_with_meta(invoice_id)
+    if not inv or int(inv.get("order_id") or 0) != int(order_id):
+        abort(404)
+
+    ok_pdf, abs_path = invoice_pdf_exists(inv.get("pdf_path", ""), inv.get("invoice_no", ""))
+    try:
+        if ok_pdf and abs_path and os.path.exists(abs_path):
+            os.remove(abs_path)
+    except Exception:
+        pass
+
+    c = conn()
+    cur = c.cursor()
+    cur.execute("DELETE FROM invoice_meta WHERE invoice_id=?", (invoice_id,))
+    cur.execute("DELETE FROM invoices WHERE id=? AND order_id=?", (invoice_id, order_id))
+    c.commit()
+    c.close()
+
+    if supabase_enabled():
+        try:
+            sync_local_table_to_supabase("invoice_meta", "invoice_id")
+        except Exception:
+            pass
+        try:
+            sync_local_table_to_supabase("invoices", "id")
+        except Exception:
+            pass
+
+    return redirect(url_for("order_invoice", order_id=order_id, deleted="1"))
 
 @app.post("/orders/<int:order_id>/invoice/<int:invoice_id>/send")
 def order_invoice_send(order_id, invoice_id):
