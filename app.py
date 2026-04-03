@@ -3502,7 +3502,13 @@ def order_invoice(order_id):
         customer_row = cur.fetchone()
 
     cur.execute("""
-      SELECT i.*, m.pdf_path, m.sent_to_client, m.invoice_items_json
+      SELECT
+        i.*,
+        COALESCE(m.pdf_path,'') AS pdf_path,
+        COALESCE(m.sent_to_client,0) AS sent_to_client,
+        COALESCE(m.seen_by_client,0) AS seen_by_client,
+        COALESCE(m.seen_at,'') AS seen_at,
+        COALESCE(m.invoice_items_json,'') AS invoice_items_json
       FROM invoices i
       LEFT JOIN invoice_meta m ON m.invoice_id = i.id
       WHERE i.order_id=?
@@ -4242,6 +4248,13 @@ def api_invoice_seen(invoice_id):
         seen_by_client=1,
         seen_at=ts
     )
+
+    if supabase_enabled():
+        try:
+            sync_local_table_to_supabase("invoice_meta", "invoice_id")
+        except Exception:
+            pass
+
     return jsonify(ok=True, seen_at=ts)
 
 @app.get("/api/invoices/<int:invoice_id>/download")
@@ -4349,6 +4362,13 @@ def order_invoice_send(order_id, invoice_id):
             pdf_path = invoice_pdf_relpath(fallback)
 
     upsert_invoice_meta(invoice_id, pdf_path, meta.get("invoice_items_json",""), sent_to_client=1, seen_by_client=0, seen_at=None)
+
+    if supabase_enabled():
+        try:
+            sync_local_table_to_supabase("invoice_meta", "invoice_id")
+        except Exception:
+            pass
+
     return redirect(url_for("order_invoice", order_id=order_id, sent="1", invoice_id=invoice_id))
 
 @app.get("/orders/by-code/<path:token>")
