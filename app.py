@@ -578,6 +578,7 @@ SUPABASE_PULL_TABLES = [
     ("order_items", "id"),
     ("china_items", "id"),
     ("invoices", "id"),
+    ("invoice_meta", "invoice_id"),
 ]
 
 _supabase_sync_lock = threading.Lock()
@@ -3612,6 +3613,10 @@ def order_invoice(order_id):
             if supabase_enabled():
                 try:
                     sync_local_rows_to_supabase("invoices", "id", [invoice_id])
+                except Exception:
+                    pass
+                try:
+                    sync_local_rows_to_supabase("invoice_meta", "invoice_id", [invoice_id])
                 except Exception:
                     pass
             return redirect(url_for("order_invoice", order_id=order_id, generated="1", invoice_id=invoice_id))
