@@ -563,6 +563,7 @@ SUPABASE_SYNC_TABLES = [
     ("pricing", "model"),
     ("company_profile", "id"),
     ("invoices", "id"),
+    ("invoice_meta", "invoice_id"),
 ]
 
 # Kolejność PULL jest ważna: najpierw rodzice, potem dzieci.
