@@ -167,6 +167,11 @@ def init_db():
     )
     """)
 
+    cur.execute("PRAGMA table_info(china_packages)")
+    china_cols = {r[1] for r in cur.fetchall()}
+    if "archived" not in china_cols:
+        cur.execute("ALTER TABLE china_packages ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS china_items(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -252,11 +257,6 @@ def init_db():
     customer_cols = {r[1] for r in cur.fetchall()}
     if "nip" not in customer_cols:
         cur.execute("ALTER TABLE customers ADD COLUMN nip TEXT")
-
-    cur.execute("PRAGMA table_info(china_packages)")
-    china_package_cols = {r[1] for r in cur.fetchall()}
-    if "archived" not in china_package_cols:
-        cur.execute("ALTER TABLE china_packages ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
 
     # migracja: QR zamówień
     cur.execute("PRAGMA table_info(orders)")
@@ -890,16 +890,6 @@ def maybe_pull_shared_from_supabase(force: bool = False):
         pass
 
 
-def sync_local_table_to_supabase(table: str, conflict_col: str):
-    if not supabase_enabled():
-        return 0
-    rows = sqlite_table_rows(table)
-    if rows:
-        for pack in _chunks(rows, 500):
-            supabase_upsert_rows(table, pack, conflict_col)
-    return len(rows)
-
-
 def sync_local_rows_to_supabase(table: str, conflict_col: str, ids: list):
     ids = [x for x in ids if x is not None]
     if not ids or not supabase_enabled():
@@ -1008,20 +998,6 @@ def remote_first_create_order(customer_id, customer_name, customer_address, cust
     return order_id
 
 
-def archive_old_china_packages():
-    c = conn()
-    cur = c.cursor()
-    cur.execute("""
-      UPDATE china_packages
-      SET archived = 1
-      WHERE status='arrived'
-        AND COALESCE(archived,0)=0
-        AND datetime(created_at) <= datetime('now', '-60 days')
-    """)
-    c.commit()
-    c.close()
-
-
 def get_stock(product_id):
     c = conn()
     cur = c.cursor()
@@ -1035,6 +1011,20 @@ def change_stock(product_id, delta):
     cur = c.cursor()
     cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (product_id,))
     cur.execute("UPDATE stock SET qty = qty + ? WHERE product_id=?", (delta, product_id))
+    c.commit()
+    c.close()
+
+
+def archive_old_china_packages():
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+        UPDATE china_packages
+        SET archived = 1
+        WHERE status = 'arrived'
+          AND COALESCE(archived,0) = 0
+          AND datetime(created_at) < datetime('now', '-60 days')
+    """)
     c.commit()
     c.close()
 
@@ -3445,8 +3435,8 @@ def order_status_update(order_id):
     changed_product_ids = []
     warehouse_issued = int(o["warehouse_issued"] or 0)
 
-    # Zdjęcie stanu następuje przy przejściu na "in_delivery" albo od razu na "issued",
-    # ale tylko wtedy, gdy jeszcze nie było wydane z magazynu.
+    # Zdjęcie stanu przy przejściu na "in_delivery" LUB "issued",
+    # ale tylko jeśli wcześniej nie zostało jeszcze wykonane.
     if new_status in {"in_delivery", "issued"} and warehouse_issued == 0:
         cur.execute("""
           SELECT oi.product_id, oi.qty
@@ -4660,7 +4650,7 @@ def china():
                         <button class="btn danger" type="submit">Usuń</button>
                       </form>
                     {% else %}
-                      <span class="badge">ARRIVED – bez usuwania</span>
+                      <span class="badge">ARRIVED</span>
                     {% endif %}
                   </div>
                 </td>
@@ -4690,8 +4680,8 @@ def china_create():
     cur = c.cursor()
     try:
         cur.execute("""
-          INSERT INTO china_packages(package_no, status, tracking, note, created_at)
-          VALUES(?,?,?,?,?)
+          INSERT INTO china_packages(package_no, status, tracking, note, created_at, archived)
+          VALUES(?,?,?,?,?,0)
         """, (package_no, status, tracking, note, now_iso()))
         c.commit()
     except sqlite3.IntegrityError:
@@ -4704,6 +4694,10 @@ def china_create():
             sync_local_table_to_supabase("china_packages", "id")
         except Exception:
             pass
+
+    ref = request.referrer or ""
+    if ref.endswith(f"/china/{package_id}"):
+        return redirect(url_for("china_package", package_id=package_id))
     return redirect(url_for("china"))
 
 @app.post("/china/<int:package_id>/status")
@@ -4742,18 +4736,9 @@ def china_status(package_id):
             cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (pid,))
             cur.execute("UPDATE stock SET qty = qty - ? WHERE product_id=?", (qty, pid))
 
-    cur.execute("UPDATE china_packages SET status=?, archived=CASE WHEN ?='arrived' THEN archived ELSE 0 END WHERE id=?", (status, status, package_id))
+    cur.execute("UPDATE china_packages SET status=?, archived=CASE WHEN ?='arrived' THEN COALESCE(archived,0) ELSE 0 END WHERE id=?", (status, status, package_id))
     c.commit()
     c.close()
-    if supabase_enabled():
-        try:
-            sync_local_table_to_supabase("china_packages", "id")
-        except Exception:
-            pass
-        try:
-            sync_local_table_to_supabase("stock", "product_id")
-        except Exception:
-            pass
     return redirect(url_for("china"))
 
 @app.post("/china/<int:package_id>/tracking")
@@ -4776,40 +4761,10 @@ def china_tracking(package_id):
         return redirect(url_for("china_package", package_id=package_id))
     return redirect(url_for("china"))
 
-@app.post("/china/<int:package_id>/delete")
-def china_delete(package_id):
-    c = conn()
-    cur = c.cursor()
-    cur.execute("SELECT status FROM china_packages WHERE id=?", (package_id,))
-    pack = cur.fetchone()
-    if not pack:
-        c.close()
-        abort(404)
-    if pack["status"] == "arrived":
-        c.close()
-        return "Nie można usunąć paczki ARRIVED", 400
-
-    cur.execute("SELECT id FROM china_items WHERE package_id=?", (package_id,))
-    item_ids = [int(r["id"]) for r in cur.fetchall()]
-    cur.execute("DELETE FROM china_items WHERE package_id=?", (package_id,))
-    cur.execute("DELETE FROM china_packages WHERE id=?", (package_id,))
-    c.commit()
-    c.close()
-
-    if supabase_enabled():
-        try:
-            if item_ids:
-                for iid in item_ids:
-                    supabase_delete_rows("china_items", {"id": iid})
-            supabase_delete_rows("china_packages", {"id": package_id})
-        except Exception:
-            pass
-
-    return redirect(url_for("china"))
-
 @app.get("/china/<int:package_id>")
 def china_package(package_id):
     maybe_pull_shared_from_supabase()
+    archive_old_china_packages()
     c = conn()
     cur = c.cursor()
     cur.execute("SELECT * FROM china_packages WHERE id=?", (package_id,))
@@ -4842,6 +4797,18 @@ def china_package(package_id):
           <a class="btn right" href="{{ url_for('china') }}">← Lista paczek</a>
         </div>
         <div class="muted">Tracking: {{ pack['tracking'] or '-' }}</div>
+        <form method="post" action="{{ url_for('china_status', package_id=pack['id']) }}" class="flex" style="margin-top:10px;">
+          <select name="status" style="width:180px;">
+            <option value="planned" {% if pack['status']=='planned' %}selected{% endif %}>planned</option>
+            <option value="ordered" {% if pack['status']=='ordered' %}selected{% endif %}>ordered</option>
+            <option value="shipped" {% if pack['status']=='shipped' %}selected{% endif %}>shipped</option>
+            <option value="arrived" {% if pack['status']=='arrived' %}selected{% endif %}>arrived</option>
+          </select>
+          <button class="btn" type="submit">Zmień status</button>
+          {% if pack['status'] == 'arrived' %}
+            <span class="badge">ARRIVED</span>
+          {% endif %}
+        </form>
         <form method="post" action="{{ url_for('china_tracking', package_id=pack['id']) }}" class="flex" style="margin-top:10px;">
           <input name="tracking" value="{{ pack['tracking'] or '' }}" placeholder="nr trackingu" style="width:260px;">
           <button class="btn" type="submit">Zmień tracking</button>
@@ -4851,12 +4818,6 @@ def china_package(package_id):
         </form>
       </div>
 
-      {% if hide_contents %}
-      <div class="card">
-        <h2>Zawartość paczki</h2>
-        <div class="hint">Paczka ma status <b>planned</b> — zawartość jest ukryta. Ta paczka nadal liczy się do ilości uchwytów w drodze.</div>
-      </div>
-      {% else %}
       <div class="card">
         <h2>Dodaj zawartość paczki</h2>
         <form method="post" action="{{ url_for('china_item_add', package_id=pack['id']) }}" class="items-row">
@@ -4905,11 +4866,10 @@ def china_package(package_id):
           </tbody>
         </table>
       </div>
-      {% endif %}
     {% endblock %}
     """
     return render_template_string(tpl, title=f"Paczka {pack['package_no']}", base_url=BASE_URL, db_path=DB_PATH,
-                                  pack=pack, products=products_rows, items=items, hide_contents=hide_contents)
+                                  pack=pack, products=products_rows, items=items)
 
 @app.post("/china/<int:package_id>/items/add")
 def china_item_add(package_id):
@@ -4935,12 +4895,11 @@ def china_item_add(package_id):
         "INSERT INTO china_items(package_id, product_id, sku, qty, created_at) VALUES (?,?,?,?,?)",
         (package_id, product_id, p["sku"], qty, now_iso())
     )
-    item_id = cur.lastrowid
     c.commit()
     c.close()
     if supabase_enabled():
         try:
-            sync_local_rows_to_supabase("china_items", "id", [item_id])
+            sync_local_table_to_supabase("china_items", "id")
         except Exception:
             pass
     return redirect(url_for("china_package", package_id=package_id))
@@ -4955,6 +4914,11 @@ def china_item_delete(package_id, item_id):
     cur.execute("DELETE FROM china_items WHERE id=? AND package_id=?", (item_id, package_id))
     c.commit()
     c.close()
+    if supabase_enabled():
+        try:
+            supabase_delete_rows("china_items", {"id": item_id})
+        except Exception:
+            pass
     return redirect(url_for("china_package", package_id=package_id))
 
 
