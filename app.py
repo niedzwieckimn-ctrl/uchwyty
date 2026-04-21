@@ -162,15 +162,9 @@ def init_db():
         status TEXT NOT NULL DEFAULT 'planned', -- planned/ordered/shipped/arrived
         tracking TEXT,
         note TEXT,
-        created_at TEXT NOT NULL,
-        archived INTEGER NOT NULL DEFAULT 0
+        created_at TEXT NOT NULL
     )
     """)
-
-    cur.execute("PRAGMA table_info(china_packages)")
-    china_package_cols = {r[1] for r in cur.fetchall()}
-    if "archived" not in china_package_cols:
-        cur.execute("ALTER TABLE china_packages ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS china_items(
@@ -1597,21 +1591,6 @@ app.jinja_env.globals["order_status_label"] = order_status_label if "order_statu
 app.jinja_env.globals["order_status_css"] = order_status_css if "order_status_css" in globals() else None
 
 
-
-
-def archive_old_china_packages():
-    c = conn()
-    cur = c.cursor()
-    cur.execute("""
-      UPDATE china_packages
-      SET archived = 1
-      WHERE status='arrived'
-        AND COALESCE(archived,0)=0
-        AND datetime(created_at) <= datetime('now', '-60 days')
-    """)
-    c.commit()
-    c.close()
-
 # =========================
 # PAGES
 # =========================
@@ -1694,7 +1673,6 @@ def home():
           <div class="pill">Wartość magazynu + w drodze (netto): <b>{{ "%.2f"|format(inventory_value_net) }} PLN</b></div>
         </div>
       </div>
-      {% endif %}
     {% endblock %}
     """
     return render_template_string(tpl, title="Start", base_url=BASE_URL, db_path=DB_PATH,
@@ -3437,10 +3415,9 @@ def order_status_update(order_id):
     changed_product_ids = []
     warehouse_issued = int(o["warehouse_issued"] or 0)
 
-    # Zdjęcie stanu:
-    # przy przejściu na "in_delivery" albo od razu na "issued",
-    # ale tylko jeśli wcześniej jeszcze nie było wydane.
-    if new_status in {"in_delivery", "issued"} and warehouse_issued == 0:
+    # Jedyny moment zdjęcia stanu:
+    # przy przejściu na "in_delivery" i tylko jeśli jeszcze nie było wydane.
+    if new_status == "in_delivery" and warehouse_issued == 0:
         cur.execute("""
           SELECT oi.product_id, oi.qty
           FROM order_items oi
@@ -4565,28 +4542,13 @@ def order_scan():
 
 @app.get("/china")
 def china():
-    maybe_pull_shared_from_supabase()
-    archive_old_china_packages()
+    # Wyłączony pull z Supabase tylko dla modułu Chiny.
+    # Tu pracujemy na lokalnej bazie, żeby POST -> redirect nie cofał zmian.
     c = conn()
     cur = c.cursor()
-    cur.execute("SELECT * FROM china_packages WHERE COALESCE(archived,0)=0 ORDER BY id DESC LIMIT 200")
-    packs = [dict(r) for r in cur.fetchall()]
-
-    pack_ids = [int(p["id"]) for p in packs]
-    qty_map = {}
-    if pack_ids:
-        ph = ",".join(["?"] * len(pack_ids))
-        cur.execute(f"""
-          SELECT package_id, COALESCE(SUM(qty),0) AS qty_sum
-          FROM china_items
-          WHERE package_id IN ({ph})
-          GROUP BY package_id
-        """, tuple(pack_ids))
-        qty_map = {int(r["package_id"]): int(r["qty_sum"] or 0) for r in cur.fetchall()}
+    cur.execute("SELECT * FROM china_packages ORDER BY id DESC LIMIT 200")
+    packs = cur.fetchall()
     c.close()
-
-    for p in packs:
-        p["in_delivery_qty"] = int(qty_map.get(int(p["id"]), 0))
 
     tpl = r"""
     {% extends "base.html" %}
@@ -4595,7 +4557,7 @@ def china():
         <div class="flex">
           <h1 style="margin:0;">Chiny (P/O)</h1>
         </div>
-        <div class="muted">Zarządzaj przesyłkami: status, tracking i zawartość paczki. Paczki planned nie pokazują zawartości, ale liczą się do ilości w drodze. Paczki arrived po 60 dniach trafiają do archiwum.</div>
+        <div class="muted">Zarządzaj przesyłkami: status, tracking i zawartość paczki. Tracking otwiera 17TRACK.</div>
       </div>
 
       <div class="card">
@@ -4632,7 +4594,7 @@ def china():
         <h2>Paczki (max 200)</h2>
         <table>
           <thead>
-            <tr><th>Nr</th><th>Status</th><th>W drodze</th><th>Tracking</th><th>Notatka</th><th>Data</th><th>Akcje</th></tr>
+            <tr><th>Nr</th><th>Status</th><th>Tracking</th><th>Notatka</th><th>Data</th><th>Akcje</th></tr>
           </thead>
           <tbody>
             {% for p in packs %}
@@ -4649,7 +4611,6 @@ def china():
                     <button class="btn" type="submit">Zmień</button>
                   </form>
                 </td>
-                <td><span class="badge">{{ p['in_delivery_qty'] }}</span></td>
                 <td>
                   <form method="post" action="{{ url_for('china_tracking', package_id=p['id']) }}" class="flex">
                     <input name="tracking" value="{{ p['tracking'] or '' }}" placeholder="nr trackingu" style="width:180px;">
@@ -4661,22 +4622,11 @@ def china():
                 </td>
                 <td>{{ p['note'] or "-" }}</td>
                 <td class="muted">{{ p['created_at'] }}</td>
-                <td class="flex">
-                  <a class="btn primary" href="{{ url_for('china_package', package_id=p['id']) }}">
-                    {% if p['status'] == 'planned' %}Podgląd{% else %}Zawartość{% endif %}
-                  </a>
-                  {% if p['status'] != 'arrived' %}
-                    <form method="post" action="{{ url_for('china_delete', package_id=p['id']) }}" onsubmit="return confirm('Usunąć paczkę?')">
-                      <button class="btn danger" type="submit">Usuń</button>
-                    </form>
-                  {% else %}
-                    <span class="badge">Arrived — bez usuwania</span>
-                  {% endif %}
-                </td>
+                <td><a class="btn primary" href="{{ url_for('china_package', package_id=p['id']) }}">Zawartość</a></td>
               </tr>
             {% endfor %}
             {% if not packs %}
-              <tr><td colspan="7" class="muted">Brak paczek.</td></tr>
+              <tr><td colspan="6" class="muted">Brak paczek.</td></tr>
             {% endif %}
           </tbody>
         </table>
@@ -4699,26 +4649,14 @@ def china_create():
     cur = c.cursor()
     try:
         cur.execute("""
-          INSERT INTO china_packages(package_no, status, tracking, note, created_at, archived)
-          VALUES(?,?,?,?,?,0)
+          INSERT INTO china_packages(package_no, status, tracking, note, created_at)
+          VALUES(?,?,?,?,?)
         """, (package_no, status, tracking, note, now_iso()))
         c.commit()
     except sqlite3.IntegrityError:
         pass
     finally:
         c.close()
-
-    if supabase_enabled():
-        try:
-            c2 = conn()
-            cur2 = c2.cursor()
-            cur2.execute("SELECT id FROM china_packages WHERE package_no=?", (package_no,))
-            row = cur2.fetchone()
-            c2.close()
-            if row:
-                sync_local_rows_to_supabase("china_packages", "id", [int(row["id"])])
-        except Exception:
-            pass
 
     return redirect(url_for("china"))
 
@@ -4761,20 +4699,6 @@ def china_status(package_id):
     cur.execute("UPDATE china_packages SET status=? WHERE id=?", (status, package_id))
     c.commit()
     c.close()
-
-    if supabase_enabled():
-        try:
-            sync_local_rows_to_supabase("china_packages", "id", [package_id])
-            c2 = conn()
-            cur2 = c2.cursor()
-            cur2.execute("SELECT product_id FROM china_items WHERE package_id=?", (package_id,))
-            product_ids = [int(r["product_id"]) for r in cur2.fetchall()]
-            c2.close()
-            if product_ids:
-                sync_local_rows_to_supabase("stock", "product_id", product_ids)
-        except Exception:
-            pass
-
     return redirect(url_for("china"))
 
 @app.post("/china/<int:package_id>/tracking")
@@ -4792,12 +4716,6 @@ def china_tracking(package_id):
     c.commit()
     c.close()
 
-    if supabase_enabled():
-        try:
-            sync_local_rows_to_supabase("china_packages", "id", [package_id])
-        except Exception:
-            pass
-
     ref = request.referrer or ""
     if ref.endswith(f"/china/{package_id}"):
         return redirect(url_for("china_package", package_id=package_id))
@@ -4805,8 +4723,7 @@ def china_tracking(package_id):
 
 @app.get("/china/<int:package_id>")
 def china_package(package_id):
-    maybe_pull_shared_from_supabase()
-    archive_old_china_packages()
+    # Wyłączony pull z Supabase tylko dla modułu Chiny.
     c = conn()
     cur = c.cursor()
     cur.execute("SELECT * FROM china_packages WHERE id=?", (package_id,))
@@ -4818,16 +4735,14 @@ def china_package(package_id):
     cur.execute("SELECT id, sku, model, name FROM products ORDER BY sku LIMIT 5000")
     products_rows = cur.fetchall()
 
-    items = []
-    if pack["status"] != "planned":
-        cur.execute("""
-          SELECT ci.*, p.model, p.name
-          FROM china_items ci
-          JOIN products p ON p.id=ci.product_id
-          WHERE ci.package_id=?
-          ORDER BY ci.id DESC
-        """, (package_id,))
-        items = cur.fetchall()
+    cur.execute("""
+      SELECT ci.*, p.model, p.name
+      FROM china_items ci
+      JOIN products p ON p.id=ci.product_id
+      WHERE ci.package_id=?
+      ORDER BY ci.id DESC
+    """, (package_id,))
+    items = cur.fetchall()
     c.close()
 
     tpl = r"""
@@ -4840,20 +4755,6 @@ def china_package(package_id):
           <a class="btn right" href="{{ url_for('china') }}">← Lista paczek</a>
         </div>
         <div class="muted">Tracking: {{ pack['tracking'] or '-' }}</div>
-
-        <form method="post" action="{{ url_for('china_status', package_id=pack['id']) }}" class="flex" style="margin-top:10px;">
-          <select name="status" style="width:180px;">
-            <option value="planned" {% if pack['status']=='planned' %}selected{% endif %}>planned</option>
-            <option value="ordered" {% if pack['status']=='ordered' %}selected{% endif %}>ordered</option>
-            <option value="shipped" {% if pack['status']=='shipped' %}selected{% endif %}>shipped</option>
-            <option value="arrived" {% if pack['status']=='arrived' %}selected{% endif %}>arrived</option>
-          </select>
-          <button class="btn" type="submit">Zmień status</button>
-          {% if pack['status'] == 'arrived' %}
-            <span class="badge">Po 60 dniach trafi do archiwum</span>
-          {% endif %}
-        </form>
-
         <form method="post" action="{{ url_for('china_tracking', package_id=pack['id']) }}" class="flex" style="margin-top:10px;">
           <input name="tracking" value="{{ pack['tracking'] or '' }}" placeholder="nr trackingu" style="width:260px;">
           <button class="btn" type="submit">Zmień tracking</button>
@@ -4863,12 +4764,6 @@ def china_package(package_id):
         </form>
       </div>
 
-      {% if pack['status'] == 'planned' %}
-      <div class="card">
-        <h2>Zawartość ukryta</h2>
-        <div class="muted">Dla paczek planned zawartość nie jest pokazywana. Ta paczka nadal liczy się do ilości uchwytów w drodze.</div>
-      </div>
-      {% else %}
       <div class="card">
         <h2>Dodaj zawartość paczki</h2>
         <form method="post" action="{{ url_for('china_item_add', package_id=pack['id']) }}" class="items-row">
@@ -4922,39 +4817,6 @@ def china_package(package_id):
     return render_template_string(tpl, title=f"Paczka {pack['package_no']}", base_url=BASE_URL, db_path=DB_PATH,
                                   pack=pack, products=products_rows, items=items)
 
-
-@app.post("/china/<int:package_id>/delete")
-def china_delete(package_id):
-    c = conn()
-    cur = c.cursor()
-    cur.execute("SELECT status FROM china_packages WHERE id=?", (package_id,))
-    pack = cur.fetchone()
-    if not pack:
-        c.close()
-        abort(404)
-
-    if norm(pack["status"]).lower() == "arrived":
-        c.close()
-        return "Nie można usunąć paczki ARRIVED", 400
-
-    cur.execute("SELECT id FROM china_items WHERE package_id=?", (package_id,))
-    item_ids = [int(r["id"]) for r in cur.fetchall()]
-
-    cur.execute("DELETE FROM china_items WHERE package_id=?", (package_id,))
-    cur.execute("DELETE FROM china_packages WHERE id=?", (package_id,))
-    c.commit()
-    c.close()
-
-    if supabase_enabled():
-        try:
-            for iid in item_ids:
-                supabase_delete_rows("china_items", {"id": iid})
-            supabase_delete_rows("china_packages", {"id": package_id})
-        except Exception:
-            pass
-
-    return redirect(url_for("china"))
-
 @app.post("/china/<int:package_id>/items/add")
 def china_item_add(package_id):
     product_id = to_int(request.form.get("product_id"), 0)
@@ -4981,19 +4843,6 @@ def china_item_add(package_id):
     )
     c.commit()
     c.close()
-
-    if supabase_enabled():
-        try:
-            c2 = conn()
-            cur2 = c2.cursor()
-            cur2.execute("SELECT id FROM china_items WHERE package_id=? ORDER BY id DESC LIMIT 1", (package_id,))
-            row = cur2.fetchone()
-            c2.close()
-            if row:
-                sync_local_rows_to_supabase("china_items", "id", [int(row["id"])])
-        except Exception:
-            pass
-
     return redirect(url_for("china_package", package_id=package_id))
 
 @app.post("/china/<int:package_id>/items/<int:item_id>/delete")
