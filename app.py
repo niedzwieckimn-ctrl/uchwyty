@@ -1494,6 +1494,21 @@ def prepare_invoice_items(order_items: list[dict], form):
     return prepared
 
 
+
+
+def archive_old_china_packages():
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+      UPDATE china_packages
+      SET archived = 1
+      WHERE status='arrived'
+        AND COALESCE(archived,0)=0
+        AND datetime(created_at) <= datetime('now', '-60 days')
+    """)
+    c.commit()
+    c.close()
+
 # =========================
 # TEMPLATES (BASE as "file")
 # =========================
@@ -1596,21 +1611,6 @@ app.jinja_env.globals["canonical_order_no"] = canonical_order_no
 app.jinja_env.globals["order_status_label"] = order_status_label if "order_status_label" in globals() else None
 app.jinja_env.globals["order_status_css"] = order_status_css if "order_status_css" in globals() else None
 
-
-
-
-def archive_old_china_packages():
-    c = conn()
-    cur = c.cursor()
-    cur.execute("""
-      UPDATE china_packages
-      SET archived = 1
-      WHERE status='arrived'
-        AND COALESCE(archived,0)=0
-        AND datetime(created_at) <= datetime('now', '-60 days')
-    """)
-    c.commit()
-    c.close()
 
 # =========================
 # PAGES
@@ -3437,8 +3437,7 @@ def order_status_update(order_id):
     warehouse_issued = int(o["warehouse_issued"] or 0)
 
     # Zdjęcie stanu:
-    # - przy przejściu na "in_delivery"
-    # - albo od razu na "issued"
+    # przy przejściu na "in_delivery" albo od razu na "issued",
     # ale tylko jeśli wcześniej jeszcze nie było wydane.
     if new_status in {"in_delivery", "issued"} and warehouse_issued == 0:
         cur.execute("""
@@ -4766,13 +4765,6 @@ def china_status(package_id):
     if supabase_enabled():
         try:
             sync_local_rows_to_supabase("china_packages", "id", [package_id])
-            c2 = conn()
-            cur2 = c2.cursor()
-            cur2.execute("SELECT product_id FROM china_items WHERE package_id=?", (package_id,))
-            product_ids = [int(r["product_id"]) for r in cur2.fetchall()]
-            c2.close()
-            if product_ids:
-                sync_local_rows_to_supabase("stock", "product_id", product_ids)
         except Exception:
             pass
 
@@ -4845,8 +4837,6 @@ def china_package(package_id):
           <a class="btn right" href="{{ url_for('china') }}">← Lista paczek</a>
         </div>
         <div class="muted">Tracking: {{ pack['tracking'] or '-' }}</div>
-
-        <div class="line"></div>
 
         <form method="post" action="{{ url_for('china_status', package_id=pack['id']) }}" class="flex" style="margin-top:10px;">
           <select name="status" style="width:180px;">
@@ -4947,7 +4937,6 @@ def china_delete(package_id):
 
     cur.execute("SELECT id FROM china_items WHERE package_id=?", (package_id,))
     item_ids = [int(r["id"]) for r in cur.fetchall()]
-
     cur.execute("DELETE FROM china_items WHERE package_id=?", (package_id,))
     cur.execute("DELETE FROM china_packages WHERE id=?", (package_id,))
     c.commit()
