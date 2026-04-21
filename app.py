@@ -162,9 +162,15 @@ def init_db():
         status TEXT NOT NULL DEFAULT 'planned', -- planned/ordered/shipped/arrived
         tracking TEXT,
         note TEXT,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        archived INTEGER NOT NULL DEFAULT 0
     )
     """)
+
+    cur.execute("PRAGMA table_info(china_packages)")
+    china_package_cols = {r[1] for r in cur.fetchall()}
+    if "archived" not in china_package_cols:
+        cur.execute("ALTER TABLE china_packages ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS china_items(
@@ -1487,6 +1493,21 @@ def prepare_invoice_items(order_items: list[dict], form):
         prepared.append(row)
     return prepared
 
+
+
+
+def archive_old_china_packages():
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+      UPDATE china_packages
+      SET archived = 1
+      WHERE status='arrived'
+        AND COALESCE(archived,0)=0
+        AND datetime(created_at) <= datetime('now', '-60 days')
+    """)
+    c.commit()
+    c.close()
 
 # =========================
 # TEMPLATES (BASE as "file")
@@ -4549,9 +4570,10 @@ def order_scan():
 def china():
     # Wyłączony pull z Supabase tylko dla modułu Chiny.
     # Tu pracujemy na lokalnej bazie, żeby POST -> redirect nie cofał zmian.
+    archive_old_china_packages()
     c = conn()
     cur = c.cursor()
-    cur.execute("SELECT * FROM china_packages ORDER BY id DESC LIMIT 200")
+    cur.execute("SELECT * FROM china_packages WHERE COALESCE(archived,0)=0 ORDER BY id DESC LIMIT 200")
     packs = cur.fetchall()
     c.close()
 
@@ -4562,7 +4584,7 @@ def china():
         <div class="flex">
           <h1 style="margin:0;">Chiny (P/O)</h1>
         </div>
-        <div class="muted">Zarządzaj przesyłkami: status, tracking i zawartość paczki. Tracking otwiera 17TRACK.</div>
+        <div class="muted">Zarządzaj przesyłkami: status, tracking i zawartość paczki. Paczki arrived po 60 dniach trafiają do archiwum. Paczek arrived nie da się usuwać.</div>
       </div>
 
       <div class="card">
@@ -4627,7 +4649,16 @@ def china():
                 </td>
                 <td>{{ p['note'] or "-" }}</td>
                 <td class="muted">{{ p['created_at'] }}</td>
-                <td><a class="btn primary" href="{{ url_for('china_package', package_id=p['id']) }}">Zawartość</a></td>
+                <td class="flex">
+                  <a class="btn primary" href="{{ url_for('china_package', package_id=p['id']) }}">Zawartość</a>
+                  {% if p['status'] != 'arrived' %}
+                    <form method="post" action="{{ url_for('china_delete', package_id=p['id']) }}" onsubmit="return confirm('Usunąć paczkę?')">
+                      <button class="btn danger" type="submit">Usuń</button>
+                    </form>
+                  {% else %}
+                    <span class="badge">Arrived — bez usuwania</span>
+                  {% endif %}
+                </td>
               </tr>
             {% endfor %}
             {% if not packs %}
@@ -4729,6 +4760,7 @@ def china_tracking(package_id):
 @app.get("/china/<int:package_id>")
 def china_package(package_id):
     # Wyłączony pull z Supabase tylko dla modułu Chiny.
+    archive_old_china_packages()
     c = conn()
     cur = c.cursor()
     cur.execute("SELECT * FROM china_packages WHERE id=?", (package_id,))
@@ -4821,6 +4853,28 @@ def china_package(package_id):
     """
     return render_template_string(tpl, title=f"Paczka {pack['package_no']}", base_url=BASE_URL, db_path=DB_PATH,
                                   pack=pack, products=products_rows, items=items)
+
+
+@app.post("/china/<int:package_id>/delete")
+def china_delete(package_id):
+    c = conn()
+    cur = c.cursor()
+    cur.execute("SELECT status FROM china_packages WHERE id=?", (package_id,))
+    pack = cur.fetchone()
+    if not pack:
+        c.close()
+        abort(404)
+
+    if norm(pack["status"]).lower() == "arrived":
+        c.close()
+        return "Nie można usunąć paczki ARRIVED", 400
+
+    cur.execute("DELETE FROM china_items WHERE package_id=?", (package_id,))
+    cur.execute("DELETE FROM china_packages WHERE id=?", (package_id,))
+    c.commit()
+    c.close()
+
+    return redirect(url_for("china"))
 
 @app.post("/china/<int:package_id>/items/add")
 def china_item_add(package_id):
