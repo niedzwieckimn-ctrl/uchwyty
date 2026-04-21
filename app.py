@@ -548,7 +548,7 @@ def ensure_stock_row(product_id):
 
 SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "https://qfzawzkynmqkbjlbtkjd.supabase.co").strip().rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFmemF3emt5bm1xa2JqbGJ0a2pkIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NDUyNDgxMCwiZXhwIjoyMDkwMTAwODEwfQ.DcyQuZL4atOlbsgSWBmgl-nvQ0eJOTrcu6ciU59O7zU").strip()
-SUPABASE_AUTO_SYNC_ON_WRITE = (os.environ.get("SUPABASE_AUTO_SYNC_ON_WRITE") or "1").strip().lower() in ("1", "true", "yes", "on")
+SUPABASE_AUTO_SYNC_ON_WRITE = (os.environ.get("SUPABASE_AUTO_SYNC_ON_WRITE") or "0").strip().lower() in ("1", "true", "yes", "on")
 SUPABASE_MIN_SYNC_INTERVAL_SEC = float((os.environ.get("SUPABASE_MIN_SYNC_INTERVAL_SEC") or "2").strip())
 SUPABASE_MIN_PULL_INTERVAL_SEC = float((os.environ.get("SUPABASE_MIN_PULL_INTERVAL_SEC") or "2").strip())
 
@@ -3150,7 +3150,8 @@ def order_view(order_id):
           <div>{{ o['note'] or "-" }}</div>
           <div class="line"></div>
           <div class="hint">
-            <b>Wydaj z magazynu</b> odejmie ilości z magazynu, ale nie zmieni automatycznie statusu klienta na „Zrealizowane”.<br>
+            <b>Status zamówienia steruje magazynem.</b><br>
+            Przy zmianie na <b>W dostawie</b> albo <b>Zrealizowane</b> stan schodzi tylko <b>raz</b>.<br>
             Jeśli brakuje stanu, pozycja może być realizowana z <b>towaru w drodze z Chin</b> (kolumna „W dostawie” poniżej).
           </div>
         </div>
@@ -3415,9 +3416,10 @@ def order_status_update(order_id):
     changed_product_ids = []
     warehouse_issued = int(o["warehouse_issued"] or 0)
 
-    # Jedyny moment zdjęcia stanu:
-    # przy przejściu na "in_delivery" i tylko jeśli jeszcze nie było wydane.
-    if new_status == "in_delivery" and warehouse_issued == 0:
+    # Zdjęcie stanu następuje tylko raz:
+    # przy przejściu na "in_delivery" albo od razu na "issued",
+    # ale wyłącznie jeśli wcześniej jeszcze nie było wydane.
+    if new_status in {"in_delivery", "issued"} and warehouse_issued == 0:
         cur.execute("""
           SELECT oi.product_id, oi.qty
           FROM order_items oi
@@ -3463,7 +3465,10 @@ def order_status_update(order_id):
 
 @app.get("/orders/<int:order_id>/issue")
 def order_issue(order_id):
-    # Stara akcja wyłączona. Wydanie dzieje się teraz przy zmianie statusu na "W dostawie".
+    # Stara akcja wyłączona.
+    # Zdjęcie stanu dzieje się teraz wyłącznie przy zmianie statusu na:
+    # - "W dostawie"
+    # - albo od razu "Zrealizowane"
     return redirect(url_for("order_view", order_id=order_id))
 
 
