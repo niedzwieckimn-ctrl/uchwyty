@@ -168,8 +168,8 @@ def init_db():
     """)
 
     cur.execute("PRAGMA table_info(china_packages)")
-    china_cols = {r[1] for r in cur.fetchall()}
-    if "archived" not in china_cols:
+    china_package_cols = {r[1] for r in cur.fetchall()}
+    if "archived" not in china_package_cols:
         cur.execute("ALTER TABLE china_packages ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
 
     cur.execute("""
@@ -1494,21 +1494,6 @@ def prepare_invoice_items(order_items: list[dict], form):
     return prepared
 
 
-
-
-def archive_old_china_packages():
-    c = conn()
-    cur = c.cursor()
-    cur.execute("""
-      UPDATE china_packages
-      SET archived=1
-      WHERE status='arrived'
-        AND COALESCE(archived,0)=0
-        AND datetime(created_at) <= datetime('now', '-60 days')
-    """)
-    c.commit()
-    c.close()
-
 # =========================
 # TEMPLATES (BASE as "file")
 # =========================
@@ -1611,6 +1596,21 @@ app.jinja_env.globals["canonical_order_no"] = canonical_order_no
 app.jinja_env.globals["order_status_label"] = order_status_label if "order_status_label" in globals() else None
 app.jinja_env.globals["order_status_css"] = order_status_css if "order_status_css" in globals() else None
 
+
+
+
+def archive_old_china_packages():
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+      UPDATE china_packages
+      SET archived = 1
+      WHERE status='arrived'
+        AND COALESCE(archived,0)=0
+        AND datetime(created_at) <= datetime('now', '-60 days')
+    """)
+    c.commit()
+    c.close()
 
 # =========================
 # PAGES
@@ -3436,7 +3436,9 @@ def order_status_update(order_id):
     changed_product_ids = []
     warehouse_issued = int(o["warehouse_issued"] or 0)
 
-    # Zdjęcie stanu następuje przy przejściu na "in_delivery" lub od razu na "issued",
+    # Zdjęcie stanu:
+    # - przy przejściu na "in_delivery"
+    # - albo od razu na "issued"
     # ale tylko jeśli wcześniej jeszcze nie było wydane.
     if new_status in {"in_delivery", "issued"} and warehouse_issued == 0:
         cur.execute("""
@@ -4572,7 +4574,7 @@ def china():
     packs = [dict(r) for r in cur.fetchall()]
 
     pack_ids = [int(p["id"]) for p in packs]
-    qty_in_delivery = {}
+    qty_map = {}
     if pack_ids:
         ph = ",".join(["?"] * len(pack_ids))
         cur.execute(f"""
@@ -4581,11 +4583,11 @@ def china():
           WHERE package_id IN ({ph})
           GROUP BY package_id
         """, tuple(pack_ids))
-        qty_in_delivery = {int(r["package_id"]): int(r["qty_sum"] or 0) for r in cur.fetchall()}
+        qty_map = {int(r["package_id"]): int(r["qty_sum"] or 0) for r in cur.fetchall()}
     c.close()
 
     for p in packs:
-        p["in_delivery_qty"] = int(qty_in_delivery.get(int(p["id"]), 0))
+        p["in_delivery_qty"] = int(qty_map.get(int(p["id"]), 0))
 
     tpl = r"""
     {% extends "base.html" %}
@@ -4594,7 +4596,7 @@ def china():
         <div class="flex">
           <h1 style="margin:0;">Chiny (P/O)</h1>
         </div>
-        <div class="muted">Zarządzaj przesyłkami: status, tracking i zawartość paczki. Planned nie pokazuje zawartości, ale liczy się do ilości w drodze. Paczki arrived po 60 dniach trafiają do archiwum.</div>
+        <div class="muted">Zarządzaj przesyłkami: status, tracking i zawartość paczki. Paczki planned nie pokazują zawartości, ale liczą się do ilości w drodze. Paczki arrived po 60 dniach trafiają do archiwum.</div>
       </div>
 
       <div class="card">
@@ -4662,7 +4664,7 @@ def china():
                 <td class="muted">{{ p['created_at'] }}</td>
                 <td class="flex">
                   <a class="btn primary" href="{{ url_for('china_package', package_id=p['id']) }}">
-                    {% if p['status'] == 'planned' %}Podgląd{% else %}Zawartość{% endif %}
+                    {% if p['status']=='planned' %}Podgląd{% else %}Zawartość{% endif %}
                   </a>
                   {% if p['status'] != 'arrived' %}
                     <form method="post" action="{{ url_for('china_delete', package_id=p['id']) }}" onsubmit="return confirm('Usunąć paczkę?')">
@@ -4709,11 +4711,11 @@ def china_create():
 
     if supabase_enabled():
         try:
-            c = conn()
-            cur = c.cursor()
-            cur.execute("SELECT id FROM china_packages WHERE package_no=?", (package_no,))
-            row = cur.fetchone()
-            c.close()
+            c2 = conn()
+            cur2 = c2.cursor()
+            cur2.execute("SELECT id FROM china_packages WHERE package_no=?", (package_no,))
+            row = cur2.fetchone()
+            c2.close()
             if row:
                 sync_local_rows_to_supabase("china_packages", "id", [int(row["id"])])
         except Exception:
@@ -4764,14 +4766,13 @@ def china_status(package_id):
     if supabase_enabled():
         try:
             sync_local_rows_to_supabase("china_packages", "id", [package_id])
-            changed_ids = []
             c2 = conn()
             cur2 = c2.cursor()
             cur2.execute("SELECT product_id FROM china_items WHERE package_id=?", (package_id,))
-            changed_ids = [int(r["product_id"]) for r in cur2.fetchall()]
+            product_ids = [int(r["product_id"]) for r in cur2.fetchall()]
             c2.close()
-            if changed_ids:
-                sync_local_rows_to_supabase("stock", "product_id", changed_ids)
+            if product_ids:
+                sync_local_rows_to_supabase("stock", "product_id", product_ids)
         except Exception:
             pass
 
@@ -4934,7 +4935,7 @@ def china_package(package_id):
 def china_delete(package_id):
     c = conn()
     cur = c.cursor()
-    cur.execute("SELECT * FROM china_packages WHERE id=?", (package_id,))
+    cur.execute("SELECT status FROM china_packages WHERE id=?", (package_id,))
     pack = cur.fetchone()
     if not pack:
         c.close()
