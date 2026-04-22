@@ -162,15 +162,9 @@ def init_db():
         status TEXT NOT NULL DEFAULT 'planned', -- planned/ordered/shipped/arrived
         tracking TEXT,
         note TEXT,
-        created_at TEXT NOT NULL,
-        archived INTEGER NOT NULL DEFAULT 0
+        created_at TEXT NOT NULL
     )
     """)
-
-    cur.execute("PRAGMA table_info(china_packages)")
-    china_package_cols = {r[1] for r in cur.fetchall()}
-    if "archived" not in china_package_cols:
-        cur.execute("ALTER TABLE china_packages ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS china_items(
@@ -554,7 +548,7 @@ def ensure_stock_row(product_id):
 
 SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "https://qfzawzkynmqkbjlbtkjd.supabase.co").strip().rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFmemF3emt5bm1xa2JqbGJ0a2pkIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NDUyNDgxMCwiZXhwIjoyMDkwMTAwODEwfQ.DcyQuZL4atOlbsgSWBmgl-nvQ0eJOTrcu6ciU59O7zU").strip()
-SUPABASE_AUTO_SYNC_ON_WRITE = (os.environ.get("SUPABASE_AUTO_SYNC_ON_WRITE") or "0").strip().lower() in ("1", "true", "yes", "on")
+SUPABASE_AUTO_SYNC_ON_WRITE = (os.environ.get("SUPABASE_AUTO_SYNC_ON_WRITE") or "1").strip().lower() in ("1", "true", "yes", "on")
 SUPABASE_MIN_SYNC_INTERVAL_SEC = float((os.environ.get("SUPABASE_MIN_SYNC_INTERVAL_SEC") or "2").strip())
 SUPABASE_MIN_PULL_INTERVAL_SEC = float((os.environ.get("SUPABASE_MIN_PULL_INTERVAL_SEC") or "2").strip())
 
@@ -1493,21 +1487,6 @@ def prepare_invoice_items(order_items: list[dict], form):
         prepared.append(row)
     return prepared
 
-
-
-
-def archive_old_china_packages():
-    c = conn()
-    cur = c.cursor()
-    cur.execute("""
-      UPDATE china_packages
-      SET archived = 1
-      WHERE status='arrived'
-        AND COALESCE(archived,0)=0
-        AND datetime(created_at) <= datetime('now', '-60 days')
-    """)
-    c.commit()
-    c.close()
 
 # =========================
 # TEMPLATES (BASE as "file")
@@ -3171,8 +3150,7 @@ def order_view(order_id):
           <div>{{ o['note'] or "-" }}</div>
           <div class="line"></div>
           <div class="hint">
-            <b>Status zamówienia steruje magazynem.</b><br>
-            Przy zmianie na <b>W dostawie</b> albo <b>Zrealizowane</b> stan schodzi tylko <b>raz</b>.<br>
+            <b>Wydaj z magazynu</b> odejmie ilości z magazynu, ale nie zmieni automatycznie statusu klienta na „Zrealizowane”.<br>
             Jeśli brakuje stanu, pozycja może być realizowana z <b>towaru w drodze z Chin</b> (kolumna „W dostawie” poniżej).
           </div>
         </div>
@@ -3437,10 +3415,9 @@ def order_status_update(order_id):
     changed_product_ids = []
     warehouse_issued = int(o["warehouse_issued"] or 0)
 
-    # Zdjęcie stanu następuje tylko raz:
-    # przy przejściu na "in_delivery" albo od razu na "issued",
-    # ale wyłącznie jeśli wcześniej jeszcze nie było wydane.
-    if new_status in {"in_delivery", "issued"} and warehouse_issued == 0:
+    # Jedyny moment zdjęcia stanu:
+    # przy przejściu na "in_delivery" i tylko jeśli jeszcze nie było wydane.
+    if new_status == "in_delivery" and warehouse_issued == 0:
         cur.execute("""
           SELECT oi.product_id, oi.qty
           FROM order_items oi
@@ -3486,10 +3463,7 @@ def order_status_update(order_id):
 
 @app.get("/orders/<int:order_id>/issue")
 def order_issue(order_id):
-    # Stara akcja wyłączona.
-    # Zdjęcie stanu dzieje się teraz wyłącznie przy zmianie statusu na:
-    # - "W dostawie"
-    # - albo od razu "Zrealizowane"
+    # Stara akcja wyłączona. Wydanie dzieje się teraz przy zmianie statusu na "W dostawie".
     return redirect(url_for("order_view", order_id=order_id))
 
 
@@ -4570,10 +4544,9 @@ def order_scan():
 def china():
     # Wyłączony pull z Supabase tylko dla modułu Chiny.
     # Tu pracujemy na lokalnej bazie, żeby POST -> redirect nie cofał zmian.
-    archive_old_china_packages()
     c = conn()
     cur = c.cursor()
-    cur.execute("SELECT * FROM china_packages WHERE COALESCE(archived,0)=0 ORDER BY id DESC LIMIT 200")
+    cur.execute("SELECT * FROM china_packages ORDER BY id DESC LIMIT 200")
     packs = cur.fetchall()
     c.close()
 
@@ -4584,7 +4557,7 @@ def china():
         <div class="flex">
           <h1 style="margin:0;">Chiny (P/O)</h1>
         </div>
-        <div class="muted">Zarządzaj przesyłkami: status, tracking i zawartość paczki. Paczki arrived po 60 dniach trafiają do archiwum. Paczek arrived nie da się usuwać.</div>
+        <div class="muted">Zarządzaj przesyłkami: status, tracking i zawartość paczki. Tracking otwiera 17TRACK.</div>
       </div>
 
       <div class="card">
@@ -4651,13 +4624,9 @@ def china():
                 <td class="muted">{{ p['created_at'] }}</td>
                 <td class="flex">
                   <a class="btn primary" href="{{ url_for('china_package', package_id=p['id']) }}">Zawartość</a>
-                  {% if p['status'] != 'arrived' %}
-                    <form method="post" action="{{ url_for('china_delete', package_id=p['id']) }}" onsubmit="return confirm('Usunąć paczkę?')">
-                      <button class="btn danger" type="submit">Usuń</button>
-                    </form>
-                  {% else %}
-                    <span class="badge">Arrived — bez usuwania</span>
-                  {% endif %}
+                  <form method="post" action="{{ url_for('china_delete', package_id=p['id']) }}" onsubmit="return confirm('Usunąć paczkę?')">
+                    <button class="btn danger" type="submit">Usuń</button>
+                  </form>
                 </td>
               </tr>
             {% endfor %}
@@ -4760,7 +4729,6 @@ def china_tracking(package_id):
 @app.get("/china/<int:package_id>")
 def china_package(package_id):
     # Wyłączony pull z Supabase tylko dla modułu Chiny.
-    archive_old_china_packages()
     c = conn()
     cur = c.cursor()
     cur.execute("SELECT * FROM china_packages WHERE id=?", (package_id,))
@@ -4869,11 +4837,20 @@ def china_delete(package_id):
         c.close()
         return "Nie można usunąć paczki ARRIVED", 400
 
+    if supabase_enabled():
+        try:
+            cur.execute("SELECT id FROM china_items WHERE package_id=?", (package_id,))
+            item_ids = [int(r["id"]) for r in cur.fetchall()]
+            for iid in item_ids:
+                supabase_delete_rows("china_items", {"id": iid})
+            supabase_delete_rows("china_packages", {"id": package_id})
+        except Exception:
+            pass
+
     cur.execute("DELETE FROM china_items WHERE package_id=?", (package_id,))
     cur.execute("DELETE FROM china_packages WHERE id=?", (package_id,))
     c.commit()
     c.close()
-
     return redirect(url_for("china"))
 
 @app.post("/china/<int:package_id>/items/add")
