@@ -331,10 +331,44 @@ init_db()
 def now_iso():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def make_order_no(order_id: int) -> str:
-    # np. ZAM-20260220-000123
-    d = datetime.now().strftime("%Y%m%d")
-    return f"ZAM-{d}-{order_id:06d}"
+SHORT_ORDER_NO_RE = re.compile(r"^ZAM-(\d{6})(\d+)$", re.I)
+
+
+def order_date_code(created_at: str | None = "") -> str:
+    created = norm(created_at)
+    if len(created) >= 10 and created[4:5] == "-" and created[7:8] == "-":
+        return created[2:4] + created[5:7] + created[8:10]
+    return datetime.now().strftime("%y%m%d")
+
+
+def is_short_order_no(value: str | None) -> bool:
+    return bool(SHORT_ORDER_NO_RE.match(norm(value)))
+
+
+def make_order_no(order_id: int | None = None, created_at: str | None = "") -> str:
+    # Format: ZAM-2607141 = ZAM- + YYMMDD + kolejny numer w danym dniu.
+    date_code = order_date_code(created_at)
+    day = norm(created_at)[:10] if norm(created_at) else datetime.now().strftime("%Y-%m-%d")
+    seq = 1
+    try:
+        c = conn()
+        cur = c.cursor()
+        if order_id:
+            cur.execute("SELECT order_no FROM orders WHERE substr(created_at,1,10)=? AND id<>?", (day, int(order_id)))
+        else:
+            cur.execute("SELECT order_no FROM orders WHERE substr(created_at,1,10)=?", (day,))
+        for r in cur.fetchall():
+            raw = norm(r["order_no"])
+            m = SHORT_ORDER_NO_RE.match(raw)
+            if m and m.group(1) == date_code:
+                seq = max(seq, int(m.group(2)) + 1)
+            elif raw and raw.upper() != "TEMP":
+                seq += 1
+        c.close()
+    except Exception:
+        oid = int(order_id or 1)
+        seq = max(1, oid)
+    return f"ZAM-{date_code}{seq}"
 
 
 def canonical_order_no(order_id: int | None, created_at: str | None = "", raw_order_no: str | None = "") -> str:
@@ -344,26 +378,35 @@ def canonical_order_no(order_id: int | None, created_at: str | None = "", raw_or
             return "ZAM-" + raw[4:]
         return raw
 
-    created = norm(created_at)
-    if len(created) >= 10 and created[4:5] == "-" and created[7:8] == "-":
-        date_part = created[:10].replace("-", "")
-    else:
-        date_part = datetime.now().strftime("%Y%m%d")
+    return make_order_no(order_id, created_at)
 
-    oid = int(order_id or 0)
-    if oid > 0:
-        return f"ZAM-{date_part}-{oid:06d}"
-    return f"ZAM-{date_part}-000000"
+
+def order_display_no(order_id: int | None, created_at: str | None = "", raw_order_no: str | None = "", note: str | None = "") -> str:
+    base = canonical_order_no(order_id, created_at, raw_order_no)
+    note_text = norm(note)
+    return f"{base} {note_text}" if note_text else base
 
 
 def normalize_temp_order_numbers():
     c = conn()
     cur = c.cursor()
-    cur.execute("SELECT id, order_no, created_at FROM orders ORDER BY id")
+    cur.execute("SELECT id, order_no, created_at FROM orders ORDER BY created_at, id")
     rows = cur.fetchall()
     changed = []
+    used_seq_by_date = {}
     for r in rows:
-        new_no = canonical_order_no(r["id"], r["created_at"], r["order_no"])
+        raw = norm(r["order_no"])
+        m = SHORT_ORDER_NO_RE.match(raw)
+        if m:
+            used_seq_by_date[m.group(1)] = max(used_seq_by_date.get(m.group(1), 0), int(m.group(2)))
+
+    for r in rows:
+        raw = norm(r["order_no"])
+        if is_short_order_no(raw):
+            continue
+        date_code = order_date_code(r["created_at"])
+        used_seq_by_date[date_code] = used_seq_by_date.get(date_code, 0) + 1
+        new_no = f"ZAM-{date_code}{used_seq_by_date[date_code]}"
         if new_no != (r["order_no"] or ""):
             cur.execute("UPDATE orders SET order_no=? WHERE id=?", (new_no, r["id"]))
             changed.append((int(r["id"]), new_no))
@@ -1034,7 +1077,7 @@ def remote_first_create_order(customer_id, customer_name, customer_address, cust
         raise RuntimeError("Supabase nie zwrĂłciĹ‚ ID dla zamĂłwienia")
 
     order_id = int(created_order["id"])
-    order_no = make_order_no(order_id)
+    order_no = make_order_no(order_id, created_at)
     qr_data_url = ""
     supabase_update_rows("orders", {"order_no": order_no, "qr_data_url": qr_data_url}, {"id": order_id})
 
@@ -1807,6 +1850,7 @@ function removeRow(btn){
 # loader: BASE dostÄ™pny jako "base.html"
 app.jinja_loader = DictLoader({"base.html": BASE})
 app.jinja_env.globals["canonical_order_no"] = canonical_order_no
+app.jinja_env.globals["order_display_no"] = order_display_no
 app.jinja_env.globals["order_status_label"] = order_status_label if "order_status_label" in globals() else None
 app.jinja_env.globals["order_status_css"] = order_status_css if "order_status_css" in globals() else None
 
@@ -2908,7 +2952,7 @@ def orders():
           <tbody>
             {% for r in rows %}
               <tr {% if tab == 'new' and (r['has_shortage'] or r['status'] in ['new','pending','unconfirmed']) %}style="background:#ffe7e7;"{% endif %}>
-                <td><b>{{ canonical_order_no(r['id'], r['created_at'], r['order_no']) }}</b></td>
+                <td><b>{{ order_display_no(r['id'], r['created_at'], r['order_no'], r['note']) }}</b></td>
                 <td>{{ r['customer_name'] }}</td>
                 <td><span class="badge {{ order_status_css(r['status']) }}">{{ order_status_label(r['status']) }}</span></td>
                 <td><span class="badge">{{ "%.2f"|format(r['order_value_net']) }} PLN</span></td>
@@ -3118,13 +3162,14 @@ def order_create():
     else:
         c = conn()
         cur = c.cursor()
+        created_at = now_iso()
         cur.execute("""
           INSERT INTO orders(order_no, customer_id, customer_name, customer_address, customer_phone, customer_email, status, note, created_at, qr_data_url)
           VALUES(?,?,?,?,?,?,?,?,?,?)
-        """, ("TEMP", customer_id if customer_id > 0 else None, customer_name, customer_address, customer_phone, customer_email, "new", note, now_iso(), ""))
+        """, ("TEMP", customer_id if customer_id > 0 else None, customer_name, customer_address, customer_phone, customer_email, "new", note, created_at, ""))
         oid = cur.lastrowid
 
-        order_no = make_order_no(oid)
+        order_no = make_order_no(oid, created_at)
         qr_data_url = ""
         cur.execute("UPDATE orders SET order_no=?, qr_data_url=? WHERE id=?", (order_no, qr_data_url, oid))
 
@@ -3266,7 +3311,7 @@ def order_view(order_id):
     {% block content %}
       <div class="card">
         <div class="flex">
-          <h1 style="margin:0;">{{ canonical_order_no(o['id'], o['created_at'], o['order_no']) }}</h1>
+          <h1 style="margin:0;">{{ order_display_no(o['id'], o['created_at'], o['order_no'], o['note']) }}</h1>
           <span class="badge {{ order_status_css(o['status']) }}">{{ order_status_label(o['status']) }}</span>
           <div class="right flex">
             <a class="btn" href="{{ url_for('orders') }}">â† Lista</a>
@@ -3690,10 +3735,11 @@ def order_invoice(order_id):
         source_order = related_order_by_id.get(int(it.get("order_id") or 0), {})
         ordered_qty = int(it.get("qty") or 0)
         done_qty = int(invoiced_by_item.get(int(it["id"])) or 0)
-        it["source_order_no"] = canonical_order_no(
+        it["source_order_no"] = order_display_no(
             source_order.get("id") or it.get("order_id"),
             source_order.get("created_at") or it.get("source_order_created_at"),
-            source_order.get("order_no") or it.get("source_order_no")
+            source_order.get("order_no") or it.get("source_order_no"),
+            source_order.get("note") or it.get("source_order_note") or ""
         )
         it["source_order_note"] = source_order.get("note") or it.get("source_order_note") or ""
         it["ordered_qty"] = ordered_qty
@@ -4010,7 +4056,7 @@ def order_print(order_id):
 
     y = h - 18 * mm
     cpdf.setFont(pdf_font_bold, 14)
-    cpdf.drawString(15 * mm, y, f"Wydruk zamĂłwienia: {canonical_order_no(o['id'], o['created_at'], o['order_no'])}")
+    cpdf.drawString(15 * mm, y, f"Wydruk zamĂłwienia: {order_display_no(o['id'], o['created_at'], o['order_no'], o['note'])}")
     y -= 7 * mm
     cpdf.setFont(pdf_font, 10)
     cpdf.drawString(15 * mm, y, f"Klient: {o['customer_name']}")
@@ -4146,7 +4192,7 @@ def order_label(order_id):
     cpdf.setFont(pdf_font_bold, 6.2)
     cpdf.drawString(margin, text_y, customer_lines[0][:60])
 
-    order_no_value = canonical_order_no(o['id'], o['created_at'], o['order_no'])
+    order_no_value = order_display_no(o['id'], o['created_at'], o['order_no'], o['note'])
     order_no_lines = [f"Nr: {order_no_value}"]
 
     if pdfmetrics.stringWidth(order_no_lines[0], pdf_font_bold, 5.1) > max_text_width:
@@ -4687,12 +4733,12 @@ def order_scan():
           const raw = String(value || '').trim();
           if(!raw) return '';
 
-          const match = raw.match(/ZAM-[0-9]{8}-[A-Z0-9-]+/i);
+          const match = raw.match(/ZAM-[0-9]{6}[0-9]+|ZAM-[0-9]{8}-[A-Z0-9-]+/i);
           if(match) return match[0].toUpperCase();
 
           try {
             const url = new URL(raw);
-            const fromPath = url.pathname.match(/ZAM-[0-9]{8}-[A-Z0-9-]+/i);
+            const fromPath = url.pathname.match(/ZAM-[0-9]{6}[0-9]+|ZAM-[0-9]{8}-[A-Z0-9-]+/i);
             if(fromPath) return fromPath[0].toUpperCase();
           } catch(e) {}
 
