@@ -4248,11 +4248,25 @@ def api_client_stock_catalog():
         p.sku,
         p.model,
         p.name,
-        COALESCE(s.qty, 0) AS qty_on_stock,
+        COALESCE(s.qty, 0) AS qty_physical,
+        COALESCE(r.reserved_qty, 0) AS qty_reserved,
+        CASE
+          WHEN COALESCE(s.qty, 0) - COALESCE(r.reserved_qty, 0) > 0
+          THEN COALESCE(s.qty, 0) - COALESCE(r.reserved_qty, 0)
+          ELSE 0
+        END AS qty_on_stock,
         COALESCE(pr.net_price, 0) AS net_price,
         COALESCE(pr.gross_price, 0) AS gross_price
       FROM products p
       LEFT JOIN stock s ON s.product_id = p.id
+      LEFT JOIN (
+        SELECT oi.product_id, SUM(oi.qty) AS reserved_qty
+        FROM order_items oi
+        JOIN orders o ON o.id = oi.order_id
+        WHERE LOWER(COALESCE(o.status,'')) IN ('new','pending','unconfirmed','confirmed','packed','in_delivery','shipped')
+          AND COALESCE(o.warehouse_issued,0) = 0
+        GROUP BY oi.product_id
+      ) r ON r.product_id = p.id
       LEFT JOIN pricing pr
         ON (TRIM(LOWER(pr.model)) = TRIM(LOWER(p.model))
             OR TRIM(LOWER(pr.model)) = TRIM(LOWER(p.sku)))
