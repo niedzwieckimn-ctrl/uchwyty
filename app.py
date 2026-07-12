@@ -4544,7 +4544,7 @@ def api_client_stock_catalog():
 
 @app.get("/api/order_lookup")
 def api_order_lookup():
-    maybe_pull_shared_from_supabase()
+    maybe_pull_shared_from_supabase(force=True)
     token = norm(request.args.get("token"))
     if not token:
         return jsonify(ok=False, error="Brak tokenu"), 400
