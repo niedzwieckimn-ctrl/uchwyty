@@ -4630,7 +4630,10 @@ def api_client_invoices():
         COALESCE(m.sent_to_client,0) AS sent_to_client,
         COALESCE(m.seen_by_client,0) AS seen_by_client,
         COALESCE(m.seen_at,'') AS seen_at,
+        o.id AS source_order_id,
         o.order_no,
+        o.created_at AS source_order_created_at,
+        o.note AS source_order_note,
         o.customer_email AS order_customer_email
       FROM invoices i
       LEFT JOIN invoice_meta m ON m.invoice_id = i.id
@@ -4643,17 +4646,18 @@ def api_client_invoices():
       ORDER BY i.order_id DESC, i.id DESC
     """, (email, email))
     rows = []
-    latest_by_order = {}
     for r in cur.fetchall():
         d = dict(r)
         ok_pdf, _ = invoice_pdf_exists(d.get("pdf_path", ""), d.get("invoice_no", ""))
         if not ok_pdf:
             continue
-        order_id = int(d.get("order_id") or 0)
-        if order_id in latest_by_order:
-            continue
+        d["order_display"] = order_display_no(
+            d.get("source_order_id"),
+            d.get("source_order_created_at"),
+            d.get("order_no"),
+            d.get("source_order_note")
+        ) if d.get("source_order_id") else (d.get("order_no") or "")
         d["pdf_exists"] = 1
-        latest_by_order[order_id] = d
         rows.append(d)
     c.close()
     rows.sort(key=lambda x: ((x.get("seen_by_client") or 0), (x.get("issue_date") or ""), int(x.get("id") or 0)), reverse=True)
