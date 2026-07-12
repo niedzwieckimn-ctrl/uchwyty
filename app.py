@@ -5194,7 +5194,7 @@ def invoice_regenerate_admin(invoice_id):
 
 
 def _redirect_after_invoice_action(default_endpoint="invoices"):
-    target = norm(request.form.get("next")) or request.referrer or url_for(default_endpoint)
+    target = norm(request.values.get("next")) or request.referrer or url_for(default_endpoint)
     return redirect(target)
 
 
@@ -5236,19 +5236,19 @@ def _set_invoice_payment_state(invoice_id: int, *, reminder: int | None = None, 
             pass
 
 
-@app.post("/invoices/<int:invoice_id>/payment-reminder")
+@app.route("/invoices/<int:invoice_id>/payment-reminder", methods=["GET", "POST"])
 def invoice_payment_reminder_admin(invoice_id):
     _set_invoice_payment_state(invoice_id, reminder=1, paid=0)
     return _redirect_after_invoice_action()
 
 
-@app.post("/invoices/<int:invoice_id>/paid")
+@app.route("/invoices/<int:invoice_id>/paid", methods=["GET", "POST"])
 def invoice_paid_admin(invoice_id):
     _set_invoice_payment_state(invoice_id, reminder=0, paid=1)
     return _redirect_after_invoice_action()
 
 
-@app.post("/invoices/<int:invoice_id>/unpaid")
+@app.route("/invoices/<int:invoice_id>/unpaid", methods=["GET", "POST"])
 def invoice_unpaid_admin(invoice_id):
     _set_invoice_payment_state(invoice_id, reminder=0, paid=0)
     return _redirect_after_invoice_action()
