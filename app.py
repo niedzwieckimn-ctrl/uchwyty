@@ -272,6 +272,9 @@ def init_db():
         invoice_items_json TEXT,
         sent_to_client INTEGER NOT NULL DEFAULT 0,
         seen_by_client INTEGER NOT NULL DEFAULT 0,
+        payment_reminder INTEGER NOT NULL DEFAULT 0,
+        paid INTEGER NOT NULL DEFAULT 0,
+        paid_at TEXT,
         seen_at TEXT,
         updated_at TEXT NOT NULL,
         FOREIGN KEY(invoice_id) REFERENCES invoices(id)
@@ -300,6 +303,12 @@ def init_db():
         cur.execute("ALTER TABLE invoice_meta ADD COLUMN seen_by_client INTEGER NOT NULL DEFAULT 0")
     if "seen_at" not in invoice_meta_cols:
         cur.execute("ALTER TABLE invoice_meta ADD COLUMN seen_at TEXT")
+    if "payment_reminder" not in invoice_meta_cols:
+        cur.execute("ALTER TABLE invoice_meta ADD COLUMN payment_reminder INTEGER NOT NULL DEFAULT 0")
+    if "paid" not in invoice_meta_cols:
+        cur.execute("ALTER TABLE invoice_meta ADD COLUMN paid INTEGER NOT NULL DEFAULT 0")
+    if "paid_at" not in invoice_meta_cols:
+        cur.execute("ALTER TABLE invoice_meta ADD COLUMN paid_at TEXT")
 
     # migracja: starsze bazy mogÄ… nie mieÄ‡ kolumny NIP u klientĂłw
     cur.execute("PRAGMA table_info(customers)")
@@ -1789,7 +1798,10 @@ def upsert_invoice_meta(
     invoice_items_json: str = "",
     sent_to_client: int | None = None,
     seen_by_client: int | None = None,
-    seen_at: str | None = None
+    seen_at: str | None = None,
+    payment_reminder: int | None = None,
+    paid: int | None = None,
+    paid_at: str | None = None
 ):
     current = load_invoice_meta(invoice_id) or {}
     if sent_to_client is None:
@@ -1798,20 +1810,29 @@ def upsert_invoice_meta(
         seen_by_client = int(current.get("seen_by_client") or 0)
     if seen_at is None:
         seen_at = current.get("seen_at")
+    if payment_reminder is None:
+        payment_reminder = int(current.get("payment_reminder") or 0)
+    if paid is None:
+        paid = int(current.get("paid") or 0)
+    if paid_at is None:
+        paid_at = current.get("paid_at")
 
     c = conn()
     cur = c.cursor()
     cur.execute("""
-      INSERT INTO invoice_meta(invoice_id, pdf_path, invoice_items_json, sent_to_client, seen_by_client, seen_at, updated_at)
-      VALUES(?,?,?,?,?,?,?)
+      INSERT INTO invoice_meta(invoice_id, pdf_path, invoice_items_json, sent_to_client, seen_by_client, payment_reminder, paid, paid_at, seen_at, updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?)
       ON CONFLICT(invoice_id) DO UPDATE SET
         pdf_path=excluded.pdf_path,
         invoice_items_json=excluded.invoice_items_json,
         sent_to_client=excluded.sent_to_client,
         seen_by_client=excluded.seen_by_client,
+        payment_reminder=excluded.payment_reminder,
+        paid=excluded.paid,
+        paid_at=excluded.paid_at,
         seen_at=excluded.seen_at,
         updated_at=excluded.updated_at
-    """, (invoice_id, pdf_path, invoice_items_json, int(sent_to_client), int(seen_by_client), seen_at, now_iso()))
+    """, (invoice_id, pdf_path, invoice_items_json, int(sent_to_client), int(seen_by_client), int(payment_reminder), int(paid), paid_at, seen_at, now_iso()))
     c.commit()
     c.close()
 
@@ -4022,6 +4043,9 @@ def order_invoice(order_id):
         COALESCE(m.pdf_path,'') AS pdf_path,
         COALESCE(m.sent_to_client,0) AS sent_to_client,
         COALESCE(m.seen_by_client,0) AS seen_by_client,
+        COALESCE(m.payment_reminder,0) AS payment_reminder,
+        COALESCE(m.paid,0) AS paid,
+        COALESCE(m.paid_at,'') AS paid_at,
         COALESCE(m.seen_at,'') AS seen_at,
         COALESCE(m.invoice_items_json,'') AS invoice_items_json
       FROM invoices i
@@ -4226,7 +4250,7 @@ def order_invoice(order_id):
       <div class="card">
         <h2>Zapisane faktury</h2>
         <table>
-          <thead><tr><th>Numer</th><th>Data</th><th>Netto</th><th>Brutto</th><th>Status klienta</th><th>Akcje</th></tr></thead>
+          <thead><tr><th>Numer</th><th>Data</th><th>Netto</th><th>Brutto</th><th>Status klienta</th><th>Płatność</th><th>Akcje</th></tr></thead>
           <tbody>
             {% for inv in invoice_rows %}
               <tr>
@@ -4234,7 +4258,16 @@ def order_invoice(order_id):
                 <td>{{ inv['issue_date'] }}</td>
                 <td>{{ "%.2f"|format(inv['total_net']) }}</td>
                 <td>{{ "%.2f"|format(inv['total_gross']) }}</td>
-                <td>{{ "UdostÄ™pniona" if inv['sent_to_client'] else "Tylko wewnÄ™trzna" }}</td>
+                <td>{{ "Udostępniona" if inv['sent_to_client'] else "Tylko wewnętrzna" }}</td>
+                <td>
+                  {% if inv['paid'] %}
+                    <span class="badge ok">Opłacona</span>
+                    {% if inv['paid_at'] %}<div class="muted small">{{ inv['paid_at'] }}</div>{% endif %}
+                  {% else %}
+                    <span class="badge danger">Nieopłacona</span>
+                    {% if inv['payment_reminder'] %}<span class="badge">Przypomnienie aktywne</span>{% endif %}
+                  {% endif %}
+                </td>
                 <td>
                   <div class="flex">
                     <a class="btn" href="{{ url_for('invoice_download_admin', invoice_id=inv['id']) }}" target="_blank">Pobierz PDF</a>
@@ -4249,6 +4282,21 @@ def order_invoice(order_id):
                     {% else %}
                       <span class="badge">Widoczna w panelu klienta</span>
                     {% endif %}
+                    {% if not inv['paid'] %}
+                      <form method="post" action="{{ url_for('invoice_payment_reminder_admin', invoice_id=inv['id']) }}">
+                        <input type="hidden" name="next" value="{{ request.full_path }}">
+                        <button class="btn" type="submit">Przypomnij o płatności</button>
+                      </form>
+                      <form method="post" action="{{ url_for('invoice_paid_admin', invoice_id=inv['id']) }}">
+                        <input type="hidden" name="next" value="{{ request.full_path }}">
+                        <button class="btn ok" type="submit">Faktura opłacona</button>
+                      </form>
+                    {% else %}
+                      <form method="post" action="{{ url_for('invoice_unpaid_admin', invoice_id=inv['id']) }}">
+                        <input type="hidden" name="next" value="{{ request.full_path }}">
+                        <button class="btn" type="submit">Cofnij opłacenie</button>
+                      </form>
+                    {% endif %}
                     <form method="post" action="{{ url_for('order_invoice_delete', order_id=o['id'], invoice_id=inv['id']) }}" onsubmit="return confirm('UsunÄ…Ä‡ fakturÄ™?')">
                       <button class="btn danger" type="submit">UsuĹ„ fakturÄ™</button>
                     </form>
@@ -4257,7 +4305,7 @@ def order_invoice(order_id):
               </tr>
             {% endfor %}
             {% if not invoice_rows %}
-              <tr><td colspan="6" class="muted">Brak wystawionych faktur.</td></tr>
+              <tr><td colspan="7" class="muted">Brak wystawionych faktur.</td></tr>
             {% endif %}
           </tbody>
         </table>
@@ -4632,6 +4680,9 @@ def api_client_invoices():
         COALESCE(m.pdf_path,'') AS pdf_path,
         COALESCE(m.sent_to_client,0) AS sent_to_client,
         COALESCE(m.seen_by_client,0) AS seen_by_client,
+        COALESCE(m.payment_reminder,0) AS payment_reminder,
+        COALESCE(m.paid,0) AS paid,
+        COALESCE(m.paid_at,'') AS paid_at,
         COALESCE(m.seen_at,'') AS seen_at,
         o.id AS source_order_id,
         o.order_no,
@@ -4689,6 +4740,9 @@ def invoices():
         COALESCE(m.pdf_path,'') AS pdf_path,
         COALESCE(m.sent_to_client,0) AS sent_to_client,
         COALESCE(m.seen_by_client,0) AS seen_by_client,
+        COALESCE(m.payment_reminder,0) AS payment_reminder,
+        COALESCE(m.paid,0) AS paid,
+        COALESCE(m.paid_at,'') AS paid_at,
         COALESCE(m.seen_at,'') AS seen_at,
         o.id AS source_order_id,
         o.order_no AS source_order_no,
@@ -4802,6 +4856,12 @@ def invoices():
                           {% if not inv.pdf_ok %}
                             <span class="badge danger">Brak PDF</span>
                           {% endif %}
+                          {% if inv.paid %}
+                            <span class="badge ok">Opłacona</span>
+                          {% else %}
+                            <span class="badge danger">Nieopłacona</span>
+                            {% if inv.payment_reminder %}<span class="badge">Przypomnienie aktywne</span>{% endif %}
+                          {% endif %}
                         </td>
                         <td>
                           <div class="flex">
@@ -4809,6 +4869,21 @@ def invoices():
                             <a class="btn" href="{{ url_for('invoice_packing_list_download_admin', invoice_id=inv.id) }}" target="_blank">Lista do paczki</a>
                             {% if inv.source_order_id %}
                               <a class="btn" href="{{ url_for('order_view', order_id=inv.source_order_id) }}">Zamówienie</a>
+                            {% endif %}
+                            {% if not inv.paid %}
+                              <form method="post" action="{{ url_for('invoice_payment_reminder_admin', invoice_id=inv.id) }}">
+                                <input type="hidden" name="next" value="{{ request.full_path }}">
+                                <button class="btn" type="submit">Przypomnij o płatności</button>
+                              </form>
+                              <form method="post" action="{{ url_for('invoice_paid_admin', invoice_id=inv.id) }}">
+                                <input type="hidden" name="next" value="{{ request.full_path }}">
+                                <button class="btn ok" type="submit">Faktura opłacona</button>
+                              </form>
+                            {% else %}
+                              <form method="post" action="{{ url_for('invoice_unpaid_admin', invoice_id=inv.id) }}">
+                                <input type="hidden" name="next" value="{{ request.full_path }}">
+                                <button class="btn" type="submit">Cofnij opłacenie</button>
+                              </form>
                             {% endif %}
                           </div>
                         </td>
@@ -5077,6 +5152,67 @@ def invoice_regenerate_admin(invoice_id):
             pass
 
     return redirect(request.referrer or url_for("orders"))
+
+
+def _redirect_after_invoice_action(default_endpoint="invoices"):
+    target = norm(request.form.get("next")) or request.referrer or url_for(default_endpoint)
+    return redirect(target)
+
+
+def _set_invoice_payment_state(invoice_id: int, *, reminder: int | None = None, paid: int | None = None):
+    meta = load_invoice_meta(invoice_id) or {}
+    pdf_path = meta.get("pdf_path", "")
+    items_json = meta.get("invoice_items_json", "")
+    sent_to_client = int(meta.get("sent_to_client") or 0)
+    seen_by_client = int(meta.get("seen_by_client") or 0)
+    seen_at = meta.get("seen_at")
+    current_reminder = int(meta.get("payment_reminder") or 0)
+    current_paid = int(meta.get("paid") or 0)
+    current_paid_at = meta.get("paid_at")
+
+    next_paid = current_paid if paid is None else int(paid)
+    next_reminder = current_reminder if reminder is None else int(reminder)
+    next_paid_at = current_paid_at
+    if next_paid:
+        next_reminder = 0
+        next_paid_at = now_iso()
+    elif paid == 0:
+        next_paid_at = None
+
+    upsert_invoice_meta(
+        invoice_id,
+        pdf_path,
+        items_json,
+        sent_to_client=sent_to_client,
+        seen_by_client=seen_by_client,
+        seen_at=seen_at,
+        payment_reminder=next_reminder,
+        paid=next_paid,
+        paid_at=next_paid_at
+    )
+    if supabase_enabled():
+        try:
+            sync_local_rows_to_supabase("invoice_meta", "invoice_id", [invoice_id])
+        except Exception:
+            pass
+
+
+@app.post("/invoices/<int:invoice_id>/payment-reminder")
+def invoice_payment_reminder_admin(invoice_id):
+    _set_invoice_payment_state(invoice_id, reminder=1, paid=0)
+    return _redirect_after_invoice_action()
+
+
+@app.post("/invoices/<int:invoice_id>/paid")
+def invoice_paid_admin(invoice_id):
+    _set_invoice_payment_state(invoice_id, reminder=0, paid=1)
+    return _redirect_after_invoice_action()
+
+
+@app.post("/invoices/<int:invoice_id>/unpaid")
+def invoice_unpaid_admin(invoice_id):
+    _set_invoice_payment_state(invoice_id, reminder=0, paid=0)
+    return _redirect_after_invoice_action()
 
 @app.post("/api/invoices/<int:invoice_id>/seen")
 def api_invoice_seen(invoice_id):
