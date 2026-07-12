@@ -45,6 +45,43 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024  # 20 MB
+app.config["JSON_AS_ASCII"] = False
+
+
+_MOJIBAKE_REPLACEMENTS = {
+    "Ä…": "ą", "Ä‡": "ć", "Ä™": "ę", "Ĺ‚": "ł", "Ĺ„": "ń",
+    "Ăł": "ó", "Ĺ›": "ś", "Ĺş": "ź", "ĹĽ": "ż",
+    "Ä„": "Ą", "Ä†": "Ć", "Ä": "Ę", "Ĺ": "Ł", "Ĺƒ": "Ń",
+    "Ă“": "Ó", "Ĺš": "Ś", "Ĺą": "Ź", "Ĺ»": "Ż",
+    "Ã³": "ó", "Å‚": "ł", "Å„": "ń", "Å›": "ś", "Åº": "ź",
+    "Å¼": "ż", "Å": "Ł", "Åƒ": "Ń", "Åš": "Ś", "Å¹": "Ź",
+    "Å»": "Ż", "Ä": "ą", "Ä": "ć", "Ä": "ę",
+    "â€˘": "•", "â€¢": "•", "â€“": "–", "â€”": "—",
+    "â€ž": "„", "â€ť": "”", "â€ś": "“", "â€™": "’",
+    "â†": "←", "â†’": "→",
+}
+
+
+def fix_polish_mojibake(text: str) -> str:
+    if not text or not any(marker in text for marker in ("Ä", "Ĺ", "Ă", "Å", "Ã", "â")):
+        return text
+    for bad, good in _MOJIBAKE_REPLACEMENTS.items():
+        text = text.replace(bad, good)
+    return text
+
+
+@app.after_request
+def force_utf8_html(response):
+    if response.direct_passthrough:
+        return response
+    if response.mimetype in {"text/html", "text/plain", "application/json"}:
+        response.headers["Content-Type"] = f"{response.mimetype}; charset=utf-8"
+    if response.mimetype == "text/html":
+        body = response.get_data(as_text=True)
+        fixed = fix_polish_mojibake(body)
+        if fixed != body:
+            response.set_data(fixed)
+    return response
 
 
 def _detect_lan_base_url(port: int) -> str:
@@ -1527,7 +1564,7 @@ def prepare_invoice_items(order_items: list[dict], form):
     prepared = []
     for it in order_items:
         remaining_qty = int(it.get("remaining_qty") if it.get("remaining_qty") is not None else it.get("qty") or 0)
-        qty = to_int(form.get(f"invoice_qty_{it['id']}"), remaining_qty)
+        qty = to_int(form.get(f"invoice_qty_{it['id']}"), 0)
         if qty <= 0:
             continue
         qty = min(qty, remaining_qty)
@@ -3863,7 +3900,7 @@ def order_invoice(order_id):
                   <td>{{ it['invoiced_qty'] }}</td>
                   <td><b>{{ it['remaining_qty'] }}</b></td>
                   <td>
-                    <input name="invoice_qty_{{ it['id'] }}" value="{{ it['remaining_qty'] }}" max="{{ it['remaining_qty'] }}" style="width:110px;" {% if it['remaining_qty'] <= 0 %}disabled{% endif %}>
+                    <input type="number" min="0" name="invoice_qty_{{ it['id'] }}" value="0" max="{{ it['remaining_qty'] }}" style="width:110px;" {% if it['remaining_qty'] <= 0 %}disabled{% endif %}>
                   </td>
                   <td>{{ "%.2f"|format(it['net_price']) }}</td>
                   <td>{{ "%.2f"|format(it['gross_price']) }}</td>
