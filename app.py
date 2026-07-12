@@ -1876,6 +1876,7 @@ BASE = r"""
       <a href="{{ url_for('home') }}">Start</a>
       <a href="{{ url_for('orders') }}">ZamĂłwienia</a>
       <a href="{{ url_for('order_new') }}">Nowe zamĂłwienie</a>
+      <a href="{{ url_for('invoices') }}">Faktury</a>
       <a href="{{ url_for('products') }}">Produkty</a>
       <a href="{{ url_for('customers') }}">Klienci</a>
       <a href="{{ url_for('pricing') }}">Cennik</a>
@@ -4468,6 +4469,143 @@ def api_client_invoices():
     c.close()
     rows.sort(key=lambda x: ((x.get("seen_by_client") or 0), (x.get("issue_date") or ""), int(x.get("id") or 0)), reverse=True)
     return jsonify(ok=True, invoices=rows)
+
+
+@app.get("/invoices")
+def invoices():
+    maybe_pull_shared_from_supabase()
+    q = norm(request.args.get("q"))
+    c = conn()
+    cur = c.cursor()
+    params = []
+    where = ""
+    if q:
+        like = f"%{q.lower()}%"
+        where = """
+          WHERE LOWER(COALESCE(i.invoice_no,'')) LIKE ?
+             OR LOWER(COALESCE(i.buyer_name,'')) LIKE ?
+             OR LOWER(COALESCE(o.customer_name,'')) LIKE ?
+             OR LOWER(COALESCE(o.order_no,'')) LIKE ?
+             OR LOWER(COALESCE(o.note,'')) LIKE ?
+        """
+        params = [like, like, like, like, like]
+
+    cur.execute(f"""
+      SELECT
+        i.*,
+        COALESCE(m.pdf_path,'') AS pdf_path,
+        COALESCE(m.sent_to_client,0) AS sent_to_client,
+        COALESCE(m.seen_by_client,0) AS seen_by_client,
+        COALESCE(m.seen_at,'') AS seen_at,
+        o.id AS source_order_id,
+        o.order_no AS source_order_no,
+        o.created_at AS source_order_created_at,
+        o.note AS source_order_note,
+        o.customer_name AS order_customer_name
+      FROM invoices i
+      LEFT JOIN invoice_meta m ON m.invoice_id = i.id
+      LEFT JOIN orders o ON o.id = i.order_id
+      {where}
+      ORDER BY LOWER(COALESCE(i.buyer_name, o.customer_name, '')), i.issue_date DESC, i.id DESC
+    """, params)
+    rows = [dict(r) for r in cur.fetchall()]
+    c.close()
+
+    groups = []
+    current_key = None
+    current = None
+    for inv in rows:
+        customer_name = inv.get("buyer_name") or inv.get("order_customer_name") or "Bez klienta"
+        key = customer_name.strip().lower()
+        if key != current_key:
+            current = {"customer_name": customer_name, "invoices": [], "total_net": 0.0, "total_gross": 0.0}
+            groups.append(current)
+            current_key = key
+        inv["order_display"] = order_display_no(
+            inv.get("source_order_id"),
+            inv.get("source_order_created_at"),
+            inv.get("source_order_no"),
+            inv.get("source_order_note")
+        ) if inv.get("source_order_id") else "-"
+        inv["pdf_ok"] = 1 if invoice_pdf_exists(inv.get("pdf_path", ""), inv.get("invoice_no", ""))[0] else 0
+        current["invoices"].append(inv)
+        current["total_net"] += float(inv.get("total_net") or 0)
+        current["total_gross"] += float(inv.get("total_gross") or 0)
+
+    tpl = r"""
+    {% extends "base.html" %}
+    {% block content %}
+      <div class="card">
+        <div class="flex">
+          <h1 style="margin:0;">Faktury</h1>
+        </div>
+        <form method="get" class="flex" style="margin-top:12px;">
+          <input name="q" value="{{ q }}" placeholder="Szukaj: klient, numer faktury, numer zamówienia, notatka">
+          <button class="btn primary" type="submit">Szukaj</button>
+          <a class="btn" href="{{ url_for('invoices') }}">Wyczyść</a>
+        </form>
+      </div>
+
+      {% for g in groups %}
+        <div class="card">
+          <div class="flex">
+            <h2 style="margin:0;">{{ g.customer_name }}</h2>
+            <span class="badge">{{ g.invoices|length }} faktur</span>
+            <span class="badge">Netto: {{ "%.2f"|format(g.total_net) }} PLN</span>
+            <span class="badge">Brutto: {{ "%.2f"|format(g.total_gross) }} PLN</span>
+          </div>
+          <table style="margin-top:10px;">
+            <thead>
+              <tr>
+                <th>Faktura</th>
+                <th>Data</th>
+                <th>Zamówienie</th>
+                <th>Netto</th>
+                <th>Brutto</th>
+                <th>Status</th>
+                <th>Akcje</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for inv in g.invoices %}
+                <tr>
+                  <td><b>{{ inv.invoice_no }}</b></td>
+                  <td>{{ inv.issue_date }}</td>
+                  <td>{{ inv.order_display }}</td>
+                  <td>{{ "%.2f"|format(inv.total_net) }}</td>
+                  <td>{{ "%.2f"|format(inv.total_gross) }}</td>
+                  <td>
+                    {% if inv.sent_to_client %}
+                      <span class="badge">W panelu klienta</span>
+                    {% else %}
+                      <span class="badge">Wewnętrzna</span>
+                    {% endif %}
+                    {% if not inv.pdf_ok %}
+                      <span class="badge danger">Brak PDF</span>
+                    {% endif %}
+                  </td>
+                  <td>
+                    <div class="flex">
+                      <a class="btn" href="{{ url_for('invoice_download_admin', invoice_id=inv.id) }}" target="_blank">Faktura PDF</a>
+                      <a class="btn" href="{{ url_for('invoice_packing_list_download_admin', invoice_id=inv.id) }}" target="_blank">Lista do paczki</a>
+                      {% if inv.source_order_id %}
+                        <a class="btn" href="{{ url_for('order_view', order_id=inv.source_order_id) }}">Zamówienie</a>
+                      {% endif %}
+                    </div>
+                  </td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% endfor %}
+
+      {% if not groups %}
+        <div class="card muted">Brak faktur.</div>
+      {% endif %}
+    {% endblock %}
+    """
+    return render_template_string(tpl, title="Faktury", base_url=BASE_URL, db_path=DB_PATH, groups=groups, q=q)
 
 
 def load_invoice_with_meta(invoice_id: int):
