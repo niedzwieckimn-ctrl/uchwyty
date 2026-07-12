@@ -60,8 +60,8 @@ def _detect_lan_base_url(port: int) -> str:
 
 
 def build_public_url(path: str) -> str:
-    # Dla QR preferuj adres LAN; jeśli aplikacja jest otwarta lokalnie,
-    # spróbuj wykryć LAN IP automatycznie (bardziej niezawodne niż stały BASE_URL).
+    # Dla QR preferuj adres LAN; jeĹ›li aplikacja jest otwarta lokalnie,
+    # sprĂłbuj wykryÄ‡ LAN IP automatycznie (bardziej niezawodne niĹĽ staĹ‚y BASE_URL).
     base_cfg = (BASE_URL or "").rstrip("/")
     try:
         host = (request.host or "").split(":")[0].lower()
@@ -154,7 +154,7 @@ def init_db():
     )
     """)
 
-    # Paczki z Chin (prosty moduł na start)
+    # Paczki z Chin (prosty moduĹ‚ na start)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS china_packages(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -239,6 +239,22 @@ def init_db():
     )
     """)
 
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS invoice_allocations(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        invoice_id INTEGER NOT NULL,
+        order_id INTEGER NOT NULL,
+        order_item_id INTEGER NOT NULL,
+        product_id INTEGER,
+        sku TEXT,
+        qty INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(invoice_id) REFERENCES invoices(id),
+        FOREIGN KEY(order_id) REFERENCES orders(id),
+        FOREIGN KEY(order_item_id) REFERENCES order_items(id)
+    )
+    """)
+
     cur.execute("PRAGMA table_info(invoice_meta)")
     invoice_meta_cols = {r[1] for r in cur.fetchall()}
     if "seen_by_client" not in invoice_meta_cols:
@@ -246,13 +262,13 @@ def init_db():
     if "seen_at" not in invoice_meta_cols:
         cur.execute("ALTER TABLE invoice_meta ADD COLUMN seen_at TEXT")
 
-    # migracja: starsze bazy mogą nie mieć kolumny NIP u klientów
+    # migracja: starsze bazy mogÄ… nie mieÄ‡ kolumny NIP u klientĂłw
     cur.execute("PRAGMA table_info(customers)")
     customer_cols = {r[1] for r in cur.fetchall()}
     if "nip" not in customer_cols:
         cur.execute("ALTER TABLE customers ADD COLUMN nip TEXT")
 
-    # migracja: QR zamówień
+    # migracja: QR zamĂłwieĹ„
     cur.execute("PRAGMA table_info(orders)")
     order_cols = {r[1] for r in cur.fetchall()}
     if "qr_data_url" not in order_cols:
@@ -260,7 +276,7 @@ def init_db():
     if "warehouse_issued" not in order_cols:
         cur.execute("ALTER TABLE orders ADD COLUMN warehouse_issued INTEGER NOT NULL DEFAULT 0")
 
-    # Ułatwia agregowanie "w dostawie" po statusach paczek
+    # UĹ‚atwia agregowanie "w dostawie" po statusach paczek
     cur.execute("CREATE INDEX IF NOT EXISTS idx_china_items_package_id ON china_items(package_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_china_items_product_id ON china_items(product_id)")
 
@@ -461,8 +477,8 @@ def split_address(addr: str):
 def payment_type_pl(x: str) -> str:
     v = norm(x).lower()
     mapping = {
-        "cash": "gotówka",
-        "gotowka": "gotówka",
+        "cash": "gotĂłwka",
+        "gotowka": "gotĂłwka",
         "transfer": "przelew",
         "card": "karta",
         "karta": "karta",
@@ -527,7 +543,7 @@ def guess_col(headers, candidates):
         cand = cand.lower()
         if cand in h:
             return h.index(cand)
-    # luźne dopasowanie: np. "model" w "Model uchwytu"
+    # luĹşne dopasowanie: np. "model" w "Model uchwytu"
     for i, col in enumerate(h):
         for cand in candidates:
             if cand.lower() in col:
@@ -564,9 +580,10 @@ SUPABASE_SYNC_TABLES = [
     ("company_profile", "id"),
     ("invoices", "id"),
     ("invoice_meta", "invoice_id"),
+    ("invoice_allocations", "id"),
 ]
 
-# Kolejność PULL jest ważna: najpierw rodzice, potem dzieci.
+# KolejnoĹ›Ä‡ PULL jest waĹĽna: najpierw rodzice, potem dzieci.
 SUPABASE_PULL_TABLES = [
     ("company_profile", "id"),
     ("pricing", "model"),
@@ -579,6 +596,7 @@ SUPABASE_PULL_TABLES = [
     ("china_items", "id"),
     ("invoices", "id"),
     ("invoice_meta", "invoice_id"),
+    ("invoice_allocations", "id"),
 ]
 
 _supabase_sync_lock = threading.Lock()
@@ -743,7 +761,7 @@ def supabase_select_rows(table: str, order_by: str = "id", page_size: int = 1000
             params.update(extra_params)
         chunk = supabase_request(f"/rest/v1/{table}", method="GET", params=params) or []
         if not isinstance(chunk, list):
-            raise RuntimeError(f"Nieprawidłowa odpowiedź Supabase dla tabeli {table}")
+            raise RuntimeError(f"NieprawidĹ‚owa odpowiedĹş Supabase dla tabeli {table}")
         rows.extend(chunk)
         if len(chunk) < page_size:
             break
@@ -851,7 +869,7 @@ def pull_shared_tables_from_supabase(force: bool = False):
             result["tables"].setdefault(table, {})
             result["tables"][table].update({"status": "error", "stage": "upsert", "error": str(e)})
 
-    # 3) usuń lokalne rekordy, których już nie ma w Supabase
+    # 3) usuĹ„ lokalne rekordy, ktĂłrych juĹĽ nie ma w Supabase
     for table, conflict_col in reversed(SUPABASE_PULL_TABLES):
         if (table, conflict_col) not in fetched:
             continue
@@ -921,7 +939,7 @@ def remote_first_create_customer(name: str, address: str, phone: str, email: str
         "created_at": now_iso(),
     })
     if not created or "id" not in created:
-        raise RuntimeError("Supabase nie zwrócił ID dla klienta")
+        raise RuntimeError("Supabase nie zwrĂłciĹ‚ ID dla klienta")
 
     customer_id = int(created["id"])
     c = conn()
@@ -950,7 +968,7 @@ def remote_first_create_order(customer_id, customer_name, customer_address, cust
         "qr_data_url": "",
     })
     if not created_order or "id" not in created_order:
-        raise RuntimeError("Supabase nie zwrócił ID dla zamówienia")
+        raise RuntimeError("Supabase nie zwrĂłciĹ‚ ID dla zamĂłwienia")
 
     order_id = int(created_order["id"])
     order_no = make_order_no(order_id)
@@ -977,7 +995,7 @@ def remote_first_create_order(customer_id, customer_name, customer_address, cust
             "created_at": now_iso(),
         })
         if not created_item or "id" not in created_item:
-            raise RuntimeError("Supabase nie zwrócił ID dla pozycji zamówienia")
+            raise RuntimeError("Supabase nie zwrĂłciĹ‚ ID dla pozycji zamĂłwienia")
         cur.execute(
             "INSERT INTO order_items(id, order_id, product_id, sku, qty, created_at) VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET order_id=excluded.order_id, product_id=excluded.product_id, sku=excluded.sku, qty=excluded.qty, created_at=excluded.created_at",
             (int(created_item["id"]), order_id, pid, p["sku"], qty, created_item.get("created_at") or now_iso())
@@ -1025,9 +1043,9 @@ def get_pdf_font_names():
     regular = "Helvetica"
     bold = "Helvetica-Bold"
 
-    # Szukaj czcionek Unicode także po wildcardach i lokalnym katalogu app/fonts.
+    # Szukaj czcionek Unicode takĹĽe po wildcardach i lokalnym katalogu app/fonts.
     regular_candidates = [
-        # Lokalne fonty aplikacji (najwyższy priorytet)
+        # Lokalne fonty aplikacji (najwyĹĽszy priorytet)
         ("AppFont-Regular", os.path.join(APP_DIR, "fonts", "regular.ttf")),
 
         # Linux
@@ -1063,7 +1081,7 @@ def get_pdf_font_names():
         ("Arial-BoldMT", "/System/Library/Fonts/Supplemental/Arial Bold.ttf"),
     ]
 
-    # Dodatkowe wildcardy gdy ścieżki systemowe różnią się między maszynami.
+    # Dodatkowe wildcardy gdy Ĺ›cieĹĽki systemowe rĂłĹĽniÄ… siÄ™ miÄ™dzy maszynami.
     for path in glob.glob('/usr/share/fonts/**/*DejaVuSans*.ttf', recursive=True)[:6]:
         regular_candidates.append((f"AutoReg-{safe_filename(os.path.basename(path))}", path))
     for path in glob.glob('/usr/share/fonts/**/*NotoSans*.ttf', recursive=True)[:6]:
@@ -1122,7 +1140,7 @@ def generate_sales_invoice(order_row, items):
 
     y = h - 18 * mm
     cpdf.setFont(pdf_font_bold, 14)
-    cpdf.drawString(15 * mm, y, f"Faktura sprzedażowa: {canonical_order_no(order_row['id'] if 'id' in order_row.keys() else None, order_row['created_at'] if 'created_at' in order_row.keys() else '', order_row['order_no'])}")
+    cpdf.drawString(15 * mm, y, f"Faktura sprzedaĹĽowa: {canonical_order_no(order_row['id'] if 'id' in order_row.keys() else None, order_row['created_at'] if 'created_at' in order_row.keys() else '', order_row['order_no'])}")
 
     y -= 8 * mm
     cpdf.setFont(pdf_font, 10)
@@ -1145,7 +1163,7 @@ def generate_sales_invoice(order_row, items):
         y -= 5 * mm
         cpdf.drawString(15 * mm, y, f"Konto: {company['bank_account'] or '-'}")
     else:
-        cpdf.drawString(15 * mm, y, "Brak danych firmy (uzupełnij w zakładce: Dane mojej firmy)")
+        cpdf.drawString(15 * mm, y, "Brak danych firmy (uzupeĹ‚nij w zakĹ‚adce: Dane mojej firmy)")
 
     y -= 8 * mm
     cpdf.setFont(pdf_font_bold, 10)
@@ -1163,10 +1181,10 @@ def generate_sales_invoice(order_row, items):
     cpdf.setFont(pdf_font_bold, 9)
     cpdf.drawString(15 * mm, y, "SKU")
     cpdf.drawString(45 * mm, y, "Model")
-    cpdf.drawString(95 * mm, y, "Ilość")
+    cpdf.drawString(95 * mm, y, "IloĹ›Ä‡")
     cpdf.drawString(112 * mm, y, "Netto/szt")
     cpdf.drawString(140 * mm, y, "Brutto/szt")
-    cpdf.drawString(170 * mm, y, "Wartość brutto")
+    cpdf.drawString(170 * mm, y, "WartoĹ›Ä‡ brutto")
     y -= 5 * mm
 
     total_net = 0.0
@@ -1205,7 +1223,7 @@ def generate_sales_invoice(order_row, items):
 
     y -= 8 * mm
     cpdf.setFont(pdf_font, 9)
-    cpdf.drawString(15 * mm, y, "Ceny pobrane z zakładki Cennik (model, netto, brutto).")
+    cpdf.drawString(15 * mm, y, "Ceny pobrane z zakĹ‚adki Cennik (model, netto, brutto).")
 
     cpdf.save()
     return fpath
@@ -1256,11 +1274,11 @@ def generate_order_invoice_pdf(order_row, items, meta):
     cpdf.setFont(pdf_font, 10)
     cpdf.drawString(15 * mm, y, f"Miejsce: {meta.get('place') or '-'}")
     cpdf.drawString(85 * mm, y, f"Data wystawienia: {meta['issue_date']}")
-    cpdf.drawString(150 * mm, y, f"Data sprzedaży: {meta['sell_date']}")
+    cpdf.drawString(150 * mm, y, f"Data sprzedaĹĽy: {meta['sell_date']}")
 
     y -= 7 * mm
-    cpdf.drawString(15 * mm, y, f"Forma płatności: {payment_type_pl(meta.get('payment_type'))}")
-    cpdf.drawString(85 * mm, y, f"Termin płatności: {meta.get('payment_to') or '-'}")
+    cpdf.drawString(15 * mm, y, f"Forma pĹ‚atnoĹ›ci: {payment_type_pl(meta.get('payment_type'))}")
+    cpdf.drawString(85 * mm, y, f"Termin pĹ‚atnoĹ›ci: {meta.get('payment_to') or '-'}")
 
     y -= 10 * mm
     cpdf.setFont(pdf_font_bold, 10)
@@ -1311,7 +1329,7 @@ def generate_order_invoice_pdf(order_row, items, meta):
     table_left = 15 * mm
     table_right = 198 * mm
     row_h = 9 * mm
-    # L.p. | Nazwa/SKU | Ilość | Netto/szt | Brutto/szt | Wartość netto | VAT
+    # L.p. | Nazwa/SKU | IloĹ›Ä‡ | Netto/szt | Brutto/szt | WartoĹ›Ä‡ netto | VAT
     col_x = [15 * mm, 23 * mm, 96 * mm, 110 * mm, 134 * mm, 158 * mm, 180 * mm, 198 * mm]
 
     def cell_center(x1, x2):
@@ -1332,10 +1350,10 @@ def generate_order_invoice_pdf(order_row, items, meta):
     header_y = cell_baseline(y, row_h, pdf_font_bold, header_font)
     cpdf.drawCentredString(cell_center(col_x[0], col_x[1]), header_y, "L.p.")
     cpdf.drawCentredString(cell_center(col_x[1], col_x[2]), header_y, "Nazwa/SKU")
-    cpdf.drawCentredString(cell_center(col_x[2], col_x[3]), header_y, "Ilość")
+    cpdf.drawCentredString(cell_center(col_x[2], col_x[3]), header_y, "IloĹ›Ä‡")
     cpdf.drawCentredString(cell_center(col_x[3], col_x[4]), header_y, "Netto/szt")
     cpdf.drawCentredString(cell_center(col_x[4], col_x[5]), header_y, "Brutto/szt")
-    cpdf.drawCentredString(cell_center(col_x[5], col_x[6]), header_y, "Wartość netto")
+    cpdf.drawCentredString(cell_center(col_x[5], col_x[6]), header_y, "WartoĹ›Ä‡ netto")
     cpdf.drawCentredString(cell_center(col_x[6], col_x[7]), header_y, "VAT")
     cpdf.line(table_left, y + 1, table_right, y + 1)
     cpdf.line(table_left, y - row_h + 1, table_right, y - row_h + 1)
@@ -1477,15 +1495,75 @@ def upsert_invoice_meta(
 def prepare_invoice_items(order_items: list[dict], form):
     prepared = []
     for it in order_items:
-        qty = to_int(form.get(f"invoice_qty_{it['id']}"), int(it.get("qty") or 0))
+        remaining_qty = int(it.get("remaining_qty") if it.get("remaining_qty") is not None else it.get("qty") or 0)
+        qty = to_int(form.get(f"invoice_qty_{it['id']}"), remaining_qty)
+        if qty <= 0:
+            continue
+        qty = min(qty, remaining_qty)
         if qty <= 0:
             continue
         row = dict(it)
+        row["order_item_id"] = int(it.get("id") or 0)
+        row["source_order_id"] = int(it.get("order_id") or it.get("source_order_id") or 0)
+        row["source_order_no"] = it.get("source_order_no") or ""
+        row["source_order_note"] = it.get("source_order_note") or ""
+        row["ordered_qty"] = int(it.get("qty") or 0)
+        row["invoiced_qty_before"] = int(it.get("invoiced_qty") or 0)
         row["qty"] = qty
         row["line_value_net"] = round(float(row.get("net_price") or 0) * qty, 2)
         row["line_value_gross"] = round(float(row.get("gross_price") or 0) * qty, 2)
         prepared.append(row)
     return prepared
+
+
+def invoiced_qty_by_order_item_ids(order_item_ids: list[int]):
+    ids = [int(x) for x in order_item_ids if x is not None]
+    out = {x: 0 for x in ids}
+    if not ids:
+        return out
+
+    c = conn()
+    cur = c.cursor()
+    ph = ",".join(["?"] * len(ids))
+    cur.execute(f"""
+      SELECT order_item_id, COALESCE(SUM(qty),0) AS qty
+      FROM invoice_allocations
+      WHERE order_item_id IN ({ph})
+      GROUP BY order_item_id
+    """, tuple(ids))
+    for r in cur.fetchall():
+        out[int(r["order_item_id"])] = int(r["qty"] or 0)
+    c.close()
+    return out
+
+
+def replace_invoice_allocations(invoice_id: int, invoice_items: list[dict]):
+    c = conn()
+    cur = c.cursor()
+    cur.execute("DELETE FROM invoice_allocations WHERE invoice_id=?", (invoice_id,))
+    allocation_ids = []
+    for it in invoice_items:
+        order_item_id = int(it.get("order_item_id") or it.get("id") or 0)
+        order_id = int(it.get("source_order_id") or it.get("order_id") or 0)
+        qty = int(it.get("qty") or 0)
+        if order_item_id <= 0 or order_id <= 0 or qty <= 0:
+            continue
+        cur.execute("""
+          INSERT INTO invoice_allocations(invoice_id, order_id, order_item_id, product_id, sku, qty, created_at)
+          VALUES(?,?,?,?,?,?,?)
+        """, (
+            invoice_id,
+            order_id,
+            order_item_id,
+            int(it.get("product_id") or 0) or None,
+            it.get("sku") or "",
+            qty,
+            now_iso()
+        ))
+        allocation_ids.append(int(cur.lastrowid))
+    c.commit()
+    c.close()
+    return allocation_ids
 
 
 # =========================
@@ -1498,7 +1576,7 @@ BASE = r"""
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{ title or "Niedźwieccy Orders" }}</title>
+  <title>{{ title or "NiedĹşwieccy Orders" }}</title>
   <style>
     body{font-family:Arial, sans-serif; margin:0; background:#f6f7fb; color:#111;}
     .top{background:#111; color:#fff; padding:12px 14px; display:flex; gap:10px; flex-wrap:wrap; align-items:center;}
@@ -1537,11 +1615,11 @@ BASE = r"""
 </head>
 <body>
   <div class="top">
-    <div class="brand">Niedźwieccy Orders</div>
+    <div class="brand">NiedĹşwieccy Orders</div>
     <div class="nav flex">
       <a href="{{ url_for('home') }}">Start</a>
-      <a href="{{ url_for('orders') }}">Zamówienia</a>
-      <a href="{{ url_for('order_new') }}">Nowe zamówienie</a>
+      <a href="{{ url_for('orders') }}">ZamĂłwienia</a>
+      <a href="{{ url_for('order_new') }}">Nowe zamĂłwienie</a>
       <a href="{{ url_for('products') }}">Produkty</a>
       <a href="{{ url_for('customers') }}">Klienci</a>
       <a href="{{ url_for('pricing') }}">Cennik</a>
@@ -1549,9 +1627,8 @@ BASE = r"""
       <a href="{{ url_for('stock') }}">Magazyn</a>
       <a href="{{ url_for('china') }}">Chiny (P/O)</a>
       <a href="{{ url_for('order_scan') }}">Skan QR</a>
-      <a href="{{ url_for('cloud_supabase') }}">Chmura</a>
     </div>
-    <div class="right muted">Lokalnie • {{ base_url }}</div>
+    <div class="right muted">Lokalnie â€˘ {{ base_url }}</div>
   </div>
 
   <div class="wrap">
@@ -1584,7 +1661,7 @@ function removeRow(btn){
 </html>
 """
 
-# loader: BASE dostępny jako "base.html"
+# loader: BASE dostÄ™pny jako "base.html"
 app.jinja_loader = DictLoader({"base.html": BASE})
 app.jinja_env.globals["canonical_order_no"] = canonical_order_no
 app.jinja_env.globals["order_status_label"] = order_status_label if "order_status_label" in globals() else None
@@ -1653,13 +1730,13 @@ def home():
 
       <div class="card">
         <h1>Start</h1>
-        <div class="muted">Szybki podgląd najważniejszych, bieżących danych.</div>
+        <div class="muted">Szybki podglÄ…d najwaĹĽniejszych, bieĹĽÄ…cych danych.</div>
       </div>
 
       <div class="card">
-        <h2>Zamówienia i paczki (aktualne)</h2>
+        <h2>ZamĂłwienia i paczki (aktualne)</h2>
         <div class="kpi start-kpi">
-          <div class="pill">Zamówienia aktualne (new/packed/confirmed/in_delivery): <b>{{ n_orders_current }}</b></div>
+          <div class="pill">ZamĂłwienia aktualne (new/packed/confirmed/in_delivery): <b>{{ n_orders_current }}</b></div>
           <div class="pill">Paczki Chiny aktywne (planned/ordered/shipped): <b>{{ n_china_active }}</b></div>
         </div>
       </div>
@@ -1670,7 +1747,7 @@ def home():
           <div class="pill">Produkty: <b>{{ n_products }}</b></div>
           <div class="pill">Uchwyty na stanie: <b>{{ n_stock_qty }}</b> szt.</div>
           <div class="pill">Uchwyty w drodze: <b>{{ n_in_delivery_qty }}</b> szt.</div>
-          <div class="pill">Wartość magazynu + w drodze (netto): <b>{{ "%.2f"|format(inventory_value_net) }} PLN</b></div>
+          <div class="pill">WartoĹ›Ä‡ magazynu + w drodze (netto): <b>{{ "%.2f"|format(inventory_value_net) }} PLN</b></div>
         </div>
       </div>
     {% endblock %}
@@ -1679,65 +1756,6 @@ def home():
                                   n_products=n_products, n_orders_current=n_orders_current, n_china_active=n_china_active,
                                   n_stock_qty=n_stock_qty, n_in_delivery_qty=n_in_delivery_qty,
                                   inventory_value_net=inventory_value_net)
-
-
-@app.get("/cloud/supabase")
-def cloud_supabase():
-    tpl = r"""
-    {% extends "base.html" %}
-    {% block content %}
-      <style>
-        .st-unconfirmed{background:#ef4444;color:#fff;border-color:#ef4444;}
-        .st-confirmed{background:#16a34a;color:#fff;border-color:#16a34a;}
-        .st-delivery{background:#2563eb;color:#fff;border-color:#2563eb;}
-        .st-issued{background:#6b7280;color:#fff;border-color:#6b7280;}
-      </style>
-
-      <div class="card">
-        <h1>Supabase Cloud Sync</h1>
-        <div class="muted">Przerzucanie danych z lokalnego SQLite do tabel w Supabase (REST upsert).</div>
-      </div>
-
-      <div class="card">
-        <div><b>Status konfiguracji:</b> {% if enabled %}<span class="badge">AKTYWNA</span>{% else %}<span class="badge">BRAK</span>{% endif %}</div>
-        <div class="muted" style="margin-top:8px;">Wymagane zmienne środowiskowe: <code>SUPABASE_URL</code>, <code>SUPABASE_SERVICE_ROLE_KEY</code>.</div>
-        <div class="muted" style="margin-top:6px;">Auto sync po zapisie: <b>{{ "ON" if auto_sync else "OFF" }}</b> (co najmniej co {{ min_interval }} s).</div>
-      </div>
-
-      <div class="card">
-        <h2>Ręczna synchronizacja</h2>
-        <div class="flex">
-          <form method="post" action="{{ url_for('cloud_supabase_sync') }}">
-            <button class="btn primary" type="submit">Push do Supabase</button>
-          </form>
-          <form method="post" action="{{ url_for('cloud_supabase_pull') }}">
-            <button class="btn" type="submit">Pull z Supabase</button>
-          </form>
-        </div>
-      </div>
-    {% endblock %}
-    """
-    return render_template_string(
-        tpl,
-        title="Chmura / Supabase",
-        base_url=BASE_URL,
-        db_path=DB_PATH,
-        enabled=supabase_enabled(),
-        auto_sync=SUPABASE_AUTO_SYNC_ON_WRITE,
-        min_interval=SUPABASE_MIN_SYNC_INTERVAL_SEC
-    )
-
-
-@app.post("/cloud/supabase/sync")
-def cloud_supabase_sync():
-    result = sync_all_to_supabase()
-    return jsonify(result), (200 if result.get("ok") else 500)
-
-
-@app.post("/cloud/supabase/pull")
-def cloud_supabase_pull():
-    result = pull_shared_tables_from_supabase(force=True)
-    return jsonify(result), (200 if result.get("ok") else 500)
 
 
 @app.after_request
@@ -1749,8 +1767,7 @@ def auto_sync_after_write(response):
             response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
 
         if response.status_code < 400 and request.method in ("POST", "PUT", "PATCH", "DELETE"):
-            if not request.path.startswith("/cloud/supabase"):
-                trigger_background_supabase_sync(reason=f"{request.method} {request.path}")
+            trigger_background_supabase_sync(reason=f"{request.method} {request.path}")
     except Exception:
         pass
     return response
@@ -1774,7 +1791,7 @@ def company():
     {% block content %}
       <div class="card">
         <h1>Dane mojej firmy</h1>
-        <div class="muted">Te dane trafią na fakturę sprzedażową.</div>
+        <div class="muted">Te dane trafiÄ… na fakturÄ™ sprzedaĹĽowÄ….</div>
       </div>
 
       <div class="card">
@@ -1843,7 +1860,7 @@ def pricing():
     {% block content %}
       <div class="card">
         <h1>Cennik</h1>
-        <div class="muted">Import pliku cen (kolumny: model, netto, brutto). Obsługa CSV i XLSX (jeśli dostępny openpyxl).</div>
+        <div class="muted">Import pliku cen (kolumny: model, netto, brutto). ObsĹ‚uga CSV i XLSX (jeĹ›li dostÄ™pny openpyxl).</div>
       </div>
 
       <div class="card">
@@ -1862,7 +1879,7 @@ def pricing():
         <form method="get" class="grid3" style="margin-bottom:10px;">
           <input name="q" value="{{ q }}" placeholder="Szukaj modelu">
           <button class="btn primary" type="submit">Szukaj</button>
-          <a class="btn" href="{{ url_for('pricing') }}">Wyczyść</a>
+          <a class="btn" href="{{ url_for('pricing') }}">WyczyĹ›Ä‡</a>
         </form>
         <h2>Pozycje cennika</h2>
         <table>
@@ -1898,7 +1915,7 @@ def pricing_import():
         try:
             from openpyxl import load_workbook
         except Exception:
-            return "Brak biblioteki openpyxl do odczytu XLSX. Użyj CSV albo doinstaluj openpyxl.", 400
+            return "Brak biblioteki openpyxl do odczytu XLSX. UĹĽyj CSV albo doinstaluj openpyxl.", 400
 
         wb = load_workbook(f, data_only=True)
         ws = wb.active
@@ -1911,7 +1928,7 @@ def pricing_import():
         i_net = guess_col(headers, ["netto", "net", "cena netto"])
         i_gross = guess_col(headers, ["brutto", "gross", "cena brutto"])
         if i_model is None or i_net is None or i_gross is None:
-            return "Plik musi mieć kolumny: model, netto, brutto", 400
+            return "Plik musi mieÄ‡ kolumny: model, netto, brutto", 400
         for r in data:
             if not r:
                 continue
@@ -1940,7 +1957,7 @@ def pricing_import():
         i_net = guess_col(headers, ["netto", "net", "cena netto"])
         i_gross = guess_col(headers, ["brutto", "gross", "cena brutto"])
         if i_model is None or i_net is None or i_gross is None:
-            return "Plik musi mieć kolumny: model, netto, brutto", 400
+            return "Plik musi mieÄ‡ kolumny: model, netto, brutto", 400
         for r in data:
             if not r:
                 continue
@@ -1998,7 +2015,7 @@ def customers():
         <form method="get" class="grid3" style="margin-top:10px;">
           <input name="q" value="{{ q }}" placeholder="Szukaj: nazwa / telefon / email / adres / NIP">
           <button class="btn primary" type="submit">Szukaj</button>
-          <a class="btn" href="{{ url_for('customers') }}">Wyczyść</a>
+          <a class="btn" href="{{ url_for('customers') }}">WyczyĹ›Ä‡</a>
         </form>
       </div>
 
@@ -2032,7 +2049,7 @@ def customers():
       </div>
 
       <div class="card">
-        <h2>Lista klientów</h2>
+        <h2>Lista klientĂłw</h2>
         <table>
           <thead>
             <tr><th>Nazwa</th><th>Telefon</th><th>Email</th><th>NIP</th><th>Adres</th><th>Akcje</th></tr>
@@ -2048,15 +2065,15 @@ def customers():
                 <td>
                   <div class="flex">
                     <a class="btn" href="{{ url_for('customers_edit', customer_id=r['id']) }}">Edytuj</a>
-                    <form method="post" action="{{ url_for('customers_delete', customer_id=r['id']) }}" onsubmit="return confirm('Usunąć klienta?')">
-                      <button class="btn danger" type="submit">Usuń</button>
+                    <form method="post" action="{{ url_for('customers_delete', customer_id=r['id']) }}" onsubmit="return confirm('UsunÄ…Ä‡ klienta?')">
+                      <button class="btn danger" type="submit">UsuĹ„</button>
                     </form>
                   </div>
                 </td>
               </tr>
             {% endfor %}
             {% if not rows %}
-              <tr><td colspan="6" class="muted">Brak klientów.</td></tr>
+              <tr><td colspan="6" class="muted">Brak klientĂłw.</td></tr>
             {% endif %}
           </tbody>
         </table>
@@ -2108,7 +2125,7 @@ def customers_edit(customer_id):
     {% block content %}
       <div class="card">
         <h1>Edycja klienta</h1>
-        <div class="muted">Zmień dane zapisane dla stałego klienta.</div>
+        <div class="muted">ZmieĹ„ dane zapisane dla staĹ‚ego klienta.</div>
       </div>
 
       <div class="card">
@@ -2135,7 +2152,7 @@ def customers_edit(customer_id):
           </div>
           <div class="flex" style="align-items:flex-end;">
             <button class="btn primary" type="submit">Zapisz zmiany</button>
-            <a class="btn" href="{{ url_for('customers') }}">Powrót</a>
+            <a class="btn" href="{{ url_for('customers') }}">PowrĂłt</a>
           </div>
         </form>
       </div>
@@ -2233,17 +2250,17 @@ def products():
         <form method="get" class="grid3" style="margin-top:10px;">
           <input name="q" value="{{ q }}" placeholder="Szukaj: SKU / model / EAN / nazwa">
           <button class="btn primary" type="submit">Szukaj</button>
-          <a class="btn" href="{{ url_for('products') }}">Wyczyść</a>
+          <a class="btn" href="{{ url_for('products') }}">WyczyĹ›Ä‡</a>
         </form>
       </div>
 
       <div class="card">
         <h2>Import CSV (478 pozycji)</h2>
-        <div class="muted">Wybierz plik CSV z Excela. Minimalnie: kolumna SKU (unikalna). Pozostałe: model, ean, name/nazwa.</div>
+        <div class="muted">Wybierz plik CSV z Excela. Minimalnie: kolumna SKU (unikalna). PozostaĹ‚e: model, ean, name/nazwa.</div>
         <form method="post" action="{{ url_for('products_import') }}" enctype="multipart/form-data" class="row" style="margin-top:10px;">
           <div>
             <input type="file" name="file" accept=".csv,text/csv" required>
-            <div class="muted small" style="margin-top:6px;">Kodowanie: najlepiej UTF-8. Separator zwykle „;” lub „,” – program sam spróbuje.</div>
+            <div class="muted small" style="margin-top:6px;">Kodowanie: najlepiej UTF-8. Separator zwykle â€ž;â€ť lub â€ž,â€ť â€“ program sam sprĂłbuje.</div>
           </div>
           <div class="flex" style="align-items:flex-end;">
             <button class="btn primary" type="submit">Importuj</button>
@@ -2274,7 +2291,7 @@ def products():
             </tr>
             {% endfor %}
             {% if not rows %}
-              <tr><td colspan="5" class="muted">Brak produktów. Zrób import CSV.</td></tr>
+              <tr><td colspan="5" class="muted">Brak produktĂłw. ZrĂłb import CSV.</td></tr>
             {% endif %}
           </tbody>
         </table>
@@ -2290,13 +2307,13 @@ def products_import():
         return "Brak pliku", 400
 
     raw = f.read()
-    # Spróbuj UTF-8, jak nie pójdzie to latin2
+    # SprĂłbuj UTF-8, jak nie pĂłjdzie to latin2
     try:
         text = raw.decode("utf-8-sig")
     except:
         text = raw.decode("latin2", errors="replace")
 
-    # Spróbuj wykryć delimiter
+    # SprĂłbuj wykryÄ‡ delimiter
     sample = text[:5000]
     delim = ";" if sample.count(";") >= sample.count(",") else ","
 
@@ -2314,7 +2331,7 @@ def products_import():
     i_name = guess_col(headers, ["name", "nazwa", "produkt", "product"])
 
     if i_sku is None:
-        return "CSV musi mieć kolumnę SKU / Symbol / Indeks", 400
+        return "CSV musi mieÄ‡ kolumnÄ™ SKU / Symbol / Indeks", 400
 
     c = conn()
     cur = c.cursor()
@@ -2441,7 +2458,7 @@ def stock():
         <form method="get" class="grid3" style="margin-top:10px;">
           <input name="q" value="{{ q }}" placeholder="Szukaj produktu: SKU / model / EAN / nazwa">
           <button class="btn primary" type="submit">Szukaj</button>
-          <a class="btn" href="{{ url_for('stock') }}">Wyczyść</a>
+          <a class="btn" href="{{ url_for('stock') }}">WyczyĹ›Ä‡</a>
         </form>
       </div>
 
@@ -2463,7 +2480,7 @@ def stock():
           </div>
         </div>
         <div class="flex" style="margin-top:10px;">
-          <button class="btn ok" onclick="applyDelta(); return false;">Zapisz korektę</button>
+          <button class="btn ok" onclick="applyDelta(); return false;">Zapisz korektÄ™</button>
           <div class="muted" id="deltaMsg"></div>
         </div>
       </div>
@@ -2471,11 +2488,11 @@ def stock():
       <div class="card">
         <h2>Stany (max 1000)</h2>
         <div class="muted" style="margin-bottom:8px;">
-          Najpierw realizowane są ilości z magazynu. Niedobory z otwartych zamówień (status <b>new</b>) rezerwują towar „w drodze”.
+          Najpierw realizowane sÄ… iloĹ›ci z magazynu. Niedobory z otwartych zamĂłwieĹ„ (status <b>new</b>) rezerwujÄ… towar â€žw drodzeâ€ť.
         </div>
         <table>
           <thead>
-            <tr><th>SKU</th><th>Model</th><th>EAN</th><th>Nazwa</th><th>Stan</th><th>W drodze</th><th>Zarezerwowane w drodze</th><th>Dostępne w drodze</th></tr>
+            <tr><th>SKU</th><th>Model</th><th>EAN</th><th>Nazwa</th><th>Stan</th><th>W drodze</th><th>Zarezerwowane w drodze</th><th>DostÄ™pne w drodze</th></tr>
           </thead>
           <tbody>
             {% for r in rows %}
@@ -2491,7 +2508,7 @@ def stock():
               </tr>
             {% endfor %}
             {% if not rows %}
-              <tr><td colspan="8" class="muted">Brak produktów.</td></tr>
+              <tr><td colspan="8" class="muted">Brak produktĂłw.</td></tr>
             {% endif %}
           </tbody>
         </table>
@@ -2504,7 +2521,7 @@ async function applyDelta(){
   const msg = document.getElementById("deltaMsg");
   msg.innerText = "";
   if(!sku){ msg.innerText = "Podaj SKU"; return; }
-  if(!delta){ msg.innerText = "Podaj zmianę"; return; }
+  if(!delta){ msg.innerText = "Podaj zmianÄ™"; return; }
 
   const r = await fetch("/api/stock_delta", {
     method:"POST",
@@ -2512,7 +2529,7 @@ async function applyDelta(){
     body: JSON.stringify({sku, delta})
   });
   const j = await r.json();
-  if(!j.ok){ msg.innerText = "Błąd: " + (j.error || ""); return; }
+  if(!j.ok){ msg.innerText = "BĹ‚Ä…d: " + (j.error || ""); return; }
   msg.innerText = "OK. Nowy stan: " + j.new_qty;
   setTimeout(()=>location.reload(), 500);
 }
@@ -2533,11 +2550,11 @@ def api_stock_delta():
 
     delta = to_int(delta_raw, None)
     if delta is None:
-        # spróbuj +10 / -3
+        # sprĂłbuj +10 / -3
         try:
             delta = int(delta_raw)
         except:
-            return jsonify(ok=False, error="Nieprawidłowa zmiana (np. +10 lub -3)"), 400
+            return jsonify(ok=False, error="NieprawidĹ‚owa zmiana (np. +10 lub -3)"), 400
 
     c = conn()
     cur = c.cursor()
@@ -2716,8 +2733,8 @@ def orders():
     {% block content %}
       <div class="card">
         <div class="flex">
-          <h1 style="margin:0;">Zamówienia</h1>
-          <a class="btn primary right" href="{{ url_for('order_new') }}">+ Nowe zamówienie</a>
+          <h1 style="margin:0;">ZamĂłwienia</h1>
+          <a class="btn primary right" href="{{ url_for('order_new') }}">+ Nowe zamĂłwienie</a>
         </div>
         <div class="flex" style="margin-top:10px;">
           <a class="btn {% if tab=='new' %}primary{% endif %}" href="{{ url_for('orders', tab='new', q=q) }}">Do wydania</a>
@@ -2727,9 +2744,9 @@ def orders():
         </div>
         <form method="get" class="grid3" style="margin-top:10px;">
           <input type="hidden" name="tab" value="{{ tab }}">
-          <input name="q" value="{{ q }}" placeholder="Szukaj: numer zamówienia lub klient">
+          <input name="q" value="{{ q }}" placeholder="Szukaj: numer zamĂłwienia lub klient">
           <button class="btn primary" type="submit">Szukaj</button>
-          <a class="btn" href="{{ url_for('orders', tab=tab) }}">Wyczyść</a>
+          <a class="btn" href="{{ url_for('orders', tab=tab) }}">WyczyĹ›Ä‡</a>
         </form>
       </div>
 
@@ -2743,7 +2760,7 @@ def orders():
       <div class="card">
         <table>
           <thead>
-            <tr><th>Nr</th><th>Klient</th><th>Status</th><th>Wartość netto</th><th>Data</th><th>Akcje</th></tr>
+            <tr><th>Nr</th><th>Klient</th><th>Status</th><th>WartoĹ›Ä‡ netto</th><th>Data</th><th>Akcje</th></tr>
           </thead>
           <tbody>
             {% for r in rows %}
@@ -2754,27 +2771,27 @@ def orders():
                 <td><span class="badge">{{ "%.2f"|format(r['order_value_net']) }} PLN</span></td>
                 <td class="muted">{{ r['created_at'] }}</td>
                 <td class="flex">
-                  <a class="btn" href="{{ url_for('order_view', order_id=r['id']) }}">Szczegóły</a>
+                  <a class="btn" href="{{ url_for('order_view', order_id=r['id']) }}">SzczegĂłĹ‚y</a>
                   {% if r['status'] != 'issued' %}
                     <a class="btn" href="{{ url_for('order_label', order_id=r['id']) }}">Etykieta 30x50</a>
-                    <form method="post" action="{{ url_for('order_delete', order_id=r['id']) }}" onsubmit="return confirm('Usunąć zamówienie?')">
-                      <button class="btn danger" type="submit">Usuń</button>
+                    <form method="post" action="{{ url_for('order_delete', order_id=r['id']) }}" onsubmit="return confirm('UsunÄ…Ä‡ zamĂłwienie?')">
+                      <button class="btn danger" type="submit">UsuĹ„</button>
                     </form>
                   {% else %}
-                    <span class="muted">Podgląd</span>
+                    <span class="muted">PodglÄ…d</span>
                   {% endif %}
                 </td>
               </tr>
             {% endfor %}
             {% if not rows %}
-              <tr><td colspan="5" class="muted">Brak zamówień.</td></tr>
+              <tr><td colspan="5" class="muted">Brak zamĂłwieĹ„.</td></tr>
             {% endif %}
           </tbody>
         </table>
       </div>
     {% endblock %}
     """
-    return render_template_string(tpl, title="Zamówienia", base_url=BASE_URL, db_path=DB_PATH, rows=rows, q=q, tab=tab, order_status_label=order_status_label, order_status_css=order_status_css, canonical_order_no=canonical_order_no)
+    return render_template_string(tpl, title="ZamĂłwienia", base_url=BASE_URL, db_path=DB_PATH, rows=rows, q=q, tab=tab, order_status_label=order_status_label, order_status_css=order_status_css, canonical_order_no=canonical_order_no)
 
 @app.get("/orders/new")
 def order_new():
@@ -2791,7 +2808,7 @@ def order_new():
     {% extends "base.html" %}
     {% block content %}
       <div class="card">
-        <h1>Nowe zamówienie</h1>
+        <h1>Nowe zamĂłwienie</h1>
         <div class="muted">Produkty wybierasz z bazy. Przy wyborze pokazuje stan magazynowy.</div>
       </div>
 
@@ -2799,20 +2816,20 @@ def order_new():
         <form method="post" action="{{ url_for('order_create') }}">
           <div class="row">
             <div>
-              <label class="muted small">Wybierz stałego klienta (opcjonalnie)</label>
+              <label class="muted small">Wybierz staĹ‚ego klienta (opcjonalnie)</label>
               <select id="customerSelect" name="customer_id" onchange="fillCustomer(this.value)">
-                <option value="">-- ręcznie / nowy klient --</option>
+                <option value="">-- rÄ™cznie / nowy klient --</option>
                 {% for c in customers %}
                   <option value="{{ c['id'] }}">{{ c['name'] }}</option>
                 {% endfor %}
               </select>
             </div>
-            <div class="muted">Po wyborze pola klienta zostaną automatycznie uzupełnione.</div>
+            <div class="muted">Po wyborze pola klienta zostanÄ… automatycznie uzupeĹ‚nione.</div>
           </div>
 
           <div class="row">
             <div>
-              <label class="muted small">Zamawiający (nazwa firmy / osoba)</label>
+              <label class="muted small">ZamawiajÄ…cy (nazwa firmy / osoba)</label>
               <input name="customer_name" required>
             </div>
             <div>
@@ -2823,14 +2840,14 @@ def order_new():
 
           <div class="row" style="margin-top:10px;">
             <div>
-              <label class="muted small">Adres (na etykietę)</label>
+              <label class="muted small">Adres (na etykietÄ™)</label>
               <textarea name="customer_address" placeholder="Ulica, kod, miasto, kraj"></textarea>
             </div>
             <div>
               <label class="muted small">Email</label>
               <input name="customer_email">
               <div style="height:10px;"></div>
-              <label class="muted small">Adres Wysyłki</label>
+              <label class="muted small">Adres WysyĹ‚ki</label>
               <input name="note">
             </div>
           </div>
@@ -2838,8 +2855,8 @@ def order_new():
           <div class="line"></div>
 
           <div class="flex">
-            <h2 style="margin:0;">Pozycje zamówienia</h2>
-            <button class="btn" onclick="addItemRow(); return false;">+ Dodaj pozycję</button>
+            <h2 style="margin:0;">Pozycje zamĂłwienia</h2>
+            <button class="btn" onclick="addItemRow(); return false;">+ Dodaj pozycjÄ™</button>
           </div>
 
           <div id="itemsContainer" style="margin-top:10px;"></div>
@@ -2851,12 +2868,12 @@ def order_new():
                 <select name="product_id[]" onchange="refreshStock(this.value, this.dataset.stockTarget)" data-stock-target="">
                   <option value="">-- wybierz --</option>
                   {% for p in products %}
-                    <option value="{{ p['id'] }}">{{ p['sku'] }}{% if p['model'] %} • {{ p['model'] }}{% endif %}{% if p['name'] %} • {{ p['name'] }}{% endif %}</option>
+                    <option value="{{ p['id'] }}">{{ p['sku'] }}{% if p['model'] %} â€˘ {{ p['model'] }}{% endif %}{% if p['name'] %} â€˘ {{ p['name'] }}{% endif %}</option>
                   {% endfor %}
                 </select>
               </div>
               <div>
-                <label class="muted small">Ilość</label>
+                <label class="muted small">IloĹ›Ä‡</label>
                 <input name="qty[]" value="1">
               </div>
               <div>
@@ -2864,25 +2881,25 @@ def order_new():
                 <div class="badge" id="">-</div>
               </div>
               <div class="flex" style="align-items:flex-end;">
-                <button class="btn danger" onclick="removeRow(this); return false;">Usuń</button>
+                <button class="btn danger" onclick="removeRow(this); return false;">UsuĹ„</button>
               </div>
             </div>
           </template>
 
           <div class="line"></div>
-          <button class="btn primary" type="submit">Zapisz zamówienie</button>
+          <button class="btn primary" type="submit">Zapisz zamĂłwienie</button>
           <a class="btn" href="{{ url_for('orders') }}">Anuluj</a>
         </form>
       </div>
 
 <script>
-// po dodaniu wiersza trzeba podpiąć ID na badge (stan)
+// po dodaniu wiersza trzeba podpiÄ…Ä‡ ID na badge (stan)
 function addItemRow(){
   const tpl = document.getElementById("itemRowTpl");
   const container = document.getElementById("itemsContainer");
   const node = tpl.content.cloneNode(true);
 
-  // znajdź select i badge w nowo wstawionym wierszu
+  // znajdĹş select i badge w nowo wstawionym wierszu
   const wrap = node.querySelector(".items-row");
   const select = wrap.querySelector("select");
   const badge = wrap.querySelector(".badge");
@@ -2920,7 +2937,7 @@ function fillCustomer(customerId){
     }
     return render_template_string(
         tpl,
-        title="Nowe zamówienie",
+        title="Nowe zamĂłwienie",
         base_url=BASE_URL,
         db_path=DB_PATH,
         products=products_rows,
@@ -2933,7 +2950,7 @@ def order_create():
     customer_id = to_int(request.form.get("customer_id"), 0)
     customer_name = norm(request.form.get("customer_name"))
     if not customer_name:
-        return "Brak zamawiającego", 400
+        return "Brak zamawiajÄ…cego", 400
 
     customer_address = norm(request.form.get("customer_address"))
     customer_phone = norm(request.form.get("customer_phone"))
@@ -2951,7 +2968,7 @@ def order_create():
             items.append((pid, qty))
 
     if not items:
-        return "Dodaj minimum 1 pozycję", 400
+        return "Dodaj minimum 1 pozycjÄ™", 400
 
     if supabase_enabled():
         oid = remote_first_create_order(customer_id if customer_id > 0 else None, customer_name, customer_address, customer_phone, customer_email, note, items)
@@ -3109,8 +3126,8 @@ def order_view(order_id):
           <h1 style="margin:0;">{{ canonical_order_no(o['id'], o['created_at'], o['order_no']) }}</h1>
           <span class="badge {{ order_status_css(o['status']) }}">{{ order_status_label(o['status']) }}</span>
           <div class="right flex">
-            <a class="btn" href="{{ url_for('orders') }}">← Lista</a>
-            <a class="btn" href="{{ url_for('order_print', order_id=o['id']) }}">Drukuj zamówienie</a>
+            <a class="btn" href="{{ url_for('orders') }}">â† Lista</a>
+            <a class="btn" href="{{ url_for('order_print', order_id=o['id']) }}">Drukuj zamĂłwienie</a>
             <a class="btn primary" href="{{ url_for('order_invoice', order_id=o['id']) }}">Faktura</a>
             <form method="post" action="{{ url_for('order_status_update', order_id=o['id']) }}" class="flex">
                 <select name="status" style="width:190px;">
@@ -3119,14 +3136,14 @@ def order_view(order_id):
                   <option value="in_delivery" {% if o['status'] in ['packed','in_delivery'] %}selected{% endif %}>W dostawie</option>
                   <option value="issued" {% if o['status']=='issued' %}selected{% endif %}>Zrealizowane</option>
                 </select>
-                <button class="btn" type="submit">Zmień status</button>
+                <button class="btn" type="submit">ZmieĹ„ status</button>
               </form>
               <a class="btn primary" href="{{ url_for('order_label', order_id=o['id']) }}">Etykieta 30x50</a>
               {% if locked %}
                 <span class="badge">Wydane z magazynu</span>
               {% endif %}
-              <form method="post" action="{{ url_for('order_delete', order_id=o['id']) }}" onsubmit="return confirm('Usunąć zamówienie?')">
-                <button class="btn danger" type="submit">Usuń zamówienie</button>
+              <form method="post" action="{{ url_for('order_delete', order_id=o['id']) }}" onsubmit="return confirm('UsunÄ…Ä‡ zamĂłwienie?')">
+                <button class="btn danger" type="submit">UsuĹ„ zamĂłwienie</button>
               </form>
           </div>
         </div>
@@ -3135,14 +3152,14 @@ def order_view(order_id):
 
       <div class="row">
         <div class="card">
-          <h2>Zamawiający</h2>
+          <h2>ZamawiajÄ…cy</h2>
           <div><b>{{ o['customer_name'] }}</b></div>
           <div class="muted" style="white-space:pre-line; margin-top:6px;">{{ o['customer_address'] or "-" }}</div>
           <div class="muted" style="margin-top:6px;">Tel: {{ o['customer_phone'] or "-" }}</div>
           <div class="muted">Email: {{ o['customer_email'] or "-" }}</div>
           <div class="line"></div>
-          <div class="muted small">Kod zamówienia do skanowania: <b>{{ canonical_order_no(o['id'], o['created_at'], o['order_no']) }}</b></div>
-          <div class="muted small" style="margin-top:10px;">QR jest używany do etykiety 30x50 i skanowania zamówienia.</div>
+          <div class="muted small">Kod zamĂłwienia do skanowania: <b>{{ canonical_order_no(o['id'], o['created_at'], o['order_no']) }}</b></div>
+          <div class="muted small" style="margin-top:10px;">QR jest uĹĽywany do etykiety 30x50 i skanowania zamĂłwienia.</div>
         </div>
 
         <div class="card">
@@ -3150,21 +3167,21 @@ def order_view(order_id):
           <div>{{ o['note'] or "-" }}</div>
           <div class="line"></div>
           <div class="hint">
-            <b>Wydaj z magazynu</b> odejmie ilości z magazynu, ale nie zmieni automatycznie statusu klienta na „Zrealizowane”.<br>
-            Jeśli brakuje stanu, pozycja może być realizowana z <b>towaru w drodze z Chin</b> (kolumna „W dostawie” poniżej).
+            <b>Wydaj z magazynu</b> odejmie iloĹ›ci z magazynu, ale nie zmieni automatycznie statusu klienta na â€žZrealizowaneâ€ť.<br>
+            JeĹ›li brakuje stanu, pozycja moĹĽe byÄ‡ realizowana z <b>towaru w drodze z Chin</b> (kolumna â€žW dostawieâ€ť poniĹĽej).
           </div>
         </div>
       </div>
 
       {% if not locked %}
       <div class="card">
-        <h2>Dodaj produkt do zamówienia</h2>
+        <h2>Dodaj produkt do zamĂłwienia</h2>
         <form method="post" action="{{ url_for('order_item_add', order_id=o['id']) }}" class="items-row">
           <div>
             <select name="product_id" required>
               <option value="">-- wybierz produkt --</option>
               {% for p in products %}
-                <option value="{{ p['id'] }}">{{ p['sku'] }}{% if p['model'] %} • {{ p['model'] }}{% endif %}{% if p['name'] %} • {{ p['name'] }}{% endif %}</option>
+                <option value="{{ p['id'] }}">{{ p['sku'] }}{% if p['model'] %} â€˘ {{ p['model'] }}{% endif %}{% if p['name'] %} â€˘ {{ p['name'] }}{% endif %}</option>
               {% endfor %}
             </select>
           </div>
@@ -3182,7 +3199,7 @@ def order_view(order_id):
         <h2>Pozycje</h2>
         <table>
           <thead>
-            <tr><th>SKU</th><th>Model / Nazwa</th><th>Ilość</th><th>Cena netto</th><th>Cena brutto</th><th>Wartość netto</th><th>Wartość brutto</th><th>Stan teraz</th><th>W dostawie (dostępne)</th><th>Realizacja</th><th>Akcje</th></tr>
+            <tr><th>SKU</th><th>Model / Nazwa</th><th>IloĹ›Ä‡</th><th>Cena netto</th><th>Cena brutto</th><th>WartoĹ›Ä‡ netto</th><th>WartoĹ›Ä‡ brutto</th><th>Stan teraz</th><th>W dostawie (dostÄ™pne)</th><th>Realizacja</th><th>Akcje</th></tr>
           </thead>
           <tbody>
             {% set ns = namespace(total_net=0, total_gross=0) %}
@@ -3202,7 +3219,7 @@ def order_view(order_id):
                   {% else %}
                     <form method="post" action="{{ url_for('order_item_update', order_id=o['id'], item_id=it['id']) }}" class="flex">
                       <input name="qty" value="{{ it['qty'] }}" style="width:90px;">
-                      <button class="btn" type="submit">Zmień</button>
+                      <button class="btn" type="submit">ZmieĹ„</button>
                     </form>
                   {% endif %}
                 </td>
@@ -3216,18 +3233,18 @@ def order_view(order_id):
                   {% if it['line_shortage'] <= 0 and it['delivery_used'] == 0 %}
                     <span class="badge">Z magazynu</span>
                   {% elif it['line_shortage'] <= 0 %}
-                    <span class="badge">Część / całość z Chin</span>
+                    <span class="badge">CzÄ™Ĺ›Ä‡ / caĹ‚oĹ›Ä‡ z Chin</span>
                   {% else %}
                     <span class="badge">Brak towaru</span>
                   {% endif %}
                 </td>
                 <td>
                   {% if not locked %}
-                    <form method="post" action="{{ url_for('order_item_delete', order_id=o['id'], item_id=it['id']) }}" onsubmit="return confirm('Usunąć pozycję?')">
-                      <button class="btn danger" type="submit">Usuń</button>
+                    <form method="post" action="{{ url_for('order_item_delete', order_id=o['id'], item_id=it['id']) }}" onsubmit="return confirm('UsunÄ…Ä‡ pozycjÄ™?')">
+                      <button class="btn danger" type="submit">UsuĹ„</button>
                     </form>
                   {% else %}
-                    <span class="muted">Podgląd</span>
+                    <span class="muted">PodglÄ…d</span>
                   {% endif %}
                 </td>
               </tr>
@@ -3244,7 +3261,7 @@ def order_view(order_id):
                 <td colspan="4"></td>
               </tr>
             {% else %}
-              <tr><td colspan="11" class="muted">Brak pozycji w zamówieniu.</td></tr>
+              <tr><td colspan="11" class="muted">Brak pozycji w zamĂłwieniu.</td></tr>
             {% endif %}
           </tbody>
         </table>
@@ -3258,7 +3275,7 @@ def order_item_add(order_id):
     product_id = to_int(request.form.get("product_id"), 0)
     qty = to_int(request.form.get("qty"), 0)
     if product_id <= 0 or qty <= 0:
-        return "Nieprawidłowy produkt lub ilość", 400
+        return "NieprawidĹ‚owy produkt lub iloĹ›Ä‡", 400
 
     c = conn()
     cur = c.cursor()
@@ -3269,7 +3286,7 @@ def order_item_add(order_id):
         abort(404)
     if int(o["warehouse_issued"] or 0) == 1:
         c.close()
-        return "Zamówienie wydane z magazynu jest tylko do podglądu", 400
+        return "ZamĂłwienie wydane z magazynu jest tylko do podglÄ…du", 400
 
     cur.execute("SELECT sku FROM products WHERE id=?", (product_id,))
     p = cur.fetchone()
@@ -3287,7 +3304,7 @@ def order_item_add(order_id):
         })
         if not created_item or "id" not in created_item:
             c.close()
-            return "Nie udało się dodać pozycji do Supabase", 500
+            return "Nie udaĹ‚o siÄ™ dodaÄ‡ pozycji do Supabase", 500
         cur.execute(
             "INSERT INTO order_items(id, order_id, product_id, sku, qty, created_at) VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET order_id=excluded.order_id, product_id=excluded.product_id, sku=excluded.sku, qty=excluded.qty, created_at=excluded.created_at",
             (int(created_item["id"]), order_id, product_id, p["sku"], qty, created_item.get("created_at") or now_iso())
@@ -3305,7 +3322,7 @@ def order_item_add(order_id):
 def order_item_update(order_id, item_id):
     qty = to_int(request.form.get("qty"), 0)
     if qty <= 0:
-        return "Ilość musi być > 0", 400
+        return "IloĹ›Ä‡ musi byÄ‡ > 0", 400
     c = conn()
     cur = c.cursor()
     cur.execute("SELECT status, warehouse_issued FROM orders WHERE id=?", (order_id,))
@@ -3315,7 +3332,11 @@ def order_item_update(order_id, item_id):
         abort(404)
     if int(o["warehouse_issued"] or 0) == 1:
         c.close()
-        return "Zamówienie wydane z magazynu jest tylko do podglądu", 400
+        return "ZamĂłwienie wydane z magazynu jest tylko do podglÄ…du", 400
+    invoiced_qty = int(invoiced_qty_by_order_item_ids([item_id]).get(int(item_id)) or 0)
+    if qty < invoiced_qty:
+        c.close()
+        return f"Nie moĹĽesz ustawiÄ‡ iloĹ›ci poniĹĽej juĹĽ zafakturowanej ({invoiced_qty} szt.)", 400
     cur.execute("UPDATE order_items SET qty=? WHERE id=? AND order_id=?", (qty, item_id, order_id))
     c.commit()
     c.close()
@@ -3337,7 +3358,11 @@ def order_item_delete(order_id, item_id):
         abort(404)
     if int(o["warehouse_issued"] or 0) == 1:
         c.close()
-        return "Zamówienie wydane z magazynu jest tylko do podglądu", 400
+        return "ZamĂłwienie wydane z magazynu jest tylko do podglÄ…du", 400
+    invoiced_qty = int(invoiced_qty_by_order_item_ids([item_id]).get(int(item_id)) or 0)
+    if invoiced_qty > 0:
+        c.close()
+        return f"Nie moĹĽesz usunÄ…Ä‡ pozycji, bo jest juĹĽ zafakturowana ({invoiced_qty} szt.)", 400
 
     if supabase_enabled():
         supabase_delete_rows("order_items", {"id": item_id})
@@ -3373,7 +3398,9 @@ def order_delete(order_id):
             changed_product_ids.append(pid)
 
     if invoice_ids:
+        cur.execute("DELETE FROM invoice_allocations WHERE invoice_id IN (" + ",".join(["?"] * len(invoice_ids)) + ")", tuple(invoice_ids))
         cur.execute("DELETE FROM invoice_meta WHERE invoice_id IN (" + ",".join(["?"] * len(invoice_ids)) + ")", tuple(invoice_ids))
+    cur.execute("DELETE FROM invoice_allocations WHERE order_id=?", (order_id,))
     cur.execute("DELETE FROM invoices WHERE order_id=?", (order_id,))
     cur.execute("DELETE FROM order_items WHERE order_id=?", (order_id,))
     cur.execute("DELETE FROM orders WHERE id=?", (order_id,))
@@ -3382,7 +3409,10 @@ def order_delete(order_id):
 
     if supabase_enabled():
         try:
+            supabase_delete_rows("invoice_allocations", {"order_id": order_id})
             for iid in invoice_ids:
+                supabase_delete_rows("invoice_allocations", {"invoice_id": iid})
+                supabase_delete_rows("invoice_meta", {"invoice_id": iid})
                 supabase_delete_rows("invoices", {"id": iid})
             supabase_delete_rows("order_items", {"order_id": order_id})
             supabase_delete_rows("orders", {"id": order_id})
@@ -3398,7 +3428,7 @@ def order_status_update(order_id):
     new_status = norm(request.form.get("status")).lower()
     allowed = {"new", "confirmed", "in_delivery", "issued"}
     if new_status not in allowed:
-        return "Nieprawidłowy status", 400
+        return "NieprawidĹ‚owy status", 400
 
     c = conn()
     cur = c.cursor()
@@ -3415,8 +3445,8 @@ def order_status_update(order_id):
     changed_product_ids = []
     warehouse_issued = int(o["warehouse_issued"] or 0)
 
-    # Jedyny moment zdjęcia stanu:
-    # przy przejściu na "in_delivery" i tylko jeśli jeszcze nie było wydane.
+    # Jedyny moment zdjÄ™cia stanu:
+    # przy przejĹ›ciu na "in_delivery" i tylko jeĹ›li jeszcze nie byĹ‚o wydane.
     if new_status == "in_delivery" and warehouse_issued == 0:
         cur.execute("""
           SELECT oi.product_id, oi.qty
@@ -3463,7 +3493,7 @@ def order_status_update(order_id):
 
 @app.get("/orders/<int:order_id>/issue")
 def order_issue(order_id):
-    # Stara akcja wyłączona. Wydanie dzieje się teraz przy zmianie statusu na "W dostawie".
+    # Stara akcja wyĹ‚Ä…czona. Wydanie dzieje siÄ™ teraz przy zmianie statusu na "W dostawie".
     return redirect(url_for("order_view", order_id=order_id))
 
 
@@ -3478,19 +3508,52 @@ def order_invoice(order_id):
         c.close()
         abort(404)
 
-    cur.execute("""
+    related_orders = [dict(o)]
+    customer_email_key = _email_key(o["customer_email"])
+    if customer_email_key:
+        cur.execute("""
+          SELECT *
+          FROM orders
+          WHERE LOWER(COALESCE(customer_email,'')) = ?
+          ORDER BY created_at DESC, id DESC
+        """, (customer_email_key,))
+        related_orders = [dict(r) for r in cur.fetchall()]
+
+    related_order_ids = [int(r["id"]) for r in related_orders] or [int(order_id)]
+    related_order_by_id = {int(r["id"]): r for r in related_orders}
+    order_ph = ",".join(["?"] * len(related_order_ids))
+
+    cur.execute(f"""
       SELECT oi.*, p.model, p.name,
+             oo.order_no AS source_order_no,
+             oo.created_at AS source_order_created_at,
+             oo.note AS source_order_note,
              COALESCE(pr.net_price, 0) AS net_price,
              COALESCE(pr.gross_price, 0) AS gross_price,
              (oi.qty * COALESCE(pr.net_price, 0)) AS line_value_net,
              (oi.qty * COALESCE(pr.gross_price, 0)) AS line_value_gross
       FROM order_items oi
+      JOIN orders oo ON oo.id=oi.order_id
       JOIN products p ON p.id=oi.product_id
       LEFT JOIN pricing pr ON (TRIM(LOWER(pr.model)) = TRIM(LOWER(p.model)) OR TRIM(LOWER(pr.model)) = TRIM(LOWER(p.sku)))
-      WHERE oi.order_id=?
-      ORDER BY oi.id
-    """, (order_id,))
+      WHERE oi.order_id IN ({order_ph})
+      ORDER BY oo.created_at DESC, oo.id DESC, oi.id
+    """, related_order_ids)
     items = [dict(r) for r in cur.fetchall()]
+    invoiced_by_item = invoiced_qty_by_order_item_ids([int(it["id"]) for it in items])
+    for it in items:
+        source_order = related_order_by_id.get(int(it.get("order_id") or 0), {})
+        ordered_qty = int(it.get("qty") or 0)
+        done_qty = int(invoiced_by_item.get(int(it["id"])) or 0)
+        it["source_order_no"] = canonical_order_no(
+            source_order.get("id") or it.get("order_id"),
+            source_order.get("created_at") or it.get("source_order_created_at"),
+            source_order.get("order_no") or it.get("source_order_no")
+        )
+        it["source_order_note"] = source_order.get("note") or it.get("source_order_note") or ""
+        it["ordered_qty"] = ordered_qty
+        it["invoiced_qty"] = done_qty
+        it["remaining_qty"] = max(0, ordered_qty - done_qty)
 
     cur.execute("SELECT * FROM company_profile WHERE id=1")
     company = cur.fetchone()
@@ -3503,7 +3566,7 @@ def order_invoice(order_id):
         cur.execute("SELECT * FROM customers WHERE name=? ORDER BY id DESC LIMIT 1", (o["customer_name"],))
         customer_row = cur.fetchone()
 
-    cur.execute("""
+    cur.execute(f"""
       SELECT
         i.*,
         COALESCE(m.pdf_path,'') AS pdf_path,
@@ -3513,9 +3576,9 @@ def order_invoice(order_id):
         COALESCE(m.invoice_items_json,'') AS invoice_items_json
       FROM invoices i
       LEFT JOIN invoice_meta m ON m.invoice_id = i.id
-      WHERE i.order_id=?
+      WHERE i.order_id IN ({order_ph})
       ORDER BY i.id DESC
-    """, (order_id,))
+    """, related_order_ids)
     invoice_rows = [dict(r) for r in cur.fetchall()]
     c.close()
 
@@ -3527,18 +3590,18 @@ def order_invoice(order_id):
 
     msg = ""
     if request.args.get("generated") == "1":
-        msg = "Faktura została zapisana."
+        msg = "Faktura zostaĹ‚a zapisana."
     if request.args.get("sent") == "1":
-        msg = "Faktura została udostępniona klientowi."
+        msg = "Faktura zostaĹ‚a udostÄ™pniona klientowi."
     if request.args.get("deleted") == "1":
-        msg = "Faktura została usunięta."
+        msg = "Faktura zostaĹ‚a usuniÄ™ta."
     if request.args.get("deleted") == "1":
-        msg = "Faktura została usunięta."
+        msg = "Faktura zostaĹ‚a usuniÄ™ta."
 
     if request.method == "GET":
         data = {
             "invoice_no": next_invoice_no(default_issue),
-            "place": "Kotuszów",
+            "place": "KotuszĂłw",
             "issue_date": default_issue,
             "sell_date": default_issue,
             "payment_type": "gotowka",
@@ -3570,7 +3633,7 @@ def order_invoice(order_id):
 
         invoice_items = prepare_invoice_items(items, request.form)
         if not invoice_items:
-            msg = "Faktura musi zawierać co najmniej jedną pozycję."
+            msg = "Faktura musi zawieraÄ‡ co najmniej jednÄ… pozycjÄ™."
         else:
             pdf_path, total_net, total_gross = generate_order_invoice_pdf(o, invoice_items, data)
             c = conn()
@@ -3610,6 +3673,7 @@ def order_invoice(order_id):
             c.commit()
             c.close()
             upsert_invoice_meta(invoice_id, invoice_pdf_relpath(pdf_path), json.dumps(invoice_items, ensure_ascii=False), sent_to_client=None)
+            allocation_ids = replace_invoice_allocations(invoice_id, invoice_items)
             if supabase_enabled():
                 try:
                     sync_local_rows_to_supabase("invoices", "id", [invoice_id])
@@ -3619,6 +3683,10 @@ def order_invoice(order_id):
                     sync_local_rows_to_supabase("invoice_meta", "invoice_id", [invoice_id])
                 except Exception:
                     pass
+                try:
+                    sync_local_rows_to_supabase("invoice_allocations", "id", allocation_ids)
+                except Exception:
+                    pass
             return redirect(url_for("order_invoice", order_id=order_id, generated="1", invoice_id=invoice_id))
 
     tpl = r"""
@@ -3626,8 +3694,8 @@ def order_invoice(order_id):
     {% block content %}
       <div class="card">
         <div class="flex">
-          <h1 style="margin:0;">Faktura do zamówienia {{ canonical_order_no(o['id'], o['created_at'], o['order_no']) }}</h1>
-          <a class="btn right" href="{{ url_for('order_view', order_id=o['id']) }}">← Szczegóły</a>
+          <h1 style="margin:0;">Faktura z pozycji klienta: {{ o['customer_name'] or o['customer_email'] }}</h1>
+          <a class="btn right" href="{{ url_for('order_view', order_id=o['id']) }}">â† SzczegĂłĹ‚y</a>
         </div>
         {% if msg %}
           <div class="hint" style="margin-top:10px;">{{ msg }}</div>
@@ -3639,15 +3707,15 @@ def order_invoice(order_id):
           <div><label class="muted small">Numer faktury</label><input name="invoice_no" value="{{ d['invoice_no'] }}" required></div>
           <div><label class="muted small">Miejsce</label><input name="place" value="{{ d['place'] }}"></div>
           <div><label class="muted small">Data wystawienia</label><input name="issue_date" type="date" value="{{ d['issue_date'] }}"></div>
-          <div><label class="muted small">Data sprzedaży</label><input name="sell_date" type="date" value="{{ d['sell_date'] }}"></div>
-          <div><label class="muted small">Forma płatności</label>
+          <div><label class="muted small">Data sprzedaĹĽy</label><input name="sell_date" type="date" value="{{ d['sell_date'] }}"></div>
+          <div><label class="muted small">Forma pĹ‚atnoĹ›ci</label>
             <select name="payment_type">
-              <option value="gotowka" {% if d['payment_type'] in ['cash','gotowka'] %}selected{% endif %}>gotówka</option>
+              <option value="gotowka" {% if d['payment_type'] in ['cash','gotowka'] %}selected{% endif %}>gotĂłwka</option>
               <option value="przelew" {% if d['payment_type'] in ['transfer','przelew'] %}selected{% endif %}>przelew</option>
               <option value="karta" {% if d['payment_type'] in ['card','karta'] %}selected{% endif %}>karta</option>
             </select>
           </div>
-          <div><label class="muted small">Termin płatności</label><input name="payment_to" type="date" value="{{ d['payment_to'] }}"></div>
+          <div><label class="muted small">Termin pĹ‚atnoĹ›ci</label><input name="payment_to" type="date" value="{{ d['payment_to'] }}"></div>
           <div><label class="muted small">Rabat %</label><input name="discount_percent" value="{{ d['discount_percent'] or "0" }}"></div>
 
           <div><label class="muted small">Nabywca</label><input name="buyer_name" value="{{ d['buyer_name'] }}" required></div>
@@ -3658,16 +3726,25 @@ def order_invoice(order_id):
           <div><label class="muted small">Telefon</label><input name="buyer_phone" value="{{ d['buyer_phone'] }}"></div>
 
           <div style="grid-column:1/-1;">
-            <h2>Pozycje faktury — możesz skorygować ilości przed wystawieniem</h2>
+            <h2>Pozycje faktury — wybierz ilości z zamówień klienta</h2>
+            <div class="hint" style="margin-bottom:10px;">
+              Wpisz ilość tylko przy pozycjach, które idą na fakturę. Zamówienia klienta zostają jako osobne listy/notatki.
+            </div>
             <table>
-              <thead><tr><th>SKU</th><th>Model / Nazwa</th><th>Ilość w zamówieniu</th><th>Ilość na fakturze</th><th>Netto/szt</th><th>Brutto/szt</th></tr></thead>
+              <thead><tr><th>Zamówienie</th><th>Notatka klienta</th><th>SKU</th><th>Model / Nazwa</th><th>Zamówiono</th><th>Zafakturowano</th><th>Pozostało</th><th>Ilość na fakturze</th><th>Netto/szt</th><th>Brutto/szt</th></tr></thead>
               <tbody>
                 {% for it in items %}
                 <tr>
+                  <td><b>{{ it['source_order_no'] }}</b></td>
+                  <td>{{ it['source_order_note'] or '-' }}</td>
                   <td><b>{{ it['sku'] }}</b></td>
                   <td>{{ it['model'] or '' }}{% if it['name'] %}<div class="muted small">{{ it['name'] }}</div>{% endif %}</td>
-                  <td>{{ it['qty'] }}</td>
-                  <td><input name="invoice_qty_{{ it['id'] }}" value="{{ it['qty'] }}" style="width:110px;"></td>
+                  <td>{{ it['ordered_qty'] }}</td>
+                  <td>{{ it['invoiced_qty'] }}</td>
+                  <td><b>{{ it['remaining_qty'] }}</b></td>
+                  <td>
+                    <input name="invoice_qty_{{ it['id'] }}" value="{{ it['remaining_qty'] }}" max="{{ it['remaining_qty'] }}" style="width:110px;" {% if it['remaining_qty'] <= 0 %}disabled{% endif %}>
+                  </td>
                   <td>{{ "%.2f"|format(it['net_price']) }}</td>
                   <td>{{ "%.2f"|format(it['gross_price']) }}</td>
                 </tr>
@@ -3677,7 +3754,7 @@ def order_invoice(order_id):
           </div>
 
           <div class="flex" style="align-items:flex-end;">
-            <button class="btn primary" type="submit">Zapisz fakturę PDF</button>
+            <button class="btn primary" type="submit">Zapisz fakturÄ™ PDF</button>
           </div>
         </form>
       </div>
@@ -3693,7 +3770,7 @@ def order_invoice(order_id):
                 <td>{{ inv['issue_date'] }}</td>
                 <td>{{ "%.2f"|format(inv['total_net']) }}</td>
                 <td>{{ "%.2f"|format(inv['total_gross']) }}</td>
-                <td>{{ "Udostępniona" if inv['sent_to_client'] else "Tylko wewnętrzna" }}</td>
+                <td>{{ "UdostÄ™pniona" if inv['sent_to_client'] else "Tylko wewnÄ™trzna" }}</td>
                 <td>
                   <div class="flex">
                     <a class="btn" href="{{ url_for('invoice_download_admin', invoice_id=inv['id']) }}" target="_blank">Pobierz PDF</a>
@@ -3702,13 +3779,13 @@ def order_invoice(order_id):
                     </form>
                     {% if not inv['sent_to_client'] %}
                       <form method="post" action="{{ url_for('order_invoice_send', order_id=o['id'], invoice_id=inv['id']) }}">
-                        <button class="btn primary" type="submit">Wyślij fakturę klientowi</button>
+                        <button class="btn primary" type="submit">WyĹ›lij fakturÄ™ klientowi</button>
                       </form>
                     {% else %}
                       <span class="badge">Widoczna w panelu klienta</span>
                     {% endif %}
-                    <form method="post" action="{{ url_for('order_invoice_delete', order_id=o['id'], invoice_id=inv['id']) }}" onsubmit="return confirm('Usunąć fakturę?')">
-                      <button class="btn danger" type="submit">Usuń fakturę</button>
+                    <form method="post" action="{{ url_for('order_invoice_delete', order_id=o['id'], invoice_id=inv['id']) }}" onsubmit="return confirm('UsunÄ…Ä‡ fakturÄ™?')">
+                      <button class="btn danger" type="submit">UsuĹ„ fakturÄ™</button>
                     </form>
                   </div>
                 </td>
@@ -3776,7 +3853,7 @@ def order_print(order_id):
 
     y = h - 18 * mm
     cpdf.setFont(pdf_font_bold, 14)
-    cpdf.drawString(15 * mm, y, f"Wydruk zamówienia: {canonical_order_no(o['id'], o['created_at'], o['order_no'])}")
+    cpdf.drawString(15 * mm, y, f"Wydruk zamĂłwienia: {canonical_order_no(o['id'], o['created_at'], o['order_no'])}")
     y -= 7 * mm
     cpdf.setFont(pdf_font, 10)
     cpdf.drawString(15 * mm, y, f"Klient: {o['customer_name']}")
@@ -3784,10 +3861,10 @@ def order_print(order_id):
     cpdf.drawString(15 * mm, y, f"Data: {o['created_at']}")
     y -= 6 * mm
     cpdf.setFont(pdf_font_bold, 10)
-    cpdf.drawString(15 * mm, y, f"Łączna liczba sztuk w zamówieniu: {total_qty}")
+    cpdf.drawString(15 * mm, y, f"ĹÄ…czna liczba sztuk w zamĂłwieniu: {total_qty}")
     y -= 5 * mm
     cpdf.setFont(pdf_font, 10)
-    cpdf.drawString(15 * mm, y, f"Łączny brak na stanie: {total_missing_qty}")
+    cpdf.drawString(15 * mm, y, f"ĹÄ…czny brak na stanie: {total_missing_qty}")
 
     def draw_section(title, rows, y_pos, show_missing=False):
         cpdf.setFont(pdf_font_bold, 11)
@@ -3796,7 +3873,7 @@ def order_print(order_id):
         cpdf.setFont(pdf_font_bold, 9)
         cpdf.drawString(15 * mm, y_pos, "SKU")
         cpdf.drawString(55 * mm, y_pos, "Model/Nazwa")
-        cpdf.drawString(160 * mm, y_pos, "Ilość")
+        cpdf.drawString(160 * mm, y_pos, "IloĹ›Ä‡")
         if show_missing:
             cpdf.drawString(176 * mm, y_pos, "Brak")
         y_pos -= 5 * mm
@@ -3841,8 +3918,8 @@ def order_label(order_id):
     if not o:
         abort(404)
 
-    # Etykieta 30x50 ma zawsze używać aktualnego QR z poprawnym numerem ZAM-...
-    # i nadpisywać stare QR-y wygenerowane kiedy zamówienie miało jeszcze TEMP.
+    # Etykieta 30x50 ma zawsze uĹĽywaÄ‡ aktualnego QR z poprawnym numerem ZAM-...
+    # i nadpisywaÄ‡ stare QR-y wygenerowane kiedy zamĂłwienie miaĹ‚o jeszcze TEMP.
     qr_data_url = make_qr_data_url(canonical_order_no(o["id"], o["created_at"], o["order_no"]))
 
     c = conn()
@@ -3879,12 +3956,12 @@ def order_label(order_id):
     qr_buf = io.BytesIO(qr_bytes)
     qr_img = ImageReader(qr_buf)
 
-    # QR na górze (większy), dane poniżej
+    # QR na gĂłrze (wiÄ™kszy), dane poniĹĽej
     margin = 2 * mm
     qr_size = 26 * mm  # zostaje margines
     cpdf.drawImage(qr_img, margin, h - margin - qr_size, width=qr_size, height=qr_size, preserveAspectRatio=True, mask='auto')
 
-    # Dane zamawiającego + nr zamówienia
+    # Dane zamawiajÄ…cego + nr zamĂłwienia
     pdf_font, pdf_font_bold = get_pdf_font_names()
     text_y = h - margin - qr_size - 2*mm
     max_text_width = w - (2 * margin)
@@ -3931,7 +4008,7 @@ def order_label(order_id):
 
     lines = []
     if addr:
-        # podziel na linie i dodatkowo łam długie
+        # podziel na linie i dodatkowo Ĺ‚am dĹ‚ugie
         for ln in addr.splitlines():
             ln = ln.strip()
             if not ln:
@@ -4005,7 +4082,7 @@ def api_order_lookup():
                 break
     if not o:
         c.close()
-        return jsonify(ok=False, error="Nie znaleziono zamówienia"), 404
+        return jsonify(ok=False, error="Nie znaleziono zamĂłwienia"), 404
 
     cur.execute("""
       SELECT oi.*, p.model, p.ean, p.name,
@@ -4021,6 +4098,20 @@ def api_order_lookup():
     """, (o["id"],))
     items = [dict(r) for r in cur.fetchall()]
     c.close()
+
+    invoiced_by_item = invoiced_qty_by_order_item_ids([int(it["id"]) for it in items])
+    for it in items:
+        ordered_qty = int(it.get("qty") or 0)
+        invoiced_qty = int(invoiced_by_item.get(int(it["id"])) or 0)
+        it["ordered_qty"] = ordered_qty
+        it["invoiced_qty"] = invoiced_qty
+        it["remaining_qty"] = max(0, ordered_qty - invoiced_qty)
+        if ordered_qty > 0 and invoiced_qty >= ordered_qty:
+            it["realization_label"] = "w caĹ‚oĹ›ci"
+        elif invoiced_qty > 0:
+            it["realization_label"] = f"czÄ™Ĺ›ciowo: {invoiced_qty}/{ordered_qty} szt."
+        else:
+            it["realization_label"] = "0 szt."
 
     total_net = round(sum(float(it.get("line_value_net") or 0) for it in items), 2)
     total_gross = round(sum(float(it.get("line_value_gross") or 0) for it in items), 2)
@@ -4113,7 +4204,7 @@ def invoice_meta_payload(invoice_row: dict):
 
     return {
         "invoice_no": invoice_row.get("invoice_no") or "",
-        "place": "Kotuszów",
+        "place": "KotuszĂłw",
         "issue_date": invoice_row.get("issue_date") or datetime.now().strftime("%Y-%m-%d"),
         "sell_date": invoice_row.get("sell_date") or datetime.now().strftime("%Y-%m-%d"),
         "payment_type": invoice_row.get("payment_type") or "przelew",
@@ -4179,7 +4270,7 @@ def invoice_regenerate_admin(invoice_id):
     o = cur.fetchone()
     c.close()
     if not o:
-        return "Brak powiązanego zamówienia", 404
+        return "Brak powiÄ…zanego zamĂłwienia", 404
 
     items = invoice_items_from_saved_json(invoice_id)
     if not items:
@@ -4238,7 +4329,7 @@ def api_invoice_seen(invoice_id):
         buyer_ok = _email_key(row["buyer_email"]) == email
         order_ok = _email_key(row["order_customer_email"]) == email
         if int(row["sent_to_client"] or 0) != 1 or not (buyer_ok or order_ok):
-            return jsonify(ok=False, error="Brak dostępu"), 403
+            return jsonify(ok=False, error="Brak dostÄ™pu"), 403
 
     ok_pdf, _ = invoice_pdf_exists(row["pdf_path"], row["invoice_no"])
     if not ok_pdf:
@@ -4289,7 +4380,7 @@ def api_invoice_download(invoice_id):
         buyer_ok = _email_key(row["buyer_email"]) == email
         order_ok = _email_key(row["order_customer_email"]) == email
         if int(row["sent_to_client"] or 0) != 1 or not (buyer_ok or order_ok):
-            return "Brak dostępu", 403
+            return "Brak dostÄ™pu", 403
 
     ok_pdf, abs_path = invoice_pdf_exists(row["pdf_path"], row["invoice_no"])
     if not ok_pdf:
@@ -4298,7 +4389,7 @@ def api_invoice_download(invoice_id):
     try:
         return send_file(abs_path, mimetype="application/pdf", as_attachment=True, download_name=os.path.basename(abs_path))
     except Exception as e:
-        return f"Błąd pobierania PDF: {e}", 500
+        return f"BĹ‚Ä…d pobierania PDF: {e}", 500
 
 @app.post("/orders/<int:order_id>/invoice/<int:invoice_id>/delete")
 def order_invoice_delete(order_id, invoice_id):
@@ -4315,12 +4406,17 @@ def order_invoice_delete(order_id, invoice_id):
 
     c = conn()
     cur = c.cursor()
+    cur.execute("DELETE FROM invoice_allocations WHERE invoice_id=?", (invoice_id,))
     cur.execute("DELETE FROM invoice_meta WHERE invoice_id=?", (invoice_id,))
     cur.execute("DELETE FROM invoices WHERE id=? AND order_id=?", (invoice_id, order_id))
     c.commit()
     c.close()
 
     if supabase_enabled():
+        try:
+            supabase_delete_rows("invoice_allocations", {"invoice_id": invoice_id})
+        except Exception:
+            pass
         try:
             supabase_delete_rows("invoice_meta", {"invoice_id": invoice_id})
         except Exception:
@@ -4393,7 +4489,7 @@ def order_by_code(token):
                 break
     c.close()
     if not row:
-        return "Nie znaleziono zamówienia", 404
+        return "Nie znaleziono zamĂłwienia", 404
     return redirect(url_for("order_view", order_id=row["id"]))
 
 
@@ -4407,10 +4503,10 @@ def order_scan():
       </style>
 
       <div class="card">
-        <h1 id="openQrScanner" style="cursor:pointer;text-decoration:underline;">Skanuj QR zamówienia</h1>
+        <h1 id="openQrScanner" style="cursor:pointer;text-decoration:underline;">Skanuj QR zamĂłwienia</h1>
         <div>
-          <input id="orderCodeInput" placeholder="Wklej kod zamówienia ZAM-... albo kliknij „Skanuj QR zamówienia”" />
-          <button id="btnShowOrderByCode" class="btn primary" type="button" style="margin-top:8px">Pokaż zamówienie</button>
+          <input id="orderCodeInput" placeholder="Wklej kod zamĂłwienia ZAM-... albo kliknij â€žSkanuj QR zamĂłwieniaâ€ť" />
+          <button id="btnShowOrderByCode" class="btn primary" type="button" style="margin-top:8px">PokaĹĽ zamĂłwienie</button>
         </div>
         <div id="orderScanOut" class="muted" style="margin-top:10px"></div>
       </div>
@@ -4421,7 +4517,7 @@ def order_scan():
             <b>Skanuj QR</b>
             <button id="closeQrScanner" class="btn" type="button">Zamknij</button>
           </div>
-          <div class="muted" style="margin-bottom:8px;">Uruchamia się tylko tylny aparat.</div>
+          <div class="muted" style="margin-bottom:8px;">Uruchamia siÄ™ tylko tylny aparat.</div>
           <div id="orderQrReader" style="width:100%;min-height:280px;"></div>
         </div>
       </div>
@@ -4493,7 +4589,7 @@ def order_scan():
               );
               orderQrScannerRunning = true;
             } catch (e2) {
-              $('orderScanOut').innerHTML = '<div class="muted">Nie udało się uruchomić tylnego aparatu.</div>';
+              $('orderScanOut').innerHTML = '<div class="muted">Nie udaĹ‚o siÄ™ uruchomiÄ‡ tylnego aparatu.</div>';
               $('qrScannerModal').classList.add('hidden');
             }
           }
@@ -4542,8 +4638,8 @@ def order_scan():
 
 @app.get("/china")
 def china():
-    # Wyłączony pull z Supabase tylko dla modułu Chiny.
-    # Tu pracujemy na lokalnej bazie, żeby POST -> redirect nie cofał zmian.
+    # WyĹ‚Ä…czony pull z Supabase tylko dla moduĹ‚u Chiny.
+    # Tu pracujemy na lokalnej bazie, ĹĽeby POST -> redirect nie cofaĹ‚ zmian.
     c = conn()
     cur = c.cursor()
     cur.execute("SELECT * FROM china_packages ORDER BY id DESC LIMIT 200")
@@ -4557,7 +4653,7 @@ def china():
         <div class="flex">
           <h1 style="margin:0;">Chiny (P/O)</h1>
         </div>
-        <div class="muted">Zarządzaj przesyłkami: status, tracking i zawartość paczki. Tracking otwiera 17TRACK.</div>
+        <div class="muted">ZarzÄ…dzaj przesyĹ‚kami: status, tracking i zawartoĹ›Ä‡ paczki. Tracking otwiera 17TRACK.</div>
       </div>
 
       <div class="card">
@@ -4608,7 +4704,7 @@ def china():
                       <option value="shipped" {% if p['status']=='shipped' %}selected{% endif %}>shipped</option>
                       <option value="arrived" {% if p['status']=='arrived' %}selected{% endif %}>arrived</option>
                     </select>
-                    <button class="btn" type="submit">Zmień</button>
+                    <button class="btn" type="submit">ZmieĹ„</button>
                   </form>
                 </td>
                 <td>
@@ -4623,9 +4719,9 @@ def china():
                 <td>{{ p['note'] or "-" }}</td>
                 <td class="muted">{{ p['created_at'] }}</td>
                 <td class="flex">
-                  <a class="btn primary" href="{{ url_for('china_package', package_id=p['id']) }}">Zawartość</a>
-                  <form method="post" action="{{ url_for('china_delete', package_id=p['id']) }}" onsubmit="return confirm('Usunąć paczkę?')">
-                    <button class="btn danger" type="submit">Usuń</button>
+                  <a class="btn primary" href="{{ url_for('china_package', package_id=p['id']) }}">ZawartoĹ›Ä‡</a>
+                  <form method="post" action="{{ url_for('china_delete', package_id=p['id']) }}" onsubmit="return confirm('UsunÄ…Ä‡ paczkÄ™?')">
+                    <button class="btn danger" type="submit">UsuĹ„</button>
                   </form>
                 </td>
               </tr>
@@ -4669,7 +4765,7 @@ def china_create():
 def china_status(package_id):
     status = norm(request.form.get("status"))
     if status not in {"planned", "ordered", "shipped", "arrived"}:
-        return "Nieprawidłowy status", 400
+        return "NieprawidĹ‚owy status", 400
 
     c = conn()
     cur = c.cursor()
@@ -4685,7 +4781,7 @@ def china_status(package_id):
     cur.execute("SELECT product_id, qty FROM china_items WHERE package_id=?", (package_id,))
     items = cur.fetchall()
 
-    # Przejście NA arrived: fizycznie przyjęto towar -> dodaj na stan.
+    # PrzejĹ›cie NA arrived: fizycznie przyjÄ™to towar -> dodaj na stan.
     if old_status != "arrived" and status == "arrived":
         for it in items:
             pid = it["product_id"]
@@ -4693,7 +4789,7 @@ def china_status(package_id):
             cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (pid,))
             cur.execute("UPDATE stock SET qty = qty + ? WHERE product_id=?", (qty, pid))
 
-    # Cofnięcie Z arrived na inny status: towar wraca jako "w drodze" -> odejmij ze stanu.
+    # CofniÄ™cie Z arrived na inny status: towar wraca jako "w drodze" -> odejmij ze stanu.
     elif old_status == "arrived" and status != "arrived":
         for it in items:
             pid = it["product_id"]
@@ -4728,7 +4824,7 @@ def china_tracking(package_id):
 
 @app.get("/china/<int:package_id>")
 def china_package(package_id):
-    # Wyłączony pull z Supabase tylko dla modułu Chiny.
+    # WyĹ‚Ä…czony pull z Supabase tylko dla moduĹ‚u Chiny.
     c = conn()
     cur = c.cursor()
     cur.execute("SELECT * FROM china_packages WHERE id=?", (package_id,))
@@ -4757,32 +4853,32 @@ def china_package(package_id):
         <div class="flex">
           <h1 style="margin:0;">Paczka {{ pack['package_no'] }}</h1>
           <span class="badge">{{ pack['status'] }}</span>
-          <a class="btn right" href="{{ url_for('china') }}">← Lista paczek</a>
+          <a class="btn right" href="{{ url_for('china') }}">â† Lista paczek</a>
         </div>
         <div class="muted">Tracking: {{ pack['tracking'] or '-' }}</div>
         <form method="post" action="{{ url_for('china_tracking', package_id=pack['id']) }}" class="flex" style="margin-top:10px;">
           <input name="tracking" value="{{ pack['tracking'] or '' }}" placeholder="nr trackingu" style="width:260px;">
-          <button class="btn" type="submit">Zmień tracking</button>
+          <button class="btn" type="submit">ZmieĹ„ tracking</button>
           {% if pack['tracking'] %}
-            <a class="btn" target="_blank" href="https://t.17track.net/en#nums={{ pack['tracking']|urlencode }}">Otwórz 17TRACK</a>
+            <a class="btn" target="_blank" href="https://t.17track.net/en#nums={{ pack['tracking']|urlencode }}">OtwĂłrz 17TRACK</a>
           {% endif %}
         </form>
       </div>
 
       <div class="card">
-        <h2>Dodaj zawartość paczki</h2>
+        <h2>Dodaj zawartoĹ›Ä‡ paczki</h2>
         <form method="post" action="{{ url_for('china_item_add', package_id=pack['id']) }}" class="items-row">
           <div>
             <label class="muted small">Produkt</label>
             <select name="product_id" required>
               <option value="">-- wybierz --</option>
               {% for p in products %}
-                <option value="{{ p['id'] }}">{{ p['sku'] }}{% if p['model'] %} • {{ p['model'] }}{% endif %}{% if p['name'] %} • {{ p['name'] }}{% endif %}</option>
+                <option value="{{ p['id'] }}">{{ p['sku'] }}{% if p['model'] %} â€˘ {{ p['model'] }}{% endif %}{% if p['name'] %} â€˘ {{ p['name'] }}{% endif %}</option>
               {% endfor %}
             </select>
           </div>
           <div>
-            <label class="muted small">Ilość</label>
+            <label class="muted small">IloĹ›Ä‡</label>
             <input name="qty" value="1" required>
           </div>
           <div class="flex" style="align-items:flex-end;">
@@ -4792,10 +4888,10 @@ def china_package(package_id):
       </div>
 
       <div class="card">
-        <h2>Zawartość paczki</h2>
+        <h2>ZawartoĹ›Ä‡ paczki</h2>
         <table>
           <thead>
-            <tr><th>SKU</th><th>Model / Nazwa</th><th>Ilość</th><th>Data</th><th>Akcje</th></tr>
+            <tr><th>SKU</th><th>Model / Nazwa</th><th>IloĹ›Ä‡</th><th>Data</th><th>Akcje</th></tr>
           </thead>
           <tbody>
             {% for it in items %}
@@ -4805,8 +4901,8 @@ def china_package(package_id):
                 <td><span class="badge">{{ it['qty'] }}</span></td>
                 <td class="muted">{{ it['created_at'] }}</td>
                 <td>
-                  <form method="post" action="{{ url_for('china_item_delete', package_id=pack['id'], item_id=it['id']) }}" onsubmit="return confirm('Usunąć pozycję?')">
-                    <button class="btn danger" type="submit">Usuń</button>
+                  <form method="post" action="{{ url_for('china_item_delete', package_id=pack['id'], item_id=it['id']) }}" onsubmit="return confirm('UsunÄ…Ä‡ pozycjÄ™?')">
+                    <button class="btn danger" type="submit">UsuĹ„</button>
                   </form>
                 </td>
               </tr>
@@ -4835,7 +4931,7 @@ def china_delete(package_id):
 
     if norm(pack["status"]).lower() == "arrived":
         c.close()
-        return "Nie można usunąć paczki ARRIVED", 400
+        return "Nie moĹĽna usunÄ…Ä‡ paczki ARRIVED", 400
 
     if supabase_enabled():
         try:
@@ -4858,7 +4954,7 @@ def china_item_add(package_id):
     product_id = to_int(request.form.get("product_id"), 0)
     qty = to_int(request.form.get("qty"), 0)
     if product_id <= 0 or qty <= 0:
-        return "Nieprawidłowy produkt lub ilość", 400
+        return "NieprawidĹ‚owy produkt lub iloĹ›Ä‡", 400
 
     c = conn()
     cur = c.cursor()
@@ -4898,5 +4994,5 @@ def china_item_delete(package_id, item_id):
 # RUN
 # =========================
 if __name__ == "__main__":
-    # debug=True możesz zostawić na czas budowy
+    # debug=True moĹĽesz zostawiÄ‡ na czas budowy
     app.run(host="0.0.0.0", port=5000, debug=True)
