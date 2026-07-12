@@ -3469,6 +3469,7 @@ def order_view(order_id):
 
     cur.execute("""
       SELECT oi.*, p.model, p.ean, p.name,
+             COALESCE(s.qty, 0) AS stock_qty,
              COALESCE(pr.net_price, 0) AS net_price,
              COALESCE(pr.gross_price, 0) AS gross_price,
              (oi.qty * COALESCE(pr.net_price, 0)) AS line_value_net,
@@ -3483,6 +3484,7 @@ def order_view(order_id):
              ), 0) AS in_delivery
       FROM order_items oi
       JOIN products p ON p.id=oi.product_id
+      LEFT JOIN stock s ON s.product_id=p.id
       LEFT JOIN pricing pr ON (TRIM(LOWER(pr.model)) = TRIM(LOWER(p.model)) OR TRIM(LOWER(pr.model)) = TRIM(LOWER(p.sku)))
       LEFT JOIN stock s ON s.product_id=p.id
       WHERE oi.order_id=?
@@ -4584,10 +4586,12 @@ def api_order_lookup():
         it["ordered_qty"] = ordered_qty
         it["invoiced_qty"] = invoiced_qty
         it["remaining_qty"] = max(0, ordered_qty - invoiced_qty)
+        stock_qty = int(it.get("stock_qty") or 0)
+        it["availability_label"] = "dostępne" if stock_qty >= ordered_qty else "10/20 dni"
         if ordered_qty > 0 and invoiced_qty >= ordered_qty:
-            it["realization_label"] = "w caĹ‚oĹ›ci"
+            it["realization_label"] = "w całości"
         elif invoiced_qty > 0:
-            it["realization_label"] = f"czÄ™Ĺ›ciowo: {invoiced_qty}/{ordered_qty} szt."
+            it["realization_label"] = f"częściowo: {invoiced_qty}/{ordered_qty} szt."
         else:
             it["realization_label"] = "0 szt."
 
@@ -4648,16 +4652,13 @@ def api_client_invoices():
     rows = []
     for r in cur.fetchall():
         d = dict(r)
-        ok_pdf, _ = invoice_pdf_exists(d.get("pdf_path", ""), d.get("invoice_no", ""))
-        if not ok_pdf:
-            continue
         d["order_display"] = order_display_no(
             d.get("source_order_id"),
             d.get("source_order_created_at"),
             d.get("order_no"),
             d.get("source_order_note")
         ) if d.get("source_order_id") else (d.get("order_no") or "")
-        d["pdf_exists"] = 1
+        d["pdf_exists"] = 1 if d.get("pdf_path") else 0
         rows.append(d)
     c.close()
     rows.sort(key=lambda x: ((x.get("seen_by_client") or 0), (x.get("issue_date") or ""), int(x.get("id") or 0)), reverse=True)
