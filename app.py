@@ -1836,6 +1836,31 @@ def upsert_invoice_meta(
     c.commit()
     c.close()
 
+
+def sync_invoice_meta_to_supabase(invoice_id: int):
+    if not supabase_enabled():
+        return
+    meta = load_invoice_meta(invoice_id)
+    if not meta:
+        return
+    try:
+        sync_local_rows_to_supabase("invoice_meta", "invoice_id", [invoice_id])
+        return
+    except Exception:
+        pass
+
+    # Fallback dla Supabase bez najnowszych kolumn payment_reminder/paid/paid_at.
+    legacy = {
+        "invoice_id": meta.get("invoice_id"),
+        "pdf_path": meta.get("pdf_path") or "",
+        "invoice_items_json": meta.get("invoice_items_json") or "",
+        "sent_to_client": int(meta.get("sent_to_client") or 0),
+        "seen_by_client": int(meta.get("seen_by_client") or 0),
+        "seen_at": meta.get("seen_at"),
+        "updated_at": meta.get("updated_at") or now_iso(),
+    }
+    supabase_upsert_rows("invoice_meta", [legacy], "invoice_id")
+
 def prepare_invoice_items(order_items: list[dict], form):
     prepared = []
     for it in order_items:
@@ -3968,6 +3993,20 @@ def order_issue(order_id):
 @app.route("/orders/<int:order_id>/invoice", methods=["GET", "POST"])
 def order_invoice(order_id):
     maybe_pull_shared_from_supabase()
+    sent_invoice_id = to_int(request.args.get("invoice_id"), 0) if norm(request.args.get("sent")) == "1" else 0
+    if sent_invoice_id:
+        meta = load_invoice_meta(sent_invoice_id) or {}
+        upsert_invoice_meta(
+            sent_invoice_id,
+            meta.get("pdf_path", ""),
+            meta.get("invoice_items_json", ""),
+            sent_to_client=1,
+            seen_by_client=int(meta.get("seen_by_client") or 0),
+            seen_at=meta.get("seen_at"),
+            payment_reminder=int(meta.get("payment_reminder") or 0),
+            paid=int(meta.get("paid") or 0),
+            paid_at=meta.get("paid_at")
+        )
     c = conn()
     cur = c.cursor()
     cur.execute("SELECT * FROM orders WHERE id=?", (order_id,))
@@ -4158,7 +4197,7 @@ def order_invoice(order_id):
                 except Exception:
                     pass
                 try:
-                    sync_local_rows_to_supabase("invoice_meta", "invoice_id", [invoice_id])
+                    sync_invoice_meta_to_supabase(invoice_id)
                 except Exception:
                     pass
                 try:
@@ -5025,7 +5064,7 @@ def invoice_download_admin(invoice_id):
             except Exception:
                 pass
             try:
-                sync_local_rows_to_supabase("invoice_meta", "invoice_id", [invoice_id])
+                sync_invoice_meta_to_supabase(invoice_id)
             except Exception:
                 pass
         if parse_supabase_storage_ref(stored_pdf_path):
@@ -5050,7 +5089,7 @@ def invoice_download_admin(invoice_id):
                 seen_by_client=int(current_meta.get("seen_by_client") or 0),
                 seen_at=current_meta.get("seen_at")
             )
-            sync_local_rows_to_supabase("invoice_meta", "invoice_id", [invoice_id])
+            sync_invoice_meta_to_supabase(invoice_id)
             data, filename = supabase_storage_download_bytes(stored_pdf_path)
             return send_file(io.BytesIO(data), mimetype="application/pdf", as_attachment=True, download_name=filename)
         except Exception:
@@ -5147,7 +5186,7 @@ def invoice_regenerate_admin(invoice_id):
         except Exception:
             pass
         try:
-            sync_local_rows_to_supabase("invoice_meta", "invoice_id", [invoice_id])
+            sync_invoice_meta_to_supabase(invoice_id)
         except Exception:
             pass
 
@@ -5192,7 +5231,7 @@ def _set_invoice_payment_state(invoice_id: int, *, reminder: int | None = None, 
     )
     if supabase_enabled():
         try:
-            sync_local_rows_to_supabase("invoice_meta", "invoice_id", [invoice_id])
+            sync_invoice_meta_to_supabase(invoice_id)
         except Exception:
             pass
 
@@ -5261,7 +5300,7 @@ def api_invoice_seen(invoice_id):
 
     if supabase_enabled():
         try:
-            sync_local_table_to_supabase("invoice_meta", "invoice_id")
+            sync_invoice_meta_to_supabase(invoice_id)
         except Exception:
             pass
 
@@ -5330,7 +5369,7 @@ def api_invoice_download(invoice_id):
         )
         if supabase_enabled():
             try:
-                sync_local_rows_to_supabase("invoice_meta", "invoice_id", [invoice_id])
+                sync_invoice_meta_to_supabase(invoice_id)
             except Exception:
                 pass
         if parse_supabase_storage_ref(stored_pdf_path):
@@ -5355,7 +5394,7 @@ def api_invoice_download(invoice_id):
                 seen_by_client=int(current_meta.get("seen_by_client") or 0),
                 seen_at=current_meta.get("seen_at")
             )
-            sync_local_rows_to_supabase("invoice_meta", "invoice_id", [invoice_id])
+            sync_invoice_meta_to_supabase(invoice_id)
             data, filename = supabase_storage_download_bytes(stored_pdf_path)
             return send_file(io.BytesIO(data), mimetype="application/pdf", as_attachment=True, download_name=filename)
         except Exception:
@@ -5481,7 +5520,7 @@ def order_invoice_send(order_id, invoice_id):
 
     if supabase_enabled():
         try:
-            sync_local_table_to_supabase("invoice_meta", "invoice_id")
+            sync_invoice_meta_to_supabase(invoice_id)
         except Exception:
             pass
 
