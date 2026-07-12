@@ -1530,6 +1530,76 @@ def generate_order_invoice_pdf(order_row, items, meta):
     return fpath, round(total_net,2), round(total_gross,2)
 
 
+def packing_list_pdf_path_for_invoice(invoice_pdf_path: str, invoice_no: str) -> str:
+    base_dir = os.path.dirname(invoice_pdf_path) if invoice_pdf_path else os.path.join(DATA_DIR, "faktury")
+    return os.path.join(base_dir, f"{safe_filename(invoice_no)}_lista_pakowania.pdf")
+
+
+def generate_invoice_packing_list_pdf(order_row, items, meta, invoice_pdf_path: str = "") -> str:
+    customer_dir = invoice_dir_for_customer(meta.get("buyer_name") or (order_row["customer_name"] if order_row and "customer_name" in order_row.keys() else "") or "Klient")
+    fpath = packing_list_pdf_path_for_invoice(invoice_pdf_path or os.path.join(customer_dir, f"{safe_filename(meta['invoice_no'])}.pdf"), meta["invoice_no"])
+
+    w = 210 * mm
+    h = 297 * mm
+    cpdf = canvas.Canvas(fpath, pagesize=(w, h))
+    pdf_font, pdf_font_bold = get_pdf_font_names()
+
+    y = h - 18 * mm
+    cpdf.setFont(pdf_font_bold, 15)
+    cpdf.drawString(15 * mm, y, "Lista pakowania")
+    y -= 7 * mm
+    cpdf.setFont(pdf_font, 10)
+    cpdf.drawString(15 * mm, y, f"Do faktury: {meta.get('invoice_no') or '-'}")
+    y -= 5 * mm
+    if order_row:
+        cpdf.drawString(15 * mm, y, f"Klient: {order_row['customer_name']}")
+        y -= 5 * mm
+    cpdf.drawString(15 * mm, y, f"Data: {meta.get('issue_date') or datetime.now().strftime('%Y-%m-%d')}")
+    y -= 8 * mm
+
+    cpdf.setFont(pdf_font_bold, 9)
+    headers = [("Lp.", 15), ("Zamówienie", 27), ("Notatka", 62), ("SKU", 92), ("Model / nazwa", 122), ("Ilość", 184)]
+    for label, x_mm in headers:
+        cpdf.drawString(x_mm * mm, y, label)
+    y -= 3 * mm
+    cpdf.line(15 * mm, y, 198 * mm, y)
+    y -= 5 * mm
+
+    cpdf.setFont(pdf_font, 9)
+    total_qty = 0
+    for lp, it in enumerate(items, 1):
+        qty = int(it.get("qty") or 0)
+        if qty <= 0:
+            continue
+        total_qty += qty
+        order_no = norm(it.get("source_order_no") or "")
+        note = norm(it.get("source_order_note") or "")
+        sku = norm(it.get("sku") or "")
+        model_name = norm(it.get("model") or it.get("name") or "")
+
+        if y < 22 * mm:
+            cpdf.showPage()
+            y = h - 18 * mm
+            cpdf.setFont(pdf_font, 9)
+
+        cpdf.drawString(15 * mm, y, str(lp))
+        cpdf.drawString(27 * mm, y, order_no[:18])
+        cpdf.drawString(62 * mm, y, note[:18] if note else "-")
+        cpdf.drawString(92 * mm, y, sku[:18])
+        cpdf.drawString(122 * mm, y, model_name[:34])
+        cpdf.drawRightString(198 * mm, y, str(qty))
+        y -= 5 * mm
+
+    y -= 4 * mm
+    cpdf.line(15 * mm, y, 198 * mm, y)
+    y -= 6 * mm
+    cpdf.setFont(pdf_font_bold, 10)
+    cpdf.drawRightString(198 * mm, y, f"Razem szt.: {total_qty}")
+
+    cpdf.save()
+    return fpath
+
+
 def invoice_pdf_relpath(abs_path: str) -> str:
     try:
         return os.path.relpath(abs_path, DATA_DIR)
@@ -3315,7 +3385,6 @@ def order_view(order_id):
           <span class="badge {{ order_status_css(o['status']) }}">{{ order_status_label(o['status']) }}</span>
           <div class="right flex">
             <a class="btn" href="{{ url_for('orders') }}">â† Lista</a>
-            <a class="btn" href="{{ url_for('order_print', order_id=o['id']) }}">Drukuj zamĂłwienie</a>
             <a class="btn primary" href="{{ url_for('order_invoice', order_id=o['id']) }}">Faktura</a>
             <form method="post" action="{{ url_for('order_status_update', order_id=o['id']) }}" class="flex">
                 <select name="status" style="width:190px;">
@@ -3827,6 +3896,7 @@ def order_invoice(order_id):
             msg = "Faktura musi zawieraÄ‡ co najmniej jednÄ… pozycjÄ™."
         else:
             pdf_path, total_net, total_gross = generate_order_invoice_pdf(o, invoice_items, data)
+            generate_invoice_packing_list_pdf(o, invoice_items, data, pdf_path)
             c = conn()
             cur = c.cursor()
             cur.execute("""
@@ -3977,6 +4047,7 @@ def order_invoice(order_id):
                 <td>
                   <div class="flex">
                     <a class="btn" href="{{ url_for('invoice_download_admin', invoice_id=inv['id']) }}" target="_blank">Pobierz PDF</a>
+                    <a class="btn" href="{{ url_for('invoice_packing_list_download_admin', invoice_id=inv['id']) }}" target="_blank">Lista do paczki</a>
                     <form method="post" action="{{ url_for('invoice_regenerate_admin', invoice_id=inv['id']) }}">
                       <button class="btn" type="submit">Regeneruj PDF</button>
                     </form>
@@ -4403,7 +4474,8 @@ def load_invoice_with_meta(invoice_id: int):
     c = conn()
     cur = c.cursor()
     cur.execute("""
-      SELECT i.*, COALESCE(m.pdf_path,'') AS pdf_path, COALESCE(m.sent_to_client,0) AS sent_to_client
+      SELECT i.*, COALESCE(m.pdf_path,'') AS pdf_path, COALESCE(m.sent_to_client,0) AS sent_to_client,
+             COALESCE(m.invoice_items_json,'') AS invoice_items_json
       FROM invoices i
       LEFT JOIN invoice_meta m ON m.invoice_id = i.id
       WHERE i.id=?
@@ -4475,6 +4547,32 @@ def invoice_download_admin(invoice_id):
         return "Brak pliku PDF", 404
     return send_file(abs_path, mimetype="application/pdf", as_attachment=True, download_name=os.path.basename(abs_path))
 
+
+@app.get("/invoices/<int:invoice_id>/packing-list")
+def invoice_packing_list_download_admin(invoice_id):
+    inv = load_invoice_with_meta(invoice_id)
+    if not inv:
+        return "Nie znaleziono faktury", 404
+
+    c = conn()
+    cur = c.cursor()
+    cur.execute("SELECT * FROM orders WHERE id=?", (inv["order_id"],))
+    o = cur.fetchone()
+    c.close()
+    if not o:
+        return "Brak powiązanego zamówienia", 404
+
+    items = invoice_items_from_saved_json(invoice_id)
+    if not items:
+        return "Brak pozycji faktury", 400
+
+    ok_pdf, invoice_abs_path = invoice_pdf_exists(inv.get("pdf_path", ""), inv.get("invoice_no", ""))
+    pack_path = packing_list_pdf_path_for_invoice(invoice_abs_path if ok_pdf else "", inv.get("invoice_no") or f"FV_{invoice_id}")
+    if not os.path.exists(pack_path):
+        pack_path = generate_invoice_packing_list_pdf(o, items, invoice_meta_payload(inv), invoice_abs_path if ok_pdf else "")
+
+    return send_file(pack_path, mimetype="application/pdf", as_attachment=True, download_name=os.path.basename(pack_path))
+
 @app.post("/invoices/<int:invoice_id>/regenerate")
 def invoice_regenerate_admin(invoice_id):
     inv = load_invoice_with_meta(invoice_id)
@@ -4495,6 +4593,7 @@ def invoice_regenerate_admin(invoice_id):
 
     meta = invoice_meta_payload(inv)
     pdf_path, total_net, total_gross = generate_order_invoice_pdf(o, items, meta)
+    generate_invoice_packing_list_pdf(o, items, meta, pdf_path)
 
     c = conn()
     cur = c.cursor()
@@ -4616,6 +4715,9 @@ def order_invoice_delete(order_id, invoice_id):
 
     ok_pdf, abs_path = invoice_pdf_exists(inv.get("pdf_path", ""), inv.get("invoice_no", ""))
     try:
+        pack_path = packing_list_pdf_path_for_invoice(abs_path if ok_pdf else "", inv.get("invoice_no", ""))
+        if pack_path and os.path.exists(pack_path):
+            os.remove(pack_path)
         if ok_pdf and abs_path and os.path.exists(abs_path):
             os.remove(abs_path)
     except Exception:
