@@ -12,6 +12,7 @@ import time
 import threading
 import urllib.parse
 import urllib.request
+import urllib.error
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 
@@ -670,6 +671,7 @@ def ensure_stock_row(product_id):
 
 SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "https://qfzawzkynmqkbjlbtkjd.supabase.co").strip().rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFmemF3emt5bm1xa2JqbGJ0a2pkIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NDUyNDgxMCwiZXhwIjoyMDkwMTAwODEwfQ.DcyQuZL4atOlbsgSWBmgl-nvQ0eJOTrcu6ciU59O7zU").strip()
+SUPABASE_STORAGE_BUCKET = (os.environ.get("SUPABASE_STORAGE_BUCKET") or "invoice-pdfs").strip()
 SUPABASE_AUTO_SYNC_ON_WRITE = (os.environ.get("SUPABASE_AUTO_SYNC_ON_WRITE") or "1").strip().lower() in ("1", "true", "yes", "on")
 SUPABASE_MIN_SYNC_INTERVAL_SEC = float((os.environ.get("SUPABASE_MIN_SYNC_INTERVAL_SEC") or "2").strip())
 SUPABASE_MIN_PULL_INTERVAL_SEC = float((os.environ.get("SUPABASE_MIN_PULL_INTERVAL_SEC") or "2").strip())
@@ -821,6 +823,72 @@ def supabase_request(path: str, method: str = "GET", params: dict | None = None,
         if "application/json" in ctype or raw[:1] in (b"[", b"{"):
             return json.loads(raw.decode("utf-8"))
         return raw.decode("utf-8", errors="replace")
+
+
+def supabase_storage_ref(object_path: str, bucket: str | None = None) -> str:
+    bucket = bucket or SUPABASE_STORAGE_BUCKET
+    return f"supabase://{bucket}/{object_path.lstrip('/')}"
+
+
+def parse_supabase_storage_ref(value: str) -> tuple[str, str] | None:
+    raw = norm(value)
+    if not raw.startswith("supabase://"):
+        return None
+    rest = raw[len("supabase://"):]
+    if "/" not in rest:
+        return None
+    bucket, object_path = rest.split("/", 1)
+    return bucket, object_path
+
+
+def supabase_storage_object_url(bucket: str, object_path: str) -> str:
+    quoted_path = urllib.parse.quote(object_path.lstrip("/"), safe="/")
+    return f"{SUPABASE_URL}/storage/v1/object/{urllib.parse.quote(bucket, safe='')}/{quoted_path}"
+
+
+def ensure_supabase_storage_bucket(bucket: str | None = None):
+    bucket = bucket or SUPABASE_STORAGE_BUCKET
+    if not supabase_enabled() or not bucket:
+        return
+    payload = json.dumps({"id": bucket, "name": bucket, "public": False}).encode("utf-8")
+    req = urllib.request.Request(f"{SUPABASE_URL}/storage/v1/bucket", data=payload, method="POST")
+    req.add_header("apikey", SUPABASE_SERVICE_ROLE_KEY)
+    req.add_header("Authorization", f"Bearer {SUPABASE_SERVICE_ROLE_KEY}")
+    req.add_header("Content-Type", "application/json")
+    try:
+        urllib.request.urlopen(req, timeout=30).read()
+    except urllib.error.HTTPError as e:
+        if e.code not in (400, 409):
+            raise
+
+
+def supabase_storage_upload_file(local_path: str, object_path: str, bucket: str | None = None, content_type: str = "application/pdf") -> str:
+    if not supabase_enabled():
+        raise RuntimeError("Brak konfiguracji Supabase")
+    bucket = bucket or SUPABASE_STORAGE_BUCKET
+    ensure_supabase_storage_bucket(bucket)
+    with open(local_path, "rb") as f:
+        data = f.read()
+    req = urllib.request.Request(supabase_storage_object_url(bucket, object_path), data=data, method="POST")
+    req.add_header("apikey", SUPABASE_SERVICE_ROLE_KEY)
+    req.add_header("Authorization", f"Bearer {SUPABASE_SERVICE_ROLE_KEY}")
+    req.add_header("Content-Type", content_type)
+    req.add_header("x-upsert", "true")
+    with urllib.request.urlopen(req, timeout=90) as resp:
+        resp.read()
+    return supabase_storage_ref(object_path, bucket)
+
+
+def supabase_storage_download_bytes(storage_ref: str) -> tuple[bytes, str]:
+    parsed = parse_supabase_storage_ref(storage_ref)
+    if not parsed:
+        raise RuntimeError("Nieprawidłowa ścieżka Supabase Storage")
+    bucket, object_path = parsed
+    req = urllib.request.Request(supabase_storage_object_url(bucket, object_path), method="GET")
+    req.add_header("apikey", SUPABASE_SERVICE_ROLE_KEY)
+    req.add_header("Authorization", f"Bearer {SUPABASE_SERVICE_ROLE_KEY}")
+    with urllib.request.urlopen(req, timeout=90) as resp:
+        return resp.read(), os.path.basename(object_path)
 
 
 def supabase_insert_row(table: str, row: dict):
@@ -1531,8 +1599,38 @@ def generate_order_invoice_pdf(order_row, items, meta):
 
 
 def packing_list_pdf_path_for_invoice(invoice_pdf_path: str, invoice_no: str) -> str:
+    if parse_supabase_storage_ref(invoice_pdf_path):
+        invoice_pdf_path = ""
     base_dir = os.path.dirname(invoice_pdf_path) if invoice_pdf_path else os.path.join(DATA_DIR, "faktury")
     return os.path.join(base_dir, f"{safe_filename(invoice_no)}_lista_pakowania.pdf")
+
+
+def invoice_storage_object_path(invoice_id: int, invoice_no: str, suffix: str = ".pdf") -> str:
+    return f"invoices/{int(invoice_id)}/{safe_filename(invoice_no)}{suffix}"
+
+
+def invoice_packing_storage_object_path(invoice_id: int, invoice_no: str) -> str:
+    return invoice_storage_object_path(invoice_id, invoice_no, "_lista_pakowania.pdf")
+
+
+def upload_invoice_pdfs_to_supabase(invoice_id: int, invoice_no: str, invoice_pdf_path: str, packing_pdf_path: str = "") -> str:
+    if not supabase_enabled():
+        return invoice_pdf_relpath(invoice_pdf_path)
+    invoice_ref = supabase_storage_upload_file(
+        invoice_pdf_path,
+        invoice_storage_object_path(invoice_id, invoice_no),
+        content_type="application/pdf",
+    )
+    if packing_pdf_path and os.path.exists(packing_pdf_path):
+        try:
+            supabase_storage_upload_file(
+                packing_pdf_path,
+                invoice_packing_storage_object_path(invoice_id, invoice_no),
+                content_type="application/pdf",
+            )
+        except Exception:
+            pass
+    return invoice_ref
 
 
 def generate_invoice_packing_list_pdf(order_row, items, meta, invoice_pdf_path: str = "") -> str:
@@ -1623,6 +1721,12 @@ def find_invoice_pdf_fallback(invoice_no: str) -> str:
 def invoice_pdf_exists(pdf_path: str, invoice_no: str = "") -> tuple[bool, str]:
     abs_path = ""
     raw_pdf = norm(pdf_path)
+    if parse_supabase_storage_ref(raw_pdf):
+        try:
+            supabase_storage_download_bytes(raw_pdf)
+            return True, raw_pdf
+        except Exception:
+            return False, raw_pdf
     if raw_pdf:
         abs_path = raw_pdf if os.path.isabs(raw_pdf) else invoice_pdf_abspath(raw_pdf)
     if abs_path and os.path.exists(abs_path):
@@ -3897,7 +4001,7 @@ def order_invoice(order_id):
             msg = "Faktura musi zawieraÄ‡ co najmniej jednÄ… pozycjÄ™."
         else:
             pdf_path, total_net, total_gross = generate_order_invoice_pdf(o, invoice_items, data)
-            generate_invoice_packing_list_pdf(o, invoice_items, data, pdf_path)
+            packing_pdf_path = generate_invoice_packing_list_pdf(o, invoice_items, data, pdf_path)
             c = conn()
             cur = c.cursor()
             cur.execute("""
@@ -3934,7 +4038,8 @@ def order_invoice(order_id):
                 invoice_id = int(rr["id"]) if rr else 0
             c.commit()
             c.close()
-            upsert_invoice_meta(invoice_id, invoice_pdf_relpath(pdf_path), json.dumps(invoice_items, ensure_ascii=False), sent_to_client=None)
+            stored_pdf_path = upload_invoice_pdfs_to_supabase(invoice_id, data["invoice_no"], pdf_path, packing_pdf_path)
+            upsert_invoice_meta(invoice_id, stored_pdf_path, json.dumps(invoice_items, ensure_ascii=False), sent_to_client=None)
             allocation_ids = replace_invoice_allocations(invoice_id, invoice_items)
             touched_order_ids = [int(x.get("source_order_id") or x.get("order_id") or 0) for x in invoice_items]
             completed_order_ids, changed_product_ids = finalize_fully_invoiced_orders(touched_order_ids)
@@ -4518,7 +4623,7 @@ def invoices():
         customer_name = inv.get("buyer_name") or inv.get("order_customer_name") or "Bez klienta"
         key = customer_name.strip().lower()
         if key != current_key:
-            current = {"customer_name": customer_name, "invoices": [], "total_net": 0.0, "total_gross": 0.0}
+            current = {"customer_name": customer_name, "invoices": [], "months": [], "total_net": 0.0, "total_gross": 0.0}
             groups.append(current)
             current_key = key
         inv["order_display"] = order_display_no(
@@ -4527,10 +4632,24 @@ def invoices():
             inv.get("source_order_no"),
             inv.get("source_order_note")
         ) if inv.get("source_order_id") else "-"
-        inv["pdf_ok"] = 1 if invoice_pdf_exists(inv.get("pdf_path", ""), inv.get("invoice_no", ""))[0] else 0
+        inv["pdf_ok"] = 1 if (invoice_pdf_exists(inv.get("pdf_path", ""), inv.get("invoice_no", ""))[0] or inv.get("invoice_items_json")) else 0
         current["invoices"].append(inv)
         current["total_net"] += float(inv.get("total_net") or 0)
         current["total_gross"] += float(inv.get("total_gross") or 0)
+
+    for g in groups:
+        month_map = {}
+        for inv in g["invoices"]:
+            issue_date = norm(inv.get("issue_date"))
+            month_key = issue_date[:7] if len(issue_date) >= 7 else "bez-daty"
+            month_label = month_key if month_key != "bez-daty" else "Bez daty"
+            if month_key not in month_map:
+                month_map[month_key] = {"month": month_key, "label": month_label, "invoices": [], "total_net": 0.0, "total_gross": 0.0}
+                g["months"].append(month_map[month_key])
+            month = month_map[month_key]
+            month["invoices"].append(inv)
+            month["total_net"] += float(inv.get("total_net") or 0)
+            month["total_gross"] += float(inv.get("total_gross") or 0)
 
     tpl = r"""
     {% extends "base.html" %}
@@ -4548,55 +4667,70 @@ def invoices():
 
       {% for g in groups %}
         <div class="card">
-          <div class="flex">
-            <h2 style="margin:0;">{{ g.customer_name }}</h2>
-            <span class="badge">{{ g.invoices|length }} faktur</span>
-            <span class="badge">Netto: {{ "%.2f"|format(g.total_net) }} PLN</span>
-            <span class="badge">Brutto: {{ "%.2f"|format(g.total_gross) }} PLN</span>
-          </div>
-          <table style="margin-top:10px;">
-            <thead>
-              <tr>
-                <th>Faktura</th>
-                <th>Data</th>
-                <th>Zamówienie</th>
-                <th>Netto</th>
-                <th>Brutto</th>
-                <th>Status</th>
-                <th>Akcje</th>
-              </tr>
-            </thead>
-            <tbody>
-              {% for inv in g.invoices %}
-                <tr>
-                  <td><b>{{ inv.invoice_no }}</b></td>
-                  <td>{{ inv.issue_date }}</td>
-                  <td>{{ inv.order_display }}</td>
-                  <td>{{ "%.2f"|format(inv.total_net) }}</td>
-                  <td>{{ "%.2f"|format(inv.total_gross) }}</td>
-                  <td>
-                    {% if inv.sent_to_client %}
-                      <span class="badge">W panelu klienta</span>
-                    {% else %}
-                      <span class="badge">Wewnętrzna</span>
-                    {% endif %}
-                    {% if not inv.pdf_ok %}
-                      <span class="badge danger">Brak PDF</span>
-                    {% endif %}
-                  </td>
-                  <td>
-                    <div class="flex">
-                      <a class="btn" href="{{ url_for('invoice_download_admin', invoice_id=inv.id) }}" target="_blank">Faktura PDF</a>
-                      <a class="btn" href="{{ url_for('invoice_packing_list_download_admin', invoice_id=inv.id) }}" target="_blank">Lista do paczki</a>
-                      {% if inv.source_order_id %}
-                        <a class="btn" href="{{ url_for('order_view', order_id=inv.source_order_id) }}">Zamówienie</a>
-                      {% endif %}
-                    </div>
-                  </td>
-                </tr>
-              {% endfor %}
-            </tbody>
-          </table>
+          <details {% if q %}open{% endif %}>
+            <summary class="flex" style="cursor:pointer; align-items:center;">
+              <h2 style="margin:0;">{{ g.customer_name }}</h2>
+              <span class="badge">{{ g.invoices|length }} faktur</span>
+              <span class="badge">Netto: {{ "%.2f"|format(g.total_net) }} PLN</span>
+              <span class="badge">Brutto: {{ "%.2f"|format(g.total_gross) }} PLN</span>
+              <span class="btn right">Pokaż faktury</span>
+            </summary>
+
+            {% for m in g.months %}
+              <details style="margin-top:10px;" {% if q %}open{% endif %}>
+                <summary class="flex" style="cursor:pointer; align-items:center;">
+                  <b>{{ m.label }}</b>
+                  <span class="badge">{{ m.invoices|length }} faktur</span>
+                  <span class="badge">Netto: {{ "%.2f"|format(m.total_net) }} PLN</span>
+                  <span class="badge">Brutto: {{ "%.2f"|format(m.total_gross) }} PLN</span>
+                </summary>
+
+                <table style="margin-top:10px;">
+                  <thead>
+                    <tr>
+                      <th>Faktura</th>
+                      <th>Data</th>
+                      <th>Zamówienie</th>
+                      <th>Netto</th>
+                      <th>Brutto</th>
+                      <th>Status</th>
+                      <th>Akcje</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {% for inv in m.invoices %}
+                      <tr>
+                        <td><b>{{ inv.invoice_no }}</b></td>
+                        <td>{{ inv.issue_date }}</td>
+                        <td>{{ inv.order_display }}</td>
+                        <td>{{ "%.2f"|format(inv.total_net) }}</td>
+                        <td>{{ "%.2f"|format(inv.total_gross) }}</td>
+                        <td>
+                          {% if inv.sent_to_client %}
+                            <span class="badge">W panelu klienta</span>
+                          {% else %}
+                            <span class="badge">Wewnętrzna</span>
+                          {% endif %}
+                          {% if not inv.pdf_ok %}
+                            <span class="badge danger">Brak PDF</span>
+                          {% endif %}
+                        </td>
+                        <td>
+                          <div class="flex">
+                            <a class="btn" href="{{ url_for('invoice_download_admin', invoice_id=inv.id) }}" target="_blank">Faktura PDF</a>
+                            <a class="btn" href="{{ url_for('invoice_packing_list_download_admin', invoice_id=inv.id) }}" target="_blank">Lista do paczki</a>
+                            {% if inv.source_order_id %}
+                              <a class="btn" href="{{ url_for('order_view', order_id=inv.source_order_id) }}">Zamówienie</a>
+                            {% endif %}
+                          </div>
+                        </td>
+                      </tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+              </details>
+            {% endfor %}
+          </details>
         </div>
       {% endfor %}
 
@@ -4680,9 +4814,84 @@ def invoice_download_admin(invoice_id):
     if not row:
         return "Nie znaleziono faktury", 404
 
+    if parse_supabase_storage_ref(row.get("pdf_path", "")):
+        try:
+            data, filename = supabase_storage_download_bytes(row.get("pdf_path", ""))
+            return send_file(io.BytesIO(data), mimetype="application/pdf", as_attachment=True, download_name=filename)
+        except Exception:
+            pass
+
     ok_pdf, abs_path = invoice_pdf_exists(row.get("pdf_path", ""), row.get("invoice_no", ""))
     if not ok_pdf:
-        return "Brak pliku PDF", 404
+        c = conn()
+        cur = c.cursor()
+        cur.execute("SELECT * FROM orders WHERE id=?", (row["order_id"],))
+        o = cur.fetchone()
+        c.close()
+        if not o:
+            return "Brak powiązanego zamówienia", 404
+
+        items = invoice_items_from_saved_json(invoice_id)
+        if not items:
+            return "Brak pozycji faktury", 400
+
+        meta = invoice_meta_payload(row)
+        abs_path, total_net, total_gross = generate_order_invoice_pdf(o, items, meta)
+        packing_pdf_path = generate_invoice_packing_list_pdf(o, items, meta, abs_path)
+        stored_pdf_path = upload_invoice_pdfs_to_supabase(invoice_id, row.get("invoice_no") or f"FV_{invoice_id}", abs_path, packing_pdf_path)
+
+        c = conn()
+        cur = c.cursor()
+        cur.execute("UPDATE invoices SET total_net=?, total_gross=? WHERE id=?", (total_net, total_gross, invoice_id))
+        c.commit()
+        c.close()
+
+        current_meta = load_invoice_meta(invoice_id) or {}
+        upsert_invoice_meta(
+            invoice_id,
+            stored_pdf_path,
+            current_meta.get("invoice_items_json") or json.dumps(items, ensure_ascii=False),
+            sent_to_client=int(current_meta.get("sent_to_client") or 0),
+            seen_by_client=int(current_meta.get("seen_by_client") or 0),
+            seen_at=current_meta.get("seen_at")
+        )
+
+        if supabase_enabled():
+            try:
+                sync_local_rows_to_supabase("invoices", "id", [invoice_id])
+            except Exception:
+                pass
+            try:
+                sync_local_rows_to_supabase("invoice_meta", "invoice_id", [invoice_id])
+            except Exception:
+                pass
+        if parse_supabase_storage_ref(stored_pdf_path):
+            data, filename = supabase_storage_download_bytes(stored_pdf_path)
+            return send_file(io.BytesIO(data), mimetype="application/pdf", as_attachment=True, download_name=filename)
+
+    if supabase_enabled() and abs_path and os.path.exists(abs_path) and not parse_supabase_storage_ref(row.get("pdf_path", "")):
+        try:
+            items = invoice_items_from_saved_json(invoice_id)
+            packing_pdf_path = ""
+            if items:
+                pack_candidate = packing_list_pdf_path_for_invoice(abs_path, row.get("invoice_no") or f"FV_{invoice_id}")
+                if os.path.exists(pack_candidate):
+                    packing_pdf_path = pack_candidate
+            stored_pdf_path = upload_invoice_pdfs_to_supabase(invoice_id, row.get("invoice_no") or f"FV_{invoice_id}", abs_path, packing_pdf_path)
+            current_meta = load_invoice_meta(invoice_id) or {}
+            upsert_invoice_meta(
+                invoice_id,
+                stored_pdf_path,
+                current_meta.get("invoice_items_json") or (json.dumps(items, ensure_ascii=False) if items else ""),
+                sent_to_client=int(current_meta.get("sent_to_client") or 0),
+                seen_by_client=int(current_meta.get("seen_by_client") or 0),
+                seen_at=current_meta.get("seen_at")
+            )
+            sync_local_rows_to_supabase("invoice_meta", "invoice_id", [invoice_id])
+            data, filename = supabase_storage_download_bytes(stored_pdf_path)
+            return send_file(io.BytesIO(data), mimetype="application/pdf", as_attachment=True, download_name=filename)
+        except Exception:
+            pass
     return send_file(abs_path, mimetype="application/pdf", as_attachment=True, download_name=os.path.basename(abs_path))
 
 
@@ -4704,10 +4913,29 @@ def invoice_packing_list_download_admin(invoice_id):
     if not items:
         return "Brak pozycji faktury", 400
 
+    if supabase_enabled():
+        packing_ref = supabase_storage_ref(invoice_packing_storage_object_path(invoice_id, inv.get("invoice_no") or f"FV_{invoice_id}"))
+        try:
+            data, filename = supabase_storage_download_bytes(packing_ref)
+            return send_file(io.BytesIO(data), mimetype="application/pdf", as_attachment=True, download_name=filename)
+        except Exception:
+            pass
+
     ok_pdf, invoice_abs_path = invoice_pdf_exists(inv.get("pdf_path", ""), inv.get("invoice_no", ""))
     pack_path = packing_list_pdf_path_for_invoice(invoice_abs_path if ok_pdf else "", inv.get("invoice_no") or f"FV_{invoice_id}")
     if not os.path.exists(pack_path):
         pack_path = generate_invoice_packing_list_pdf(o, items, invoice_meta_payload(inv), invoice_abs_path if ok_pdf else "")
+    if supabase_enabled():
+        try:
+            packing_ref = supabase_storage_upload_file(
+                pack_path,
+                invoice_packing_storage_object_path(invoice_id, inv.get("invoice_no") or f"FV_{invoice_id}"),
+                content_type="application/pdf",
+            )
+            data, filename = supabase_storage_download_bytes(packing_ref)
+            return send_file(io.BytesIO(data), mimetype="application/pdf", as_attachment=True, download_name=filename)
+        except Exception:
+            pass
 
     return send_file(pack_path, mimetype="application/pdf", as_attachment=True, download_name=os.path.basename(pack_path))
 
@@ -4731,7 +4959,8 @@ def invoice_regenerate_admin(invoice_id):
 
     meta = invoice_meta_payload(inv)
     pdf_path, total_net, total_gross = generate_order_invoice_pdf(o, items, meta)
-    generate_invoice_packing_list_pdf(o, items, meta, pdf_path)
+    packing_pdf_path = generate_invoice_packing_list_pdf(o, items, meta, pdf_path)
+    stored_pdf_path = upload_invoice_pdfs_to_supabase(invoice_id, inv["invoice_no"], pdf_path, packing_pdf_path)
 
     c = conn()
     cur = c.cursor()
@@ -4742,14 +4971,20 @@ def invoice_regenerate_admin(invoice_id):
     current_meta = load_invoice_meta(invoice_id) or {}
     upsert_invoice_meta(
         invoice_id,
-        invoice_pdf_relpath(pdf_path),
+        stored_pdf_path,
         current_meta.get("invoice_items_json") or json.dumps(items, ensure_ascii=False),
-        sent_to_client=int(current_meta.get("sent_to_client") or 0)
+        sent_to_client=int(current_meta.get("sent_to_client") or 0),
+        seen_by_client=int(current_meta.get("seen_by_client") or 0),
+        seen_at=current_meta.get("seen_at")
     )
 
     if supabase_enabled():
         try:
             sync_local_rows_to_supabase("invoices", "id", [invoice_id])
+        except Exception:
+            pass
+        try:
+            sync_local_rows_to_supabase("invoice_meta", "invoice_id", [invoice_id])
         except Exception:
             pass
 
@@ -4836,9 +5071,71 @@ def api_invoice_download(invoice_id):
         if int(row["sent_to_client"] or 0) != 1 or not (buyer_ok or order_ok):
             return "Brak dostÄ™pu", 403
 
+    if parse_supabase_storage_ref(row["pdf_path"]):
+        try:
+            data, filename = supabase_storage_download_bytes(row["pdf_path"])
+            return send_file(io.BytesIO(data), mimetype="application/pdf", as_attachment=True, download_name=filename)
+        except Exception:
+            pass
+
     ok_pdf, abs_path = invoice_pdf_exists(row["pdf_path"], row["invoice_no"])
     if not ok_pdf:
-        return "Brak pliku PDF", 404
+        cur_order = None
+        c = conn()
+        cur = c.cursor()
+        cur.execute("SELECT * FROM orders WHERE id=?", (row["order_id"],))
+        cur_order = cur.fetchone()
+        c.close()
+        if not cur_order:
+            return "Brak powiązanego zamówienia", 404
+        items = invoice_items_from_saved_json(invoice_id)
+        if not items:
+            return "Brak pozycji faktury", 400
+        meta = invoice_meta_payload(dict(row))
+        abs_path, total_net, total_gross = generate_order_invoice_pdf(cur_order, items, meta)
+        packing_pdf_path = generate_invoice_packing_list_pdf(cur_order, items, meta, abs_path)
+        stored_pdf_path = upload_invoice_pdfs_to_supabase(invoice_id, row["invoice_no"], abs_path, packing_pdf_path)
+        current_meta = load_invoice_meta(invoice_id) or {}
+        upsert_invoice_meta(
+            invoice_id,
+            stored_pdf_path,
+            current_meta.get("invoice_items_json") or json.dumps(items, ensure_ascii=False),
+            sent_to_client=int(current_meta.get("sent_to_client") or 0),
+            seen_by_client=int(current_meta.get("seen_by_client") or 0),
+            seen_at=current_meta.get("seen_at")
+        )
+        if supabase_enabled():
+            try:
+                sync_local_rows_to_supabase("invoice_meta", "invoice_id", [invoice_id])
+            except Exception:
+                pass
+        if parse_supabase_storage_ref(stored_pdf_path):
+            data, filename = supabase_storage_download_bytes(stored_pdf_path)
+            return send_file(io.BytesIO(data), mimetype="application/pdf", as_attachment=True, download_name=filename)
+
+    if supabase_enabled() and abs_path and os.path.exists(abs_path) and not parse_supabase_storage_ref(row["pdf_path"]):
+        try:
+            items = invoice_items_from_saved_json(invoice_id)
+            packing_pdf_path = ""
+            if items:
+                pack_candidate = packing_list_pdf_path_for_invoice(abs_path, row["invoice_no"])
+                if os.path.exists(pack_candidate):
+                    packing_pdf_path = pack_candidate
+            stored_pdf_path = upload_invoice_pdfs_to_supabase(invoice_id, row["invoice_no"], abs_path, packing_pdf_path)
+            current_meta = load_invoice_meta(invoice_id) or {}
+            upsert_invoice_meta(
+                invoice_id,
+                stored_pdf_path,
+                current_meta.get("invoice_items_json") or (json.dumps(items, ensure_ascii=False) if items else ""),
+                sent_to_client=int(current_meta.get("sent_to_client") or 0),
+                seen_by_client=int(current_meta.get("seen_by_client") or 0),
+                seen_at=current_meta.get("seen_at")
+            )
+            sync_local_rows_to_supabase("invoice_meta", "invoice_id", [invoice_id])
+            data, filename = supabase_storage_download_bytes(stored_pdf_path)
+            return send_file(io.BytesIO(data), mimetype="application/pdf", as_attachment=True, download_name=filename)
+        except Exception:
+            pass
 
     try:
         return send_file(abs_path, mimetype="application/pdf", as_attachment=True, download_name=os.path.basename(abs_path))
@@ -4915,12 +5212,48 @@ def order_invoice_send(order_id, invoice_id):
 
     meta = load_invoice_meta(invoice_id) or {}
     pdf_path = norm(meta.get("pdf_path"))
-    if (not pdf_path) or (not os.path.exists(pdf_path if os.path.isabs(pdf_path) else invoice_pdf_abspath(pdf_path))):
-        fallback = find_invoice_pdf_fallback(row["invoice_no"])
-        if fallback:
-            pdf_path = invoice_pdf_relpath(fallback)
+    stored_pdf_path = pdf_path
 
-    upsert_invoice_meta(invoice_id, pdf_path, meta.get("invoice_items_json",""), sent_to_client=1, seen_by_client=0, seen_at=None)
+    if not parse_supabase_storage_ref(stored_pdf_path):
+        local_pdf_path = ""
+        if pdf_path:
+            candidate = pdf_path if os.path.isabs(pdf_path) else invoice_pdf_abspath(pdf_path)
+            if os.path.exists(candidate):
+                local_pdf_path = candidate
+
+        if not local_pdf_path:
+            fallback = find_invoice_pdf_fallback(row["invoice_no"])
+            if fallback:
+                local_pdf_path = fallback
+
+        items = invoice_items_from_saved_json(invoice_id)
+        if not local_pdf_path and items:
+            c = conn()
+            cur = c.cursor()
+            cur.execute("SELECT * FROM orders WHERE id=?", (order_id,))
+            order_row = cur.fetchone()
+            c.close()
+            if order_row:
+                meta_payload = invoice_meta_payload(dict(row))
+                local_pdf_path, _total_net, _total_gross = generate_order_invoice_pdf(order_row, items, meta_payload)
+
+        if local_pdf_path:
+            packing_pdf_path = ""
+            if items:
+                pack_candidate = packing_list_pdf_path_for_invoice(local_pdf_path, row["invoice_no"])
+                if os.path.exists(pack_candidate):
+                    packing_pdf_path = pack_candidate
+                else:
+                    c = conn()
+                    cur = c.cursor()
+                    cur.execute("SELECT * FROM orders WHERE id=?", (order_id,))
+                    order_row = cur.fetchone()
+                    c.close()
+                    if order_row:
+                        packing_pdf_path = generate_invoice_packing_list_pdf(order_row, items, invoice_meta_payload(dict(row)), local_pdf_path)
+            stored_pdf_path = upload_invoice_pdfs_to_supabase(invoice_id, row["invoice_no"], local_pdf_path, packing_pdf_path)
+
+    upsert_invoice_meta(invoice_id, stored_pdf_path, meta.get("invoice_items_json",""), sent_to_client=1, seen_by_client=0, seen_at=None)
 
     if supabase_enabled():
         try:
