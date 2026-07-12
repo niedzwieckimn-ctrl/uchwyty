@@ -3486,7 +3486,6 @@ def order_view(order_id):
       JOIN products p ON p.id=oi.product_id
       LEFT JOIN stock s ON s.product_id=p.id
       LEFT JOIN pricing pr ON (TRIM(LOWER(pr.model)) = TRIM(LOWER(p.model)) OR TRIM(LOWER(pr.model)) = TRIM(LOWER(p.sku)))
-      LEFT JOIN stock s ON s.product_id=p.id
       WHERE oi.order_id=?
       ORDER BY oi.id
     """, (order_id,))
