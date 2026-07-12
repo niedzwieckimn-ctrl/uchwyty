@@ -13,6 +13,7 @@ import threading
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
+from decimal import Decimal, ROUND_HALF_UP
 
 from flask import (
     Flask, request, redirect, url_for, jsonify,
@@ -484,6 +485,31 @@ def payment_type_pl(x: str) -> str:
         "karta": "karta",
     }
     return mapping.get(v, v or "-")
+
+
+VAT_23 = Decimal("0.23")
+MONEY_Q = Decimal("0.01")
+CURRENT_ORDER_STATUSES = {"new", "pending", "unconfirmed", "confirmed", "packed", "in_delivery", "shipped"}
+
+
+def money_dec(value) -> Decimal:
+    try:
+        return Decimal(str(value or "0")).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
+    except Exception:
+        return Decimal("0.00")
+
+
+def money_float(value) -> float:
+    return float(money_dec(value))
+
+
+def vat23_from_net(net_value) -> Decimal:
+    return (money_dec(net_value) * VAT_23).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
+
+
+def gross_from_net_23(net_value) -> Decimal:
+    net = money_dec(net_value)
+    return (net + vat23_from_net(net)).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
 
 
 def find_logo_path() -> str:
@@ -1372,15 +1398,20 @@ def generate_order_invoice_pdf(order_row, items, meta):
         model = norm(it.get("model"))
         sku = norm(it.get("sku"))
         pr = pricing_map.get(model) or pricing_map.get(sku)
-        net = float(pr["net_price"]) if pr else 0.0
-        gross = float(pr["gross_price"]) if pr else round(net * 1.23, 2)
+        net_dec = money_dec(pr["net_price"] if pr else it.get("net_price"))
         qty = int(it["qty"])
-        line_net = round(net * qty, 2)
-        line_gross = round(gross * qty, 2)
+        line_net_dec = (net_dec * Decimal(qty)).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
         if discount_pct > 0:
-            line_net = round(line_net * (100.0 - discount_pct) / 100.0, 2)
-            line_gross = round(line_gross * (100.0 - discount_pct) / 100.0, 2)
-        line_tax = round(line_gross - line_net, 2)
+            line_net_dec = (line_net_dec * (Decimal("100.0") - Decimal(str(discount_pct))) / Decimal("100.0")).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
+        line_tax_dec = vat23_from_net(line_net_dec)
+        line_gross_dec = (line_net_dec + line_tax_dec).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
+        unit_gross_dec = gross_from_net_23(net_dec)
+
+        net = money_float(net_dec)
+        gross = money_float(unit_gross_dec)
+        line_net = money_float(line_net_dec)
+        line_tax = money_float(line_tax_dec)
+        line_gross = money_float(line_gross_dec)
 
         total_net += line_net
         total_gross += line_gross
@@ -1510,8 +1541,15 @@ def prepare_invoice_items(order_items: list[dict], form):
         row["ordered_qty"] = int(it.get("qty") or 0)
         row["invoiced_qty_before"] = int(it.get("invoiced_qty") or 0)
         row["qty"] = qty
-        row["line_value_net"] = round(float(row.get("net_price") or 0) * qty, 2)
-        row["line_value_gross"] = round(float(row.get("gross_price") or 0) * qty, 2)
+        line_net = money_dec(row.get("net_price")) * Decimal(qty)
+        line_net = line_net.quantize(MONEY_Q, rounding=ROUND_HALF_UP)
+        line_vat = vat23_from_net(line_net)
+        line_gross = (line_net + line_vat).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
+        row["gross_price"] = money_float(gross_from_net_23(row.get("net_price")))
+        row["vat_rate"] = 23
+        row["line_value_net"] = money_float(line_net)
+        row["line_value_vat"] = money_float(line_vat)
+        row["line_value_gross"] = money_float(line_gross)
         prepared.append(row)
     return prepared
 
@@ -1564,6 +1602,74 @@ def replace_invoice_allocations(invoice_id: int, invoice_items: list[dict]):
     c.commit()
     c.close()
     return allocation_ids
+
+
+def order_fully_invoiced(cur, order_id: int) -> bool:
+    cur.execute("SELECT id, qty FROM order_items WHERE order_id=?", (order_id,))
+    rows = [dict(r) for r in cur.fetchall()]
+    if not rows:
+        return False
+    item_ids = [int(r["id"]) for r in rows]
+    ph = ",".join(["?"] * len(item_ids))
+    cur.execute(f"""
+      SELECT order_item_id, COALESCE(SUM(qty),0) AS qty
+      FROM invoice_allocations
+      WHERE order_item_id IN ({ph})
+      GROUP BY order_item_id
+    """, tuple(item_ids))
+    done = {int(r["order_item_id"]): int(r["qty"] or 0) for r in cur.fetchall()}
+    return all(int(row["qty"] or 0) > 0 and int(done.get(int(row["id"]), 0)) >= int(row["qty"] or 0) for row in rows)
+
+
+def finalize_fully_invoiced_orders(order_ids: list[int]):
+    touched = sorted({int(x) for x in order_ids if x})
+    if not touched:
+        return [], []
+
+    c = conn()
+    cur = c.cursor()
+    completed_order_ids = []
+    changed_product_ids = []
+
+    for order_id in touched:
+        if not order_fully_invoiced(cur, order_id):
+            continue
+        cur.execute("SELECT id, status, warehouse_issued FROM orders WHERE id=?", (order_id,))
+        order_row = cur.fetchone()
+        if not order_row:
+            continue
+
+        warehouse_issued = int(order_row["warehouse_issued"] or 0)
+        if warehouse_issued == 0:
+            cur.execute("SELECT product_id, qty FROM order_items WHERE order_id=?", (order_id,))
+            for it in cur.fetchall():
+                pid = int(it["product_id"])
+                qty = int(it["qty"] or 0)
+                cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (pid,))
+                cur.execute("UPDATE stock SET qty = qty - ? WHERE product_id=?", (qty, pid))
+                changed_product_ids.append(pid)
+            warehouse_issued = 1
+
+        if norm(order_row["status"]).lower() != "issued" or int(order_row["warehouse_issued"] or 0) != warehouse_issued:
+            cur.execute("UPDATE orders SET status='issued', warehouse_issued=? WHERE id=?", (warehouse_issued, order_id))
+            completed_order_ids.append(order_id)
+
+    c.commit()
+    c.close()
+
+    if supabase_enabled():
+        for order_id in completed_order_ids:
+            try:
+                supabase_update_rows("orders", {"status": "issued", "warehouse_issued": 1}, {"id": order_id})
+            except Exception:
+                pass
+        if changed_product_ids:
+            try:
+                sync_local_rows_to_supabase("stock", "product_id", list(set(changed_product_ids)))
+            except Exception:
+                pass
+
+    return completed_order_ids, list(set(changed_product_ids))
 
 
 # =========================
@@ -3508,18 +3614,20 @@ def order_invoice(order_id):
         c.close()
         abort(404)
 
-    related_orders = [dict(o)]
+    related_orders = [dict(o)] if norm(o["status"]).lower() in CURRENT_ORDER_STATUSES else []
     customer_email_key = _email_key(o["customer_email"])
     if customer_email_key:
-        cur.execute("""
+        status_ph = ",".join(["?"] * len(CURRENT_ORDER_STATUSES))
+        cur.execute(f"""
           SELECT *
           FROM orders
           WHERE LOWER(COALESCE(customer_email,'')) = ?
+            AND LOWER(COALESCE(status,'')) IN ({status_ph})
           ORDER BY created_at DESC, id DESC
-        """, (customer_email_key,))
+        """, (customer_email_key, *sorted(CURRENT_ORDER_STATUSES)))
         related_orders = [dict(r) for r in cur.fetchall()]
 
-    related_order_ids = [int(r["id"]) for r in related_orders] or [int(order_id)]
+    related_order_ids = [int(r["id"]) for r in related_orders] or [-1]
     related_order_by_id = {int(r["id"]): r for r in related_orders}
     order_ph = ",".join(["?"] * len(related_order_ids))
 
@@ -3674,6 +3782,8 @@ def order_invoice(order_id):
             c.close()
             upsert_invoice_meta(invoice_id, invoice_pdf_relpath(pdf_path), json.dumps(invoice_items, ensure_ascii=False), sent_to_client=None)
             allocation_ids = replace_invoice_allocations(invoice_id, invoice_items)
+            touched_order_ids = [int(x.get("source_order_id") or x.get("order_id") or 0) for x in invoice_items]
+            completed_order_ids, changed_product_ids = finalize_fully_invoiced_orders(touched_order_ids)
             if supabase_enabled():
                 try:
                     sync_local_rows_to_supabase("invoices", "id", [invoice_id])
@@ -3687,6 +3797,16 @@ def order_invoice(order_id):
                     sync_local_rows_to_supabase("invoice_allocations", "id", allocation_ids)
                 except Exception:
                     pass
+                if completed_order_ids:
+                    try:
+                        sync_local_rows_to_supabase("orders", "id", completed_order_ids)
+                    except Exception:
+                        pass
+                if changed_product_ids:
+                    try:
+                        sync_local_rows_to_supabase("stock", "product_id", changed_product_ids)
+                    except Exception:
+                        pass
             return redirect(url_for("order_invoice", order_id=order_id, generated="1", invoice_id=invoice_id))
 
     tpl = r"""
