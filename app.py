@@ -1428,9 +1428,23 @@ def generate_order_invoice_pdf(order_row, items, meta):
     company = cur.fetchone()
     cur.execute("SELECT model, net_price, gross_price FROM pricing")
     pricing_rows = cur.fetchall()
+    cur.execute("SELECT sku, model, name FROM products")
+    product_rows = cur.fetchall()
     c.close()
 
     pricing_map = {norm(r["model"]): r for r in pricing_rows}
+    product_map = {norm(r["sku"]): r for r in product_rows}
+
+    def pdf_txt(value) -> str:
+        return fix_polish_mojibake(norm(value))
+
+    def fit_pdf_text(value, font_name, font_size, max_width, suffix="...") -> str:
+        text = pdf_txt(value)
+        if pdfmetrics.stringWidth(text, font_name, font_size) <= max_width:
+            return text
+        while text and pdfmetrics.stringWidth(text + suffix, font_name, font_size) > max_width:
+            text = text[:-1]
+        return (text + suffix) if text else ""
 
     w = 210 * mm
     h = 297 * mm
@@ -2311,6 +2325,9 @@ def pricing_import():
         headers = [norm(x) for x in rows[0]]
         data = rows[1:]
         i_model = guess_col(headers, ["model"])
+        i_sku = guess_col(headers, ["sku", "symbol", "index", "indeks", "kod", "code"])
+        i_name = guess_col(headers, ["nazwa", "name", "produkt", "product"])
+        i_ean = guess_col(headers, ["ean", "gtin"])
         i_net = guess_col(headers, ["netto", "net", "cena netto"])
         i_gross = guess_col(headers, ["brutto", "gross", "cena brutto"])
         if i_model is None or i_net is None or i_gross is None:
@@ -2321,9 +2338,12 @@ def pricing_import():
             model = norm(r[i_model]) if len(r) > i_model else ""
             if not model:
                 continue
+            sku = norm(r[i_sku]) if i_sku is not None and len(r) > i_sku else model
+            name = norm(r[i_name]) if i_name is not None and len(r) > i_name else ""
+            ean = norm(r[i_ean]) if i_ean is not None and len(r) > i_ean else ""
             net = to_float(r[i_net] if len(r) > i_net else "", 0.0)
             gross = to_float(r[i_gross] if len(r) > i_gross else "", 0.0)
-            parsed_rows.append((model, net, gross))
+            parsed_rows.append((sku, model, name, ean, net, gross))
 
     else:
         raw = f.read()
@@ -2340,6 +2360,9 @@ def pricing_import():
         headers = rows[0]
         data = rows[1:]
         i_model = guess_col(headers, ["model"])
+        i_sku = guess_col(headers, ["sku", "symbol", "index", "indeks", "kod", "code"])
+        i_name = guess_col(headers, ["nazwa", "name", "produkt", "product"])
+        i_ean = guess_col(headers, ["ean", "gtin"])
         i_net = guess_col(headers, ["netto", "net", "cena netto"])
         i_gross = guess_col(headers, ["brutto", "gross", "cena brutto"])
         if i_model is None or i_net is None or i_gross is None:
@@ -2350,13 +2373,17 @@ def pricing_import():
             model = norm(r[i_model]) if len(r) > i_model else ""
             if not model:
                 continue
+            sku = norm(r[i_sku]) if i_sku is not None and len(r) > i_sku else model
+            name = norm(r[i_name]) if i_name is not None and len(r) > i_name else ""
+            ean = norm(r[i_ean]) if i_ean is not None and len(r) > i_ean else ""
             net = to_float(r[i_net] if len(r) > i_net else "", 0.0)
             gross = to_float(r[i_gross] if len(r) > i_gross else "", 0.0)
-            parsed_rows.append((model, net, gross))
+            parsed_rows.append((sku, model, name, ean, net, gross))
 
     c = conn()
     cur = c.cursor()
-    for model, net, gross in parsed_rows:
+    changed_product_ids = []
+    for sku, model, name, ean, net, gross in parsed_rows:
         cur.execute("""
           INSERT INTO pricing(model, net_price, gross_price, created_at)
           VALUES(?,?,?,?)
@@ -2365,8 +2392,41 @@ def pricing_import():
             gross_price=excluded.gross_price,
             created_at=excluded.created_at
         """, (model, net, gross, now_iso()))
+        if sku:
+            cur.execute("SELECT id FROM products WHERE sku=? LIMIT 1", (sku,))
+            existing = cur.fetchone()
+            if existing:
+                cur.execute("""
+                  UPDATE products
+                  SET model=COALESCE(NULLIF(?, ''), model),
+                      ean=COALESCE(NULLIF(?, ''), ean),
+                      name=COALESCE(NULLIF(?, ''), name)
+                  WHERE sku=?
+                """, (model, ean, name, sku))
+                pid = int(existing["id"])
+            else:
+                cur.execute(
+                    "INSERT INTO products(sku, model, ean, name, created_at) VALUES (?,?,?,?,?)",
+                    (sku, model, ean, name, now_iso())
+                )
+                pid = int(cur.lastrowid)
+            changed_product_ids.append(pid)
+            cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (pid,))
     c.commit()
     c.close()
+    if supabase_enabled():
+        try:
+            sync_local_table_to_supabase("pricing", "model")
+        except Exception:
+            pass
+        try:
+            sync_local_rows_to_supabase("products", "id", changed_product_ids)
+        except Exception:
+            pass
+        try:
+            sync_local_rows_to_supabase("stock", "product_id", changed_product_ids)
+        except Exception:
+            pass
     return redirect(url_for("pricing"))
 
 
