@@ -1302,9 +1302,23 @@ def generate_sales_invoice(order_row, items):
     company = cur.fetchone()
     cur.execute("SELECT model, net_price, gross_price FROM pricing")
     pricing_rows = cur.fetchall()
+    cur.execute("SELECT sku, model, name FROM products")
+    product_rows = cur.fetchall()
     c.close()
 
     pricing_map = {norm(r["model"]): r for r in pricing_rows}
+    product_map = {norm(r["sku"]): r for r in product_rows}
+
+    def pdf_txt(value) -> str:
+        return fix_polish_mojibake(norm(value))
+
+    def fit_pdf_text(value, font_name, font_size, max_width, suffix="...") -> str:
+        text = pdf_txt(value)
+        if pdfmetrics.stringWidth(text, font_name, font_size) <= max_width:
+            return text
+        while text and pdfmetrics.stringWidth(text + suffix, font_name, font_size) > max_width:
+            text = text[:-1]
+        return (text + suffix) if text else ""
 
     w = 210 * mm
     h = 297 * mm
@@ -1446,13 +1460,13 @@ def generate_order_invoice_pdf(order_row, items, meta):
 
     y -= 7 * mm
     cpdf.setFont(pdf_font, 10)
-    cpdf.drawString(15 * mm, y, f"Miejsce: {meta.get('place') or '-'}")
-    cpdf.drawString(85 * mm, y, f"Data wystawienia: {meta['issue_date']}")
-    cpdf.drawString(150 * mm, y, f"Data sprzedaĹĽy: {meta['sell_date']}")
+    cpdf.drawString(15 * mm, y, f"Miejsce: {pdf_txt(meta.get('place') or '-')}")
+    cpdf.drawString(85 * mm, y, f"Data wystawienia: {pdf_txt(meta['issue_date'])}")
+    cpdf.drawString(150 * mm, y, f"Data sprzedaży: {pdf_txt(meta['sell_date'])}")
 
     y -= 7 * mm
-    cpdf.drawString(15 * mm, y, f"Forma pĹ‚atnoĹ›ci: {payment_type_pl(meta.get('payment_type'))}")
-    cpdf.drawString(85 * mm, y, f"Termin pĹ‚atnoĹ›ci: {meta.get('payment_to') or '-'}")
+    cpdf.drawString(15 * mm, y, f"Forma płatności: {pdf_txt(payment_type_pl(meta.get('payment_type')))}")
+    cpdf.drawString(85 * mm, y, f"Termin płatności: {pdf_txt(meta.get('payment_to') or '-')}")
 
     y -= 10 * mm
     cpdf.setFont(pdf_font_bold, 10)
@@ -1461,21 +1475,21 @@ def generate_order_invoice_pdf(order_row, items, meta):
 
     y -= 6 * mm
     cpdf.setFont(pdf_font, 9)
-    seller_name = (company["company_name"] if company else "") or "-"
-    seller_nip = (company["nip"] if company else "") or "-"
-    seller_addr = (company["address"] if company else "") or "-"
-    seller_phone = (company["phone"] if company else "") or ""
-    seller_email = (company["email"] if company else "") or ""
-    seller_bank = (company["bank_account"] if company else "") or ""
+    seller_name = pdf_txt((company["company_name"] if company else "") or "-")
+    seller_nip = pdf_txt((company["nip"] if company else "") or "-")
+    seller_addr = pdf_txt((company["address"] if company else "") or "-")
+    seller_phone = pdf_txt((company["phone"] if company else "") or "")
+    seller_email = pdf_txt((company["email"] if company else "") or "")
+    seller_bank = pdf_txt((company["bank_account"] if company else "") or "")
 
-    buyer_name = meta.get("buyer_name") or (order_row["customer_name"] if order_row and "customer_name" in order_row.keys() else "") or "-"
-    buyer_tax_no = meta.get("buyer_tax_no") or "-"
-    buyer_street = meta.get("buyer_street") or "-"
-    buyer_post = meta.get("buyer_post_code") or ""
-    buyer_city = meta.get("buyer_city") or ""
-    buyer_country = meta.get("buyer_country") or "PL"
-    buyer_email = meta.get("buyer_email") or ""
-    buyer_phone = meta.get("buyer_phone") or ""
+    buyer_name = pdf_txt(meta.get("buyer_name") or (order_row["customer_name"] if order_row and "customer_name" in order_row.keys() else "") or "-")
+    buyer_tax_no = pdf_txt(meta.get("buyer_tax_no") or "-")
+    buyer_street = pdf_txt(meta.get("buyer_street") or "-")
+    buyer_post = pdf_txt(meta.get("buyer_post_code") or "")
+    buyer_city = pdf_txt(meta.get("buyer_city") or "")
+    buyer_country = pdf_txt(meta.get("buyer_country") or "PL")
+    buyer_email = pdf_txt(meta.get("buyer_email") or "")
+    buyer_phone = pdf_txt(meta.get("buyer_phone") or "")
 
     seller_lines = [seller_name, f"NIP: {seller_nip}", seller_addr]
     if seller_phone:
@@ -1502,8 +1516,8 @@ def generate_order_invoice_pdf(order_row, items, meta):
     y -= 3 * mm
     table_left = 15 * mm
     table_right = 198 * mm
-    row_h = 9 * mm
-    # L.p. | Nazwa/SKU | IloĹ›Ä‡ | Netto/szt | Brutto/szt | WartoĹ›Ä‡ netto | VAT
+    row_h = 12 * mm
+    # L.p. | Nazwa/SKU | Ilość | Netto/szt | Brutto/szt | Wartość netto | VAT
     col_x = [15 * mm, 23 * mm, 96 * mm, 110 * mm, 134 * mm, 158 * mm, 180 * mm, 198 * mm]
 
     def cell_center(x1, x2):
@@ -1524,10 +1538,10 @@ def generate_order_invoice_pdf(order_row, items, meta):
     header_y = cell_baseline(y, row_h, pdf_font_bold, header_font)
     cpdf.drawCentredString(cell_center(col_x[0], col_x[1]), header_y, "L.p.")
     cpdf.drawCentredString(cell_center(col_x[1], col_x[2]), header_y, "Nazwa/SKU")
-    cpdf.drawCentredString(cell_center(col_x[2], col_x[3]), header_y, "IloĹ›Ä‡")
+    cpdf.drawCentredString(cell_center(col_x[2], col_x[3]), header_y, "Ilość")
     cpdf.drawCentredString(cell_center(col_x[3], col_x[4]), header_y, "Netto/szt")
     cpdf.drawCentredString(cell_center(col_x[4], col_x[5]), header_y, "Brutto/szt")
-    cpdf.drawCentredString(cell_center(col_x[5], col_x[6]), header_y, "WartoĹ›Ä‡ netto")
+    cpdf.drawCentredString(cell_center(col_x[5], col_x[6]), header_y, "Wartość netto")
     cpdf.drawCentredString(cell_center(col_x[6], col_x[7]), header_y, "VAT")
     cpdf.line(table_left, y + 1, table_right, y + 1)
     cpdf.line(table_left, y - row_h + 1, table_right, y - row_h + 1)
@@ -1543,8 +1557,11 @@ def generate_order_invoice_pdf(order_row, items, meta):
 
     lp = 1
     for it in items:
-        model = norm(it.get("model"))
-        sku = norm(it.get("sku"))
+        sku = pdf_txt(it.get("sku"))
+        product_row = product_map.get(norm(sku))
+        model = pdf_txt(it.get("model") or (product_row["model"] if product_row else ""))
+        name = pdf_txt(it.get("name") or (product_row["name"] if product_row else ""))
+        common_name = name or model
         pr = pricing_map.get(model) or pricing_map.get(sku)
         net_dec = money_dec(pr["net_price"] if pr else it.get("net_price"))
         qty = int(it["qty"])
@@ -1566,7 +1583,14 @@ def generate_order_invoice_pdf(order_row, items, meta):
 
         text_y = cell_baseline(y, row_h, pdf_font, body_font)
         cpdf.drawCentredString(cell_center(col_x[0], col_x[1]), text_y, str(lp))
-        cpdf.drawString(col_x[1] + 1.5 * mm, text_y, (sku or model or "-")[:24])
+        name_left = col_x[1] + 1.5 * mm
+        name_width = (col_x[2] - col_x[1]) - 3 * mm
+        cpdf.setFont(pdf_font_bold, body_font)
+        cpdf.drawString(name_left, y - 4.4 * mm, fit_pdf_text(sku or "-", pdf_font_bold, body_font, name_width))
+        cpdf.setFont(pdf_font, body_font)
+        if common_name:
+            label = common_name if common_name.lower() == model.lower() else f"{common_name} / {model}".strip(" /")
+            cpdf.drawString(name_left, y - 8.7 * mm, fit_pdf_text(label, pdf_font, body_font, name_width))
         cpdf.drawCentredString(cell_center(col_x[2], col_x[3]), text_y, str(qty))
         cpdf.drawRightString(col_x[4] - 1.5 * mm, text_y, f"{net:.2f}")
         cpdf.drawRightString(col_x[5] - 1.5 * mm, text_y, f"{gross:.2f}")
