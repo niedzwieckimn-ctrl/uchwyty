@@ -5103,6 +5103,10 @@ def invoices():
                                 <button class="btn" type="submit">Cofnij opłacenie</button>
                               </form>
                             {% endif %}
+                            <form method="post" action="{{ url_for('invoice_delete_admin', invoice_id=inv.id) }}" onsubmit="return confirm('Usunąć fakturę {{ inv.invoice_no }}? To usunie też PDF i widoczność w panelu klienta.')">
+                              <input type="hidden" name="next" value="{{ request.full_path }}">
+                              <button class="btn danger" type="submit">Usuń</button>
+                            </form>
                           </div>
                         </td>
                       </tr>
@@ -5584,11 +5588,18 @@ def api_invoice_download(invoice_id):
     except Exception as e:
         return f"BĹ‚Ä…d pobierania PDF: {e}", 500
 
-@app.post("/orders/<int:order_id>/invoice/<int:invoice_id>/delete")
-def order_invoice_delete(order_id, invoice_id):
+def _delete_invoice_everywhere(invoice_id: int):
     inv = load_invoice_with_meta(invoice_id)
-    if not inv or int(inv.get("order_id") or 0) != int(order_id):
+    if not inv:
         abort(404)
+
+    c = conn()
+    cur = c.cursor()
+    cur.execute("SELECT DISTINCT order_id FROM invoice_allocations WHERE invoice_id=?", (invoice_id,))
+    touched_order_ids = [int(r["order_id"]) for r in cur.fetchall()]
+    if int(inv.get("order_id") or 0) and int(inv.get("order_id") or 0) not in touched_order_ids:
+        touched_order_ids.append(int(inv.get("order_id") or 0))
+    c.close()
 
     ok_pdf, abs_path = invoice_pdf_exists(inv.get("pdf_path", ""), inv.get("invoice_no", ""))
     try:
@@ -5608,6 +5619,8 @@ def order_invoice_delete(order_id, invoice_id):
     c.commit()
     c.close()
 
+    changed_order_ids, changed_product_ids = reconcile_orders_after_invoice_change(touched_order_ids)
+
     if supabase_enabled():
         try:
             supabase_delete_rows("invoice_allocations", {"invoice_id": invoice_id})
@@ -5621,6 +5634,32 @@ def order_invoice_delete(order_id, invoice_id):
             supabase_delete_rows("invoices", {"id": invoice_id})
         except Exception:
             pass
+        if changed_order_ids:
+            try:
+                sync_local_rows_to_supabase("orders", "id", changed_order_ids)
+            except Exception:
+                pass
+        if changed_product_ids:
+            try:
+                sync_local_rows_to_supabase("stock", "product_id", changed_product_ids)
+            except Exception:
+                pass
+
+    return inv
+
+
+@app.post("/invoices/<int:invoice_id>/delete")
+def invoice_delete_admin(invoice_id):
+    _delete_invoice_everywhere(invoice_id)
+    return _redirect_after_invoice_action()
+
+
+@app.post("/orders/<int:order_id>/invoice/<int:invoice_id>/delete")
+def order_invoice_delete(order_id, invoice_id):
+    inv = load_invoice_with_meta(invoice_id)
+    if not inv or int(inv.get("order_id") or 0) != int(order_id):
+        abort(404)
+    _delete_invoice_everywhere(invoice_id)
 
     return redirect(url_for("order_invoice", order_id=order_id, deleted="1"))
 
