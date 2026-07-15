@@ -15,6 +15,10 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 
 from flask import (
     Flask, request, redirect, url_for, jsonify,
@@ -338,8 +342,13 @@ init_db()
 # UTILS
 # =========================
 
+APP_TZ = ZoneInfo("Europe/Warsaw") if ZoneInfo else None
+
+def app_now():
+    return datetime.now(APP_TZ) if APP_TZ else datetime.now()
+
 def now_iso():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return app_now().strftime("%Y-%m-%d %H:%M:%S")
 
 SHORT_ORDER_NO_RE = re.compile(r"^ZAM-(\d{6})(\d+)$", re.I)
 
@@ -348,7 +357,7 @@ def order_date_code(created_at: str | None = "") -> str:
     created = norm(created_at)
     if len(created) >= 10 and created[4:5] == "-" and created[7:8] == "-":
         return created[2:4] + created[5:7] + created[8:10]
-    return datetime.now().strftime("%y%m%d")
+    return app_now().strftime("%y%m%d")
 
 
 def is_short_order_no(value: str | None) -> bool:
@@ -358,7 +367,7 @@ def is_short_order_no(value: str | None) -> bool:
 def make_order_no(order_id: int | None = None, created_at: str | None = "") -> str:
     # Format: ZAM-2607141 = ZAM- + YYMMDD + kolejny numer w danym dniu.
     date_code = order_date_code(created_at)
-    day = norm(created_at)[:10] if norm(created_at) else datetime.now().strftime("%Y-%m-%d")
+    day = norm(created_at)[:10] if norm(created_at) else app_now().strftime("%Y-%m-%d")
     seq = 1
     try:
         c = conn()
@@ -1699,7 +1708,7 @@ def generate_invoice_packing_list_pdf(order_row, items, meta, invoice_pdf_path: 
     if order_row:
         cpdf.drawString(15 * mm, y, f"Klient: {order_row['customer_name']}")
         y -= 5 * mm
-    cpdf.drawString(15 * mm, y, f"Data: {meta.get('issue_date') or datetime.now().strftime('%Y-%m-%d')}")
+    cpdf.drawString(15 * mm, y, f"Data: {meta.get('issue_date') or app_now().strftime('%Y-%m-%d')}")
     y -= 8 * mm
 
     cpdf.setFont(pdf_font_bold, 9)
@@ -4265,7 +4274,7 @@ def order_invoice(order_id):
     invoice_rows = [dict(r) for r in cur.fetchall()]
     c.close()
 
-    default_issue = datetime.now().strftime("%Y-%m-%d")
+    default_issue = app_now().strftime("%Y-%m-%d")
     buyer_address_source = customer_row["address"] if customer_row and customer_row["address"] else (o["customer_address"] or "")
     st, pc, city = split_address(buyer_address_source)
     buyer_tax_no = customer_row["nip"] if customer_row and customer_row["nip"] else ""
@@ -4288,7 +4297,7 @@ def order_invoice(order_id):
             "issue_date": default_issue,
             "sell_date": default_issue,
             "payment_type": "gotowka",
-            "payment_to": (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d"),
+            "payment_to": (app_now() + timedelta(days=30)).strftime("%Y-%m-%d"),
             "buyer_name": o["customer_name"] or "",
             "buyer_tax_no": buyer_tax_no,
             "buyer_address": buyer_address_default,
@@ -5236,8 +5245,8 @@ def invoice_meta_payload(invoice_row: dict):
     return {
         "invoice_no": invoice_row.get("invoice_no") or "",
         "place": "KotuszĂłw",
-        "issue_date": invoice_row.get("issue_date") or datetime.now().strftime("%Y-%m-%d"),
-        "sell_date": invoice_row.get("sell_date") or datetime.now().strftime("%Y-%m-%d"),
+        "issue_date": invoice_row.get("issue_date") or app_now().strftime("%Y-%m-%d"),
+        "sell_date": invoice_row.get("sell_date") or app_now().strftime("%Y-%m-%d"),
         "payment_type": invoice_row.get("payment_type") or "przelew",
         "payment_to": invoice_row.get("payment_to") or "",
         "buyer_name": invoice_row.get("buyer_name") or "",
