@@ -5615,7 +5615,7 @@ def _delete_invoice_everywhere(invoice_id: int):
     cur = c.cursor()
     cur.execute("DELETE FROM invoice_allocations WHERE invoice_id=?", (invoice_id,))
     cur.execute("DELETE FROM invoice_meta WHERE invoice_id=?", (invoice_id,))
-    cur.execute("DELETE FROM invoices WHERE id=? AND order_id=?", (invoice_id, order_id))
+    cur.execute("DELETE FROM invoices WHERE id=?", (invoice_id,))
     c.commit()
     c.close()
 
@@ -5648,7 +5648,7 @@ def _delete_invoice_everywhere(invoice_id: int):
     return inv
 
 
-@app.post("/invoices/<int:invoice_id>/delete")
+@app.route("/invoices/<int:invoice_id>/delete", methods=["GET", "POST"])
 def invoice_delete_admin(invoice_id):
     _delete_invoice_everywhere(invoice_id)
     return _redirect_after_invoice_action()
