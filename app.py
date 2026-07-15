@@ -307,11 +307,23 @@ def init_db():
         customer_email TEXT,
         customer_name TEXT,
         query TEXT NOT NULL,
+        product_sku TEXT,
+        product_model TEXT,
+        product_name TEXT,
         results_count INTEGER NOT NULL DEFAULT 0,
         source TEXT,
         created_at TEXT NOT NULL
     )
     """)
+
+    cur.execute("PRAGMA table_info(client_search_logs)")
+    search_cols = {r["name"] for r in cur.fetchall()}
+    if "product_sku" not in search_cols:
+        cur.execute("ALTER TABLE client_search_logs ADD COLUMN product_sku TEXT")
+    if "product_model" not in search_cols:
+        cur.execute("ALTER TABLE client_search_logs ADD COLUMN product_model TEXT")
+    if "product_name" not in search_cols:
+        cur.execute("ALTER TABLE client_search_logs ADD COLUMN product_name TEXT")
 
     cur.execute("PRAGMA table_info(invoice_meta)")
     invoice_meta_cols = {r[1] for r in cur.fetchall()}
@@ -345,6 +357,7 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_china_items_product_id ON china_items(product_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_client_search_logs_created ON client_search_logs(created_at)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_client_search_logs_email_query ON client_search_logs(customer_email, query)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_client_search_logs_model ON client_search_logs(product_model)")
 
     c.commit()
     c.close()
@@ -979,7 +992,7 @@ def local_client_search_rows(limit: int = 5000):
     c = conn()
     cur = c.cursor()
     cur.execute("""
-      SELECT customer_email, customer_name, query, results_count, source, created_at
+      SELECT customer_email, customer_name, query, product_sku, product_model, product_name, results_count, source, created_at
       FROM client_search_logs
       ORDER BY created_at DESC, id DESC
       LIMIT ?
@@ -996,7 +1009,7 @@ def supabase_client_search_rows(limit: int = 5000):
         "/rest/v1/client_search_logs",
         method="GET",
         params={
-            "select": "customer_email,customer_name,query,results_count,source,created_at",
+            "select": "customer_email,customer_name,query,product_sku,product_model,product_name,results_count,source,created_at",
             "order": "created_at.desc",
             "limit": str(limit),
         },
@@ -1023,6 +1036,9 @@ def load_client_search_rows(limit: int = 5000):
             "customer_email": norm((row or {}).get("customer_email")).lower(),
             "customer_name": norm((row or {}).get("customer_name")),
             "query": norm((row or {}).get("query")),
+            "product_sku": norm((row or {}).get("product_sku")),
+            "product_model": norm((row or {}).get("product_model")),
+            "product_name": norm((row or {}).get("product_name")),
             "results_count": to_int((row or {}).get("results_count"), 0),
             "source": norm((row or {}).get("source")) or "stock",
             "created_at": norm((row or {}).get("created_at")),
@@ -1033,6 +1049,9 @@ def load_client_search_rows(limit: int = 5000):
             cleaned["customer_email"],
             cleaned["customer_name"],
             cleaned["query"].lower(),
+            cleaned["product_sku"].lower(),
+            cleaned["product_model"].lower(),
+            cleaned["product_name"].lower(),
             cleaned["results_count"],
             cleaned["source"],
             cleaned["created_at"],
@@ -1051,12 +1070,15 @@ def save_client_search_log_local(row: dict):
     c = conn()
     cur = c.cursor()
     cur.execute("""
-      INSERT INTO client_search_logs(customer_email, customer_name, query, results_count, source, created_at)
-      VALUES(?,?,?,?,?,?)
+      INSERT INTO client_search_logs(customer_email, customer_name, query, product_sku, product_model, product_name, results_count, source, created_at)
+      VALUES(?,?,?,?,?,?,?,?,?)
     """, (
         row.get("customer_email", ""),
         row.get("customer_name", ""),
         row.get("query", ""),
+        row.get("product_sku", ""),
+        row.get("product_model", ""),
+        row.get("product_name", ""),
         to_int(row.get("results_count"), 0),
         row.get("source", "stock"),
         row.get("created_at") or now_iso(),
@@ -1072,6 +1094,9 @@ def save_client_search_log_supabase(row: dict) -> bool:
         "customer_email": row.get("customer_email", ""),
         "customer_name": row.get("customer_name", ""),
         "query": row.get("query", ""),
+        "product_sku": row.get("product_sku", ""),
+        "product_model": row.get("product_model", ""),
+        "product_name": row.get("product_name", ""),
         "results_count": to_int(row.get("results_count"), 0),
         "source": row.get("source", "stock"),
         "created_at": row.get("created_at") or now_iso(),
@@ -2517,7 +2542,9 @@ def client_searches():
         ]
 
     global_stats = {}
+    model_stats = {}
     client_stats = {}
+    phrase_events_seen = set()
     for r in rows:
         query = norm(r.get("query"))
         if not query:
@@ -2525,8 +2552,37 @@ def client_searches():
         email = norm(r.get("customer_email")).lower()
         name = norm(r.get("customer_name"))
         client_key = email or name or "anon"
+        product_sku = norm(r.get("product_sku"))
+        product_model = norm(r.get("product_model")) or product_sku
+        product_name = norm(r.get("product_name"))
         results_count = to_int(r.get("results_count"), 0)
         created_at = norm(r.get("created_at"))
+
+        if product_model:
+            m = model_stats.setdefault(product_model, {
+                "product_model": product_model,
+                "product_sku": product_sku,
+                "product_name": product_name,
+                "searches_count": 0,
+                "clients": set(),
+                "phrases": set(),
+                "last_at": "",
+            })
+            m["searches_count"] += 1
+            m["clients"].add(client_key)
+            if query:
+                m["phrases"].add(query)
+            if product_sku and not m.get("product_sku"):
+                m["product_sku"] = product_sku
+            if product_name and not m.get("product_name"):
+                m["product_name"] = product_name
+            if created_at > m["last_at"]:
+                m["last_at"] = created_at
+
+        phrase_event_key = (email, name, query.lower(), created_at)
+        if phrase_event_key in phrase_events_seen:
+            continue
+        phrase_events_seen.add(phrase_event_key)
 
         g = global_stats.setdefault(query, {
             "query": query,
@@ -2562,6 +2618,16 @@ def client_searches():
         if created_at > s["last_at"]:
             s["last_at"] = created_at
 
+    model_rows = []
+    for r in model_stats.values():
+        item = dict(r)
+        item["clients_count"] = len(item.pop("clients"))
+        phrases = sorted(item.pop("phrases"))
+        item["phrases_preview"] = ", ".join(phrases[:5])
+        model_rows.append(item)
+    model_rows.sort(key=lambda r: (r["searches_count"], r["last_at"]), reverse=True)
+    model_rows = model_rows[:100]
+
     global_rows = []
     for r in global_stats.values():
         item = dict(r)
@@ -2594,9 +2660,36 @@ def client_searches():
       </div>
 
       <div class="card">
-        <h2>Najczęściej szukane frazy — wszyscy klienci</h2>
+        <h2>Najczęściej wyszukiwane modele — wszyscy klienci</h2>
         <div class="muted" style="margin-bottom:8px;">
-          To jest zbiorczy ranking popytu. Frazy z dużą liczbą wyszukiwań i brakami wyników warto potraktować jako sygnał do zatowarowania albo poprawy nazw produktów.
+          To jest najważniejszy ranking do zatowarowania: liczymy konkretne modele/SKU, które pojawiły się klientom w wynikach wyszukiwania.
+        </div>
+        <table>
+          <thead>
+            <tr><th>Model / SKU</th><th>Nazwa</th><th>Ile razy</th><th>Klientów</th><th>Frazy, które prowadziły do modelu</th><th>Ostatnio</th></tr>
+          </thead>
+          <tbody>
+            {% for r in model_rows %}
+              <tr>
+                <td><b>{{ r.product_model }}</b>{% if r.product_sku and r.product_sku != r.product_model %}<div class="muted">{{ r.product_sku }}</div>{% endif %}</td>
+                <td>{{ r.product_name or '-' }}</td>
+                <td><span class="badge">{{ r.searches_count }}</span></td>
+                <td>{{ r.clients_count }}</td>
+                <td class="muted">{{ r.phrases_preview or '-' }}</td>
+                <td class="muted">{{ r.last_at }}</td>
+              </tr>
+            {% endfor %}
+            {% if not model_rows %}
+              <tr><td colspan="6" class="muted">Brak zapisanych wyszukiwań.</td></tr>
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>Frazy bez dopasowania albo do kontroli</h2>
+        <div class="muted" style="margin-bottom:8px;">
+          Tu zostają wpisane teksty klienta. To pomocnicza lista do wyłapania literówek, brakujących nazw albo produktów, których nie ma w ofercie.
         </div>
         <table>
           <thead>
@@ -2614,7 +2707,7 @@ def client_searches():
               </tr>
             {% endfor %}
             {% if not global_rows %}
-              <tr><td colspan="6" class="muted">Brak zapisanych wyszukiwań.</td></tr>
+              <tr><td colspan="6" class="muted">Brak zapisanych fraz.</td></tr>
             {% endif %}
           </tbody>
         </table>
@@ -2649,7 +2742,7 @@ def client_searches():
         <h2>Ostatnie wpisy</h2>
         <table>
           <thead>
-            <tr><th>Czas</th><th>Klient</th><th>Email</th><th>Fraza</th><th>Wyniki</th></tr>
+            <tr><th>Czas</th><th>Klient</th><th>Email</th><th>Fraza</th><th>Model / SKU</th><th>Wyniki</th></tr>
           </thead>
           <tbody>
             {% for r in latest_rows %}
@@ -2658,11 +2751,12 @@ def client_searches():
                 <td>{{ r.customer_name or '-' }}</td>
                 <td>{{ r.customer_email or '-' }}</td>
                 <td><b>{{ r.query }}</b></td>
+                <td>{{ r.product_model or r.product_sku or '-' }}</td>
                 <td>{{ r.results_count }}</td>
               </tr>
             {% endfor %}
             {% if not latest_rows %}
-              <tr><td colspan="5" class="muted">Brak wpisów.</td></tr>
+              <tr><td colspan="6" class="muted">Brak wpisów.</td></tr>
             {% endif %}
           </tbody>
         </table>
@@ -2670,7 +2764,7 @@ def client_searches():
     {% endblock %}
     """
     return render_template_string(tpl, title="Wyszukiwania klientów", base_url=BASE_URL, db_path=DB_PATH,
-                                  global_rows=global_rows, summary_rows=summary_rows, latest_rows=latest_rows,
+                                  model_rows=model_rows, global_rows=global_rows, summary_rows=summary_rows, latest_rows=latest_rows,
                                   total_count=total_count, q=q, source_label=source_label)
 
 
@@ -5114,24 +5208,58 @@ def api_client_search_log():
     results_count = to_int(data.get("results_count"), 0)
     if results_count < 0:
         results_count = 0
+    matches = data.get("matches") if isinstance(data.get("matches"), list) else []
 
-    row = {
-        "customer_email": email,
-        "customer_name": name,
-        "query": query,
-        "results_count": results_count,
-        "source": source,
-        "created_at": now_iso(),
-    }
+    rows_to_save = []
+    created_at = now_iso()
+    seen_products = set()
+    for item in matches[:30]:
+        if not isinstance(item, dict):
+            continue
+        product_sku = norm(item.get("sku"))[:120]
+        product_model = norm(item.get("model"))[:120] or product_sku
+        product_name = norm(item.get("name"))[:180]
+        product_key = (product_model.lower(), product_sku.lower())
+        if not product_model or product_key in seen_products:
+            continue
+        seen_products.add(product_key)
+        rows_to_save.append({
+            "customer_email": email,
+            "customer_name": name,
+            "query": query,
+            "product_sku": product_sku,
+            "product_model": product_model,
+            "product_name": product_name,
+            "results_count": results_count,
+            "source": source,
+            "created_at": created_at,
+        })
+
+    if not rows_to_save:
+        rows_to_save.append({
+            "customer_email": email,
+            "customer_name": name,
+            "query": query,
+            "product_sku": "",
+            "product_model": "",
+            "product_name": "",
+            "results_count": results_count,
+            "source": source,
+            "created_at": created_at,
+        })
 
     cloud_ok = False
-    try:
-        cloud_ok = save_client_search_log_supabase(row)
-    except Exception:
-        cloud_ok = False
+    cloud_saved = 0
+    for row in rows_to_save:
+        try:
+            if save_client_search_log_supabase(row):
+                cloud_saved += 1
+        except Exception:
+            pass
+        save_client_search_log_local(row)
 
-    save_client_search_log_local(row)
-    return jsonify(ok=True, cloud=bool(cloud_ok))
+    cloud_ok = cloud_saved == len(rows_to_save)
+    return jsonify(ok=True, cloud=bool(cloud_ok), rows=len(rows_to_save))
 
 
 @app.get("/api/order_lookup")
