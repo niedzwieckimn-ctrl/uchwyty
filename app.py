@@ -4822,17 +4822,97 @@ def api_order_lookup():
 
     cur.execute("""
       SELECT oi.*, p.model, p.ean, p.name,
+             COALESCE(s.qty, 0) AS stock_qty,
+             COALESCE(s.qty, 0) AS stock,
+             COALESCE((
+                SELECT SUM(ci.qty)
+                FROM china_items ci
+                JOIN china_packages cp ON cp.id=ci.package_id
+                WHERE ci.product_id=oi.product_id
+                  AND cp.status IN ('planned', 'ordered', 'shipped')
+             ), 0) AS in_delivery,
              COALESCE(pr.net_price, 0) AS net_price,
              COALESCE(pr.gross_price, 0) AS gross_price,
              (oi.qty * COALESCE(pr.net_price, 0)) AS line_value_net,
              (oi.qty * COALESCE(pr.gross_price, 0)) AS line_value_gross
       FROM order_items oi
       JOIN products p ON p.id=oi.product_id
+      LEFT JOIN stock s ON s.product_id=p.id
       LEFT JOIN pricing pr ON (TRIM(LOWER(pr.model)) = TRIM(LOWER(p.model)) OR TRIM(LOWER(pr.model)) = TRIM(LOWER(p.sku)))
       WHERE oi.order_id=?
       ORDER BY oi.id
     """, (o["id"],))
     items = [dict(r) for r in cur.fetchall()]
+
+    for it in items:
+        it["in_delivery_available"] = int(it.get("in_delivery", 0) or 0)
+        it["delivery_used"] = 0
+        it["line_shortage"] = 0
+
+    order_id = int(o["id"])
+    if o["status"] in ("new", "packed", "confirmed", "in_delivery"):
+        cur.execute("SELECT id FROM orders WHERE status IN ('new','packed','confirmed','in_delivery') AND id<=? ORDER BY id", (order_id,))
+        scoped_order_ids = [int(r["id"]) for r in cur.fetchall()]
+        if scoped_order_ids:
+            sph = ",".join(["?"] * len(scoped_order_ids))
+            cur.execute(f"""
+              SELECT oi.id, oi.order_id, oi.product_id, oi.qty
+              FROM order_items oi
+              WHERE oi.order_id IN ({sph})
+              ORDER BY oi.order_id, oi.id
+            """, tuple(scoped_order_ids))
+            seq_items = cur.fetchall()
+
+            product_ids = {int(r["product_id"]) for r in seq_items}
+            pool_stock = {}
+            pool_delivery = {}
+            if product_ids:
+                pph = ",".join(["?"] * len(product_ids))
+                cur.execute(f"""
+                  SELECT p.id AS product_id,
+                         COALESCE(s.qty,0) AS stock_qty,
+                         COALESCE((
+                           SELECT SUM(ci.qty)
+                           FROM china_items ci
+                           JOIN china_packages cp ON cp.id=ci.package_id
+                           WHERE ci.product_id=p.id
+                             AND cp.status IN ('planned', 'ordered', 'shipped')
+                         ),0) AS in_delivery_qty
+                  FROM products p
+                  LEFT JOIN stock s ON s.product_id=p.id
+                  WHERE p.id IN ({pph})
+                """, tuple(product_ids))
+                for pr in cur.fetchall():
+                    pid = int(pr["product_id"])
+                    pool_stock[pid] = int(pr["stock_qty"])
+                    pool_delivery[pid] = int(pr["in_delivery_qty"])
+
+            item_alloc = {}
+            for sr in seq_items:
+                pid = int(sr["product_id"])
+                need = int(sr["qty"])
+
+                stock_now = pool_stock.get(pid, 0)
+                from_stock = min(stock_now, need)
+                pool_stock[pid] = stock_now - from_stock
+                need_after_stock = need - from_stock
+
+                delivery_now = pool_delivery.get(pid, 0)
+                from_delivery = min(delivery_now, need_after_stock)
+                pool_delivery[pid] = delivery_now - from_delivery
+                shortage = need_after_stock - from_delivery
+
+                if int(sr["order_id"]) == order_id:
+                    item_alloc[int(sr["id"])] = {
+                        "in_delivery_available": from_delivery,
+                        "delivery_used": from_delivery,
+                        "line_shortage": shortage,
+                    }
+
+            for it in items:
+                al = item_alloc.get(int(it["id"]))
+                if al:
+                    it.update(al)
     c.close()
 
     invoiced_by_item = invoiced_qty_by_order_item_ids([int(it["id"]) for it in items])
@@ -4843,7 +4923,12 @@ def api_order_lookup():
         it["invoiced_qty"] = invoiced_qty
         it["remaining_qty"] = max(0, ordered_qty - invoiced_qty)
         stock_qty = int(it.get("stock_qty") or 0)
-        it["availability_label"] = "dostępne" if stock_qty >= ordered_qty else "10/20 dni"
+        delivery_used = int(it.get("delivery_used") or 0)
+        line_shortage = int(it.get("line_shortage") or 0)
+        if o["status"] in ("new", "packed", "confirmed", "in_delivery"):
+            it["availability_label"] = "dostępne" if line_shortage <= 0 and delivery_used == 0 else "10/20 dni"
+        else:
+            it["availability_label"] = "dostępne" if stock_qty >= ordered_qty else "10/20 dni"
         if ordered_qty > 0 and invoiced_qty >= ordered_qty:
             it["realization_label"] = "w całości"
         elif invoiced_qty > 0:
