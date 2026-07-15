@@ -4214,7 +4214,7 @@ def order_invoice(order_id):
                         sync_local_rows_to_supabase("stock", "product_id", changed_product_ids)
                     except Exception:
                         pass
-            return redirect(url_for("order_invoice", order_id=order_id, generated="1", invoice_id=invoice_id))
+            return redirect(url_for("invoices", generated="1", invoice_id=invoice_id))
 
     tpl = r"""
     {% extends "base.html" %}
@@ -4310,7 +4310,7 @@ def order_invoice(order_id):
                 <td>
                   <div class="flex">
                     <a class="btn" href="{{ url_for('invoice_download_admin', invoice_id=inv['id']) }}" target="_blank">Pobierz PDF</a>
-                    <a class="btn" href="{{ url_for('invoice_packing_list_download_admin', invoice_id=inv['id']) }}" target="_blank">Lista do paczki</a>
+                    <a class="btn" href="{{ url_for('invoice_packing_list_download_admin', invoice_id=inv['id']) }}" target="_blank">Pakuj</a>
                     <form method="post" action="{{ url_for('invoice_regenerate_admin', invoice_id=inv['id']) }}">
                       <button class="btn" type="submit">Regeneruj PDF</button>
                     </form>
@@ -4905,7 +4905,16 @@ def invoices():
                         <td>
                           <div class="flex">
                             <a class="btn" href="{{ url_for('invoice_download_admin', invoice_id=inv.id) }}" target="_blank">Faktura PDF</a>
-                            <a class="btn" href="{{ url_for('invoice_packing_list_download_admin', invoice_id=inv.id) }}" target="_blank">Lista do paczki</a>
+                            <a class="btn" href="{{ url_for('invoice_edit_admin', invoice_id=inv.id) }}">Edytuj</a>
+                            <a class="btn" href="{{ url_for('invoice_packing_list_download_admin', invoice_id=inv.id) }}" target="_blank">Pakuj</a>
+                            {% if not inv.sent_to_client %}
+                              <form method="post" action="{{ url_for('invoice_send_admin', invoice_id=inv.id) }}">
+                                <input type="hidden" name="next" value="{{ request.full_path }}">
+                                <button class="btn primary" type="submit">Wyślij klientowi</button>
+                              </form>
+                            {% else %}
+                              <span class="badge">Widoczna u klienta</span>
+                            {% endif %}
                             {% if inv.source_order_id %}
                               <a class="btn" href="{{ url_for('order_view', order_id=inv.source_order_id) }}">Zamówienie</a>
                             {% endif %}
@@ -5445,17 +5454,16 @@ def order_invoice_delete(order_id, invoice_id):
 
     return redirect(url_for("order_invoice", order_id=order_id, deleted="1"))
 
-@app.post("/orders/<int:order_id>/invoice/<int:invoice_id>/send")
-def order_invoice_send(order_id, invoice_id):
+def _send_invoice_to_client(invoice_id: int) -> int:
     c = conn()
     cur = c.cursor()
     cur.execute("""
-      SELECT i.id, i.buyer_email, i.invoice_no, o.customer_email
+      SELECT i.id, i.order_id, i.buyer_email, i.invoice_no, o.customer_email
       FROM invoices i
-      JOIN orders o ON o.id = i.order_id
-      WHERE i.id=? AND i.order_id=?
+      LEFT JOIN orders o ON o.id = i.order_id
+      WHERE i.id=?
       LIMIT 1
-    """, (invoice_id, order_id))
+    """, (invoice_id,))
     row = cur.fetchone()
     if not row:
         c.close()
@@ -5493,7 +5501,7 @@ def order_invoice_send(order_id, invoice_id):
         if not local_pdf_path and items:
             c = conn()
             cur = c.cursor()
-            cur.execute("SELECT * FROM orders WHERE id=?", (order_id,))
+            cur.execute("SELECT * FROM orders WHERE id=?", (row["order_id"],))
             order_row = cur.fetchone()
             c.close()
             if order_row:
@@ -5509,7 +5517,7 @@ def order_invoice_send(order_id, invoice_id):
                 else:
                     c = conn()
                     cur = c.cursor()
-                    cur.execute("SELECT * FROM orders WHERE id=?", (order_id,))
+                    cur.execute("SELECT * FROM orders WHERE id=?", (row["order_id"],))
                     order_row = cur.fetchone()
                     c.close()
                     if order_row:
@@ -5524,7 +5532,142 @@ def order_invoice_send(order_id, invoice_id):
         except Exception:
             pass
 
+    return int(row["order_id"] or 0)
+
+
+@app.post("/invoices/<int:invoice_id>/send")
+def invoice_send_admin(invoice_id):
+    _send_invoice_to_client(invoice_id)
+    return _redirect_after_invoice_action()
+
+
+@app.post("/orders/<int:order_id>/invoice/<int:invoice_id>/send")
+def order_invoice_send(order_id, invoice_id):
+    _send_invoice_to_client(invoice_id)
     return redirect(url_for("order_invoice", order_id=order_id, sent="1", invoice_id=invoice_id))
+
+
+@app.route("/invoices/<int:invoice_id>/edit", methods=["GET", "POST"])
+def invoice_edit_admin(invoice_id):
+    inv = load_invoice_with_meta(invoice_id)
+    if not inv:
+        return "Nie znaleziono faktury", 404
+
+    c = conn()
+    cur = c.cursor()
+    cur.execute("SELECT * FROM orders WHERE id=?", (inv["order_id"],))
+    order_row = cur.fetchone()
+    c.close()
+
+    msg = ""
+    if request.method == "POST":
+        data = {k: norm(request.form.get(k)) for k in [
+            "invoice_no", "issue_date", "sell_date", "payment_type", "payment_to",
+            "buyer_name", "buyer_tax_no", "buyer_address", "buyer_country",
+            "buyer_email", "buyer_phone"
+        ]}
+        if not data["invoice_no"]:
+            msg = "Numer faktury jest wymagany."
+        else:
+            st, pc, city = split_address(data.get("buyer_address", ""))
+            c = conn()
+            cur = c.cursor()
+            cur.execute("""
+              UPDATE invoices
+              SET invoice_no=?, issue_date=?, sell_date=?, payment_type=?, payment_to=?,
+                  buyer_name=?, buyer_tax_no=?, buyer_street=?, buyer_post_code=?, buyer_city=?,
+                  buyer_country=?, buyer_email=?, buyer_phone=?
+              WHERE id=?
+            """, (
+                data["invoice_no"], data["issue_date"], data["sell_date"], data["payment_type"], data["payment_to"],
+                data["buyer_name"], data["buyer_tax_no"], st, pc, city,
+                data["buyer_country"], data["buyer_email"], data["buyer_phone"], invoice_id
+            ))
+            c.commit()
+            c.close()
+
+            items = invoice_items_from_saved_json(invoice_id)
+            updated = load_invoice_with_meta(invoice_id)
+            if items and updated:
+                pdf_path, total_net, total_gross = generate_order_invoice_pdf(order_row, items, invoice_meta_payload(updated))
+                packing_pdf_path = generate_invoice_packing_list_pdf(order_row, items, invoice_meta_payload(updated), pdf_path)
+                stored_pdf_path = upload_invoice_pdfs_to_supabase(invoice_id, data["invoice_no"], pdf_path, packing_pdf_path)
+
+                c = conn()
+                cur = c.cursor()
+                cur.execute("UPDATE invoices SET total_net=?, total_gross=? WHERE id=?", (total_net, total_gross, invoice_id))
+                c.commit()
+                c.close()
+
+                meta = load_invoice_meta(invoice_id) or {}
+                upsert_invoice_meta(
+                    invoice_id,
+                    stored_pdf_path,
+                    meta.get("invoice_items_json", ""),
+                    sent_to_client=int(meta.get("sent_to_client") or 0),
+                    seen_by_client=0,
+                    seen_at=None,
+                    payment_reminder=int(meta.get("payment_reminder") or 0),
+                    paid=int(meta.get("paid") or 0),
+                    paid_at=meta.get("paid_at")
+                )
+
+            if supabase_enabled():
+                try:
+                    sync_local_rows_to_supabase("invoices", "id", [invoice_id])
+                except Exception:
+                    pass
+                try:
+                    sync_invoice_meta_to_supabase(invoice_id)
+                except Exception:
+                    pass
+
+            return redirect(url_for("invoices", edited="1", invoice_id=invoice_id))
+
+    buyer_address = "\n".join([x for x in [
+        inv.get("buyer_street") or "",
+        " ".join([inv.get("buyer_post_code") or "", inv.get("buyer_city") or ""]).strip()
+    ] if x])
+
+    tpl = r"""
+    {% extends "base.html" %}
+    {% block content %}
+      <div class="card">
+        <div class="flex">
+          <h1 style="margin:0;">Edytuj fakturę {{ inv.invoice_no }}</h1>
+          <a class="btn right" href="{{ url_for('invoices') }}">← Faktury</a>
+        </div>
+        {% if msg %}<div class="hint" style="margin-top:10px;">{{ msg }}</div>{% endif %}
+      </div>
+
+      <div class="card">
+        <form method="post" class="row">
+          <div><label class="muted small">Numer faktury</label><input name="invoice_no" value="{{ inv.invoice_no }}" required></div>
+          <div><label class="muted small">Data wystawienia</label><input name="issue_date" type="date" value="{{ inv.issue_date }}"></div>
+          <div><label class="muted small">Data sprzedaży</label><input name="sell_date" type="date" value="{{ inv.sell_date }}"></div>
+          <div><label class="muted small">Forma płatności</label>
+            <select name="payment_type">
+              <option value="gotowka" {% if inv.payment_type in ['cash','gotowka'] %}selected{% endif %}>gotówka</option>
+              <option value="przelew" {% if inv.payment_type in ['transfer','przelew'] %}selected{% endif %}>przelew</option>
+              <option value="karta" {% if inv.payment_type in ['card','karta'] %}selected{% endif %}>karta</option>
+            </select>
+          </div>
+          <div><label class="muted small">Termin płatności</label><input name="payment_to" type="date" value="{{ inv.payment_to }}"></div>
+          <div><label class="muted small">Nabywca</label><input name="buyer_name" value="{{ inv.buyer_name }}"></div>
+          <div><label class="muted small">NIP nabywcy</label><input name="buyer_tax_no" value="{{ inv.buyer_tax_no }}"></div>
+          <div><label class="muted small">Adres nabywcy</label><textarea name="buyer_address" placeholder="Ulica&#10;Kod pocztowy Miasto">{{ buyer_address }}</textarea></div>
+          <div><label class="muted small">Kraj</label><input name="buyer_country" value="{{ inv.buyer_country or 'PL' }}"></div>
+          <div><label class="muted small">Email</label><input name="buyer_email" value="{{ inv.buyer_email }}"></div>
+          <div><label class="muted small">Telefon</label><input name="buyer_phone" value="{{ inv.buyer_phone }}"></div>
+          <div style="grid-column:1/-1;" class="flex">
+            <button class="btn primary" type="submit">Zapisz i regeneruj PDF</button>
+            <a class="btn" href="{{ url_for('invoice_download_admin', invoice_id=inv.id) }}" target="_blank">Podgląd PDF</a>
+          </div>
+        </form>
+      </div>
+    {% endblock %}
+    """
+    return render_template_string(tpl, title="Edytuj fakturę", base_url=BASE_URL, db_path=DB_PATH, inv=inv, buyer_address=buyer_address, msg=msg)
 
 @app.get("/orders/by-code/<path:token>")
 def order_by_code(token):
