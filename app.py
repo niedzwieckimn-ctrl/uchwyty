@@ -2010,6 +2010,176 @@ def finalize_fully_invoiced_orders(order_ids: list[int]):
     return completed_order_ids, list(set(changed_product_ids))
 
 
+def reconcile_orders_after_invoice_change(order_ids: list[int]):
+    touched = sorted({int(x) for x in order_ids if x})
+    if not touched:
+        return [], []
+
+    c = conn()
+    cur = c.cursor()
+    changed_order_ids = []
+    changed_product_ids = []
+
+    for order_id in touched:
+        cur.execute("SELECT id, status, warehouse_issued FROM orders WHERE id=?", (order_id,))
+        order_row = cur.fetchone()
+        if not order_row:
+            continue
+
+        fully = order_fully_invoiced(cur, order_id)
+        warehouse_issued = int(order_row["warehouse_issued"] or 0)
+        current_status = norm(order_row["status"]).lower()
+
+        if fully and warehouse_issued == 0:
+            cur.execute("SELECT product_id, qty FROM order_items WHERE order_id=?", (order_id,))
+            for it in cur.fetchall():
+                pid = int(it["product_id"])
+                qty = int(it["qty"] or 0)
+                cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (pid,))
+                cur.execute("UPDATE stock SET qty = qty - ? WHERE product_id=?", (qty, pid))
+                changed_product_ids.append(pid)
+            cur.execute("UPDATE orders SET status='issued', warehouse_issued=1 WHERE id=?", (order_id,))
+            changed_order_ids.append(order_id)
+
+        elif not fully and warehouse_issued == 1:
+            cur.execute("SELECT product_id, qty FROM order_items WHERE order_id=?", (order_id,))
+            for it in cur.fetchall():
+                pid = int(it["product_id"])
+                qty = int(it["qty"] or 0)
+                cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (pid,))
+                cur.execute("UPDATE stock SET qty = qty + ? WHERE product_id=?", (qty, pid))
+                changed_product_ids.append(pid)
+            next_status = "confirmed" if current_status == "issued" else (current_status or "confirmed")
+            cur.execute("UPDATE orders SET status=?, warehouse_issued=0 WHERE id=?", (next_status, order_id))
+            changed_order_ids.append(order_id)
+
+    c.commit()
+    c.close()
+
+    if supabase_enabled():
+        if changed_order_ids:
+            try:
+                sync_local_rows_to_supabase("orders", "id", changed_order_ids)
+            except Exception:
+                pass
+        if changed_product_ids:
+            try:
+                sync_local_rows_to_supabase("stock", "product_id", list(set(changed_product_ids)))
+            except Exception:
+                pass
+
+    return changed_order_ids, list(set(changed_product_ids))
+
+
+def invoice_edit_items(invoice_id: int, invoice_row: dict):
+    c = conn()
+    cur = c.cursor()
+    cur.execute("SELECT order_id, order_item_id, qty FROM invoice_allocations WHERE invoice_id=?", (invoice_id,))
+    current_alloc_rows = [dict(r) for r in cur.fetchall()]
+    current_qty_by_item = {int(r["order_item_id"]): int(r["qty"] or 0) for r in current_alloc_rows}
+    allocated_order_ids = {int(r["order_id"]) for r in current_alloc_rows if int(r.get("order_id") or 0)}
+
+    email = _email_key(invoice_row.get("buyer_email"))
+    if not email and invoice_row.get("order_id"):
+        cur.execute("SELECT customer_email FROM orders WHERE id=?", (invoice_row.get("order_id"),))
+        rr = cur.fetchone()
+        email = _email_key(rr["customer_email"]) if rr else ""
+
+    order_ids = set(allocated_order_ids)
+    if invoice_row.get("order_id"):
+        order_ids.add(int(invoice_row.get("order_id")))
+    if email:
+        status_ph = ",".join(["?"] * len(CURRENT_ORDER_STATUSES))
+        cur.execute(f"""
+          SELECT id
+          FROM orders
+          WHERE LOWER(COALESCE(customer_email,'')) = ?
+            AND (
+              LOWER(COALESCE(status,'')) IN ({status_ph})
+              OR id IN (SELECT order_id FROM invoice_allocations WHERE invoice_id=?)
+            )
+          ORDER BY created_at DESC, id DESC
+        """, (email, *sorted(CURRENT_ORDER_STATUSES), invoice_id))
+        order_ids.update(int(r["id"]) for r in cur.fetchall())
+
+    if not order_ids:
+        c.close()
+        return []
+
+    ids = sorted(order_ids)
+    ph = ",".join(["?"] * len(ids))
+    cur.execute(f"""
+      SELECT oi.*, p.model, p.name,
+             oo.order_no AS source_order_no,
+             oo.created_at AS source_order_created_at,
+             oo.note AS source_order_note,
+             COALESCE(pr.net_price, 0) AS net_price,
+             COALESCE(pr.gross_price, 0) AS gross_price
+      FROM order_items oi
+      JOIN orders oo ON oo.id=oi.order_id
+      JOIN products p ON p.id=oi.product_id
+      LEFT JOIN pricing pr ON (TRIM(LOWER(pr.model)) = TRIM(LOWER(p.model)) OR TRIM(LOWER(pr.model)) = TRIM(LOWER(p.sku)))
+      WHERE oi.order_id IN ({ph})
+      ORDER BY oo.created_at DESC, oo.id DESC, oi.id
+    """, ids)
+    items = [dict(r) for r in cur.fetchall()]
+    c.close()
+
+    invoiced_by_item = invoiced_qty_by_order_item_ids([int(it["id"]) for it in items])
+    out = []
+    for it in items:
+        item_id = int(it["id"])
+        current_qty = int(current_qty_by_item.get(item_id, 0))
+        ordered_qty = int(it.get("qty") or 0)
+        invoiced_total = int(invoiced_by_item.get(item_id, 0))
+        invoiced_other = max(0, invoiced_total - current_qty)
+        max_qty = max(0, ordered_qty - invoiced_other)
+        row = dict(it)
+        row["order_item_id"] = item_id
+        row["source_order_id"] = int(it.get("order_id") or 0)
+        row["source_order_no"] = order_display_no(
+            row["source_order_id"],
+            it.get("source_order_created_at"),
+            it.get("source_order_no"),
+            it.get("source_order_note") or ""
+        )
+        row["source_order_note"] = it.get("source_order_note") or ""
+        row["ordered_qty"] = ordered_qty
+        row["invoiced_other_qty"] = invoiced_other
+        row["current_invoice_qty"] = current_qty
+        row["remaining_qty"] = max_qty
+        if max_qty > 0 or current_qty > 0:
+            out.append(row)
+    return out
+
+
+def prepare_invoice_edit_items(edit_items: list[dict], form):
+    prepared = []
+    for it in edit_items:
+        max_qty = int(it.get("remaining_qty") or 0)
+        qty = to_int(form.get(f"invoice_qty_{it['id']}"), 0)
+        qty = max(0, min(qty, max_qty))
+        if qty <= 0:
+            continue
+        row = dict(it)
+        row["order_item_id"] = int(it.get("id") or it.get("order_item_id") or 0)
+        row["source_order_id"] = int(it.get("order_id") or it.get("source_order_id") or 0)
+        row["ordered_qty"] = int(it.get("ordered_qty") or it.get("qty") or 0)
+        row["invoiced_qty_before"] = int(it.get("invoiced_other_qty") or 0)
+        row["qty"] = qty
+        line_net = money_dec(row.get("net_price")) * Decimal(qty)
+        line_net = line_net.quantize(MONEY_Q, rounding=ROUND_HALF_UP)
+        line_vat = vat23_from_net(line_net)
+        line_gross = (line_net + line_vat).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
+        row["gross_price"] = money_float(gross_from_net_23(row.get("net_price")))
+        row["vat_rate"] = 23
+        row["line_value_net"] = money_float(line_net)
+        row["line_value_vat"] = money_float(line_vat)
+        row["line_value_gross"] = money_float(line_gross)
+        prepared.append(row)
+    return prepared
+
+
 # =========================
 # TEMPLATES (BASE as "file")
 # =========================
@@ -5559,6 +5729,8 @@ def invoice_edit_admin(invoice_id):
     order_row = cur.fetchone()
     c.close()
 
+    edit_items = invoice_edit_items(invoice_id, dict(inv))
+
     msg = ""
     if request.method == "POST":
         data = {k: norm(request.form.get(k)) for k in [
@@ -5566,9 +5738,13 @@ def invoice_edit_admin(invoice_id):
             "buyer_name", "buyer_tax_no", "buyer_address", "buyer_country",
             "buyer_email", "buyer_phone"
         ]}
+        invoice_items = prepare_invoice_edit_items(edit_items, request.form)
         if not data["invoice_no"]:
             msg = "Numer faktury jest wymagany."
+        elif not invoice_items:
+            msg = "Faktura musi zawierać co najmniej jedną pozycję."
         else:
+            old_order_ids = sorted({int(x.get("source_order_id") or x.get("order_id") or 0) for x in edit_items if int(x.get("current_invoice_qty") or 0) > 0})
             st, pc, city = split_address(data.get("buyer_address", ""))
             c = conn()
             cur = c.cursor()
@@ -5586,12 +5762,25 @@ def invoice_edit_admin(invoice_id):
             c.commit()
             c.close()
 
-            items = invoice_items_from_saved_json(invoice_id)
             updated = load_invoice_with_meta(invoice_id)
-            if items and updated:
-                pdf_path, total_net, total_gross = generate_order_invoice_pdf(order_row, items, invoice_meta_payload(updated))
-                packing_pdf_path = generate_invoice_packing_list_pdf(order_row, items, invoice_meta_payload(updated), pdf_path)
+            if invoice_items and updated:
+                order_for_pdf = order_row
+                if not order_for_pdf:
+                    first_order_id = int(invoice_items[0].get("source_order_id") or invoice_items[0].get("order_id") or 0)
+                    if first_order_id:
+                        c = conn()
+                        cur = c.cursor()
+                        cur.execute("SELECT * FROM orders WHERE id=?", (first_order_id,))
+                        order_for_pdf = cur.fetchone()
+                        c.close()
+
+                pdf_path, total_net, total_gross = generate_order_invoice_pdf(order_for_pdf, invoice_items, invoice_meta_payload(updated))
+                packing_pdf_path = generate_invoice_packing_list_pdf(order_for_pdf, invoice_items, invoice_meta_payload(updated), pdf_path)
                 stored_pdf_path = upload_invoice_pdfs_to_supabase(invoice_id, data["invoice_no"], pdf_path, packing_pdf_path)
+                allocation_ids = replace_invoice_allocations(invoice_id, invoice_items)
+                new_order_ids = sorted({int(x.get("source_order_id") or x.get("order_id") or 0) for x in invoice_items})
+                touched_order_ids = sorted(set(old_order_ids + new_order_ids))
+                changed_order_ids, changed_product_ids = reconcile_orders_after_invoice_change(touched_order_ids)
 
                 c = conn()
                 cur = c.cursor()
@@ -5603,7 +5792,7 @@ def invoice_edit_admin(invoice_id):
                 upsert_invoice_meta(
                     invoice_id,
                     stored_pdf_path,
-                    meta.get("invoice_items_json", ""),
+                    json.dumps(invoice_items, ensure_ascii=False),
                     sent_to_client=int(meta.get("sent_to_client") or 0),
                     seen_by_client=0,
                     seen_at=None,
@@ -5621,6 +5810,25 @@ def invoice_edit_admin(invoice_id):
                     sync_invoice_meta_to_supabase(invoice_id)
                 except Exception:
                     pass
+                try:
+                    supabase_delete_rows("invoice_allocations", {"invoice_id": invoice_id})
+                except Exception:
+                    pass
+                if allocation_ids:
+                    try:
+                        sync_local_rows_to_supabase("invoice_allocations", "id", allocation_ids)
+                    except Exception:
+                        pass
+                if changed_order_ids:
+                    try:
+                        sync_local_rows_to_supabase("orders", "id", changed_order_ids)
+                    except Exception:
+                        pass
+                if changed_product_ids:
+                    try:
+                        sync_local_rows_to_supabase("stock", "product_id", changed_product_ids)
+                    except Exception:
+                        pass
 
             return redirect(url_for("invoices", edited="1", invoice_id=invoice_id))
 
@@ -5659,6 +5867,44 @@ def invoice_edit_admin(invoice_id):
           <div><label class="muted small">Kraj</label><input name="buyer_country" value="{{ inv.buyer_country or 'PL' }}"></div>
           <div><label class="muted small">Email</label><input name="buyer_email" value="{{ inv.buyer_email }}"></div>
           <div><label class="muted small">Telefon</label><input name="buyer_phone" value="{{ inv.buyer_phone }}"></div>
+          <div style="grid-column:1/-1;">
+            <h2>Pozycje faktury</h2>
+            <div class="hint" style="margin-bottom:10px;">
+              Zmień ilości pozycji na tej fakturze. Wpisanie 0 usuwa pozycję z faktury.
+            </div>
+            <table>
+              <thead>
+                <tr>
+                  <th>Zamówienie</th>
+                  <th>Notatka</th>
+                  <th>SKU</th>
+                  <th>Model / Nazwa</th>
+                  <th>Zamówiono</th>
+                  <th>Na innych fakturach</th>
+                  <th>Maks. na tej fakturze</th>
+                  <th>Ilość na fakturze</th>
+                  <th>Netto/szt</th>
+                  <th>Brutto/szt</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for it in edit_items %}
+                  <tr>
+                    <td><b>{{ it.source_order_no }}</b></td>
+                    <td>{{ it.source_order_note or '-' }}</td>
+                    <td>{{ it.sku }}</td>
+                    <td>{{ it.model or '' }}{% if it.name %}<div class="muted small">{{ it.name }}</div>{% endif %}</td>
+                    <td>{{ it.ordered_qty }}</td>
+                    <td>{{ it.invoiced_other_qty }}</td>
+                    <td><b>{{ it.remaining_qty }}</b></td>
+                    <td><input type="number" min="0" max="{{ it.remaining_qty }}" name="invoice_qty_{{ it.id }}" value="{{ it.current_invoice_qty }}" style="width:110px;"></td>
+                    <td>{{ "%.2f"|format(it.net_price) }}</td>
+                    <td>{{ "%.2f"|format(it.gross_price) }}</td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
           <div style="grid-column:1/-1;" class="flex">
             <button class="btn primary" type="submit">Zapisz i regeneruj PDF</button>
             <a class="btn" href="{{ url_for('invoice_download_admin', invoice_id=inv.id) }}" target="_blank">Podgląd PDF</a>
@@ -5667,7 +5913,7 @@ def invoice_edit_admin(invoice_id):
       </div>
     {% endblock %}
     """
-    return render_template_string(tpl, title="Edytuj fakturę", base_url=BASE_URL, db_path=DB_PATH, inv=inv, buyer_address=buyer_address, msg=msg)
+    return render_template_string(tpl, title="Edytuj fakturę", base_url=BASE_URL, db_path=DB_PATH, inv=inv, buyer_address=buyer_address, msg=msg, edit_items=edit_items)
 
 @app.get("/orders/by-code/<path:token>")
 def order_by_code(token):
