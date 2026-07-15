@@ -301,6 +301,18 @@ def init_db():
     )
     """)
 
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS client_search_logs(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        customer_email TEXT,
+        customer_name TEXT,
+        query TEXT NOT NULL,
+        results_count INTEGER NOT NULL DEFAULT 0,
+        source TEXT,
+        created_at TEXT NOT NULL
+    )
+    """)
+
     cur.execute("PRAGMA table_info(invoice_meta)")
     invoice_meta_cols = {r[1] for r in cur.fetchall()}
     if "seen_by_client" not in invoice_meta_cols:
@@ -331,6 +343,8 @@ def init_db():
     # UĹ‚atwia agregowanie "w dostawie" po statusach paczek
     cur.execute("CREATE INDEX IF NOT EXISTS idx_china_items_package_id ON china_items(package_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_china_items_product_id ON china_items(product_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_client_search_logs_created ON client_search_logs(created_at)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_client_search_logs_email_query ON client_search_logs(customer_email, query)")
 
     c.commit()
     c.close()
@@ -959,6 +973,111 @@ def supabase_select_rows(table: str, order_by: str = "id", page_size: int = 1000
             break
         offset += page_size
     return rows
+
+
+def local_client_search_rows(limit: int = 5000):
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+      SELECT customer_email, customer_name, query, results_count, source, created_at
+      FROM client_search_logs
+      ORDER BY created_at DESC, id DESC
+      LIMIT ?
+    """, (limit,))
+    rows = [dict(r) for r in cur.fetchall()]
+    c.close()
+    return rows
+
+
+def supabase_client_search_rows(limit: int = 5000):
+    if not supabase_enabled():
+        return []
+    rows = supabase_request(
+        "/rest/v1/client_search_logs",
+        method="GET",
+        params={
+            "select": "customer_email,customer_name,query,results_count,source,created_at",
+            "order": "created_at.desc",
+            "limit": str(limit),
+        },
+        timeout=30,
+    ) or []
+    return rows if isinstance(rows, list) else []
+
+
+def load_client_search_rows(limit: int = 5000):
+    local_rows = local_client_search_rows(limit=limit)
+    cloud_rows = []
+    cloud_ok = False
+    if supabase_enabled():
+        try:
+            cloud_rows = supabase_client_search_rows(limit=limit)
+            cloud_ok = True
+        except Exception:
+            cloud_rows = []
+
+    merged = []
+    seen = set()
+    for row in list(cloud_rows) + list(local_rows):
+        cleaned = {
+            "customer_email": norm((row or {}).get("customer_email")).lower(),
+            "customer_name": norm((row or {}).get("customer_name")),
+            "query": norm((row or {}).get("query")),
+            "results_count": to_int((row or {}).get("results_count"), 0),
+            "source": norm((row or {}).get("source")) or "stock",
+            "created_at": norm((row or {}).get("created_at")),
+        }
+        if not cleaned["query"]:
+            continue
+        key = (
+            cleaned["customer_email"],
+            cleaned["customer_name"],
+            cleaned["query"].lower(),
+            cleaned["results_count"],
+            cleaned["source"],
+            cleaned["created_at"],
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(cleaned)
+
+    merged.sort(key=lambda r: r.get("created_at") or "", reverse=True)
+    source_label = "Supabase + kopia lokalna" if cloud_ok else "Kopia lokalna"
+    return merged[:limit], source_label
+
+
+def save_client_search_log_local(row: dict):
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+      INSERT INTO client_search_logs(customer_email, customer_name, query, results_count, source, created_at)
+      VALUES(?,?,?,?,?,?)
+    """, (
+        row.get("customer_email", ""),
+        row.get("customer_name", ""),
+        row.get("query", ""),
+        to_int(row.get("results_count"), 0),
+        row.get("source", "stock"),
+        row.get("created_at") or now_iso(),
+    ))
+    c.commit()
+    c.close()
+
+
+def save_client_search_log_supabase(row: dict) -> bool:
+    if not supabase_enabled():
+        return False
+    payload = {
+        "customer_email": row.get("customer_email", ""),
+        "customer_name": row.get("customer_name", ""),
+        "query": row.get("query", ""),
+        "results_count": to_int(row.get("results_count"), 0),
+        "source": row.get("source", "stock"),
+        "created_at": row.get("created_at") or now_iso(),
+    }
+    supabase_insert_row("client_search_logs", payload)
+    return True
 
 
 def sqlite_table_columns(table: str):
@@ -2244,6 +2363,7 @@ BASE = r"""
       <a href="{{ url_for('orders') }}">ZamĂłwienia</a>
       <a href="{{ url_for('order_new') }}">Nowe zamĂłwienie</a>
       <a href="{{ url_for('invoices') }}">Faktury</a>
+      <a href="{{ url_for('client_searches') }}">Wyszukiwania</a>
       <a href="{{ url_for('products') }}">Produkty</a>
       <a href="{{ url_for('customers') }}">Klienci</a>
       <a href="{{ url_for('pricing') }}">Cennik</a>
@@ -2383,15 +2503,186 @@ def home():
                                   inventory_value_net=inventory_value_net)
 
 
+@app.get("/searches")
+def client_searches():
+    q = norm(request.args.get("q"))
+    rows, source_label = load_client_search_rows(limit=5000)
+    if q:
+        needle = q.lower()
+        rows = [
+            r for r in rows
+            if needle in (r.get("query") or "").lower()
+            or needle in (r.get("customer_email") or "").lower()
+            or needle in (r.get("customer_name") or "").lower()
+        ]
+
+    global_stats = {}
+    client_stats = {}
+    for r in rows:
+        query = norm(r.get("query"))
+        if not query:
+            continue
+        email = norm(r.get("customer_email")).lower()
+        name = norm(r.get("customer_name"))
+        client_key = email or name or "anon"
+        results_count = to_int(r.get("results_count"), 0)
+        created_at = norm(r.get("created_at"))
+
+        g = global_stats.setdefault(query, {
+            "query": query,
+            "searches_count": 0,
+            "clients": set(),
+            "no_result_count": 0,
+            "max_results": 0,
+            "last_at": "",
+        })
+        g["searches_count"] += 1
+        g["clients"].add(client_key)
+        if results_count == 0:
+            g["no_result_count"] += 1
+        g["max_results"] = max(g["max_results"], results_count)
+        if created_at > g["last_at"]:
+            g["last_at"] = created_at
+
+        client_label = name or email or "Nieznany klient"
+        skey = (client_label, email, query)
+        s = client_stats.setdefault(skey, {
+            "client_label": client_label,
+            "customer_email": email,
+            "query": query,
+            "searches_count": 0,
+            "no_result_count": 0,
+            "max_results": 0,
+            "last_at": "",
+        })
+        s["searches_count"] += 1
+        if results_count == 0:
+            s["no_result_count"] += 1
+        s["max_results"] = max(s["max_results"], results_count)
+        if created_at > s["last_at"]:
+            s["last_at"] = created_at
+
+    global_rows = []
+    for r in global_stats.values():
+        item = dict(r)
+        item["clients_count"] = len(item.pop("clients"))
+        global_rows.append(item)
+    global_rows.sort(key=lambda r: (r["searches_count"], r["last_at"]), reverse=True)
+    global_rows = global_rows[:100]
+
+    summary_rows = list(client_stats.values())
+    summary_rows.sort(key=lambda r: r["last_at"], reverse=True)
+    summary_rows = summary_rows[:300]
+
+    latest_rows = rows[:200]
+    total_count = len(rows)
+
+    tpl = r"""
+    {% extends "base.html" %}
+    {% block content %}
+      <div class="card">
+        <div class="flex">
+          <h1 style="margin:0;">Wyszukiwania klientów</h1>
+          <span class="badge">Łącznie: {{ total_count }}</span>
+          <span class="badge">{{ source_label }}</span>
+        </div>
+        <form method="get" class="grid3" style="margin-top:10px;">
+          <input name="q" value="{{ q }}" placeholder="Szukaj: klient / email / fraza">
+          <button class="btn primary" type="submit">Szukaj</button>
+          <a class="btn" href="{{ url_for('client_searches') }}">Wyczyść</a>
+        </form>
+      </div>
+
+      <div class="card">
+        <h2>Najczęściej szukane frazy — wszyscy klienci</h2>
+        <div class="muted" style="margin-bottom:8px;">
+          To jest zbiorczy ranking popytu. Frazy z dużą liczbą wyszukiwań i brakami wyników warto potraktować jako sygnał do zatowarowania albo poprawy nazw produktów.
+        </div>
+        <table>
+          <thead>
+            <tr><th>Fraza</th><th>Wyszukań</th><th>Klientów</th><th>Bez wyników</th><th>Najwięcej wyników</th><th>Ostatnio</th></tr>
+          </thead>
+          <tbody>
+            {% for r in global_rows %}
+              <tr>
+                <td><b>{{ r.query }}</b></td>
+                <td><span class="badge">{{ r.searches_count }}</span></td>
+                <td>{{ r.clients_count }}</td>
+                <td>{% if r.no_result_count %}<span class="badge">{{ r.no_result_count }}</span>{% else %}-{% endif %}</td>
+                <td>{{ r.max_results }}</td>
+                <td class="muted">{{ r.last_at }}</td>
+              </tr>
+            {% endfor %}
+            {% if not global_rows %}
+              <tr><td colspan="6" class="muted">Brak zapisanych wyszukiwań.</td></tr>
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>Wyszukiwania według klienta</h2>
+        <div class="muted" style="margin-bottom:8px;">Tu zobaczysz, kto konkretnie szukał danej frazy.</div>
+        <table>
+          <thead>
+            <tr><th>Klient</th><th>Email</th><th>Fraza</th><th>Ile razy</th><th>Bez wyników</th><th>Ostatnio</th></tr>
+          </thead>
+          <tbody>
+            {% for r in summary_rows %}
+              <tr>
+                <td><b>{{ r.client_label }}</b></td>
+                <td>{{ r.customer_email or '-' }}</td>
+                <td>{{ r.query }}</td>
+                <td><span class="badge">{{ r.searches_count }}</span></td>
+                <td>{% if r.no_result_count %}<span class="badge">{{ r.no_result_count }}</span>{% else %}-{% endif %}</td>
+                <td class="muted">{{ r.last_at }}</td>
+              </tr>
+            {% endfor %}
+            {% if not summary_rows %}
+              <tr><td colspan="6" class="muted">Brak zapisanych wyszukiwań.</td></tr>
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>Ostatnie wpisy</h2>
+        <table>
+          <thead>
+            <tr><th>Czas</th><th>Klient</th><th>Email</th><th>Fraza</th><th>Wyniki</th></tr>
+          </thead>
+          <tbody>
+            {% for r in latest_rows %}
+              <tr>
+                <td class="muted">{{ r.created_at }}</td>
+                <td>{{ r.customer_name or '-' }}</td>
+                <td>{{ r.customer_email or '-' }}</td>
+                <td><b>{{ r.query }}</b></td>
+                <td>{{ r.results_count }}</td>
+              </tr>
+            {% endfor %}
+            {% if not latest_rows %}
+              <tr><td colspan="5" class="muted">Brak wpisów.</td></tr>
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
+    {% endblock %}
+    """
+    return render_template_string(tpl, title="Wyszukiwania klientów", base_url=BASE_URL, db_path=DB_PATH,
+                                  global_rows=global_rows, summary_rows=summary_rows, latest_rows=latest_rows,
+                                  total_count=total_count, q=q, source_label=source_label)
+
+
 @app.after_request
 def auto_sync_after_write(response):
     try:
         if request.path.startswith("/api/"):
             response.headers["Access-Control-Allow-Origin"] = "*"
-            response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
             response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
 
-        if response.status_code < 400 and request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        if response.status_code < 400 and request.method in ("POST", "PUT", "PATCH", "DELETE") and request.path != "/api/client_search_log":
             trigger_background_supabase_sync(reason=f"{request.method} {request.path}")
     except Exception:
         pass
@@ -4805,6 +5096,42 @@ def api_client_stock_catalog():
     c.close()
 
     return jsonify(ok=True, rows=rows)
+
+
+@app.route("/api/client_search_log", methods=["POST", "OPTIONS"])
+def api_client_search_log():
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    data = request.get_json(silent=True) or {}
+    query = norm(data.get("query"))[:120]
+    if len(query) < 2:
+        return jsonify(ok=True, skipped=True)
+
+    email = norm(data.get("email")).lower()[:180]
+    name = norm(data.get("name"))[:180]
+    source = norm(data.get("source"))[:40] or "stock"
+    results_count = to_int(data.get("results_count"), 0)
+    if results_count < 0:
+        results_count = 0
+
+    row = {
+        "customer_email": email,
+        "customer_name": name,
+        "query": query,
+        "results_count": results_count,
+        "source": source,
+        "created_at": now_iso(),
+    }
+
+    cloud_ok = False
+    try:
+        cloud_ok = save_client_search_log_supabase(row)
+    except Exception:
+        cloud_ok = False
+
+    save_client_search_log_local(row)
+    return jsonify(ok=True, cloud=bool(cloud_ok))
 
 
 @app.get("/api/order_lookup")
