@@ -5650,7 +5650,7 @@ def invoices():
                             {% if inv.payment_reminder %}<span class="badge">Przypomnienie aktywne</span>{% endif %}
                           {% endif %}
                           {% if inv.ksef_status == 'ready' %}
-                            <span class="badge ok">KSeF XML</span>
+                            <span class="badge ok">KSeF diagnostyka OK</span>
                           {% elif inv.ksef_status == 'error' %}
                             <span class="badge danger">KSeF do poprawy</span>
                           {% elif inv.ksef_status == 'sent' %}
@@ -5662,7 +5662,7 @@ def invoices():
                         <td>
                           <div class="flex">
                             <a class="btn" href="{{ url_for('invoice_download_admin', invoice_id=inv.id) }}" target="_blank">Faktura PDF</a>
-                            <a class="btn" href="{{ url_for('invoice_ksef_xml', invoice_id=inv.id) }}">KSeF XML</a>
+                            <a class="btn" href="{{ url_for('invoice_ksef_xml', invoice_id=inv.id) }}">XML diagnostyczny</a>
                             <form method="post" action="{{ url_for('invoice_ksef_validate', invoice_id=inv.id) }}">
                               <input type="hidden" name="next" value="{{ request.full_path }}">
                               <button class="btn" type="submit">Sprawdź KSeF</button>
@@ -5882,14 +5882,14 @@ def ksef_dashboard():
       <div class="card">
         <div class="flex">
           <h1 style="margin:0;">KSeF</h1>
-          <span class="badge">Roboczy moduł XML</span>
+          <span class="badge">Moduł diagnostyczny</span>
         </div>
         <div class="hint" style="margin-top:10px;">
-          Etap 1: przygotowanie XML i kontrola braków. Ten moduł jeszcze nie wysyła faktur do KSeF.
+          Etap 1: kontrola danych i XML diagnostyczny. Tego pliku nie wczytujemy jeszcze do aplikacji KSeF — prawdziwy XML musi być zgodny ze strukturą FA.
         </div>
         <div class="kpi" style="margin-top:10px;">
           <div class="pill">Robocze: <b>{{ counts.get('draft',0) }}</b></div>
-          <div class="pill">Gotowe XML: <b>{{ counts.get('ready',0) }}</b></div>
+          <div class="pill">Diagnostyka OK: <b>{{ counts.get('ready',0) }}</b></div>
           <div class="pill">Do poprawy: <b>{{ counts.get('error',0) }}</b></div>
           <div class="pill">Wysłane: <b>{{ counts.get('sent',0) }}</b></div>
         </div>
@@ -5909,7 +5909,7 @@ def ksef_dashboard():
                 <td>{{ "%.2f"|format(inv.total_gross or 0) }}</td>
                 <td>
                   {% if inv.ksef_status == 'ready' %}
-                    <span class="badge ok">XML gotowy</span>
+                    <span class="badge ok">Diagnostyka OK</span>
                   {% elif inv.ksef_status == 'error' %}
                     <span class="badge danger">Do poprawy</span>
                   {% elif inv.ksef_status == 'sent' %}
@@ -5925,7 +5925,7 @@ def ksef_dashboard():
                     <form method="post" action="{{ url_for('invoice_ksef_validate', invoice_id=inv.id) }}">
                       <button class="btn" type="submit">Sprawdź</button>
                     </form>
-                    <a class="btn primary" href="{{ url_for('invoice_ksef_xml', invoice_id=inv.id) }}">Pobierz XML</a>
+                    <a class="btn primary" href="{{ url_for('invoice_ksef_xml', invoice_id=inv.id) }}">Pobierz XML diagnostyczny</a>
                     <a class="btn" href="{{ url_for('invoice_edit_admin', invoice_id=inv.id) }}">Edytuj fakturę</a>
                   </div>
                 </td>
