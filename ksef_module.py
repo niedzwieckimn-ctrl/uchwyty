@@ -1,68 +1,169 @@
 # -*- coding: utf-8 -*-
 """
-Moduł KSeF — etap 1.
+Generator XML KSeF FA(3).
 
-Ten plik nie wysyła faktur do KSeF. Na tym etapie buduje roboczy XML
-z danych faktury i robi podstawową kontrolę brakujących danych.
-Wysyłkę do API KSeF warto podpiąć dopiero po testach XML i konfiguracji
-tokenów/certyfikatów.
+Buduje plik XML w strukturze FA(3) opublikowanej przez Ministerstwo Finansów
+w CRD: https://crd.gov.pl/wzor/2025/06/25/13775/
 """
 
 from __future__ import annotations
 
-import html
+import os
 import re
+from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
-from xml.etree.ElementTree import Element, SubElement, tostring
 from xml.dom import minidom
+from xml.etree.ElementTree import Element, SubElement, register_namespace, tostring
 
+
+FA3_NS = "http://crd.gov.pl/wzor/2025/06/25/13775/"
+ETD_NS = "http://crd.gov.pl/xml/schematy/dziedzinowe/mf/2022/01/05/eD/DefinicjeTypy/"
+XSI_NS = "http://www.w3.org/2001/XMLSchema-instance"
+
+register_namespace("", FA3_NS)
+register_namespace("etd", ETD_NS)
+register_namespace("xsi", XSI_NS)
 
 MONEY_Q = Decimal("0.01")
+UNIT_Q = Decimal("0.000001")
+PRICE_Q = Decimal("0.00000001")
 
 
 def _text(value) -> str:
     return str(value or "").strip()
 
 
+def _limit(value, max_len: int) -> str:
+    return _text(value)[:max_len]
+
+
 def _nip(value) -> str:
     return re.sub(r"\D+", "", _text(value))
 
 
-def _money(value) -> str:
+def _date(value) -> str:
+    raw = _text(value)
+    if not raw:
+        return ""
+    match = re.search(r"\d{4}-\d{2}-\d{2}", raw)
+    if match:
+        return match.group(0)
+    match = re.search(r"(\d{2})\.(\d{2})\.(\d{4})", raw)
+    if match:
+        day, month, year = match.groups()
+        return f"{year}-{month}-{day}"
+    return raw[:10]
+
+
+def _now_utc() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _dec(value, default: str = "0") -> Decimal:
     try:
-        return str(Decimal(str(value or "0")).quantize(MONEY_Q, rounding=ROUND_HALF_UP))
+        return Decimal(str(value if value not in (None, "") else default).replace(",", "."))
     except Exception:
-        return "0.00"
+        return Decimal(default)
 
 
-def _add(parent, tag: str, value=None):
-    node = SubElement(parent, tag)
+def _money(value) -> str:
+    return str(_dec(value).quantize(MONEY_Q, rounding=ROUND_HALF_UP))
+
+
+def _qty(value) -> str:
+    q = _dec(value).quantize(UNIT_Q, rounding=ROUND_HALF_UP)
+    return format(q.normalize(), "f")
+
+
+def _price(value) -> str:
+    p = _dec(value).quantize(PRICE_Q, rounding=ROUND_HALF_UP)
+    return format(p.normalize(), "f")
+
+
+def _tag(name: str) -> str:
+    return f"{{{FA3_NS}}}{name}"
+
+
+def _add(parent, tag: str, value=None, *, attrs: dict | None = None):
+    node = SubElement(parent, _tag(tag), attrs or {})
     node.text = _text(value)
     return node
 
 
+def _name_for_item(item: dict) -> str:
+    name = _text(item.get("name"))
+    model = _text(item.get("model"))
+    sku = _text(item.get("sku"))
+    parts: list[str] = []
+    if name and name.lower() not in {model.lower(), sku.lower()}:
+        parts.append(name)
+    if model and model.lower() != sku.lower():
+        parts.append(model)
+    if sku:
+        parts.append(sku)
+    return _limit(" ".join(parts) or name or model or sku or "Towar", 512)
+
+
+def _sku_for_item(item: dict) -> str:
+    return _limit(item.get("sku") or item.get("model") or "", 50)
+
+
+def _buyer_address(invoice: dict) -> tuple[str, str]:
+    street = _text(invoice.get("buyer_street") or invoice.get("buyer_address"))
+    post_city = " ".join(
+        p for p in [_text(invoice.get("buyer_post_code")), _text(invoice.get("buyer_city"))] if p
+    )
+    if street:
+        return _limit(street, 512), _limit(post_city, 512)
+    return _limit(post_city or "-", 512), ""
+
+
+def _company_address(company: dict) -> tuple[str, str]:
+    address = _text(company.get("address"))
+    post_city = " ".join(
+        p for p in [_text(company.get("post_code")), _text(company.get("city"))] if p
+    )
+    if address and post_city and post_city.lower() not in address.lower():
+        return _limit(address, 512), _limit(post_city, 512)
+    return _limit(address or post_city or "-", 512), ""
+
+
+def _payment_code(payment_type: str) -> str:
+    txt = _text(payment_type).lower()
+    if "got" in txt:
+        return "1"
+    if "kart" in txt:
+        return "2"
+    if "przelew" in txt or "bank" in txt:
+        return "6"
+    if "mobil" in txt or "blik" in txt:
+        return "7"
+    return "6"
+
+
 def validate_ksef_invoice(invoice: dict, company: dict, items: list[dict]) -> list[str]:
-    """Zwraca listę braków, które trzeba poprawić przed realnym KSeF."""
-    problems = []
+    """Podstawowa kontrola danych wymaganych do FA(3)."""
+    problems: list[str] = []
 
     if not _text(invoice.get("invoice_no")):
         problems.append("Brak numeru faktury.")
-    if not _text(invoice.get("issue_date")):
+    if not _date(invoice.get("issue_date")):
         problems.append("Brak daty wystawienia.")
-    if not _text(invoice.get("sell_date")):
+    if not _date(invoice.get("sell_date")):
         problems.append("Brak daty sprzedaży.")
 
     if not _text(company.get("company_name")):
         problems.append("Brak nazwy sprzedawcy w danych firmy.")
-    if not _nip(company.get("nip")):
-        problems.append("Brak NIP sprzedawcy w danych firmy.")
-    if not _text(company.get("address")):
+    if len(_nip(company.get("nip"))) != 10:
+        problems.append("NIP sprzedawcy musi mieć 10 cyfr.")
+    if not _text(company.get("address")) and not _text(company.get("city")):
         problems.append("Brak adresu sprzedawcy w danych firmy.")
 
     if not _text(invoice.get("buyer_name")):
         problems.append("Brak nazwy nabywcy.")
-    if not _nip(invoice.get("buyer_tax_no")):
-        problems.append("Brak NIP nabywcy.")
+    buyer_nip = _nip(invoice.get("buyer_tax_no"))
+    if buyer_nip and len(buyer_nip) != 10:
+        problems.append("NIP nabywcy musi mieć 10 cyfr albo pole powinno być puste.")
     if not _text(invoice.get("buyer_street")) and not _text(invoice.get("buyer_city")):
         problems.append("Brak adresu nabywcy.")
 
@@ -70,92 +171,154 @@ def validate_ksef_invoice(invoice: dict, company: dict, items: list[dict]) -> li
         problems.append("Brak pozycji faktury.")
 
     for idx, item in enumerate(items, start=1):
-        name = _text(item.get("name") or item.get("model") or item.get("sku"))
-        qty = Decimal(str(item.get("qty") or "0"))
-        if not name:
+        qty = _dec(item.get("qty"))
+        if not _name_for_item(item):
             problems.append(f"Pozycja {idx}: brak nazwy/modelu.")
         if qty <= 0:
             problems.append(f"Pozycja {idx}: ilość musi być większa od 0.")
+        if _dec(item.get("net_price")) < 0:
+            problems.append(f"Pozycja {idx}: cena netto nie może być ujemna.")
 
     return problems
 
 
 def build_ksef_draft_xml(invoice: dict, company: dict, items: list[dict]) -> str:
     """
-    Buduje roboczy XML na potrzeby kontroli danych.
-    To nie jest jeszcze finalny plik podpisany/wysłany do bramki KSeF.
+    Buduje XML FA(3) dla zwykłej faktury VAT 23%.
+    Nazwa funkcji została zachowana dla zgodności z app.py.
     """
-    root = Element("FakturaRoboczaKSeF")
-    root.set("wersjaModulu", "draft-1")
-    root.set("uwaga", "XML roboczy; przed wysyłką wymaga walidacji ze schemą KSeF FA")
+    root = Element(_tag("Faktura"))
 
-    naglowek = SubElement(root, "Naglowek")
-    _add(naglowek, "KodFormularza", "FA")
-    _add(naglowek, "WariantFormularza", "roboczy")
-    _add(naglowek, "DataWytworzeniaFa", _text(invoice.get("issue_date")))
+    header = SubElement(root, _tag("Naglowek"))
+    _add(header, "KodFormularza", "FA", attrs={"kodSystemowy": "FA (3)", "wersjaSchemy": "1-0E"})
+    _add(header, "WariantFormularza", "3")
+    _add(header, "DataWytworzeniaFa", _now_utc())
+    _add(header, "SystemInfo", "Niedzwieccy Orders")
 
-    podmiot1 = SubElement(root, "Sprzedawca")
-    _add(podmiot1, "Nazwa", company.get("company_name"))
-    _add(podmiot1, "NIP", _nip(company.get("nip")))
-    _add(podmiot1, "Adres", company.get("address"))
-    _add(podmiot1, "Email", company.get("email"))
-    _add(podmiot1, "Telefon", company.get("phone"))
-    _add(podmiot1, "RachunekBankowy", company.get("bank_account"))
+    seller = SubElement(root, _tag("Podmiot1"))
+    seller_id = SubElement(seller, _tag("DaneIdentyfikacyjne"))
+    _add(seller_id, "NIP", _nip(company.get("nip")))
+    _add(seller_id, "Nazwa", _limit(company.get("company_name"), 512))
+    seller_addr1, seller_addr2 = _company_address(company)
+    seller_addr = SubElement(seller, _tag("Adres"))
+    _add(seller_addr, "KodKraju", "PL")
+    _add(seller_addr, "AdresL1", seller_addr1)
+    if seller_addr2:
+        _add(seller_addr, "AdresL2", seller_addr2)
 
-    podmiot2 = SubElement(root, "Nabywca")
-    _add(podmiot2, "Nazwa", invoice.get("buyer_name"))
-    _add(podmiot2, "NIP", _nip(invoice.get("buyer_tax_no")))
-    _add(podmiot2, "Ulica", invoice.get("buyer_street"))
-    _add(podmiot2, "KodPocztowy", invoice.get("buyer_post_code"))
-    _add(podmiot2, "Miejscowosc", invoice.get("buyer_city"))
-    _add(podmiot2, "Kraj", invoice.get("buyer_country") or "PL")
-    _add(podmiot2, "Email", invoice.get("buyer_email"))
+    buyer = SubElement(root, _tag("Podmiot2"))
+    buyer_id = SubElement(buyer, _tag("DaneIdentyfikacyjne"))
+    buyer_nip = _nip(invoice.get("buyer_tax_no"))
+    if buyer_nip:
+        _add(buyer_id, "NIP", buyer_nip)
+    else:
+        _add(buyer_id, "BrakID", "1")
+    _add(buyer_id, "Nazwa", _limit(invoice.get("buyer_name"), 512))
+    buyer_addr1, buyer_addr2 = _buyer_address(invoice)
+    buyer_addr = SubElement(buyer, _tag("Adres"))
+    _add(buyer_addr, "KodKraju", _text(invoice.get("buyer_country")) or "PL")
+    _add(buyer_addr, "AdresL1", buyer_addr1)
+    if buyer_addr2:
+        _add(buyer_addr, "AdresL2", buyer_addr2)
+    _add(buyer, "JST", "2")
+    _add(buyer, "GV", "2")
 
-    fa = SubElement(root, "Faktura")
-    _add(fa, "NumerFaktury", invoice.get("invoice_no"))
-    _add(fa, "DataWystawienia", invoice.get("issue_date"))
-    _add(fa, "DataSprzedazy", invoice.get("sell_date"))
-    _add(fa, "FormaPlatnosci", invoice.get("payment_type"))
-    _add(fa, "TerminPlatnosci", invoice.get("payment_to"))
-    _add(fa, "Waluta", "PLN")
+    fa = SubElement(root, _tag("Fa"))
+    _add(fa, "KodWaluty", "PLN")
+    _add(fa, "P_1", _date(invoice.get("issue_date")))
+    if _text(invoice.get("place")):
+        _add(fa, "P_1M", _limit(invoice.get("place"), 256))
+    elif _text(company.get("city")):
+        _add(fa, "P_1M", _limit(company.get("city"), 256))
+    _add(fa, "P_2", _limit(invoice.get("invoice_no"), 256))
+    if _date(invoice.get("sell_date")):
+        _add(fa, "P_6", _date(invoice.get("sell_date")))
 
-    pozycje = SubElement(fa, "Pozycje")
-    total_net = Decimal("0")
-    total_vat = Decimal("0")
-    total_gross = Decimal("0")
-
-    for idx, item in enumerate(items, start=1):
-        qty = Decimal(str(item.get("qty") or "0"))
-        unit_net = Decimal(str(item.get("net_price") or "0")).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
-        line_net = Decimal(str(item.get("line_value_net") or (unit_net * qty))).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
-        line_vat = Decimal(str(item.get("line_value_vat") or (line_net * Decimal("0.23")))).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
-        line_gross = Decimal(str(item.get("line_value_gross") or (line_net + line_vat))).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
-
+    rows: list[tuple[dict, Decimal, Decimal, Decimal]] = []
+    total_net = Decimal("0.00")
+    for item in items:
+        qty = _dec(item.get("qty"))
+        unit_net = _dec(item.get("net_price")).quantize(PRICE_Q, rounding=ROUND_HALF_UP)
+        line_net = _dec(item.get("line_value_net"), str(unit_net * qty)).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
+        if line_net == 0 and qty and unit_net:
+            line_net = (unit_net * qty).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
+        line_vat = (line_net * Decimal("0.23")).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
+        rows.append((item, qty, unit_net, line_net))
         total_net += line_net
-        total_vat += line_vat
-        total_gross += line_gross
 
-        p = SubElement(pozycje, "Pozycja")
-        _add(p, "Lp", idx)
-        _add(p, "SKU", item.get("sku"))
-        _add(p, "Nazwa", item.get("name") or item.get("model") or item.get("sku"))
-        _add(p, "Ilosc", qty)
-        _add(p, "Jednostka", "szt.")
-        _add(p, "CenaNetto", _money(unit_net))
-        _add(p, "StawkaVAT", "23")
-        _add(p, "WartoscNetto", _money(line_net))
-        _add(p, "KwotaVAT", _money(line_vat))
-        _add(p, "WartoscBrutto", _money(line_gross))
+    total_vat = (total_net * Decimal("0.23")).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
+    total_gross = (total_net + total_vat).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
 
-    suma = SubElement(fa, "Podsumowanie")
-    _add(suma, "SumaNetto", _money(invoice.get("total_net") or total_net))
-    _add(suma, "SumaVAT", _money(total_vat))
-    _add(suma, "SumaBrutto", _money(invoice.get("total_gross") or total_gross))
+    _add(fa, "P_13_1", _money(total_net))
+    _add(fa, "P_14_1", _money(total_vat))
+    _add(fa, "P_15", _money(total_gross))
+
+    annotations = SubElement(fa, _tag("Adnotacje"))
+    _add(annotations, "P_16", "2")
+    _add(annotations, "P_17", "2")
+    _add(annotations, "P_18", "2")
+    _add(annotations, "P_18A", "2")
+    exempt = SubElement(annotations, _tag("Zwolnienie"))
+    _add(exempt, "P_19N", "1")
+    transport = SubElement(annotations, _tag("NoweSrodkiTransportu"))
+    _add(transport, "P_22N", "1")
+    _add(annotations, "P_23", "2")
+    margin = SubElement(annotations, _tag("PMarzy"))
+    _add(margin, "P_PMarzyN", "1")
+
+    _add(fa, "RodzajFaktury", "VAT")
+
+    for idx, (item, qty, unit_net, line_net) in enumerate(rows, start=1):
+        row = SubElement(fa, _tag("FaWiersz"))
+        _add(row, "NrWierszaFa", str(idx))
+        _add(row, "P_7", _name_for_item(item))
+        _add(row, "P_8A", "szt.")
+        _add(row, "P_8B", _qty(qty))
+        _add(row, "P_9A", _price(unit_net))
+        _add(row, "P_11", _money(line_net))
+        _add(row, "P_12", "23")
 
     rough = tostring(root, encoding="utf-8")
     return minidom.parseString(rough).toprettyxml(indent="  ", encoding="utf-8").decode("utf-8")
 
 
+def validate_fa3_xml(xml_text: str, schema_path: str) -> list[str]:
+    """Waliduje XML względem lokalnego schematu FA(3), jeśli aplikacja ma pliki XSD."""
+    try:
+        from lxml import etree
+    except Exception:
+        return ["Brak biblioteki lxml do lokalnej walidacji XSD."]
+
+    if not os.path.exists(schema_path):
+        return [f"Brak pliku schematu XSD: {schema_path}"]
+
+    class LocalResolver(etree.Resolver):
+        def resolve(self, url, pubid, context):
+            if url.endswith("StrukturyDanych_v10-0E.xsd"):
+                local = os.path.join(os.path.dirname(schema_path), "StrukturyDanych_v10-0E.xsd")
+                if os.path.exists(local):
+                    return self.resolve_filename(local, context)
+            if url.endswith("ElementarneTypyDanych_v10-0E.xsd"):
+                local = os.path.join(os.path.dirname(schema_path), "ElementarneTypyDanych_v10-0E.xsd")
+                if os.path.exists(local):
+                    return self.resolve_filename(local, context)
+            return None
+
+    parser = etree.XMLParser()
+    parser.resolvers.add(LocalResolver())
+    try:
+        schema_doc = etree.parse(schema_path, parser)
+        schema = etree.XMLSchema(schema_doc)
+        doc = etree.fromstring(xml_text.encode("utf-8"))
+        schema.assertValid(doc)
+        return []
+    except Exception as exc:
+        msg = str(exc)
+        if hasattr(exc, "error_log") and exc.error_log:
+            msg = "; ".join(str(e) for e in list(exc.error_log)[:5])
+        return [msg]
+
+
 def xml_filename(invoice_no: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", _text(invoice_no) or "faktura")
-    return f"{safe}_ksef_roboczy.xml"
+    return f"{safe}_ksef_FA3.xml"
