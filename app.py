@@ -5451,6 +5451,7 @@ def api_order_lookup():
 
 @app.get("/api/client_invoices")
 def api_client_invoices():
+    maybe_pull_shared_from_supabase()
     email = _email_key(request.args.get("email"))
     if not email:
         return jsonify(ok=False, error="Brak email"), 400
@@ -5495,6 +5496,8 @@ def api_client_invoices():
             d.get("source_order_note")
         ) if d.get("source_order_id") else (d.get("order_no") or "")
         d["pdf_exists"] = 1 if d.get("pdf_path") else 0
+        api_base = request.url_root.rstrip("/")
+        d["download_url"] = f"{api_base}/api/invoices/{d.get('id')}/download?email={urllib.parse.quote_plus(email)}"
         rows.append(d)
     c.close()
     rows.sort(key=lambda x: ((x.get("seen_by_client") or 0), (x.get("issue_date") or ""), int(x.get("id") or 0)), reverse=True)
@@ -6289,6 +6292,7 @@ def api_invoice_seen(invoice_id):
 
 @app.get("/api/invoices/<int:invoice_id>/download")
 def api_invoice_download(invoice_id):
+    maybe_pull_shared_from_supabase()
     email = _email_key(request.args.get("email"))
     c = conn()
     cur = c.cursor()
