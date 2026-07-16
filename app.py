@@ -33,6 +33,7 @@ from reportlab.lib.units import mm
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+from ksef_module import build_ksef_draft_xml, validate_ksef_invoice, xml_filename
 
 
 # =========================
@@ -280,6 +281,20 @@ def init_db():
         paid INTEGER NOT NULL DEFAULT 0,
         paid_at TEXT,
         seen_at TEXT,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(invoice_id) REFERENCES invoices(id)
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS ksef_documents(
+        invoice_id INTEGER PRIMARY KEY,
+        status TEXT NOT NULL DEFAULT 'draft',
+        ksef_number TEXT,
+        xml_path TEXT,
+        last_error TEXT,
+        validated_at TEXT,
+        sent_at TEXT,
         updated_at TEXT NOT NULL,
         FOREIGN KEY(invoice_id) REFERENCES invoices(id)
     )
@@ -2388,6 +2403,7 @@ BASE = r"""
       <a href="{{ url_for('orders') }}">ZamĂłwienia</a>
       <a href="{{ url_for('order_new') }}">Nowe zamĂłwienie</a>
       <a href="{{ url_for('invoices') }}">Faktury</a>
+      <a href="{{ url_for('ksef_dashboard') }}">KSeF</a>
       <a href="{{ url_for('client_searches') }}">Wyszukiwania</a>
       <a href="{{ url_for('products') }}">Produkty</a>
       <a href="{{ url_for('customers') }}">Klienci</a>
@@ -5451,6 +5467,9 @@ def api_client_invoices():
         COALESCE(m.paid,0) AS paid,
         COALESCE(m.paid_at,'') AS paid_at,
         COALESCE(m.seen_at,'') AS seen_at,
+        COALESCE(k.status,'draft') AS ksef_status,
+        COALESCE(k.ksef_number,'') AS ksef_number,
+        COALESCE(k.last_error,'') AS ksef_error,
         o.id AS source_order_id,
         o.order_no,
         o.created_at AS source_order_created_at,
@@ -5518,6 +5537,7 @@ def invoices():
         o.customer_name AS order_customer_name
       FROM invoices i
       LEFT JOIN invoice_meta m ON m.invoice_id = i.id
+      LEFT JOIN ksef_documents k ON k.invoice_id = i.id
       LEFT JOIN orders o ON o.id = i.order_id
       {where}
       ORDER BY LOWER(COALESCE(i.buyer_name, o.customer_name, '')), i.issue_date DESC, i.id DESC
@@ -5629,10 +5649,24 @@ def invoices():
                             <span class="badge danger">Nieopłacona</span>
                             {% if inv.payment_reminder %}<span class="badge">Przypomnienie aktywne</span>{% endif %}
                           {% endif %}
+                          {% if inv.ksef_status == 'ready' %}
+                            <span class="badge ok">KSeF XML</span>
+                          {% elif inv.ksef_status == 'error' %}
+                            <span class="badge danger">KSeF do poprawy</span>
+                          {% elif inv.ksef_status == 'sent' %}
+                            <span class="badge ok">KSeF wysłana</span>
+                          {% else %}
+                            <span class="badge">KSeF robocza</span>
+                          {% endif %}
                         </td>
                         <td>
                           <div class="flex">
                             <a class="btn" href="{{ url_for('invoice_download_admin', invoice_id=inv.id) }}" target="_blank">Faktura PDF</a>
+                            <a class="btn" href="{{ url_for('invoice_ksef_xml', invoice_id=inv.id) }}">KSeF XML</a>
+                            <form method="post" action="{{ url_for('invoice_ksef_validate', invoice_id=inv.id) }}">
+                              <input type="hidden" name="next" value="{{ request.full_path }}">
+                              <button class="btn" type="submit">Sprawdź KSeF</button>
+                            </form>
                             <a class="btn" href="{{ url_for('invoice_edit_admin', invoice_id=inv.id) }}">Edytuj</a>
                             <a class="btn" href="{{ url_for('invoice_packing_list_download_admin', invoice_id=inv.id) }}" target="_blank">Pakuj</a>
                             {% if not inv.sent_to_client %}
@@ -5750,6 +5784,197 @@ def invoice_items_from_saved_json(invoice_id: int):
     items = [dict(r) for r in cur.fetchall()]
     c.close()
     return items
+
+
+def load_company_profile() -> dict:
+    c = conn()
+    cur = c.cursor()
+    cur.execute("SELECT * FROM company_profile WHERE id=1")
+    row = cur.fetchone()
+    c.close()
+    return dict(row) if row else {}
+
+
+def ksef_dir() -> str:
+    path = os.path.join(DATA_DIR, "ksef")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def ksef_xml_path(invoice_id: int, invoice_no: str) -> str:
+    return os.path.join(ksef_dir(), f"{int(invoice_id)}_{xml_filename(invoice_no)}")
+
+
+def load_ksef_doc(invoice_id: int) -> dict:
+    c = conn()
+    cur = c.cursor()
+    cur.execute("SELECT * FROM ksef_documents WHERE invoice_id=?", (invoice_id,))
+    row = cur.fetchone()
+    c.close()
+    return dict(row) if row else {}
+
+
+def upsert_ksef_doc(invoice_id: int, status: str, xml_path: str = "", last_error: str = "", ksef_number: str = ""):
+    current = load_ksef_doc(invoice_id)
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+      INSERT INTO ksef_documents(invoice_id, status, ksef_number, xml_path, last_error, validated_at, sent_at, updated_at)
+      VALUES(?,?,?,?,?,?,?,?)
+      ON CONFLICT(invoice_id) DO UPDATE SET
+        status=excluded.status,
+        ksef_number=COALESCE(NULLIF(excluded.ksef_number,''), ksef_documents.ksef_number),
+        xml_path=COALESCE(NULLIF(excluded.xml_path,''), ksef_documents.xml_path),
+        last_error=excluded.last_error,
+        validated_at=excluded.validated_at,
+        sent_at=COALESCE(ksef_documents.sent_at, excluded.sent_at),
+        updated_at=excluded.updated_at
+    """, (
+        invoice_id,
+        status,
+        ksef_number or current.get("ksef_number", ""),
+        xml_path or current.get("xml_path", ""),
+        last_error or "",
+        now_iso(),
+        current.get("sent_at", ""),
+        now_iso(),
+    ))
+    c.commit()
+    c.close()
+
+
+def build_invoice_ksef_payload(invoice_id: int):
+    inv = load_invoice_with_meta(invoice_id)
+    if not inv:
+        return None, {}, [], ["Nie znaleziono faktury."]
+    company = load_company_profile()
+    items = invoice_items_from_saved_json(invoice_id)
+    problems = validate_ksef_invoice(inv, company, items)
+    return inv, company, items, problems
+
+
+@app.get("/ksef")
+def ksef_dashboard():
+    maybe_pull_shared_from_supabase()
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+      SELECT i.*, COALESCE(k.status,'draft') AS ksef_status,
+             COALESCE(k.ksef_number,'') AS ksef_number,
+             COALESCE(k.last_error,'') AS ksef_error,
+             COALESCE(k.validated_at,'') AS ksef_validated_at,
+             COALESCE(k.sent_at,'') AS ksef_sent_at
+      FROM invoices i
+      LEFT JOIN ksef_documents k ON k.invoice_id=i.id
+      ORDER BY i.issue_date DESC, i.id DESC
+      LIMIT 200
+    """)
+    rows = [dict(r) for r in cur.fetchall()]
+    c.close()
+
+    counts = {"draft": 0, "ready": 0, "error": 0, "sent": 0}
+    for r in rows:
+        counts[r.get("ksef_status") or "draft"] = counts.get(r.get("ksef_status") or "draft", 0) + 1
+
+    tpl = r"""
+    {% extends "base.html" %}
+    {% block content %}
+      <div class="card">
+        <div class="flex">
+          <h1 style="margin:0;">KSeF</h1>
+          <span class="badge">Roboczy moduł XML</span>
+        </div>
+        <div class="hint" style="margin-top:10px;">
+          Etap 1: przygotowanie XML i kontrola braków. Ten moduł jeszcze nie wysyła faktur do KSeF.
+        </div>
+        <div class="kpi" style="margin-top:10px;">
+          <div class="pill">Robocze: <b>{{ counts.get('draft',0) }}</b></div>
+          <div class="pill">Gotowe XML: <b>{{ counts.get('ready',0) }}</b></div>
+          <div class="pill">Do poprawy: <b>{{ counts.get('error',0) }}</b></div>
+          <div class="pill">Wysłane: <b>{{ counts.get('sent',0) }}</b></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <table>
+          <thead>
+            <tr><th>Faktura</th><th>Klient</th><th>Data</th><th>Brutto</th><th>Status KSeF</th><th>Akcje</th></tr>
+          </thead>
+          <tbody>
+            {% for inv in rows %}
+              <tr>
+                <td><b>{{ inv.invoice_no }}</b></td>
+                <td>{{ inv.buyer_name or '-' }}</td>
+                <td>{{ inv.issue_date }}</td>
+                <td>{{ "%.2f"|format(inv.total_gross or 0) }}</td>
+                <td>
+                  {% if inv.ksef_status == 'ready' %}
+                    <span class="badge ok">XML gotowy</span>
+                  {% elif inv.ksef_status == 'error' %}
+                    <span class="badge danger">Do poprawy</span>
+                  {% elif inv.ksef_status == 'sent' %}
+                    <span class="badge ok">Wysłana</span>
+                    {% if inv.ksef_number %}<div class="muted">{{ inv.ksef_number }}</div>{% endif %}
+                  {% else %}
+                    <span class="badge">Robocza</span>
+                  {% endif %}
+                  {% if inv.ksef_error %}<div class="muted">{{ inv.ksef_error }}</div>{% endif %}
+                </td>
+                <td>
+                  <div class="flex">
+                    <form method="post" action="{{ url_for('invoice_ksef_validate', invoice_id=inv.id) }}">
+                      <button class="btn" type="submit">Sprawdź</button>
+                    </form>
+                    <a class="btn primary" href="{{ url_for('invoice_ksef_xml', invoice_id=inv.id) }}">Pobierz XML</a>
+                    <a class="btn" href="{{ url_for('invoice_edit_admin', invoice_id=inv.id) }}">Edytuj fakturę</a>
+                  </div>
+                </td>
+              </tr>
+            {% endfor %}
+            {% if not rows %}
+              <tr><td colspan="6" class="muted">Brak faktur.</td></tr>
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
+    {% endblock %}
+    """
+    return render_template_string(tpl, title="KSeF", base_url=BASE_URL, db_path=DB_PATH, rows=rows, counts=counts)
+
+
+@app.post("/invoices/<int:invoice_id>/ksef/validate")
+def invoice_ksef_validate(invoice_id):
+    inv, company, items, problems = build_invoice_ksef_payload(invoice_id)
+    if not inv:
+        return "Nie znaleziono faktury", 404
+    if problems:
+        upsert_ksef_doc(invoice_id, "error", last_error="; ".join(problems[:5]))
+    else:
+        xml = build_ksef_draft_xml(inv, company, items)
+        path = ksef_xml_path(invoice_id, inv.get("invoice_no") or f"FV_{invoice_id}")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(xml)
+        upsert_ksef_doc(invoice_id, "ready", xml_path=path)
+    return redirect(request.form.get("next") or url_for("ksef_dashboard"))
+
+
+@app.get("/invoices/<int:invoice_id>/ksef/xml")
+def invoice_ksef_xml(invoice_id):
+    inv, company, items, problems = build_invoice_ksef_payload(invoice_id)
+    if not inv:
+        return "Nie znaleziono faktury", 404
+    if problems:
+        upsert_ksef_doc(invoice_id, "error", last_error="; ".join(problems[:5]))
+        return "Nie można wygenerować XML KSeF:\n- " + "\n- ".join(problems), 400
+
+    xml = build_ksef_draft_xml(inv, company, items)
+    path = ksef_xml_path(invoice_id, inv.get("invoice_no") or f"FV_{invoice_id}")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(xml)
+    upsert_ksef_doc(invoice_id, "ready", xml_path=path)
+
+    return send_file(path, mimetype="application/xml", as_attachment=True, download_name=xml_filename(inv.get("invoice_no") or f"FV_{invoice_id}"))
+
 
 @app.get("/invoices/<int:invoice_id>/download")
 def invoice_download_admin(invoice_id):
