@@ -33,7 +33,7 @@ from reportlab.lib.units import mm
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from ksef_module import build_ksef_draft_xml, validate_ksef_invoice, xml_filename
+from ksef_module import build_ksef_draft_xml, validate_fa3_xml, validate_ksef_invoice, xml_filename
 
 
 # =========================
@@ -5650,19 +5650,19 @@ def invoices():
                             {% if inv.payment_reminder %}<span class="badge">Przypomnienie aktywne</span>{% endif %}
                           {% endif %}
                           {% if inv.ksef_status == 'ready' %}
-                            <span class="badge ok">KSeF diagnostyka OK</span>
+                            <span class="badge ok">KSeF FA(3) OK</span>
                           {% elif inv.ksef_status == 'error' %}
                             <span class="badge danger">KSeF do poprawy</span>
                           {% elif inv.ksef_status == 'sent' %}
                             <span class="badge ok">KSeF wysłana</span>
                           {% else %}
-                            <span class="badge">KSeF robocza</span>
+                            <span class="badge">KSeF do sprawdzenia</span>
                           {% endif %}
                         </td>
                         <td>
                           <div class="flex">
                             <a class="btn" href="{{ url_for('invoice_download_admin', invoice_id=inv.id) }}" target="_blank">Faktura PDF</a>
-                            <a class="btn" href="{{ url_for('invoice_ksef_xml', invoice_id=inv.id) }}">XML diagnostyczny</a>
+                            <a class="btn" href="{{ url_for('invoice_ksef_xml', invoice_id=inv.id) }}">XML KSeF FA(3)</a>
                             <form method="post" action="{{ url_for('invoice_ksef_validate', invoice_id=inv.id) }}">
                               <input type="hidden" name="next" value="{{ request.full_path }}">
                               <button class="btn" type="submit">Sprawdź KSeF</button>
@@ -5805,6 +5805,10 @@ def ksef_xml_path(invoice_id: int, invoice_no: str) -> str:
     return os.path.join(ksef_dir(), f"{int(invoice_id)}_{xml_filename(invoice_no)}")
 
 
+def ksef_schema_path() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "fa3_schemat.xsd")
+
+
 def load_ksef_doc(invoice_id: int) -> dict:
     c = conn()
     cur = c.cursor()
@@ -5882,14 +5886,14 @@ def ksef_dashboard():
       <div class="card">
         <div class="flex">
           <h1 style="margin:0;">KSeF</h1>
-          <span class="badge">Moduł diagnostyczny</span>
+          <span class="badge">FA(3)</span>
         </div>
         <div class="hint" style="margin-top:10px;">
-          Etap 1: kontrola danych i XML diagnostyczny. Tego pliku nie wczytujemy jeszcze do aplikacji KSeF — prawdziwy XML musi być zgodny ze strukturą FA.
+          Generator tworzy XML w strukturze FA(3). Przed wysłaniem sprawdź fakturę przyciskiem „Sprawdź” i przetestuj plik w Aplikacji Podatnika KSeF.
         </div>
         <div class="kpi" style="margin-top:10px;">
-          <div class="pill">Robocze: <b>{{ counts.get('draft',0) }}</b></div>
-          <div class="pill">Diagnostyka OK: <b>{{ counts.get('ready',0) }}</b></div>
+          <div class="pill">Do sprawdzenia: <b>{{ counts.get('draft',0) }}</b></div>
+          <div class="pill">FA(3) OK: <b>{{ counts.get('ready',0) }}</b></div>
           <div class="pill">Do poprawy: <b>{{ counts.get('error',0) }}</b></div>
           <div class="pill">Wysłane: <b>{{ counts.get('sent',0) }}</b></div>
         </div>
@@ -5909,14 +5913,14 @@ def ksef_dashboard():
                 <td>{{ "%.2f"|format(inv.total_gross or 0) }}</td>
                 <td>
                   {% if inv.ksef_status == 'ready' %}
-                    <span class="badge ok">Diagnostyka OK</span>
+                    <span class="badge ok">FA(3) OK</span>
                   {% elif inv.ksef_status == 'error' %}
                     <span class="badge danger">Do poprawy</span>
                   {% elif inv.ksef_status == 'sent' %}
                     <span class="badge ok">Wysłana</span>
                     {% if inv.ksef_number %}<div class="muted">{{ inv.ksef_number }}</div>{% endif %}
                   {% else %}
-                    <span class="badge">Robocza</span>
+                    <span class="badge">Do sprawdzenia</span>
                   {% endif %}
                   {% if inv.ksef_error %}<div class="muted">{{ inv.ksef_error }}</div>{% endif %}
                 </td>
@@ -5925,7 +5929,7 @@ def ksef_dashboard():
                     <form method="post" action="{{ url_for('invoice_ksef_validate', invoice_id=inv.id) }}">
                       <button class="btn" type="submit">Sprawdź</button>
                     </form>
-                    <a class="btn primary" href="{{ url_for('invoice_ksef_xml', invoice_id=inv.id) }}">Pobierz XML diagnostyczny</a>
+                    <a class="btn primary" href="{{ url_for('invoice_ksef_xml', invoice_id=inv.id) }}">Pobierz XML KSeF FA(3)</a>
                     <a class="btn" href="{{ url_for('invoice_edit_admin', invoice_id=inv.id) }}">Edytuj fakturę</a>
                   </div>
                 </td>
@@ -5952,6 +5956,11 @@ def invoice_ksef_validate(invoice_id):
     else:
         xml = build_ksef_draft_xml(inv, company, items)
         path = ksef_xml_path(invoice_id, inv.get("invoice_no") or f"FV_{invoice_id}")
+        schema = ksef_schema_path()
+        schema_errors = validate_fa3_xml(xml, schema) if os.path.exists(schema) else []
+        if schema_errors:
+            upsert_ksef_doc(invoice_id, "error", last_error="; ".join(schema_errors[:3]))
+            return redirect(request.form.get("next") or url_for("ksef_dashboard"))
         with open(path, "w", encoding="utf-8") as f:
             f.write(xml)
         upsert_ksef_doc(invoice_id, "ready", xml_path=path)
@@ -5968,6 +5977,12 @@ def invoice_ksef_xml(invoice_id):
         return "Nie można wygenerować XML KSeF:\n- " + "\n- ".join(problems), 400
 
     xml = build_ksef_draft_xml(inv, company, items)
+    schema = ksef_schema_path()
+    schema_errors = validate_fa3_xml(xml, schema) if os.path.exists(schema) else []
+    if schema_errors:
+        upsert_ksef_doc(invoice_id, "error", last_error="; ".join(schema_errors[:3]))
+        return "XML nie przeszedł walidacji FA(3):\n- " + "\n- ".join(schema_errors), 400
+
     path = ksef_xml_path(invoice_id, inv.get("invoice_no") or f"FV_{invoice_id}")
     with open(path, "w", encoding="utf-8") as f:
         f.write(xml)
