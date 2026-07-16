@@ -55,6 +55,14 @@ def _date(value) -> str:
     return raw[:10]
 
 
+def _first_nonempty(*values) -> str:
+    for value in values:
+        txt = _text(value)
+        if txt:
+            return txt
+    return ""
+
+
 def _now_utc() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -108,13 +116,38 @@ def _sku_for_item(item: dict) -> str:
     return _limit(item.get("sku") or item.get("model") or "", 50)
 
 
+def _strip_country_prefix(value: str) -> str:
+    txt = _text(value)
+    txt = re.sub(r"^(PL|POLSKA)\s*[-,]?\s+", "", txt, flags=re.IGNORECASE)
+    return txt.strip()
+
+
+def _place_of_issue(invoice: dict, company: dict) -> str:
+    place = _first_nonempty(invoice.get("place"), invoice.get("issue_place"), company.get("city"))
+    if place:
+        return _limit(_strip_country_prefix(place), 256)
+
+    address = _text(company.get("address"))
+    if address:
+        before_comma = address.split(",", 1)[0].strip()
+        before_postcode = re.split(r"\b\d{2}-\d{3}\b", before_comma)[0].strip()
+        candidate = before_postcode or before_comma
+        candidate = re.sub(r"\s+\d+\w*(?:/\d+\w*)?$", "", candidate).strip()
+        if candidate:
+            return _limit(candidate.title(), 256)
+
+    return "Kotuszów"
+
+
 def _buyer_address(invoice: dict) -> tuple[str, str]:
     street = _text(invoice.get("buyer_street") or invoice.get("buyer_address"))
-    post_city = " ".join(
-        p for p in [_text(invoice.get("buyer_post_code")), _text(invoice.get("buyer_city"))] if p
+    post_city = _strip_country_prefix(
+        " ".join(
+            p for p in [_text(invoice.get("buyer_post_code")), _text(invoice.get("buyer_city"))] if p
+        )
     )
     if street:
-        return _limit(street, 512), _limit(post_city, 512)
+        return _limit(_strip_country_prefix(street), 512), _limit(post_city, 512)
     return _limit(post_city or "-", 512), ""
 
 
@@ -139,6 +172,28 @@ def _payment_code(payment_type: str) -> str:
     if "mobil" in txt or "blik" in txt:
         return "7"
     return "6"
+
+
+def _invoice_payment_type(invoice: dict) -> str:
+    return _first_nonempty(
+        invoice.get("payment_type"),
+        invoice.get("payment_method"),
+        invoice.get("payment_form"),
+        invoice.get("payment"),
+        "przelew",
+    )
+
+
+def _payment_due_date(invoice: dict) -> str:
+    return _date(
+        _first_nonempty(
+            invoice.get("payment_to"),
+            invoice.get("due_date"),
+            invoice.get("payment_due"),
+            invoice.get("payment_due_date"),
+            invoice.get("issue_date"),
+        )
+    )
 
 
 def validate_ksef_invoice(invoice: dict, company: dict, items: list[dict]) -> list[str]:
@@ -226,10 +281,7 @@ def build_ksef_draft_xml(invoice: dict, company: dict, items: list[dict]) -> str
     fa = SubElement(root, _tag("Fa"))
     _add(fa, "KodWaluty", "PLN")
     _add(fa, "P_1", _date(invoice.get("issue_date")))
-    if _text(invoice.get("place")):
-        _add(fa, "P_1M", _limit(invoice.get("place"), 256))
-    elif _text(company.get("city")):
-        _add(fa, "P_1M", _limit(company.get("city"), 256))
+    _add(fa, "P_1M", _place_of_issue(invoice, company))
     _add(fa, "P_2", _limit(invoice.get("invoice_no"), 256))
     if _date(invoice.get("sell_date")):
         _add(fa, "P_6", _date(invoice.get("sell_date")))
@@ -277,6 +329,13 @@ def build_ksef_draft_xml(invoice: dict, company: dict, items: list[dict]) -> str
         _add(row, "P_9A", _price(unit_net))
         _add(row, "P_11", _money(line_net))
         _add(row, "P_12", "23")
+
+    payment = SubElement(fa, _tag("Platnosc"))
+    due = _payment_due_date(invoice)
+    if due:
+        due_node = SubElement(payment, _tag("TerminPlatnosci"))
+        _add(due_node, "Termin", due)
+    _add(payment, "FormaPlatnosci", _payment_code(_invoice_payment_type(invoice)))
 
     rough = tostring(root, encoding="utf-8")
     return minidom.parseString(rough).toprettyxml(indent="  ", encoding="utf-8").decode("utf-8")
