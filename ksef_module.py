@@ -302,6 +302,10 @@ def validate_fa3_xml(xml_text: str, schema_path: str) -> list[str]:
                 local = os.path.join(os.path.dirname(schema_path), "ElementarneTypyDanych_v10-0E.xsd")
                 if os.path.exists(local):
                     return self.resolve_filename(local, context)
+            if url.endswith("KodyKrajow_v10-0E.xsd"):
+                local = os.path.join(os.path.dirname(schema_path), "KodyKrajow_v10-0E.xsd")
+                if os.path.exists(local):
+                    return self.resolve_filename(local, context)
             return None
 
     parser = etree.XMLParser()
