@@ -325,4 +325,5 @@ def validate_fa3_xml(xml_text: str, schema_path: str) -> list[str]:
 
 def xml_filename(invoice_no: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", _text(invoice_no) or "faktura")
-    return f"{safe}_ksef_FA3.xml"
+    safe = safe.strip("._-") or "faktura"
+    return f"{safe}.xml"
