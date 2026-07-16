@@ -2662,11 +2662,11 @@ def client_searches():
       <div class="card">
         <h2>Najczęściej wyszukiwane modele — wszyscy klienci</h2>
         <div class="muted" style="margin-bottom:8px;">
-          To jest najważniejszy ranking do zatowarowania: liczymy konkretne modele/SKU, które pojawiły się klientom w wynikach wyszukiwania.
+          Prosty ranking popytu: konkretne modele, które klienci najczęściej znajdują w wyszukiwarce.
         </div>
         <table>
           <thead>
-            <tr><th>Model / SKU</th><th>Nazwa</th><th>Ile razy</th><th>Klientów</th><th>Frazy, które prowadziły do modelu</th><th>Ostatnio</th></tr>
+            <tr><th>Model / SKU</th><th>Nazwa</th><th>Ile razy</th><th>Klientów</th><th>Ostatnio</th></tr>
           </thead>
           <tbody>
             {% for r in model_rows %}
@@ -2675,18 +2675,20 @@ def client_searches():
                 <td>{{ r.product_name or '-' }}</td>
                 <td><span class="badge">{{ r.searches_count }}</span></td>
                 <td>{{ r.clients_count }}</td>
-                <td class="muted">{{ r.phrases_preview or '-' }}</td>
                 <td class="muted">{{ r.last_at }}</td>
               </tr>
             {% endfor %}
             {% if not model_rows %}
-              <tr><td colspan="6" class="muted">Brak zapisanych wyszukiwań.</td></tr>
+              <tr><td colspan="5" class="muted">Brak zapisanych wyszukiwań.</td></tr>
             {% endif %}
           </tbody>
         </table>
       </div>
 
-      <div class="card">
+      <details class="card">
+        <summary style="cursor:pointer;font-weight:700;font-size:16px;">Pokaż szczegóły</summary>
+
+      <div style="margin-top:14px;">
         <h2>Frazy bez dopasowania albo do kontroli</h2>
         <div class="muted" style="margin-bottom:8px;">
           Tu zostają wpisane teksty klienta. To pomocnicza lista do wyłapania literówek, brakujących nazw albo produktów, których nie ma w ofercie.
@@ -2713,7 +2715,7 @@ def client_searches():
         </table>
       </div>
 
-      <div class="card">
+      <div style="margin-top:18px;">
         <h2>Wyszukiwania według klienta</h2>
         <div class="muted" style="margin-bottom:8px;">Tu zobaczysz, kto konkretnie szukał danej frazy.</div>
         <table>
@@ -2738,7 +2740,7 @@ def client_searches():
         </table>
       </div>
 
-      <div class="card">
+      <div style="margin-top:18px;">
         <h2>Ostatnie wpisy</h2>
         <table>
           <thead>
@@ -2761,6 +2763,7 @@ def client_searches():
           </tbody>
         </table>
       </div>
+      </details>
     {% endblock %}
     """
     return render_template_string(tpl, title="Wyszukiwania klientów", base_url=BASE_URL, db_path=DB_PATH,
@@ -5209,6 +5212,8 @@ def api_client_search_log():
     if results_count < 0:
         results_count = 0
     matches = data.get("matches") if isinstance(data.get("matches"), list) else []
+    if results_count > 20:
+        matches = []
 
     rows_to_save = []
     created_at = now_iso()
