@@ -4666,6 +4666,7 @@ def order_invoice(order_id):
     cur.execute(f"""
       SELECT
         i.*,
+        m.invoice_id AS meta_invoice_id,
         COALESCE(m.pdf_path,'') AS pdf_path,
         COALESCE(m.sent_to_client,0) AS sent_to_client,
         COALESCE(m.seen_by_client,0) AS seen_by_client,
@@ -5479,16 +5480,21 @@ def api_client_invoices():
       FROM invoices i
       LEFT JOIN invoice_meta m ON m.invoice_id = i.id
       LEFT JOIN orders o ON o.id = i.order_id
-      WHERE COALESCE(m.sent_to_client,0)=1
-        AND (
+      WHERE (
           LOWER(COALESCE(i.buyer_email,'')) = ?
           OR LOWER(COALESCE(o.customer_email,'')) = ?
+        )
+        AND (
+          COALESCE(m.sent_to_client,0)=1
+          OR m.invoice_id IS NULL
         )
       ORDER BY i.order_id DESC, i.id DESC
     """, (email, email))
     rows = []
     for r in cur.fetchall():
         d = dict(r)
+        if d.get("meta_invoice_id") is None:
+            d["sent_to_client"] = 1
         d["order_display"] = order_display_no(
             d.get("source_order_id"),
             d.get("source_order_created_at"),
@@ -6245,6 +6251,7 @@ def api_invoice_seen(invoice_id):
     cur.execute("""
       SELECT
         i.id,
+        m.invoice_id AS meta_invoice_id,
         i.buyer_email,
         o.customer_email AS order_customer_email,
         COALESCE(m.pdf_path,'') AS pdf_path,
@@ -6264,7 +6271,8 @@ def api_invoice_seen(invoice_id):
     if email:
         buyer_ok = _email_key(row["buyer_email"]) == email
         order_ok = _email_key(row["order_customer_email"]) == email
-        if int(row["sent_to_client"] or 0) != 1 or not (buyer_ok or order_ok):
+        has_meta = row["meta_invoice_id"] is not None
+        if (has_meta and int(row["sent_to_client"] or 0) != 1) or not (buyer_ok or order_ok):
             return jsonify(ok=False, error="Brak dostÄ™pu"), 403
 
     ok_pdf, _ = invoice_pdf_exists(row["pdf_path"], row["invoice_no"])
@@ -6299,6 +6307,7 @@ def api_invoice_download(invoice_id):
     cur.execute("""
       SELECT
         i.*,
+        m.invoice_id AS meta_invoice_id,
         COALESCE(m.pdf_path,'') AS pdf_path,
         COALESCE(m.sent_to_client,0) AS sent_to_client,
         o.customer_email AS order_customer_email
@@ -6316,7 +6325,8 @@ def api_invoice_download(invoice_id):
     if email:
         buyer_ok = _email_key(row["buyer_email"]) == email
         order_ok = _email_key(row["order_customer_email"]) == email
-        if int(row["sent_to_client"] or 0) != 1 or not (buyer_ok or order_ok):
+        has_meta = row["meta_invoice_id"] is not None
+        if (has_meta and int(row["sent_to_client"] or 0) != 1) or not (buyer_ok or order_ok):
             return "Brak dostÄ™pu", 403
 
     if parse_supabase_storage_ref(row["pdf_path"]):
