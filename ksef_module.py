@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import re
+import uuid
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from xml.dom import minidom
@@ -383,6 +384,7 @@ def validate_fa3_xml(xml_text: str, schema_path: str) -> list[str]:
 
 
 def xml_filename(invoice_no: str) -> str:
-    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", _text(invoice_no) or "faktura")
-    safe = safe.strip("._-") or "faktura"
-    return f"{safe}.xml"
+    # Numer faktury zostaje wyłącznie w XML w polu P_2.
+    # Nazwa pliku jest losowa, żeby przy testach/importach KSeF nie sugerował się nazwą
+    # ani nie wpadał na konflikt z wcześniej wczytanym plikiem o tej samej nazwie.
+    return f"ksef_{uuid.uuid4().hex[:12]}.xml"
