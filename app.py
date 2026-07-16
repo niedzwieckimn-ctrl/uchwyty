@@ -2545,6 +2545,7 @@ def client_searches():
     model_stats = {}
     client_stats = {}
     phrase_events_seen = set()
+    model_events_seen = set()
     for r in rows:
         query = norm(r.get("query"))
         if not query:
@@ -2553,16 +2554,19 @@ def client_searches():
         name = norm(r.get("customer_name"))
         client_key = email or name or "anon"
         product_sku = norm(r.get("product_sku"))
-        product_model = norm(r.get("product_model")) or product_sku
+        product_model = norm(r.get("product_model"))
         product_name = norm(r.get("product_name"))
         results_count = to_int(r.get("results_count"), 0)
         created_at = norm(r.get("created_at"))
 
-        if product_model:
-            m = model_stats.setdefault(product_model, {
-                "product_model": product_model,
+        product_key = product_sku or product_model
+        model_event_key = (email, name, query.lower(), product_key.lower(), created_at)
+        if product_key and 0 < results_count <= 20 and model_event_key not in model_events_seen:
+            model_events_seen.add(model_event_key)
+            m = model_stats.setdefault(product_key, {
+                "product_model": product_key,
                 "product_sku": product_sku,
-                "product_name": product_name,
+                "product_name": product_name or product_model,
                 "searches_count": 0,
                 "clients": set(),
                 "phrases": set(),
@@ -2574,8 +2578,8 @@ def client_searches():
                 m["phrases"].add(query)
             if product_sku and not m.get("product_sku"):
                 m["product_sku"] = product_sku
-            if product_name and not m.get("product_name"):
-                m["product_name"] = product_name
+            if (product_name or product_model) and not m.get("product_name"):
+                m["product_name"] = product_name or product_model
             if created_at > m["last_at"]:
                 m["last_at"] = created_at
 
@@ -2662,7 +2666,7 @@ def client_searches():
       <div class="card">
         <h2>Najczęściej wyszukiwane modele — wszyscy klienci</h2>
         <div class="muted" style="margin-bottom:8px;">
-          Prosty ranking popytu: konkretne modele, które klienci najczęściej znajdują w wyszukiwarce.
+          Prosty ranking popytu: konkretne SKU/modele, które klienci najczęściej znajdują w wyszukiwarce. Szerokie frazy z ponad 20 wynikami nie nabijają tego rankingu.
         </div>
         <table>
           <thead>
