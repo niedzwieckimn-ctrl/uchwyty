@@ -5462,6 +5462,7 @@ def api_client_invoices():
     cur.execute("""
       SELECT
         i.*,
+        m.invoice_id AS meta_invoice_id,
         COALESCE(m.pdf_path,'') AS pdf_path,
         COALESCE(m.sent_to_client,0) AS sent_to_client,
         COALESCE(m.seen_by_client,0) AS seen_by_client,
@@ -5469,9 +5470,6 @@ def api_client_invoices():
         COALESCE(m.paid,0) AS paid,
         COALESCE(m.paid_at,'') AS paid_at,
         COALESCE(m.seen_at,'') AS seen_at,
-        COALESCE(k.status,'draft') AS ksef_status,
-        COALESCE(k.ksef_number,'') AS ksef_number,
-        COALESCE(k.last_error,'') AS ksef_error,
         o.id AS source_order_id,
         o.order_no,
         o.created_at AS source_order_created_at,
