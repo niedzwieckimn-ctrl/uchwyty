@@ -183,12 +183,12 @@ def _get_public_keys(session: requests.Session, cfg: KsefConfig) -> Tuple[Dict[s
 def _authenticate(session: requests.Session, cfg: KsefConfig, token_key: Dict[str, Any]) -> str:
     challenge_data = _post(session, f"{cfg.base_url}/auth/challenge", {}, "Pobieranie challenge KSeF")
     challenge = challenge_data.get("challenge")
-    timestamp_ms = challenge_data.get("timestamp")
+    timestamp_ms = challenge_data.get("timestampMs") or challenge_data.get("timestamp")
     if not challenge or timestamp_ms is None:
         raise KsefApiError(f"Nieprawidłowa odpowiedź challenge KSeF: {challenge_data}")
 
     public_key = _public_key_from_der_b64(token_key["certificate"])
-    token_payload = f"{cfg.token}|{timestamp_ms}".encode("utf-8")
+    token_payload = f"{cfg.token}|{int(timestamp_ms)}".encode("utf-8")
     encrypted_token = _rsa_oaep_sha256_encrypt(public_key, token_payload)
 
     init_payload = {

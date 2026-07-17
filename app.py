@@ -5701,6 +5701,10 @@ def invoices():
                               <input type="hidden" name="next" value="{{ request.full_path }}">
                               <button class="btn" type="submit">Sprawdź KSeF</button>
                             </form>
+                            <form method="post" action="{{ url_for('invoice_ksef_send', invoice_id=inv.id) }}" onsubmit="return confirm('Wysłać tę fakturę bezpośrednio do KSeF?');">
+                              <input type="hidden" name="next" value="{{ request.full_path }}">
+                              <button class="btn primary" type="submit">Wyślij do KSeF</button>
+                            </form>
                             <a class="btn" href="{{ url_for('invoice_edit_admin', invoice_id=inv.id) }}">Edytuj</a>
                             <a class="btn" href="{{ url_for('invoice_packing_list_download_admin', invoice_id=inv.id) }}" target="_blank">Pakuj</a>
                             {% if not inv.sent_to_client %}
@@ -5978,6 +5982,7 @@ def ksef_dashboard():
                     </form>
                     <a class="btn primary" href="{{ url_for('invoice_ksef_xml', invoice_id=inv.id) }}">Pobierz XML KSeF FA(3)</a>
                     <form method="post" action="{{ url_for('invoice_ksef_send', invoice_id=inv.id) }}" onsubmit="return confirm('Wyslac te fakture bezposrednio do KSeF?');">
+                      <input type="hidden" name="next" value="{{ request.full_path }}">
                       <button class="btn primary" type="submit">Wyślij do KSeF</button>
                     </form>
                     <a class="btn" href="{{ url_for('invoice_edit_admin', invoice_id=inv.id) }}">Edytuj fakturę</a>
@@ -6019,19 +6024,20 @@ def invoice_ksef_validate(invoice_id):
 
 @app.post("/invoices/<int:invoice_id>/ksef/send")
 def invoice_ksef_send(invoice_id):
+    next_url = request.form.get("next") or url_for("ksef_dashboard")
     inv, company, items, problems = build_invoice_ksef_payload(invoice_id)
     if not inv:
         return "Nie znaleziono faktury", 404
     if problems:
         upsert_ksef_doc(invoice_id, "error", last_error="; ".join(problems[:5]))
-        return redirect(url_for("ksef_dashboard"))
+        return redirect(next_url)
 
     xml = build_ksef_draft_xml(inv, company, items)
     schema = ksef_schema_path()
     schema_errors = validate_fa3_xml(xml, schema) if os.path.exists(schema) else []
     if schema_errors:
         upsert_ksef_doc(invoice_id, "error", last_error="; ".join(schema_errors[:3]))
-        return redirect(url_for("ksef_dashboard"))
+        return redirect(next_url)
 
     path = ksef_xml_path(invoice_id, inv.get("invoice_no") or f"FV_{invoice_id}")
     with open(path, "w", encoding="utf-8") as f:
@@ -6039,7 +6045,7 @@ def invoice_ksef_send(invoice_id):
 
     if send_invoice_to_ksef is None:
         upsert_ksef_doc(invoice_id, "error", xml_path=path, last_error="Brak modułu ksef_api.py albo zależności requests/cryptography.")
-        return redirect(url_for("ksef_dashboard"))
+        return redirect(next_url)
 
     result = send_invoice_to_ksef(xml)
     if result.get("ok"):
@@ -6047,7 +6053,7 @@ def invoice_ksef_send(invoice_id):
         upsert_ksef_doc(invoice_id, "sent", xml_path=path, ksef_number=ksef_number)
     else:
         upsert_ksef_doc(invoice_id, "error", xml_path=path, last_error=result.get("message") or "Nie udało się wysłać faktury do KSeF.")
-    return redirect(url_for("ksef_dashboard"))
+    return redirect(next_url)
 
 
 @app.get("/invoices/<int:invoice_id>/ksef/xml")
