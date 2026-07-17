@@ -5531,6 +5531,7 @@ def api_client_invoices():
         o.customer_email AS order_customer_email
       FROM invoices i
       LEFT JOIN invoice_meta m ON m.invoice_id = i.id
+      LEFT JOIN ksef_documents k ON k.invoice_id = i.id
       LEFT JOIN orders o ON o.id = i.order_id
       WHERE (
           LOWER(COALESCE(i.buyer_email,'')) = ?
