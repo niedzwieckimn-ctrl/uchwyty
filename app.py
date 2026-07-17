@@ -34,6 +34,13 @@ from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from ksef_module import build_ksef_draft_xml, validate_fa3_xml, validate_ksef_invoice, xml_filename
+try:
+    from ksef_api import ksef_config_summary, send_invoice_to_ksef
+except Exception:
+    send_invoice_to_ksef = None
+
+    def ksef_config_summary():
+        return {"configured": False, "missing": ["ksef_api.py"], "env": "", "base_url": ""}
 
 
 # =========================
@@ -1515,7 +1522,7 @@ def generate_sales_invoice(order_row, items):
     cpdf.setFont(pdf_font_bold, 10)
     cpdf.drawString(15 * mm, y, "Sprzedawca:")
     y -= 6 * mm
-    cpdf.setFont(pdf_font, 9)
+    cpdf.setFont(pdf_font, 8.5)
     if company:
         cpdf.drawString(15 * mm, y, f"{company['company_name'] or '-'}")
         y -= 5 * mm
@@ -1733,7 +1740,7 @@ def generate_order_invoice_pdf(order_row, items, meta):
     cpdf.drawCentredString(cell_center(col_x[3], col_x[4]), header_y, "Netto/szt")
     cpdf.drawCentredString(cell_center(col_x[4], col_x[5]), header_y, "Brutto/szt")
     cpdf.drawCentredString(cell_center(col_x[5], col_x[6]), header_y, "Wartość netto")
-    cpdf.drawCentredString(cell_center(col_x[6], col_x[7]), header_y, "VAT")
+    cpdf.drawCentredString(cell_center(col_x[6], col_x[7]), header_y, "Stawka VAT")
     cpdf.line(table_left, y + 1, table_right, y + 1)
     cpdf.line(table_left, y - row_h + 1, table_right, y - row_h + 1)
     for cx in col_x:
@@ -1741,7 +1748,7 @@ def generate_order_invoice_pdf(order_row, items, meta):
     y -= row_h
 
     total_net = 0.0
-    total_gross = 0.0
+    total_net_dec = Decimal("0.00")
     discount_pct = max(0.0, to_float(meta.get("discount_percent"), 0.0))
     body_font = 8.2
     cpdf.setFont(pdf_font, body_font)
@@ -1759,18 +1766,14 @@ def generate_order_invoice_pdf(order_row, items, meta):
         line_net_dec = (net_dec * Decimal(qty)).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
         if discount_pct > 0:
             line_net_dec = (line_net_dec * (Decimal("100.0") - Decimal(str(discount_pct))) / Decimal("100.0")).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
-        line_tax_dec = vat23_from_net(line_net_dec)
-        line_gross_dec = (line_net_dec + line_tax_dec).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
         unit_gross_dec = gross_from_net_23(net_dec)
 
         net = money_float(net_dec)
         gross = money_float(unit_gross_dec)
         line_net = money_float(line_net_dec)
-        line_tax = money_float(line_tax_dec)
-        line_gross = money_float(line_gross_dec)
 
         total_net += line_net
-        total_gross += line_gross
+        total_net_dec += line_net_dec
 
         text_y = cell_baseline(y, row_h, pdf_font, body_font)
         cpdf.drawCentredString(cell_center(col_x[0], col_x[1]), text_y, str(lp))
@@ -1786,7 +1789,7 @@ def generate_order_invoice_pdf(order_row, items, meta):
         cpdf.drawRightString(col_x[4] - 1.5 * mm, text_y, f"{net:.2f}")
         cpdf.drawRightString(col_x[5] - 1.5 * mm, text_y, f"{gross:.2f}")
         cpdf.drawRightString(col_x[6] - 1.5 * mm, text_y, f"{line_net:.2f}")
-        cpdf.drawRightString(col_x[7] - 1.5 * mm, text_y, f"{line_tax:.2f}")
+        cpdf.drawCentredString(cell_center(col_x[6], col_x[7]), text_y, "23%")
         cpdf.line(table_left, y - row_h + 1, table_right, y - row_h + 1)
         for cx in col_x:
             cpdf.line(cx, y + 1, cx, y - row_h + 1)
@@ -1797,7 +1800,12 @@ def generate_order_invoice_pdf(order_row, items, meta):
             y = h - 20 * mm
             cpdf.setFont(pdf_font, 8.8)
 
-    total_tax = round(total_gross - total_net, 2)
+    total_net_dec = total_net_dec.quantize(MONEY_Q, rounding=ROUND_HALF_UP)
+    total_tax_dec = vat23_from_net(total_net_dec)
+    total_gross_dec = (total_net_dec + total_tax_dec).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
+    total_net = money_float(total_net_dec)
+    total_tax = money_float(total_tax_dec)
+    total_gross = money_float(total_gross_dec)
     y -= 6 * mm
     cpdf.setFont(pdf_font_bold, 10)
     if discount_pct > 0:
@@ -1870,6 +1878,24 @@ def generate_invoice_packing_list_pdf(order_row, items, meta, invoice_pdf_path: 
     cpdf.drawString(15 * mm, y, f"Data: {meta.get('issue_date') or app_now().strftime('%Y-%m-%d')}")
     y -= 8 * mm
 
+    def fit_text(text, max_width, font_name, font_size):
+        text = norm(text or "")
+        if not text:
+            return "-"
+        if cpdf.stringWidth(text, font_name, font_size) <= max_width:
+            return text
+        ell = "..."
+        while text and cpdf.stringWidth(text + ell, font_name, font_size) > max_width:
+            text = text[:-1]
+        return (text + ell) if text else ell
+
+    def strip_note_from_order_no(order_no, note):
+        order_no = norm(order_no or "")
+        note = norm(note or "")
+        if note and order_no.lower().endswith((" " + note).lower()):
+            return order_no[:-(len(note) + 1)].strip()
+        return order_no
+
     cpdf.setFont(pdf_font_bold, 9)
     headers = [("Lp.", 15), ("Zamówienie", 27), ("Notatka", 62), ("SKU", 92), ("Model / nazwa", 122), ("Ilość", 184)]
     for label, x_mm in headers:
@@ -1889,17 +1915,18 @@ def generate_invoice_packing_list_pdf(order_row, items, meta, invoice_pdf_path: 
         note = norm(it.get("source_order_note") or "")
         sku = norm(it.get("sku") or "")
         model_name = norm(it.get("model") or it.get("name") or "")
+        order_no = strip_note_from_order_no(order_no, note)
+        product_text = (sku + "  " + model_name).strip()
 
         if y < 22 * mm:
             cpdf.showPage()
             y = h - 18 * mm
-            cpdf.setFont(pdf_font, 9)
+            cpdf.setFont(pdf_font, 8.5)
 
         cpdf.drawString(15 * mm, y, str(lp))
-        cpdf.drawString(27 * mm, y, order_no[:18])
-        cpdf.drawString(62 * mm, y, note[:18] if note else "-")
-        cpdf.drawString(92 * mm, y, sku[:18])
-        cpdf.drawString(122 * mm, y, model_name[:34])
+        cpdf.drawString(27 * mm, y, fit_text(order_no, 32 * mm, pdf_font, 8.5))
+        cpdf.drawString(62 * mm, y, fit_text(note if note else "-", 27 * mm, pdf_font, 8.5))
+        cpdf.drawString(92 * mm, y, fit_text(product_text, 86 * mm, pdf_font, 8.5))
         cpdf.drawRightString(198 * mm, y, str(qty))
         y -= 5 * mm
 
@@ -5827,6 +5854,9 @@ def load_ksef_doc(invoice_id: int) -> dict:
 
 def upsert_ksef_doc(invoice_id: int, status: str, xml_path: str = "", last_error: str = "", ksef_number: str = ""):
     current = load_ksef_doc(invoice_id)
+    sent_at = current.get("sent_at", "")
+    if status == "sent" and not sent_at:
+        sent_at = now_iso()
     c = conn()
     cur = c.cursor()
     cur.execute("""
@@ -5847,7 +5877,7 @@ def upsert_ksef_doc(invoice_id: int, status: str, xml_path: str = "", last_error
         xml_path or current.get("xml_path", ""),
         last_error or "",
         now_iso(),
-        current.get("sent_at", ""),
+        sent_at,
         now_iso(),
     ))
     c.commit()
@@ -5867,6 +5897,7 @@ def build_invoice_ksef_payload(invoice_id: int):
 @app.get("/ksef")
 def ksef_dashboard():
     maybe_pull_shared_from_supabase()
+    ksef_cfg = ksef_config_summary()
     c = conn()
     cur = c.cursor()
     cur.execute("""
@@ -5898,6 +5929,15 @@ def ksef_dashboard():
         <div class="hint" style="margin-top:10px;">
           Generator tworzy XML w strukturze FA(3). Przed wysłaniem sprawdź fakturę przyciskiem „Sprawdź” i przetestuj plik w Aplikacji Podatnika KSeF.
         </div>
+        {% if not ksef_cfg.configured %}
+          <div class="hint" style="margin-top:10px; border-color:#fecaca; background:#fff1f2;">
+            Wysyłka bezpośrednia jest gotowa, ale w Render brakuje: <b>{{ ksef_cfg.missing|join(', ') }}</b>.
+          </div>
+        {% else %}
+          <div class="hint" style="margin-top:10px;">
+            Wysyłka bezpośrednia aktywna: <b>{{ ksef_cfg.env }}</b>.
+          </div>
+        {% endif %}
         <div class="kpi" style="margin-top:10px;">
           <div class="pill">Do sprawdzenia: <b>{{ counts.get('draft',0) }}</b></div>
           <div class="pill">FA(3) OK: <b>{{ counts.get('ready',0) }}</b></div>
@@ -5937,6 +5977,9 @@ def ksef_dashboard():
                       <button class="btn" type="submit">Sprawdź</button>
                     </form>
                     <a class="btn primary" href="{{ url_for('invoice_ksef_xml', invoice_id=inv.id) }}">Pobierz XML KSeF FA(3)</a>
+                    <form method="post" action="{{ url_for('invoice_ksef_send', invoice_id=inv.id) }}" onsubmit="return confirm('Wyslac te fakture bezposrednio do KSeF?');">
+                      <button class="btn primary" type="submit">Wyślij do KSeF</button>
+                    </form>
                     <a class="btn" href="{{ url_for('invoice_edit_admin', invoice_id=inv.id) }}">Edytuj fakturę</a>
                   </div>
                 </td>
@@ -5950,7 +5993,7 @@ def ksef_dashboard():
       </div>
     {% endblock %}
     """
-    return render_template_string(tpl, title="KSeF", base_url=BASE_URL, db_path=DB_PATH, rows=rows, counts=counts)
+    return render_template_string(tpl, title="KSeF", base_url=BASE_URL, db_path=DB_PATH, rows=rows, counts=counts, ksef_cfg=ksef_cfg)
 
 
 @app.post("/invoices/<int:invoice_id>/ksef/validate")
@@ -5972,6 +6015,39 @@ def invoice_ksef_validate(invoice_id):
             f.write(xml)
         upsert_ksef_doc(invoice_id, "ready", xml_path=path)
     return redirect(request.form.get("next") or url_for("ksef_dashboard"))
+
+
+@app.post("/invoices/<int:invoice_id>/ksef/send")
+def invoice_ksef_send(invoice_id):
+    inv, company, items, problems = build_invoice_ksef_payload(invoice_id)
+    if not inv:
+        return "Nie znaleziono faktury", 404
+    if problems:
+        upsert_ksef_doc(invoice_id, "error", last_error="; ".join(problems[:5]))
+        return redirect(url_for("ksef_dashboard"))
+
+    xml = build_ksef_draft_xml(inv, company, items)
+    schema = ksef_schema_path()
+    schema_errors = validate_fa3_xml(xml, schema) if os.path.exists(schema) else []
+    if schema_errors:
+        upsert_ksef_doc(invoice_id, "error", last_error="; ".join(schema_errors[:3]))
+        return redirect(url_for("ksef_dashboard"))
+
+    path = ksef_xml_path(invoice_id, inv.get("invoice_no") or f"FV_{invoice_id}")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(xml)
+
+    if send_invoice_to_ksef is None:
+        upsert_ksef_doc(invoice_id, "error", xml_path=path, last_error="Brak modułu ksef_api.py albo zależności requests/cryptography.")
+        return redirect(url_for("ksef_dashboard"))
+
+    result = send_invoice_to_ksef(xml)
+    if result.get("ok"):
+        ksef_number = result.get("ksef_number") or (f"ref: {result.get('invoice_reference_number')}" if result.get("invoice_reference_number") else "")
+        upsert_ksef_doc(invoice_id, "sent", xml_path=path, ksef_number=ksef_number)
+    else:
+        upsert_ksef_doc(invoice_id, "error", xml_path=path, last_error=result.get("message") or "Nie udało się wysłać faktury do KSeF.")
+    return redirect(url_for("ksef_dashboard"))
 
 
 @app.get("/invoices/<int:invoice_id>/ksef/xml")
@@ -6103,18 +6179,9 @@ def invoice_packing_list_download_admin(invoice_id):
     if not items:
         return "Brak pozycji faktury", 400
 
-    if supabase_enabled():
-        packing_ref = supabase_storage_ref(invoice_packing_storage_object_path(invoice_id, inv.get("invoice_no") or f"FV_{invoice_id}"))
-        try:
-            data, filename = supabase_storage_download_bytes(packing_ref)
-            return send_file(io.BytesIO(data), mimetype="application/pdf", as_attachment=True, download_name=filename)
-        except Exception:
-            pass
-
     ok_pdf, invoice_abs_path = invoice_pdf_exists(inv.get("pdf_path", ""), inv.get("invoice_no", ""))
     pack_path = packing_list_pdf_path_for_invoice(invoice_abs_path if ok_pdf else "", inv.get("invoice_no") or f"FV_{invoice_id}")
-    if not os.path.exists(pack_path):
-        pack_path = generate_invoice_packing_list_pdf(o, items, invoice_meta_payload(inv), invoice_abs_path if ok_pdf else "")
+    pack_path = generate_invoice_packing_list_pdf(o, items, invoice_meta_payload(inv), invoice_abs_path if ok_pdf else "")
     if supabase_enabled():
         try:
             packing_ref = supabase_storage_upload_file(
