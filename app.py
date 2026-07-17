@@ -1817,6 +1817,21 @@ def generate_order_invoice_pdf(order_row, items, meta):
     y -= 5 * mm
     cpdf.drawRightString(198 * mm, y, f"Suma brutto: {total_gross:.2f} PLN")
 
+    ksef_number = norm(meta.get("ksef_number") or "")
+    if ksef_number:
+        y -= 10 * mm
+        if y < 22 * mm:
+            cpdf.showPage()
+            y = h - 20 * mm
+        cpdf.setFont(pdf_font_bold, 9)
+        cpdf.drawString(15 * mm, y, "KSeF")
+        y -= 5 * mm
+        cpdf.setFont(pdf_font, 8.5)
+        cpdf.drawString(15 * mm, y, "Faktura zostaĹ‚a wystawiona i jest dostÄ™pna w Krajowym Systemie e-Faktur.")
+        y -= 5 * mm
+        cpdf.setFont(pdf_font_bold, 8.5)
+        cpdf.drawString(15 * mm, y, f"Numer KSeF: {pdf_txt(ksef_number)}")
+
     cpdf.save()
     return fpath, round(total_net,2), round(total_gross,2)
 
@@ -5497,6 +5512,10 @@ def api_client_invoices():
         COALESCE(m.paid,0) AS paid,
         COALESCE(m.paid_at,'') AS paid_at,
         COALESCE(m.seen_at,'') AS seen_at,
+        COALESCE(k.status,'draft') AS ksef_status,
+        COALESCE(k.ksef_number,'') AS ksef_number,
+        COALESCE(k.last_error,'') AS ksef_error,
+        COALESCE(k.sent_at,'') AS ksef_sent_at,
         o.id AS source_order_id,
         o.order_no,
         o.created_at AS source_order_created_at,
@@ -5689,6 +5708,7 @@ def invoices():
                             <span class="badge danger">KSeF do poprawy</span>
                           {% elif inv.ksef_status == 'sent' %}
                             <span class="badge ok">KSeF wysłana</span>
+                            {% if inv.ksef_number %}<div class="muted small">{{ inv.ksef_number }}</div>{% endif %}
                           {% else %}
                             <span class="badge">KSeF do sprawdzenia</span>
                           {% endif %}
@@ -5701,11 +5721,15 @@ def invoices():
                               <input type="hidden" name="next" value="{{ request.full_path }}">
                               <button class="btn" type="submit">Sprawdź KSeF</button>
                             </form>
-                            <form method="post" action="{{ url_for('invoice_ksef_send', invoice_id=inv.id) }}" onsubmit="return confirm('Wysłać tę fakturę bezpośrednio do KSeF?');">
-                              <input type="hidden" name="next" value="{{ request.full_path }}">
-                              <button class="btn primary" type="submit">Wyślij do KSeF</button>
-                            </form>
-                            <a class="btn" href="{{ url_for('invoice_edit_admin', invoice_id=inv.id) }}">Edytuj</a>
+                            {% if inv.ksef_status != 'sent' %}
+                              <form method="post" action="{{ url_for('invoice_ksef_send', invoice_id=inv.id) }}" onsubmit="return confirm('UWAGA: to jest realna wysyłka faktury do KSeF. Po wysłaniu faktura otrzyma numer KSeF i nie będzie można jej edytować. Kontynuować?');">
+                                <input type="hidden" name="next" value="{{ request.full_path }}">
+                                <button class="btn primary" type="submit">Wyślij do KSeF</button>
+                              </form>
+                              <a class="btn" href="{{ url_for('invoice_edit_admin', invoice_id=inv.id) }}">Edytuj</a>
+                            {% else %}
+                              <span class="badge ok">Zablokowana po KSeF</span>
+                            {% endif %}
                             <a class="btn" href="{{ url_for('invoice_packing_list_download_admin', invoice_id=inv.id) }}" target="_blank">Pakuj</a>
                             {% if not inv.sent_to_client %}
                               <form method="post" action="{{ url_for('invoice_send_admin', invoice_id=inv.id) }}">
@@ -5777,6 +5801,12 @@ def invoice_meta_payload(invoice_row: dict):
         invoice_row.get("buyer_street") or "",
         f"{invoice_row.get('buyer_post_code') or ''} {invoice_row.get('buyer_city') or ''}".strip()
     ] if x]).strip()
+    ksef_number = invoice_row.get("ksef_number") or ""
+    if not ksef_number and invoice_row.get("id"):
+        try:
+            ksef_number = load_ksef_doc(int(invoice_row.get("id") or 0)).get("ksef_number") or ""
+        except Exception:
+            ksef_number = ""
 
     return {
         "invoice_no": invoice_row.get("invoice_no") or "",
@@ -5792,6 +5822,7 @@ def invoice_meta_payload(invoice_row: dict):
         "buyer_email": invoice_row.get("buyer_email") or "",
         "buyer_phone": invoice_row.get("buyer_phone") or "",
         "discount_percent": "0",
+        "ksef_number": ksef_number,
     }
 
 def invoice_items_from_saved_json(invoice_id: int):
@@ -5888,6 +5919,57 @@ def upsert_ksef_doc(invoice_id: int, status: str, xml_path: str = "", last_error
     c.close()
 
 
+def regenerate_invoice_pdf_after_ksef_send(invoice_id: int, ksef_number: str) -> bool:
+    inv = load_invoice_with_meta(invoice_id)
+    if not inv:
+        return False
+    items = invoice_items_from_saved_json(invoice_id)
+    if not items:
+        return False
+
+    c = conn()
+    cur = c.cursor()
+    cur.execute("SELECT * FROM orders WHERE id=?", (inv.get("order_id"),))
+    order_row = cur.fetchone()
+    c.close()
+
+    meta_payload = invoice_meta_payload(inv)
+    meta_payload["ksef_number"] = ksef_number
+    pdf_path, total_net, total_gross = generate_order_invoice_pdf(order_row, items, meta_payload)
+    packing_pdf_path = generate_invoice_packing_list_pdf(order_row, items, meta_payload, pdf_path)
+    stored_pdf_path = upload_invoice_pdfs_to_supabase(invoice_id, inv.get("invoice_no") or f"FV_{invoice_id}", pdf_path, packing_pdf_path)
+
+    c = conn()
+    cur = c.cursor()
+    cur.execute("UPDATE invoices SET total_net=?, total_gross=? WHERE id=?", (total_net, total_gross, invoice_id))
+    c.commit()
+    c.close()
+
+    current_meta = load_invoice_meta(invoice_id) or {}
+    upsert_invoice_meta(
+        invoice_id,
+        stored_pdf_path,
+        current_meta.get("invoice_items_json") or json.dumps(items, ensure_ascii=False),
+        sent_to_client=int(current_meta.get("sent_to_client") or 0),
+        seen_by_client=int(current_meta.get("seen_by_client") or 0),
+        seen_at=current_meta.get("seen_at"),
+        payment_reminder=int(current_meta.get("payment_reminder") or 0),
+        paid=int(current_meta.get("paid") or 0),
+        paid_at=current_meta.get("paid_at"),
+    )
+
+    if supabase_enabled():
+        try:
+            sync_local_rows_to_supabase("invoices", "id", [invoice_id])
+        except Exception:
+            pass
+        try:
+            sync_invoice_meta_to_supabase(invoice_id)
+        except Exception:
+            pass
+    return True
+
+
 def build_invoice_ksef_payload(invoice_id: int):
     inv = load_invoice_with_meta(invoice_id)
     if not inv:
@@ -5981,11 +6063,15 @@ def ksef_dashboard():
                       <button class="btn" type="submit">Sprawdź</button>
                     </form>
                     <a class="btn primary" href="{{ url_for('invoice_ksef_xml', invoice_id=inv.id) }}">Pobierz XML KSeF FA(3)</a>
-                    <form method="post" action="{{ url_for('invoice_ksef_send', invoice_id=inv.id) }}" onsubmit="return confirm('Wyslac te fakture bezposrednio do KSeF?');">
-                      <input type="hidden" name="next" value="{{ request.full_path }}">
-                      <button class="btn primary" type="submit">Wyślij do KSeF</button>
-                    </form>
-                    <a class="btn" href="{{ url_for('invoice_edit_admin', invoice_id=inv.id) }}">Edytuj fakturę</a>
+                    {% if inv.ksef_status != 'sent' %}
+                      <form method="post" action="{{ url_for('invoice_ksef_send', invoice_id=inv.id) }}" onsubmit="return confirm('UWAGA: to jest realna wysyłka faktury do KSeF. Po wysłaniu faktura otrzyma numer KSeF i nie będzie można jej edytować. Kontynuować?');">
+                        <input type="hidden" name="next" value="{{ request.full_path }}">
+                        <button class="btn primary" type="submit">Wyślij do KSeF</button>
+                      </form>
+                      <a class="btn" href="{{ url_for('invoice_edit_admin', invoice_id=inv.id) }}">Edytuj fakturę</a>
+                    {% else %}
+                      <span class="badge ok">Wysłana do KSeF — edycja zablokowana</span>
+                    {% endif %}
                   </div>
                 </td>
               </tr>
@@ -6025,6 +6111,9 @@ def invoice_ksef_validate(invoice_id):
 @app.post("/invoices/<int:invoice_id>/ksef/send")
 def invoice_ksef_send(invoice_id):
     next_url = request.form.get("next") or url_for("ksef_dashboard")
+    current_ksef = load_ksef_doc(invoice_id)
+    if current_ksef.get("status") == "sent":
+        return redirect(next_url)
     inv, company, items, problems = build_invoice_ksef_payload(invoice_id)
     if not inv:
         return "Nie znaleziono faktury", 404
@@ -6051,6 +6140,10 @@ def invoice_ksef_send(invoice_id):
     if result.get("ok"):
         ksef_number = result.get("ksef_number") or (f"ref: {result.get('invoice_reference_number')}" if result.get("invoice_reference_number") else "")
         upsert_ksef_doc(invoice_id, "sent", xml_path=path, ksef_number=ksef_number)
+        try:
+            regenerate_invoice_pdf_after_ksef_send(invoice_id, ksef_number)
+        except Exception as exc:
+            upsert_ksef_doc(invoice_id, "sent", xml_path=path, ksef_number=ksef_number, last_error=f"Wysłano do KSeF, ale nie udało się odświeżyć PDF: {exc}")
     else:
         upsert_ksef_doc(invoice_id, "error", xml_path=path, last_error=result.get("message") or "Nie udało się wysłać faktury do KSeF.")
     return redirect(next_url)
@@ -6644,6 +6737,31 @@ def invoice_edit_admin(invoice_id):
     inv = load_invoice_with_meta(invoice_id)
     if not inv:
         return "Nie znaleziono faktury", 404
+    ksef_doc = load_ksef_doc(invoice_id)
+    if ksef_doc.get("status") == "sent":
+        tpl = r"""
+        {% extends "base.html" %}
+        {% block content %}
+          <div class="card">
+            <div class="flex">
+              <h1 style="margin:0;">Faktura wysłana do KSeF</h1>
+              <a class="btn right" href="{{ url_for('invoices') }}">← Faktury</a>
+            </div>
+            <div class="hint" style="margin-top:10px;">
+              Ta faktura ma już numer KSeF i jej edycja została zablokowana, żeby nie powstała różnica między aplikacją a KSeF.
+            </div>
+            {% if ksef_doc.ksef_number %}
+              <p><b>Numer KSeF:</b> {{ ksef_doc.ksef_number }}</p>
+            {% endif %}
+            <div class="flex" style="margin-top:12px;">
+              <a class="btn" href="{{ url_for('invoice_download_admin', invoice_id=inv.id) }}" target="_blank">Faktura PDF</a>
+              <a class="btn" href="{{ url_for('invoice_ksef_xml', invoice_id=inv.id) }}">XML KSeF FA(3)</a>
+              <a class="btn" href="{{ url_for('invoices') }}">Wróć do faktur</a>
+            </div>
+          </div>
+        {% endblock %}
+        """
+        return render_template_string(tpl, title="Faktura wysłana do KSeF", base_url=BASE_URL, db_path=DB_PATH, inv=inv, ksef_doc=ksef_doc)
 
     c = conn()
     cur = c.cursor()
