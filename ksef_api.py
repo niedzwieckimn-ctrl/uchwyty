@@ -61,11 +61,13 @@ class KsefApiError(RuntimeError):
 
 def _cfg() -> KsefConfig:
     env = (os.getenv("KSEF_ENV") or "test").strip().lower()
+    token = (os.getenv("KSEF_TOKEN") or "").strip()
+    token = "".join(token.split())
     return KsefConfig(
         env=env,
         base_url=BASE_URLS.get(env, BASE_URLS["test"]),
         nip=(os.getenv("KSEF_NIP") or "").strip(),
-        token=(os.getenv("KSEF_TOKEN") or "").strip(),
+        token=token,
         timeout=int(os.getenv("KSEF_TIMEOUT", "45") or "45"),
     )
 
@@ -311,9 +313,16 @@ def send_invoice_to_ksef(xml_text: str) -> Dict[str, Any]:
             "raw_status": status,
         }
     except Exception as exc:
+        message = str(exc)
+        if "nie został znaleziony" in message or "nie zostal znaleziony" in message:
+            message += (
+                f" Sprawdź KSEF_ENV: teraz aplikacja używa środowiska '{cfg.env}'. "
+                "Token musi być wygenerowany dokładnie w tym samym środowisku KSeF. "
+                "Jeśli token był z ap.ksef.mf.gov.pl, ustaw KSEF_ENV=prod dopiero wtedy, gdy świadomie wysyłasz prawdziwe faktury."
+            )
         return {
             "ok": False,
-            "message": str(exc),
+            "message": message,
             "env": cfg.env,
             "base_url": cfg.base_url,
         }
