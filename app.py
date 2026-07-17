@@ -5591,6 +5591,10 @@ def invoices():
         COALESCE(m.paid,0) AS paid,
         COALESCE(m.paid_at,'') AS paid_at,
         COALESCE(m.seen_at,'') AS seen_at,
+        COALESCE(k.status,'draft') AS ksef_status,
+        COALESCE(k.ksef_number,'') AS ksef_number,
+        COALESCE(k.last_error,'') AS ksef_error,
+        COALESCE(k.sent_at,'') AS ksef_sent_at,
         o.id AS source_order_id,
         o.order_no AS source_order_no,
         o.created_at AS source_order_created_at,
@@ -5697,9 +5701,17 @@ def invoices():
                         <td>{{ "%.2f"|format(inv.total_gross) }}</td>
                         <td>
                           {% if inv.sent_to_client %}
-                            <span class="badge">W panelu klienta</span>
+                            <span class="badge ok">Udostępniona klientowi</span>
                           {% else %}
-                            <span class="badge">Wewnętrzna</span>
+                            <span class="badge">Nieudostępniona</span>
+                          {% endif %}
+                          {% if inv.sent_to_client %}
+                            {% if inv.seen_by_client %}
+                              <span class="badge ok">PDF pobrany</span>
+                              {% if inv.seen_at %}<div class="muted small">{{ inv.seen_at }}</div>{% endif %}
+                            {% else %}
+                              <span class="badge">PDF niepobrany</span>
+                            {% endif %}
                           {% endif %}
                           {% if not inv.pdf_ok %}
                             <span class="badge danger">Brak PDF</span>
@@ -5710,42 +5722,27 @@ def invoices():
                             <span class="badge danger">Nieopłacona</span>
                             {% if inv.payment_reminder %}<span class="badge">Przypomnienie aktywne</span>{% endif %}
                           {% endif %}
-                          {% if inv.ksef_status == 'ready' %}
+                          {% if inv.ksef_status == 'sent' %}
+                            <span class="badge ok">W KSeF</span>
+                            {% if inv.ksef_number %}<div class="muted small">{{ inv.ksef_number }}</div>{% endif %}
+                          {% elif inv.ksef_status == 'ready' %}
                             <span class="badge ok">KSeF FA(3) OK</span>
                           {% elif inv.ksef_status == 'error' %}
                             <span class="badge danger">KSeF do poprawy</span>
-                          {% elif inv.ksef_status == 'sent' %}
-                            <span class="badge ok">KSeF wysłana</span>
-                            {% if inv.ksef_number %}<div class="muted small">{{ inv.ksef_number }}</div>{% endif %}
+                            {% if inv.ksef_error %}<div class="muted small">{{ inv.ksef_error }}</div>{% endif %}
                           {% else %}
-                            <span class="badge">KSeF do sprawdzenia</span>
+                            <span class="badge">Nie wysłana do KSeF</span>
                           {% endif %}
                         </td>
                         <td>
                           <div class="flex">
                             <a class="btn" href="{{ url_for('invoice_download_admin', invoice_id=inv.id) }}" target="_blank">Faktura PDF</a>
-                            <a class="btn" href="{{ url_for('invoice_ksef_xml', invoice_id=inv.id) }}">XML KSeF FA(3)</a>
-                            <form method="post" action="{{ url_for('invoice_ksef_validate', invoice_id=inv.id) }}">
-                              <input type="hidden" name="next" value="{{ request.full_path }}">
-                              <button class="btn" type="submit">Sprawdź KSeF</button>
-                            </form>
-                            {% if inv.ksef_status != 'sent' %}
-                              <form method="post" action="{{ url_for('invoice_ksef_send', invoice_id=inv.id) }}" onsubmit="return confirm('UWAGA: to jest realna wysyłka faktury do KSeF. Po wysłaniu faktura otrzyma numer KSeF i nie będzie można jej edytować. Kontynuować?');">
-                                <input type="hidden" name="next" value="{{ request.full_path }}">
-                                <button class="btn primary" type="submit">Wyślij do KSeF</button>
-                              </form>
-                              <a class="btn" href="{{ url_for('invoice_edit_admin', invoice_id=inv.id) }}">Edytuj</a>
-                            {% else %}
-                              <span class="badge ok">Zablokowana po KSeF</span>
-                            {% endif %}
                             <a class="btn" href="{{ url_for('invoice_packing_list_download_admin', invoice_id=inv.id) }}" target="_blank">Pakuj</a>
                             {% if not inv.sent_to_client %}
                               <form method="post" action="{{ url_for('invoice_send_admin', invoice_id=inv.id) }}">
                                 <input type="hidden" name="next" value="{{ request.full_path }}">
-                                <button class="btn primary" type="submit">Wyślij klientowi</button>
+                                <button class="btn primary" type="submit">Udostępnij klientowi</button>
                               </form>
-                            {% else %}
-                              <span class="badge">Widoczna u klienta</span>
                             {% endif %}
                             {% if inv.source_order_id %}
                               <a class="btn" href="{{ url_for('order_view', order_id=inv.source_order_id) }}">Zamówienie</a>
@@ -5765,10 +5762,22 @@ def invoices():
                                 <button class="btn" type="submit">Cofnij opłacenie</button>
                               </form>
                             {% endif %}
-                            <form method="post" action="{{ url_for('invoice_delete_admin', invoice_id=inv.id) }}" onsubmit="return confirm('Usunąć fakturę {{ inv.invoice_no }}? To usunie też PDF i widoczność w panelu klienta.')">
-                              <input type="hidden" name="next" value="{{ request.full_path }}">
-                              <button class="btn danger" type="submit">Usuń</button>
-                            </form>
+                            {% if inv.ksef_status != 'sent' %}
+                              <a class="btn" href="{{ url_for('invoice_ksef_xml', invoice_id=inv.id) }}">XML KSeF FA(3)</a>
+                              <form method="post" action="{{ url_for('invoice_ksef_validate', invoice_id=inv.id) }}">
+                                <input type="hidden" name="next" value="{{ request.full_path }}">
+                                <button class="btn" type="submit">Sprawdź KSeF</button>
+                              </form>
+                              <form method="post" action="{{ url_for('invoice_ksef_send', invoice_id=inv.id) }}" onsubmit="return confirm('UWAGA: to jest realna wysyłka faktury do KSeF. Po wysłaniu faktura otrzyma numer KSeF i nie będzie można jej edytować. Kontynuować?');">
+                                <input type="hidden" name="next" value="{{ request.full_path }}">
+                                <button class="btn primary" type="submit">Wyślij do KSeF</button>
+                              </form>
+                              <a class="btn" href="{{ url_for('invoice_edit_admin', invoice_id=inv.id) }}">Edytuj</a>
+                              <form method="post" action="{{ url_for('invoice_delete_admin', invoice_id=inv.id) }}" onsubmit="return confirm('Usunąć fakturę {{ inv.invoice_no }}? To usunie też PDF i widoczność w panelu klienta.')">
+                                <input type="hidden" name="next" value="{{ request.full_path }}">
+                                <button class="btn danger" type="submit">Usuń</button>
+                              </form>
+                            {% endif %}
                           </div>
                         </td>
                       </tr>
@@ -6525,9 +6534,31 @@ def api_invoice_download(invoice_id):
         if (has_meta and int(row["sent_to_client"] or 0) != 1) or not (buyer_ok or order_ok):
             return "Brak dostÄ™pu", 403
 
+    def mark_downloaded_by_client():
+        if not email:
+            return
+        meta = load_invoice_meta(invoice_id) or {}
+        upsert_invoice_meta(
+            invoice_id,
+            meta.get("pdf_path", ""),
+            meta.get("invoice_items_json", ""),
+            sent_to_client=int(meta.get("sent_to_client") or 0),
+            seen_by_client=1,
+            seen_at=now_iso(),
+            payment_reminder=int(meta.get("payment_reminder") or 0),
+            paid=int(meta.get("paid") or 0),
+            paid_at=meta.get("paid_at")
+        )
+        if supabase_enabled():
+            try:
+                sync_invoice_meta_to_supabase(invoice_id)
+            except Exception:
+                pass
+
     if parse_supabase_storage_ref(row["pdf_path"]):
         try:
             data, filename = supabase_storage_download_bytes(row["pdf_path"])
+            mark_downloaded_by_client()
             return send_file(io.BytesIO(data), mimetype="application/pdf", as_attachment=True, download_name=filename)
         except Exception:
             pass
@@ -6565,6 +6596,7 @@ def api_invoice_download(invoice_id):
                 pass
         if parse_supabase_storage_ref(stored_pdf_path):
             data, filename = supabase_storage_download_bytes(stored_pdf_path)
+            mark_downloaded_by_client()
             return send_file(io.BytesIO(data), mimetype="application/pdf", as_attachment=True, download_name=filename)
 
     if supabase_enabled() and abs_path and os.path.exists(abs_path) and not parse_supabase_storage_ref(row["pdf_path"]):
@@ -6587,11 +6619,13 @@ def api_invoice_download(invoice_id):
             )
             sync_invoice_meta_to_supabase(invoice_id)
             data, filename = supabase_storage_download_bytes(stored_pdf_path)
+            mark_downloaded_by_client()
             return send_file(io.BytesIO(data), mimetype="application/pdf", as_attachment=True, download_name=filename)
         except Exception:
             pass
 
     try:
+        mark_downloaded_by_client()
         return send_file(abs_path, mimetype="application/pdf", as_attachment=True, download_name=os.path.basename(abs_path))
     except Exception as e:
         return f"BĹ‚Ä…d pobierania PDF: {e}", 500
