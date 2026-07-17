@@ -1835,7 +1835,7 @@ def generate_order_invoice_pdf(order_row, items, meta):
         cpdf.drawString(15 * mm, y, "KSeF")
         y -= 5 * mm
         cpdf.setFont(pdf_font, 8.5)
-        cpdf.drawString(15 * mm, y, "Faktura zostaĹ‚a wystawiona i jest dostÄ™pna w Krajowym Systemie e-Faktur.")
+        cpdf.drawString(15 * mm, y, "Faktura została wystawiona i jest dostępna w Krajowym Systemie e-Faktur.")
         y -= 5 * mm
         cpdf.setFont(pdf_font_bold, 8.5)
         cpdf.drawString(15 * mm, y, f"Numer KSeF: {pdf_txt(ksef_number)}")
@@ -2413,8 +2413,12 @@ BASE = r"""
     body{font-family:Arial, sans-serif; margin:0; background:#f6f7fb; color:#111;}
     .top{background:#111; color:#fff; padding:12px 14px; display:flex; gap:10px; flex-wrap:wrap; align-items:center;}
     .brand{font-weight:700; letter-spacing:.2px;}
-    .nav a{color:#fff; text-decoration:none; padding:7px 10px; border:1px solid rgba(255,255,255,.25); border-radius:10px;}
-    .nav a:hover{background:rgba(255,255,255,.08)}
+    .nav a,.nav-drop-btn{color:#fff; text-decoration:none; padding:7px 10px; border:1px solid rgba(255,255,255,.25); border-radius:10px; background:transparent; font:inherit; cursor:pointer;}
+    .nav a:hover,.nav-drop-btn:hover{background:rgba(255,255,255,.08)}
+    .nav-dropdown{position:relative; display:inline-flex;}
+    .nav-dropdown-menu{display:none; position:absolute; top:calc(100% + 6px); left:0; min-width:190px; background:#111; border:1px solid rgba(255,255,255,.25); border-radius:12px; padding:6px; z-index:1000; box-shadow:0 12px 30px rgba(0,0,0,.35);}
+    .nav-dropdown:hover .nav-dropdown-menu,.nav-dropdown:focus-within .nav-dropdown-menu{display:grid; gap:6px;}
+    .nav-dropdown-menu a{display:block; white-space:nowrap; border-color:rgba(255,255,255,.18);}
     .wrap{max-width:1100px; margin:16px auto; padding:0 12px;}
     .card{background:#fff; border:1px solid #e7e7ee; border-radius:14px; padding:14px; box-shadow:0 8px 22px rgba(0,0,0,.04); margin-bottom:12px;}
     .row{display:grid; grid-template-columns:1fr 1fr; gap:12px;}
@@ -2455,13 +2459,18 @@ BASE = r"""
       <a href="{{ url_for('invoices') }}">Faktury</a>
       <a href="{{ url_for('ksef_dashboard') }}">KSeF</a>
       <a href="{{ url_for('client_searches') }}">Wyszukiwania</a>
-      <a href="{{ url_for('products') }}">Produkty</a>
-      <a href="{{ url_for('customers') }}">Klienci</a>
-      <a href="{{ url_for('pricing') }}">Cennik</a>
-      <a href="{{ url_for('company') }}">Dane mojej firmy</a>
       <a href="{{ url_for('stock') }}">Magazyn</a>
       <a href="{{ url_for('china') }}">Chiny (P/O)</a>
       <a href="{{ url_for('order_scan') }}">Skan QR</a>
+      <div class="nav-dropdown">
+        <button class="nav-drop-btn" type="button">Ustawienia ▾</button>
+        <div class="nav-dropdown-menu">
+          <a href="{{ url_for('products') }}">Produkty</a>
+          <a href="{{ url_for('customers') }}">Klienci</a>
+          <a href="{{ url_for('pricing') }}">Cennik</a>
+          <a href="{{ url_for('company') }}">Dane mojej firmy</a>
+        </div>
+      </div>
     </div>
     <div class="right muted">Lokalnie â€˘ {{ base_url }}</div>
   </div>
