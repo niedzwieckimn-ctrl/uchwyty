@@ -756,6 +756,7 @@ SUPABASE_SYNC_TABLES = [
     ("invoices", "id"),
     ("invoice_meta", "invoice_id"),
     ("invoice_allocations", "id"),
+    ("ksef_documents", "invoice_id"),
 ]
 
 # KolejnoĹ›Ä‡ PULL jest waĹĽna: najpierw rodzice, potem dzieci.
@@ -772,6 +773,7 @@ SUPABASE_PULL_TABLES = [
     ("invoices", "id"),
     ("invoice_meta", "invoice_id"),
     ("invoice_allocations", "id"),
+    ("ksef_documents", "invoice_id"),
 ]
 
 _supabase_sync_lock = threading.Lock()
@@ -1230,6 +1232,12 @@ def pull_shared_tables_from_supabase(force: bool = False):
     # 3) usuĹ„ lokalne rekordy, ktĂłrych juĹĽ nie ma w Supabase
     for table, conflict_col in reversed(SUPABASE_PULL_TABLES):
         if (table, conflict_col) not in fetched:
+            continue
+        if table == "ksef_documents":
+            result["tables"].setdefault(table, {})
+            result["tables"][table]["deleted_local"] = 0
+            if result["tables"][table].get("upsert") == "ok":
+                result["tables"][table]["status"] = "ok"
             continue
         try:
             remote_rows = fetched[(table, conflict_col)]
@@ -5917,6 +5925,10 @@ def upsert_ksef_doc(invoice_id: int, status: str, xml_path: str = "", last_error
     ))
     c.commit()
     c.close()
+    try:
+        sync_local_rows_to_supabase("ksef_documents", "invoice_id", [invoice_id])
+    except Exception:
+        pass
 
 
 def regenerate_invoice_pdf_after_ksef_send(invoice_id: int, ksef_number: str) -> bool:
@@ -6068,6 +6080,11 @@ def ksef_dashboard():
                         <input type="hidden" name="next" value="{{ request.full_path }}">
                         <button class="btn primary" type="submit">Wyślij do KSeF</button>
                       </form>
+                      <form method="post" action="{{ url_for('invoice_ksef_mark_sent', invoice_id=inv.id) }}" onsubmit="return confirm('Oznaczyć fakturę jako wysłaną do KSeF?');" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
+                        <input type="hidden" name="next" value="{{ request.full_path }}">
+                        <input name="ksef_number" placeholder="Numer KSeF" style="width:220px;">
+                        <button class="btn" type="submit">Oznacz wysłaną</button>
+                      </form>
                       <a class="btn" href="{{ url_for('invoice_edit_admin', invoice_id=inv.id) }}">Edytuj fakturę</a>
                     {% else %}
                       <span class="badge ok">Wysłana do KSeF — edycja zablokowana</span>
@@ -6106,6 +6123,21 @@ def invoice_ksef_validate(invoice_id):
             f.write(xml)
         upsert_ksef_doc(invoice_id, "ready", xml_path=path)
     return redirect(request.form.get("next") or url_for("ksef_dashboard"))
+
+
+@app.post("/invoices/<int:invoice_id>/ksef/mark-sent")
+def invoice_ksef_mark_sent(invoice_id):
+    next_url = request.form.get("next") or url_for("ksef_dashboard")
+    ksef_number = (request.form.get("ksef_number") or "").strip()
+    if not ksef_number:
+        upsert_ksef_doc(invoice_id, "error", last_error="Wpisz numer KSeF, żeby oznaczyć fakturę jako wysłaną.")
+        return redirect(next_url)
+    upsert_ksef_doc(invoice_id, "sent", ksef_number=ksef_number, last_error="")
+    try:
+        regenerate_invoice_pdf_after_ksef_send(invoice_id, ksef_number)
+    except Exception as exc:
+        upsert_ksef_doc(invoice_id, "sent", ksef_number=ksef_number, last_error=f"Oznaczono jako wysłaną, ale nie udało się odświeżyć PDF: {exc}")
+    return redirect(next_url)
 
 
 @app.post("/invoices/<int:invoice_id>/ksef/send")
