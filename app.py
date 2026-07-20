@@ -5333,9 +5333,40 @@ def api_client_search_log():
             "created_at": created_at,
         })
 
+    cutoff = (app_now() - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
+    deduped_rows = []
+    c = conn()
+    cur = c.cursor()
+    for row in rows_to_save:
+        cur.execute("""
+          SELECT 1
+          FROM client_search_logs
+          WHERE LOWER(COALESCE(customer_email,''))=?
+            AND LOWER(COALESCE(query,''))=?
+            AND LOWER(COALESCE(product_sku,''))=?
+            AND LOWER(COALESCE(product_model,''))=?
+            AND COALESCE(source,'stock')=?
+            AND created_at>=?
+          LIMIT 1
+        """, (
+            row.get("customer_email", "").lower(),
+            row.get("query", "").lower(),
+            row.get("product_sku", "").lower(),
+            row.get("product_model", "").lower(),
+            row.get("source", "stock"),
+            cutoff,
+        ))
+        if cur.fetchone():
+            continue
+        deduped_rows.append(row)
+    c.close()
+
+    if not deduped_rows:
+        return jsonify(ok=True, skipped=True, duplicate=True)
+
     cloud_ok = False
     cloud_saved = 0
-    for row in rows_to_save:
+    for row in deduped_rows:
         try:
             if save_client_search_log_supabase(row):
                 cloud_saved += 1
@@ -5343,8 +5374,8 @@ def api_client_search_log():
             pass
         save_client_search_log_local(row)
 
-    cloud_ok = cloud_saved == len(rows_to_save)
-    return jsonify(ok=True, cloud=bool(cloud_ok), rows=len(rows_to_save))
+    cloud_ok = cloud_saved == len(deduped_rows)
+    return jsonify(ok=True, cloud=bool(cloud_ok), rows=len(deduped_rows))
 
 
 @app.get("/api/order_lookup")
