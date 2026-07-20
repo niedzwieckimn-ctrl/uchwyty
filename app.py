@@ -2705,7 +2705,7 @@ def client_searches():
         item["phrases_preview"] = ", ".join(phrases[:5])
         model_rows.append(item)
     model_rows.sort(key=lambda r: (r["searches_count"], r["last_at"]), reverse=True)
-    model_rows = model_rows[:100]
+    model_rows = model_rows[:10]
 
     global_rows = []
     for r in global_stats.values():
@@ -2713,13 +2713,13 @@ def client_searches():
         item["clients_count"] = len(item.pop("clients"))
         global_rows.append(item)
     global_rows.sort(key=lambda r: (r["searches_count"], r["last_at"]), reverse=True)
-    global_rows = global_rows[:100]
+    global_rows = global_rows[:10]
 
     summary_rows = list(client_stats.values())
     summary_rows.sort(key=lambda r: r["last_at"], reverse=True)
-    summary_rows = summary_rows[:300]
+    summary_rows = summary_rows[:50]
 
-    latest_rows = rows[:200]
+    latest_rows = rows[:50]
     total_count = len(rows)
 
     tpl = r"""
@@ -2727,7 +2727,7 @@ def client_searches():
     {% block content %}
       <div class="card">
         <div class="flex">
-          <h1 style="margin:0;">Wyszukiwania klientów</h1>
+          <h1 style="margin:0;">Top wyszukiwania</h1>
           <span class="badge">Łącznie: {{ total_count }}</span>
           <span class="badge">{{ source_label }}</span>
         </div>
@@ -2739,9 +2739,9 @@ def client_searches():
       </div>
 
       <div class="card">
-        <h2>Najczęściej wyszukiwane modele — wszyscy klienci</h2>
+        <h2>TOP 10 modeli / SKU</h2>
         <div class="muted" style="margin-bottom:8px;">
-          Prosty ranking popytu: konkretne SKU/modele, które klienci najczęściej znajdują w wyszukiwarce. Szerokie frazy z ponad 20 wynikami nie nabijają tego rankingu.
+          Najważniejsze modele, które klienci realnie sprawdzali w panelu. Szerokie wyszukiwania typu „winsor” są zapisywane osobno w szczegółach.
         </div>
         <table>
           <thead>
@@ -2765,7 +2765,7 @@ def client_searches():
       </div>
 
       <details class="card">
-        <summary style="cursor:pointer;font-weight:700;font-size:16px;">Pokaż szczegóły</summary>
+        <summary style="cursor:pointer;font-weight:700;font-size:16px;">Pokaż szczegóły: frazy, klienci i ostatnie wpisy</summary>
 
       <div style="margin-top:14px;">
         <h2>Frazy bez dopasowania albo do kontroli</h2>
@@ -2845,7 +2845,7 @@ def client_searches():
       </details>
     {% endblock %}
     """
-    return render_template_string(tpl, title="Wyszukiwania klientów", base_url=BASE_URL, db_path=DB_PATH,
+    return render_template_string(tpl, title="Top wyszukiwania", base_url=BASE_URL, db_path=DB_PATH,
                                   model_rows=model_rows, global_rows=global_rows, summary_rows=summary_rows, latest_rows=latest_rows,
                                   total_count=total_count, q=q, source_label=source_label)
 
@@ -5292,6 +5292,8 @@ def api_client_search_log():
     if results_count < 0:
         results_count = 0
     matches = data.get("matches") if isinstance(data.get("matches"), list) else []
+    if results_count < 1:
+        return jsonify(ok=True, skipped=True, no_results=True)
     if results_count > 20:
         matches = []
 
@@ -5333,29 +5335,45 @@ def api_client_search_log():
             "created_at": created_at,
         })
 
-    cutoff = (app_now() - timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
+    cutoff = (app_now() - timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
     deduped_rows = []
     c = conn()
     cur = c.cursor()
     for row in rows_to_save:
-        cur.execute("""
-          SELECT 1
-          FROM client_search_logs
-          WHERE LOWER(COALESCE(customer_email,''))=?
-            AND LOWER(COALESCE(query,''))=?
-            AND LOWER(COALESCE(product_sku,''))=?
-            AND LOWER(COALESCE(product_model,''))=?
-            AND COALESCE(source,'stock')=?
-            AND created_at>=?
-          LIMIT 1
-        """, (
-            row.get("customer_email", "").lower(),
-            row.get("query", "").lower(),
-            row.get("product_sku", "").lower(),
-            row.get("product_model", "").lower(),
-            row.get("source", "stock"),
-            cutoff,
-        ))
+        if row.get("product_sku") or row.get("product_model"):
+            cur.execute("""
+              SELECT 1
+              FROM client_search_logs
+              WHERE LOWER(COALESCE(customer_email,''))=?
+                AND LOWER(COALESCE(product_sku,''))=?
+                AND LOWER(COALESCE(product_model,''))=?
+                AND COALESCE(source,'stock')=?
+                AND created_at>=?
+              LIMIT 1
+            """, (
+                row.get("customer_email", "").lower(),
+                row.get("product_sku", "").lower(),
+                row.get("product_model", "").lower(),
+                row.get("source", "stock"),
+                cutoff,
+            ))
+        else:
+            cur.execute("""
+              SELECT 1
+              FROM client_search_logs
+              WHERE LOWER(COALESCE(customer_email,''))=?
+                AND LOWER(COALESCE(query,''))=?
+                AND COALESCE(product_sku,'')=''
+                AND COALESCE(product_model,'')=''
+                AND COALESCE(source,'stock')=?
+                AND created_at>=?
+              LIMIT 1
+            """, (
+                row.get("customer_email", "").lower(),
+                row.get("query", "").lower(),
+                row.get("source", "stock"),
+                cutoff,
+            ))
         if cur.fetchone():
             continue
         deduped_rows.append(row)
