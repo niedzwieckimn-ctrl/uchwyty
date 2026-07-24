@@ -2741,7 +2741,7 @@ def client_searches():
       <div class="card">
         <h2>TOP 10 modeli / SKU</h2>
         <div class="muted" style="margin-bottom:8px;">
-          Najważniejsze modele, które klienci realnie sprawdzali w panelu. Szerokie wyszukiwania typu „winsor” są zapisywane osobno w szczegółach.
+          Najważniejsze produkty, które klienci realnie zobaczyli po wyszukaniu w panelu — także po nazwie zwyczajowej, rozstawie albo części SKU.
         </div>
         <table>
           <thead>
@@ -2768,9 +2768,9 @@ def client_searches():
         <summary style="cursor:pointer;font-weight:700;font-size:16px;">Pokaż szczegóły: frazy, klienci i ostatnie wpisy</summary>
 
       <div style="margin-top:14px;">
-        <h2>Frazy bez dopasowania albo do kontroli</h2>
+        <h2>Frazy klientów</h2>
         <div class="muted" style="margin-bottom:8px;">
-          Tu zostają wpisane teksty klienta. To pomocnicza lista do wyłapania literówek, brakujących nazw albo produktów, których nie ma w ofercie.
+          Tu zostają wpisane teksty klienta. Pomaga sprawdzić, jak klienci szukają produktów i gdzie pojawiają się literówki albo brakujące nazwy.
         </div>
         <table>
           <thead>
@@ -5294,9 +5294,6 @@ def api_client_search_log():
     matches = data.get("matches") if isinstance(data.get("matches"), list) else []
     if results_count < 1:
         return jsonify(ok=True, skipped=True, no_results=True)
-    if results_count > 20:
-        matches = []
-
     rows_to_save = []
     created_at = now_iso()
     seen_products = set()
