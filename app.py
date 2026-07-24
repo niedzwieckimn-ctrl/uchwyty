@@ -5521,7 +5521,7 @@ def api_order_lookup():
         delivery_used = int(it.get("delivery_used") or 0)
         line_shortage = int(it.get("line_shortage") or 0)
         if o["status"] in ("new", "packed", "confirmed", "in_delivery"):
-            it["availability_label"] = "dostępne" if line_shortage <= 0 and delivery_used == 0 else "10/20 dni"
+            it["availability_label"] = "dostępne" if stock_qty >= ordered_qty else "10/20 dni"
         else:
             it["availability_label"] = "dostępne" if stock_qty >= ordered_qty else "10/20 dni"
         if ordered_qty > 0 and invoiced_qty >= ordered_qty:
