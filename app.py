@@ -34,6 +34,7 @@ from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from ksef_module import build_ksef_draft_xml, validate_fa3_xml, validate_ksef_invoice, xml_filename
+from cash_flow_module import register_cash_flow
 try:
     from ksef_api import ksef_config_summary, send_invoice_to_ksef
 except Exception:
@@ -304,6 +305,14 @@ def init_db():
         sent_at TEXT,
         updated_at TEXT NOT NULL,
         FOREIGN KEY(invoice_id) REFERENCES invoices(id)
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS cash_flow_settings(
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL
     )
     """)
 
@@ -593,6 +602,24 @@ def next_invoice_no(issue_date: str) -> str:
     n = int(cur.fetchone()["n"] or 0) + 1
     c.close()
     return f"FVAT {n}/{mm}/{yyyy}"
+
+
+def invoice_no_exists(invoice_no: str, exclude_invoice_id: int = 0) -> int:
+    invoice_no = norm(invoice_no)
+    if not invoice_no:
+        return 0
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+      SELECT id
+      FROM invoices
+      WHERE lower(trim(invoice_no)) = lower(trim(?))
+        AND id <> ?
+      LIMIT 1
+    """, (invoice_no, int(exclude_invoice_id or 0)))
+    row = cur.fetchone()
+    c.close()
+    return int(row["id"]) if row else 0
 
 
 def split_address(addr: str):
@@ -2469,6 +2496,7 @@ BASE = r"""
           <a href="{{ url_for('customers') }}">Klienci</a>
           <a href="{{ url_for('pricing') }}">Cennik</a>
           <a href="{{ url_for('company') }}">Dane mojej firmy</a>
+          <a href="{{ url_for('cash_flow') }}">Cash flow</a>
         </div>
       </div>
     </div>
@@ -2848,6 +2876,17 @@ def client_searches():
     return render_template_string(tpl, title="Top wyszukiwania", base_url=BASE_URL, db_path=DB_PATH,
                                   model_rows=model_rows, global_rows=global_rows, summary_rows=summary_rows, latest_rows=latest_rows,
                                   total_count=total_count, q=q, source_label=source_label)
+
+
+register_cash_flow(app, {
+    "conn": conn,
+    "now_iso": now_iso,
+    "app_now": app_now,
+    "to_float": to_float,
+    "maybe_pull_shared_from_supabase": maybe_pull_shared_from_supabase,
+    "BASE_URL": BASE_URL,
+    "DB_PATH": DB_PATH,
+})
 
 
 @app.after_request
@@ -4792,7 +4831,10 @@ def order_invoice(order_id):
             data["sell_date"] = data["issue_date"]
 
         invoice_items = prepare_invoice_items(items, request.form)
-        if not invoice_items:
+        existing_invoice_id = invoice_no_exists(data["invoice_no"])
+        if existing_invoice_id:
+            msg = f"Faktura o takim numerze już istnieje! Numer: {data['invoice_no']}. Wybierz inny numer faktury."
+        elif not invoice_items:
             msg = "Faktura musi zawieraÄ‡ co najmniej jednÄ… pozycjÄ™."
         else:
             pdf_path, total_net, total_gross = generate_order_invoice_pdf(o, invoice_items, data)
@@ -4804,23 +4846,6 @@ def order_invoice(order_id):
                                    buyer_name, buyer_tax_no, buyer_street, buyer_post_code, buyer_city, buyer_country,
                                    buyer_email, buyer_phone, total_net, total_gross, created_at)
               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-              ON CONFLICT(invoice_no) DO UPDATE SET
-                order_id=excluded.order_id,
-                issue_date=excluded.issue_date,
-                sell_date=excluded.sell_date,
-                payment_type=excluded.payment_type,
-                payment_to=excluded.payment_to,
-                buyer_name=excluded.buyer_name,
-                buyer_tax_no=excluded.buyer_tax_no,
-                buyer_street=excluded.buyer_street,
-                buyer_post_code=excluded.buyer_post_code,
-                buyer_city=excluded.buyer_city,
-                buyer_country=excluded.buyer_country,
-                buyer_email=excluded.buyer_email,
-                buyer_phone=excluded.buyer_phone,
-                total_net=excluded.total_net,
-                total_gross=excluded.total_gross,
-                created_at=excluded.created_at
             """, (
                 order_id, data["invoice_no"], data["issue_date"], data["sell_date"], data["payment_type"], data["payment_to"],
                 data["buyer_name"], data["buyer_tax_no"], data["buyer_street"], data["buyer_post_code"], data["buyer_city"], data["buyer_country"],
@@ -6932,8 +6957,11 @@ def invoice_edit_admin(invoice_id):
             "buyer_email", "buyer_phone"
         ]}
         invoice_items = prepare_invoice_edit_items(edit_items, request.form)
+        existing_invoice_id = invoice_no_exists(data["invoice_no"], invoice_id)
         if not data["invoice_no"]:
             msg = "Numer faktury jest wymagany."
+        elif existing_invoice_id:
+            msg = f"Faktura o takim numerze już istnieje! Numer: {data['invoice_no']}. Wybierz inny numer faktury."
         elif not invoice_items:
             msg = "Faktura musi zawierać co najmniej jedną pozycję."
         else:
