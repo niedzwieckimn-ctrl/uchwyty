@@ -5833,6 +5833,11 @@ def invoices():
                                 <input type="hidden" name="next" value="{{ request.full_path }}">
                                 <button class="btn danger" type="submit">Usuń</button>
                               </form>
+                            {% else %}
+                              <form method="post" action="{{ url_for('invoice_rollback_admin', invoice_id=inv.id) }}" onsubmit="return confirm('AWARYJNIE cofnąć fakturę {{ inv.invoice_no }} w aplikacji? To usunie lokalny zapis faktury, status KSeF, widoczność u klienta i przeliczy zamówienia oraz stany. Używaj tylko przy pomyłce/testach.');">
+                                <input type="hidden" name="next" value="{{ request.full_path }}">
+                                <button class="btn danger" type="submit">Cofnij fakturę</button>
+                              </form>
                             {% endif %}
                           </div>
                         </td>
@@ -6153,6 +6158,10 @@ def ksef_dashboard():
                       <a class="btn" href="{{ url_for('invoice_edit_admin', invoice_id=inv.id) }}">Edytuj fakturę</a>
                     {% else %}
                       <span class="badge ok">Wysłana do KSeF — edycja zablokowana</span>
+                      <form method="post" action="{{ url_for('invoice_rollback_admin', invoice_id=inv.id) }}" onsubmit="return confirm('AWARYJNIE cofnąć fakturę {{ inv.invoice_no }} w aplikacji? To usunie lokalny zapis faktury, status KSeF, widoczność u klienta i przeliczy zamówienia oraz stany. Nie usuwa faktury z KSeF.');">
+                        <input type="hidden" name="next" value="{{ request.full_path }}">
+                        <button class="btn danger" type="submit">Cofnij w aplikacji</button>
+                      </form>
                     {% endif %}
                   </div>
                 </td>
@@ -6695,6 +6704,17 @@ def _delete_invoice_everywhere(invoice_id: int):
     cur = c.cursor()
     cur.execute("SELECT DISTINCT order_id FROM invoice_allocations WHERE invoice_id=?", (invoice_id,))
     touched_order_ids = [int(r["order_id"]) for r in cur.fetchall()]
+    meta_items_raw = inv.get("invoice_items_json") or ""
+    if meta_items_raw:
+        try:
+            meta_items = json.loads(meta_items_raw)
+            if isinstance(meta_items, list):
+                for it in meta_items:
+                    oid = int(it.get("source_order_id") or it.get("order_id") or 0)
+                    if oid and oid not in touched_order_ids:
+                        touched_order_ids.append(oid)
+        except Exception:
+            pass
     if int(inv.get("order_id") or 0) and int(inv.get("order_id") or 0) not in touched_order_ids:
         touched_order_ids.append(int(inv.get("order_id") or 0))
     c.close()
@@ -6713,6 +6733,7 @@ def _delete_invoice_everywhere(invoice_id: int):
     cur = c.cursor()
     cur.execute("DELETE FROM invoice_allocations WHERE invoice_id=?", (invoice_id,))
     cur.execute("DELETE FROM invoice_meta WHERE invoice_id=?", (invoice_id,))
+    cur.execute("DELETE FROM ksef_documents WHERE invoice_id=?", (invoice_id,))
     cur.execute("DELETE FROM invoices WHERE id=?", (invoice_id,))
     c.commit()
     c.close()
@@ -6726,6 +6747,10 @@ def _delete_invoice_everywhere(invoice_id: int):
             pass
         try:
             supabase_delete_rows("invoice_meta", {"invoice_id": invoice_id})
+        except Exception:
+            pass
+        try:
+            supabase_delete_rows("ksef_documents", {"invoice_id": invoice_id})
         except Exception:
             pass
         try:
@@ -6748,6 +6773,12 @@ def _delete_invoice_everywhere(invoice_id: int):
 
 @app.route("/invoices/<int:invoice_id>/delete", methods=["GET", "POST"])
 def invoice_delete_admin(invoice_id):
+    _delete_invoice_everywhere(invoice_id)
+    return _redirect_after_invoice_action()
+
+
+@app.post("/invoices/<int:invoice_id>/rollback")
+def invoice_rollback_admin(invoice_id):
     _delete_invoice_everywhere(invoice_id)
     return _redirect_after_invoice_action()
 
