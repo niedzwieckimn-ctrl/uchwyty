@@ -188,8 +188,8 @@ def register_cash_flow(app, deps):
                  COALESCE(SUM(s.qty * COALESCE(pr.net_price,0)),0) AS sale_net,
                  COALESCE(SUM(s.qty * COALESCE(pr.net_price,0) / 2.5),0) AS cost_est
           FROM stock s
-          LEFT JOIN products p ON p.sku=s.sku
-          LEFT JOIN pricing pr ON lower(pr.model)=lower(COALESCE(p.sku,s.sku))
+          LEFT JOIN products p ON p.id=s.product_id
+          LEFT JOIN pricing pr ON lower(pr.model)=lower(COALESCE(p.sku,p.model))
         """)
         stock_row = cur.fetchone()
         stock_units = int(stock_row["units"] or 0)
@@ -217,7 +217,7 @@ def register_cash_flow(app, deps):
           FROM order_items oi
           JOIN orders o ON o.id=oi.order_id
           LEFT JOIN products p ON p.id=oi.product_id
-          LEFT JOIN stock s ON s.sku=p.sku
+          LEFT JOIN stock s ON s.product_id=p.id
           WHERE lower(COALESCE(o.status,'')) NOT IN ('realized','zrealizowane','deleted')
           GROUP BY p.id, p.sku, p.model, p.name, s.qty
           HAVING shortage > 0
