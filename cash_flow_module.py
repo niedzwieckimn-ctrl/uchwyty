@@ -209,21 +209,56 @@ def register_cash_flow(app, deps):
         china_qty = int(china_row["qty"] or 0)
         china_cost_est = to_float(china_row["cost_est"], 0)
 
+        cutoff_30 = (today - timedelta(days=30)).isoformat()
+        cutoff_90 = (today - timedelta(days=90)).isoformat()
         cur.execute("""
-          SELECT p.sku, p.model, p.name,
-                 SUM(oi.qty) AS ordered_qty,
-                 COALESCE(s.qty,0) AS stock_qty,
-                 MAX(0, SUM(oi.qty) - COALESCE(s.qty,0)) AS shortage
-          FROM order_items oi
-          JOIN orders o ON o.id=oi.order_id
-          LEFT JOIN products p ON p.id=oi.product_id
+          WITH demand AS (
+            SELECT
+              oi.product_id,
+              SUM(CASE WHEN date(o.created_at) >= date(?) THEN oi.qty ELSE 0 END) AS ordered_30,
+              SUM(CASE WHEN date(o.created_at) >= date(?) THEN oi.qty ELSE 0 END) AS ordered_90
+            FROM order_items oi
+            JOIN orders o ON o.id=oi.order_id
+            WHERE lower(COALESCE(o.status,'')) NOT IN ('cancelled','canceled','deleted','usuniete','anulowane')
+            GROUP BY oi.product_id
+          ),
+          china_incoming AS (
+            SELECT
+              ci.product_id,
+              SUM(ci.qty) AS incoming_qty
+            FROM china_items ci
+            JOIN china_packages cp ON cp.id=ci.package_id
+            WHERE lower(COALESCE(cp.status,'')) IN ('planned','ordered','shipped')
+            GROUP BY ci.product_id
+          )
+          SELECT
+            p.sku,
+            p.model,
+            p.name,
+            COALESCE(d.ordered_30,0) AS ordered_30,
+            COALESCE(d.ordered_90,0) AS ordered_90,
+            COALESCE(s.qty,0) AS stock_qty,
+            COALESCE(ci.incoming_qty,0) AS incoming_qty,
+            MAX(0, COALESCE(d.ordered_90,0) - COALESCE(s.qty,0) - COALESCE(ci.incoming_qty,0)) AS suggested_qty,
+            CASE
+              WHEN COALESCE(d.ordered_90,0) <= 0 THEN 0
+              ELSE ROUND((COALESCE(s.qty,0) + COALESCE(ci.incoming_qty,0)) * 100.0 / COALESCE(d.ordered_90,0), 0)
+            END AS coverage_pct
+          FROM demand d
+          JOIN products p ON p.id=d.product_id
           LEFT JOIN stock s ON s.product_id=p.id
-          WHERE lower(COALESCE(o.status,'')) NOT IN ('realized','zrealizowane','deleted')
-          GROUP BY p.id, p.sku, p.model, p.name, s.qty
-          HAVING shortage > 0
-          ORDER BY shortage DESC
+          LEFT JOIN china_incoming ci ON ci.product_id=p.id
+          WHERE COALESCE(d.ordered_90,0) > 0
+            AND (
+              COALESCE(s.qty,0) + COALESCE(ci.incoming_qty,0) < COALESCE(d.ordered_90,0)
+              OR COALESCE(s.qty,0) <= COALESCE(d.ordered_30,0)
+            )
+          ORDER BY
+            COALESCE(d.ordered_90,0) DESC,
+            suggested_qty DESC,
+            coverage_pct ASC
           LIMIT 10
-        """)
+        """, (cutoff_30, cutoff_90))
         reorder_rows = cur.fetchall()
         c.close()
 
@@ -333,14 +368,23 @@ def register_cash_flow(app, deps):
             </div>
 
             <div class="card">
-              <h2>Towar, który trzeba zamówić</h2>
+              <h2>Popularne SKU z niskim zapasem</h2>
+              <p class="muted">Ranking pokazuje uchwyty najczęściej zamawiane w ostatnich 90 dniach, przy których stan magazynu jest niski. Towar w drodze z Chin zmniejsza sugerowaną ilość do domówienia.</p>
               <table>
-                <thead><tr><th>SKU</th><th>Nazwa</th><th>Zamówiono</th><th>Stan</th><th>Brakuje</th></tr></thead>
+                <thead><tr><th>SKU</th><th>Nazwa</th><th>30 dni</th><th>90 dni</th><th>Stan</th><th>W drodze</th><th>Sugeruj</th></tr></thead>
                 <tbody>
                   {% for r in reorder_rows %}
-                    <tr><td><b>{{ r.sku }}</b></td><td>{{ r.name or r.model or '-' }}</td><td>{{ r.ordered_qty }}</td><td>{{ r.stock_qty }}</td><td><b>{{ r.shortage }}</b></td></tr>
+                    <tr>
+                      <td><b>{{ r.sku }}</b></td>
+                      <td>{{ r.name or r.model or '-' }}</td>
+                      <td>{{ r.ordered_30 }}</td>
+                      <td>{{ r.ordered_90 }}</td>
+                      <td>{{ r.stock_qty }}</td>
+                      <td>{{ r.incoming_qty }}</td>
+                      <td><b>{{ r.suggested_qty }}</b></td>
+                    </tr>
                   {% endfor %}
-                  {% if not reorder_rows %}<tr><td colspan="5" class="muted">Brak widocznych braków z otwartych zamówień.</td></tr>{% endif %}
+                  {% if not reorder_rows %}<tr><td colspan="7" class="muted">Brak popularnych SKU z niskim zapasem według ostatnich zamówień.</td></tr>{% endif %}
                 </tbody>
               </table>
             </div>
