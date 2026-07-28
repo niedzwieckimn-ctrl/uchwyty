@@ -688,10 +688,16 @@ def gross_from_net_23(net_value) -> Decimal:
 
 
 def find_logo_path() -> str:
-    for fn in ("logo.png", "logo.jpg", "logo.jpeg", "logo.webp"):
-        pth = os.path.join(DATA_DIR, fn)
-        if os.path.exists(pth):
-            return pth
+    search_dirs = [
+        BASE_DIR,
+        os.path.join(BASE_DIR, "static"),
+        DATA_DIR,
+    ]
+    for folder in search_dirs:
+        for fn in ("logo.png", "logo.jpg", "logo.jpeg", "logo.webp"):
+            pth = os.path.join(folder, fn)
+            if os.path.exists(pth):
+                return pth
     return ""
 
 
@@ -1665,6 +1671,39 @@ def generate_order_invoice_pdf(order_row, items, meta):
             text = text[:-1]
         return (text + suffix) if text else ""
 
+    def wrap_pdf_text(value, font_name, font_size, max_width, max_lines=None):
+        text = pdf_txt(value)
+        if not text:
+            return []
+        out = []
+        for raw_line in str(text).replace("\r", "\n").split("\n"):
+            words = raw_line.split()
+            if not words:
+                out.append("")
+                continue
+            line = ""
+            for word in words:
+                candidate = word if not line else f"{line} {word}"
+                if pdfmetrics.stringWidth(candidate, font_name, font_size) <= max_width:
+                    line = candidate
+                    continue
+                if line:
+                    out.append(line)
+                    line = word
+                else:
+                    out.append(fit_pdf_text(word, font_name, font_size, max_width))
+                    line = ""
+                if max_lines and len(out) >= max_lines:
+                    out[-1] = fit_pdf_text(out[-1], font_name, font_size, max_width)
+                    return out
+            if line:
+                out.append(line)
+            if max_lines and len(out) >= max_lines:
+                out = out[:max_lines]
+                out[-1] = fit_pdf_text(out[-1], font_name, font_size, max_width)
+                return out
+        return out
+
     w = 210 * mm
     h = 297 * mm
     cpdf = canvas.Canvas(fpath, pagesize=(w, h))
@@ -1738,20 +1777,33 @@ def generate_order_invoice_pdf(order_row, items, meta):
     if buyer_email:
         buyer_lines.append(f"email: {buyer_email}")
 
-    max_len = max(len(seller_lines), len(buyer_lines))
-    for i in range(max_len):
-        if i < len(seller_lines):
-            cpdf.drawString(15 * mm, y, seller_lines[i][:55])
-        if i < len(buyer_lines):
-            cpdf.drawString(110 * mm, y, buyer_lines[i][:55])
-        y -= 5 * mm
+    seller_x = 15 * mm
+    buyer_x = 108 * mm
+    seller_width = 84 * mm
+    buyer_width = 87 * mm
+    line_gap = 4.8 * mm
+    seller_wrapped = []
+    buyer_wrapped = []
+    for line in seller_lines:
+        seller_wrapped.extend(wrap_pdf_text(line, pdf_font, 8.7, seller_width, max_lines=2))
+    for line in buyer_lines:
+        buyer_wrapped.extend(wrap_pdf_text(line, pdf_font, 8.7, buyer_width, max_lines=2))
 
-    y -= 3 * mm
-    table_left = 15 * mm
+    max_len = max(len(seller_wrapped), len(buyer_wrapped))
+    cpdf.setFont(pdf_font, 8.7)
+    for i in range(max_len):
+        if i < len(seller_wrapped):
+            cpdf.drawString(seller_x, y, seller_wrapped[i])
+        if i < len(buyer_wrapped):
+            cpdf.drawString(buyer_x, y, buyer_wrapped[i])
+        y -= line_gap
+
+    y -= 4 * mm
+    table_left = 12 * mm
     table_right = 198 * mm
     row_h = 12 * mm
-    # L.p. | Nazwa/SKU | Ilość | Netto/szt | Brutto/szt | Wartość netto | VAT
-    col_x = [15 * mm, 23 * mm, 96 * mm, 110 * mm, 134 * mm, 158 * mm, 180 * mm, 198 * mm]
+    # L.p. | Nazwa/SKU | Ilo?? | Netto/szt | Brutto/szt | Wart. netto | VAT
+    col_x = [12 * mm, 20 * mm, 100 * mm, 113 * mm, 136 * mm, 159 * mm, 182 * mm, 198 * mm]
 
     def cell_center(x1, x2):
         return (x1 + x2) / 2.0
@@ -1766,7 +1818,7 @@ def generate_order_invoice_pdf(order_row, items, meta):
     cpdf.setFillColorRGB(0.96, 0.96, 0.96)
     cpdf.rect(table_left, y - row_h + 1, table_right - table_left, row_h, stroke=0, fill=1)
     cpdf.setFillColorRGB(0, 0, 0)
-    header_font = 8.0
+    header_font = 7.6
     cpdf.setFont(pdf_font_bold, header_font)
     header_y = cell_baseline(y, row_h, pdf_font_bold, header_font)
     cpdf.drawCentredString(cell_center(col_x[0], col_x[1]), header_y, "L.p.")
@@ -1775,7 +1827,7 @@ def generate_order_invoice_pdf(order_row, items, meta):
     cpdf.drawCentredString(cell_center(col_x[3], col_x[4]), header_y, "Netto/szt")
     cpdf.drawCentredString(cell_center(col_x[4], col_x[5]), header_y, "Brutto/szt")
     cpdf.drawCentredString(cell_center(col_x[5], col_x[6]), header_y, "Wartość netto")
-    cpdf.drawCentredString(cell_center(col_x[6], col_x[7]), header_y, "Stawka VAT")
+    cpdf.drawCentredString(cell_center(col_x[6], col_x[7]), header_y, "VAT")
     cpdf.line(table_left, y + 1, table_right, y + 1)
     cpdf.line(table_left, y - row_h + 1, table_right, y - row_h + 1)
     for cx in col_x:
@@ -1833,7 +1885,7 @@ def generate_order_invoice_pdf(order_row, items, meta):
         if y < 26 * mm:
             cpdf.showPage()
             y = h - 20 * mm
-            cpdf.setFont(pdf_font, 8.8)
+            cpdf.setFont(pdf_font, body_font)
 
     total_net_dec = total_net_dec.quantize(MONEY_Q, rounding=ROUND_HALF_UP)
     total_tax_dec = vat23_from_net(total_net_dec)
