@@ -689,8 +689,8 @@ def gross_from_net_23(net_value) -> Decimal:
 
 def find_logo_path() -> str:
     search_dirs = [
-        BASE_DIR,
-        os.path.join(BASE_DIR, "static"),
+        APP_DIR,
+        os.path.join(APP_DIR, "static"),
         DATA_DIR,
     ]
     for folder in search_dirs:
