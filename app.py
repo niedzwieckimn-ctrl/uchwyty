@@ -312,6 +312,8 @@ def init_db():
         payment_reminder INTEGER NOT NULL DEFAULT 0,
         paid INTEGER NOT NULL DEFAULT 0,
         paid_at TEXT,
+        auto_payment_reminder_sent_at TEXT,
+        auto_payment_reminder_count INTEGER NOT NULL DEFAULT 0,
         seen_at TEXT,
         updated_at TEXT NOT NULL,
         FOREIGN KEY(invoice_id) REFERENCES invoices(id)
@@ -392,6 +394,10 @@ def init_db():
         cur.execute("ALTER TABLE invoice_meta ADD COLUMN paid INTEGER NOT NULL DEFAULT 0")
     if "paid_at" not in invoice_meta_cols:
         cur.execute("ALTER TABLE invoice_meta ADD COLUMN paid_at TEXT")
+    if "auto_payment_reminder_sent_at" not in invoice_meta_cols:
+        cur.execute("ALTER TABLE invoice_meta ADD COLUMN auto_payment_reminder_sent_at TEXT")
+    if "auto_payment_reminder_count" not in invoice_meta_cols:
+        cur.execute("ALTER TABLE invoice_meta ADD COLUMN auto_payment_reminder_count INTEGER NOT NULL DEFAULT 0")
 
     # migracja: starsze bazy mogÄ… nie mieÄ‡ kolumny NIP u klientĂłw
     cur.execute("PRAGMA table_info(customers)")
@@ -2122,7 +2128,9 @@ def upsert_invoice_meta(
     seen_at: str | None = None,
     payment_reminder: int | None = None,
     paid: int | None = None,
-    paid_at: str | None = None
+    paid_at: str | None = None,
+    auto_payment_reminder_sent_at: str | None = None,
+    auto_payment_reminder_count: int | None = None
 ):
     current = load_invoice_meta(invoice_id) or {}
     if sent_to_client is None:
@@ -2137,12 +2145,20 @@ def upsert_invoice_meta(
         paid = int(current.get("paid") or 0)
     if paid_at is None:
         paid_at = current.get("paid_at")
+    if auto_payment_reminder_sent_at is None:
+        auto_payment_reminder_sent_at = current.get("auto_payment_reminder_sent_at")
+    if auto_payment_reminder_count is None:
+        auto_payment_reminder_count = int(current.get("auto_payment_reminder_count") or 0)
 
     c = conn()
     cur = c.cursor()
     cur.execute("""
-      INSERT INTO invoice_meta(invoice_id, pdf_path, invoice_items_json, sent_to_client, seen_by_client, payment_reminder, paid, paid_at, seen_at, updated_at)
-      VALUES(?,?,?,?,?,?,?,?,?,?)
+      INSERT INTO invoice_meta(
+        invoice_id, pdf_path, invoice_items_json, sent_to_client, seen_by_client,
+        payment_reminder, paid, paid_at, auto_payment_reminder_sent_at,
+        auto_payment_reminder_count, seen_at, updated_at
+      )
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
       ON CONFLICT(invoice_id) DO UPDATE SET
         pdf_path=excluded.pdf_path,
         invoice_items_json=excluded.invoice_items_json,
@@ -2151,9 +2167,24 @@ def upsert_invoice_meta(
         payment_reminder=excluded.payment_reminder,
         paid=excluded.paid,
         paid_at=excluded.paid_at,
+        auto_payment_reminder_sent_at=excluded.auto_payment_reminder_sent_at,
+        auto_payment_reminder_count=excluded.auto_payment_reminder_count,
         seen_at=excluded.seen_at,
         updated_at=excluded.updated_at
-    """, (invoice_id, pdf_path, invoice_items_json, int(sent_to_client), int(seen_by_client), int(payment_reminder), int(paid), paid_at, seen_at, now_iso()))
+    """, (
+        invoice_id,
+        pdf_path,
+        invoice_items_json,
+        int(sent_to_client),
+        int(seen_by_client),
+        int(payment_reminder),
+        int(paid),
+        paid_at,
+        auto_payment_reminder_sent_at,
+        int(auto_payment_reminder_count or 0),
+        seen_at,
+        now_iso()
+    ))
     c.commit()
     c.close()
 
@@ -5810,7 +5841,7 @@ def api_client_order_email():
     data = request.get_json(silent=True) or {}
     order_id = to_int(data.get("order_id"), 0)
     order_no = norm(data.get("order_no"))
-    fallback_email = norm(data.get("email")).lower()
+    fallback_email = norm(data.get("email") or data.get("customer_email")).lower()
     fallback_name = norm(data.get("customer_name")) or (fallback_email.split("@")[0] if fallback_email else "")
     fallback_note = norm(data.get("note"))
     fallback_items = data.get("items") if isinstance(data.get("items"), list) else []
@@ -5842,6 +5873,14 @@ def api_client_order_email():
         row = cur.fetchone()
         if row:
             order = dict(row)
+            if fallback_email and not norm(order.get("customer_email")):
+                order["customer_email"] = fallback_email
+            if fallback_name and not norm(order.get("customer_name")):
+                order["customer_name"] = fallback_name
+            if fallback_note and not norm(order.get("note")):
+                order["note"] = fallback_note
+            if order_no and not norm(order.get("order_no")):
+                order["order_no"] = order_no
             cur.execute("""
               SELECT oi.sku, oi.qty, COALESCE(p.name, pr.name, '') AS name
               FROM order_items oi
@@ -5861,9 +5900,9 @@ def api_client_order_email():
             if not isinstance(item, dict):
                 continue
             items.append({
-                "sku": norm(item.get("sku")),
-                "name": norm(item.get("name")),
-                "qty": to_int(item.get("qty"), 0),
+                "sku": norm(item.get("sku") or item.get("product_sku") or item.get("model")),
+                "name": norm(item.get("name") or item.get("product_name") or item.get("model_name")),
+                "qty": to_int(item.get("qty") or item.get("quantity") or item.get("ilosc"), 0),
             })
 
     if not send_order_confirmation:
