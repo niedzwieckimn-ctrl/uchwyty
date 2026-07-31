@@ -247,7 +247,7 @@ def send_payment_reminder(invoice: dict, pdf_url: str = "", admin_email: str = "
         <b>Termin płatności:</b> {_esc(invoice.get('payment_to') or '-')}
       </p>
       {link_html}
-      <p>Prosimy o uregulowanie płatności. Jeśli przelew został już wykonany, możesz zignorować tę wiadomość.</p>
+      <p>Prosimy o uregulowanie płatności. Jeśli przelew został już wykonany, możesz zignorować tę wiadomość.<br>Wadomość została wygenerowana automatycznie, prosimy na nią nie odpowiadać.</p>
       <p style="color:#555;margin-top:18px">Pozdrawiamy,<br>Niedźwieccy</p>
     </div>
     """
