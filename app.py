@@ -43,6 +43,21 @@ except Exception:
     def ksef_config_summary():
         return {"configured": False, "missing": ["ksef_api.py"], "env": "", "base_url": ""}
 
+try:
+    from email_module import (
+        email_config_summary,
+        send_order_confirmation,
+        send_invoice_available,
+        send_payment_reminder,
+    )
+except Exception:
+    send_order_confirmation = None
+    send_invoice_available = None
+    send_payment_reminder = None
+
+    def email_config_summary():
+        return {"configured": False, "missing": ["email_module.py"], "enabled": False}
+
 
 # =========================
 # KONFIG
@@ -3255,7 +3270,8 @@ def auto_sync_after_write(response):
             response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
             response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
 
-        if response.status_code < 400 and request.method in ("POST", "PUT", "PATCH", "DELETE") and request.path != "/api/client_search_log":
+        no_auto_sync_paths = {"/api/client_search_log", "/api/client_order_email"}
+        if response.status_code < 400 and request.method in ("POST", "PUT", "PATCH", "DELETE") and request.path not in no_auto_sync_paths:
             trigger_background_supabase_sync(reason=f"{request.method} {request.path}")
     except Exception:
         pass
@@ -5776,6 +5792,80 @@ def api_client_search_log():
     return jsonify(ok=True, cloud=bool(cloud_ok), rows=len(deduped_rows))
 
 
+@app.route("/api/client_order_email", methods=["POST", "OPTIONS"])
+def api_client_order_email():
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    data = request.get_json(silent=True) or {}
+    order_id = to_int(data.get("order_id"), 0)
+    order_no = norm(data.get("order_no"))
+    fallback_email = norm(data.get("email")).lower()
+    fallback_name = norm(data.get("customer_name")) or (fallback_email.split("@")[0] if fallback_email else "")
+    fallback_note = norm(data.get("note"))
+    fallback_items = data.get("items") if isinstance(data.get("items"), list) else []
+
+    order = {
+        "id": order_id,
+        "order_no": order_no,
+        "customer_email": fallback_email,
+        "customer_name": fallback_name,
+        "note": fallback_note,
+        "created_at": now_iso(),
+    }
+    items = []
+
+    try:
+        maybe_pull_shared_from_supabase(force=True)
+    except Exception:
+        pass
+
+    c = conn()
+    cur = c.cursor()
+    try:
+        if order_id:
+            cur.execute("SELECT * FROM orders WHERE id=? LIMIT 1", (order_id,))
+        elif order_no:
+            cur.execute("SELECT * FROM orders WHERE order_no=? LIMIT 1", (order_no,))
+        else:
+            cur.execute("SELECT * FROM orders WHERE 1=0")
+        row = cur.fetchone()
+        if row:
+            order = dict(row)
+            cur.execute("""
+              SELECT oi.sku, oi.qty, COALESCE(p.name, pr.name, '') AS name
+              FROM order_items oi
+              LEFT JOIN products p ON p.id = oi.product_id
+              LEFT JOIN products pr ON pr.sku = oi.sku
+              WHERE oi.order_id=?
+              ORDER BY oi.id
+            """, (row["id"],))
+            items = [dict(x) for x in cur.fetchall()]
+    except Exception:
+        items = []
+    finally:
+        c.close()
+
+    if not items:
+        for item in fallback_items[:80]:
+            if not isinstance(item, dict):
+                continue
+            items.append({
+                "sku": norm(item.get("sku")),
+                "name": norm(item.get("name")),
+                "qty": to_int(item.get("qty"), 0),
+            })
+
+    if not send_order_confirmation:
+        return jsonify(ok=True, email={"ok": False, "skipped": True, "error": "Brak modułu email_module.py"})
+
+    try:
+        result = send_order_confirmation(order, items)
+    except Exception as exc:
+        result = {"ok": False, "error": str(exc)}
+    return jsonify(ok=True, email=result)
+
+
 @app.get("/api/order_lookup")
 def api_order_lookup():
     maybe_pull_shared_from_supabase(force=True)
@@ -6882,6 +6972,12 @@ def _set_invoice_payment_state(invoice_id: int, *, reminder: int | None = None, 
 @app.route("/invoices/<int:invoice_id>/payment-reminder", methods=["GET", "POST"])
 def invoice_payment_reminder_admin(invoice_id):
     _set_invoice_payment_state(invoice_id, reminder=1, paid=0)
+    try:
+        if send_payment_reminder:
+            invoice_row, pdf_url = _invoice_email_context(invoice_id)
+            send_payment_reminder(invoice_row, pdf_url=pdf_url)
+    except Exception:
+        pass
     return _redirect_after_invoice_action()
 
 
@@ -7175,6 +7271,41 @@ def order_invoice_delete(order_id, invoice_id):
 
     return redirect(url_for("order_invoice", order_id=order_id, deleted="1"))
 
+
+def _invoice_email_context(invoice_id: int):
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+      SELECT
+        i.*,
+        o.order_no AS order_no,
+        o.customer_email AS customer_email,
+        o.customer_name AS customer_name,
+        m.pdf_path AS pdf_path,
+        m.payment_reminder AS payment_reminder,
+        m.paid AS paid,
+        m.seen_by_client AS seen_by_client,
+        m.seen_at AS seen_at
+      FROM invoices i
+      LEFT JOIN orders o ON o.id = i.order_id
+      LEFT JOIN invoice_meta m ON m.invoice_id = i.id
+      WHERE i.id=?
+      LIMIT 1
+    """, (invoice_id,))
+    row = cur.fetchone()
+    c.close()
+    if not row:
+        abort(404)
+
+    invoice = dict(row)
+    email = _email_key(invoice.get("buyer_email") or invoice.get("customer_email"))
+    if email:
+        pdf_url = build_public_url(f"/api/invoices/{invoice_id}/download?email={urllib.parse.quote_plus(email)}")
+    else:
+        pdf_url = build_public_url(f"/api/invoices/{invoice_id}/download")
+    return invoice, pdf_url
+
+
 def _send_invoice_to_client(invoice_id: int) -> int:
     c = conn()
     cur = c.cursor()
@@ -7252,6 +7383,13 @@ def _send_invoice_to_client(invoice_id: int) -> int:
             sync_invoice_meta_to_supabase(invoice_id)
         except Exception:
             pass
+
+    try:
+        if send_invoice_available:
+            invoice_row, pdf_url = _invoice_email_context(invoice_id)
+            send_invoice_available(invoice_row, pdf_url=pdf_url)
+    except Exception:
+        pass
 
     return int(row["order_id"] or 0)
 
