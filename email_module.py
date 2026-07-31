@@ -163,21 +163,29 @@ def send_order_confirmation(order: dict, items: list[dict], admin_email: str = "
     customer_email = order.get("customer_email") or order.get("email") or ""
     note = order.get("note") or "-"
     recipients = _uniq_emails([customer_email, admin_email or email_config_summary().get("admin_email")])
-    subject = f"Potwierdzenie zamówienia {order_no}"
+    subject = f"Przyjęliśmy zamówienie {order_no}"
     html_body = f"""
-    <div style="font-family:Arial,sans-serif;color:#111;line-height:1.45">
-      <h2>Potwierdzenie złożenia zamówienia</h2>
-      <p>Zamówienie <b>{_esc(order_no)}</b> zostało zapisane w systemie.</p>
+    <div style="font-family:Arial,sans-serif;color:#111;line-height:1.5;max-width:760px">
+      <h2 style="margin-bottom:8px">Dziękujemy za zamówienie</h2>
+      <p>Zamówienie <b>{_esc(order_no)}</b> zostało przyjęte. Poniżej przesyłamy krótkie podsumowanie.</p>
       <p>
         <b>Klient:</b> {_esc(customer_name)}<br>
         <b>Email:</b> {_esc(customer_email)}<br>
         <b>Notatka:</b> {_esc(note)}
       </p>
       {_items_table(items)}
-      <p style="color:#555;margin-top:18px">To jest automatyczna wiadomość z panelu zamówień.</p>
+      <p style="margin-top:18px">Jeśli coś się nie zgadza, odpowiedz na tę wiadomość — sprawdzimy to od razu.</p>
+      <p style="color:#555;margin-top:18px">Pozdrawiamy,<br>Niedźwieccy</p>
     </div>
     """
-    text_body = f"Potwierdzenie zamówienia {order_no}\nKlient: {customer_name}\nEmail: {customer_email}\nNotatka: {note}"
+    text_body = (
+        f"Przyjęliśmy zamówienie {order_no}\n"
+        f"Klient: {customer_name}\n"
+        f"Email: {customer_email}\n"
+        f"Notatka: {note}\n\n"
+        "Jeśli coś się nie zgadza, odpowiedz na tę wiadomość — sprawdzimy to od razu.\n"
+        "Pozdrawiamy, Niedźwieccy"
+    )
     return send_email(recipients, subject, html_body, text_body)
 
 
@@ -192,24 +200,27 @@ def send_invoice_available(invoice: dict, pdf_url: str = "", admin_email: str = 
         if pdf_url
         else ""
     )
-    subject = f"Nowa faktura {invoice_no}"
+    subject = f"Nowa faktura do pobrania: {invoice_no}"
     html_body = f"""
-    <div style="font-family:Arial,sans-serif;color:#111;line-height:1.45">
-      <h2>Masz nową fakturę</h2>
-      <p>Faktura <b>{_esc(invoice_no)}</b> została udostępniona w panelu klienta.</p>
+    <div style="font-family:Arial,sans-serif;color:#111;line-height:1.5;max-width:760px">
+      <h2 style="margin-bottom:8px">Nowa faktura jest dostępna</h2>
+      <p>Udostępniliśmy fakturę <b>{_esc(invoice_no)}</b>. Możesz ją pobrać w panelu klienta albo przyciskiem poniżej.</p>
       <p>
         <b>Klient:</b> {_esc(buyer_name)}<br>
         <b>Kwota brutto:</b> {_esc(_money(invoice.get('total_gross')))}<br>
         <b>Termin płatności:</b> {_esc(invoice.get('payment_to') or '-')}
       </p>
       {link_html}
-      <p style="color:#555">To jest automatyczna wiadomość z panelu zamówień.</p>
+      <p style="color:#555">Po pobraniu faktury komunikat w panelu klienta przestanie się pojawiać.</p>
+      <p style="color:#555;margin-top:18px">Pozdrawiamy,<br>Niedźwieccy</p>
     </div>
     """
     text_body = (
-        f"Masz nową fakturę {invoice_no}. "
-        f"Kwota brutto: {_money(invoice.get('total_gross'))}. "
-        f"Termin płatności: {invoice.get('payment_to') or '-'}"
+        f"Nowa faktura jest dostępna: {invoice_no}\n"
+        f"Kwota brutto: {_money(invoice.get('total_gross'))}\n"
+        f"Termin płatności: {invoice.get('payment_to') or '-'}\n\n"
+        "Po pobraniu faktury komunikat w panelu klienta przestanie się pojawiać.\n"
+        "Pozdrawiamy, Niedźwieccy"
     )
     return send_email(recipients, subject, html_body, text_body)
 
@@ -227,21 +238,24 @@ def send_payment_reminder(invoice: dict, pdf_url: str = "", admin_email: str = "
     )
     subject = f"Przypomnienie o płatności: {invoice_no}"
     html_body = f"""
-    <div style="font-family:Arial,sans-serif;color:#111;line-height:1.45">
-      <h2>Przypomnienie o płatności</h2>
-      <p>Faktura <b>{_esc(invoice_no)}</b> jest oznaczona jako nieopłacona.</p>
+    <div style="font-family:Arial,sans-serif;color:#111;line-height:1.5;max-width:760px">
+      <h2 style="margin-bottom:8px">Przypomnienie o płatności</h2>
+      <p>Przypominamy o fakturze <b>{_esc(invoice_no)}</b>, która jest jeszcze oznaczona jako nieopłacona.</p>
       <p>
         <b>Klient:</b> {_esc(buyer_name)}<br>
         <b>Kwota brutto:</b> {_esc(_money(invoice.get('total_gross')))}<br>
         <b>Termin płatności:</b> {_esc(invoice.get('payment_to') or '-')}
       </p>
       {link_html}
-      <p>Prosimy o uregulowanie zaległej płatności.</p>
+      <p>Prosimy o uregulowanie płatności. Jeśli przelew został już wykonany, możesz zignorować tę wiadomość.</p>
+      <p style="color:#555;margin-top:18px">Pozdrawiamy,<br>Niedźwieccy</p>
     </div>
     """
     text_body = (
-        f"Przypomnienie o płatności za {invoice_no}. "
-        f"Kwota brutto: {_money(invoice.get('total_gross'))}. "
-        f"Termin: {invoice.get('payment_to') or '-'}"
+        f"Przypomnienie o płatności za {invoice_no}\n"
+        f"Kwota brutto: {_money(invoice.get('total_gross'))}\n"
+        f"Termin płatności: {invoice.get('payment_to') or '-'}\n\n"
+        "Prosimy o uregulowanie płatności. Jeśli przelew został już wykonany, możesz zignorować tę wiadomość.\n"
+        "Pozdrawiamy, Niedźwieccy"
     )
     return send_email(recipients, subject, html_body, text_body)
