@@ -2930,6 +2930,312 @@ def client_searches():
                                   total_count=total_count, q=q, source_label=source_label)
 
 
+def client_searches_v2():
+    q = norm(request.args.get("q"))
+    rows, source_label = load_client_search_rows(limit=5000)
+
+    customer_name_by_email = {}
+    order_name_by_email = {}
+    product_name_by_sku = {}
+    known_product_names = {}
+    try:
+        c = conn()
+        cur = c.cursor()
+        cur.execute("SELECT email, name FROM customers WHERE TRIM(COALESCE(email,''))<>''")
+        for rr in cur.fetchall():
+            email_key = _email_key(rr["email"])
+            company_name = norm(rr["name"])
+            if email_key and company_name and not _order_name_is_fallback(company_name, email_key):
+                customer_name_by_email[email_key] = company_name
+
+        cur.execute("""
+          SELECT customer_email, customer_name
+          FROM orders
+          WHERE TRIM(COALESCE(customer_email,''))<>''
+          ORDER BY id DESC
+        """)
+        for rr in cur.fetchall():
+            email_key = _email_key(rr["customer_email"])
+            company_name = norm(rr["customer_name"])
+            if email_key and company_name and email_key not in order_name_by_email and not _order_name_is_fallback(company_name, email_key):
+                order_name_by_email[email_key] = company_name
+
+        cur.execute("SELECT sku, name FROM products WHERE TRIM(COALESCE(name,''))<>''")
+        for rr in cur.fetchall():
+            sku = norm(rr["sku"])
+            product_name = norm(rr["name"])
+            if sku and product_name:
+                product_name_by_sku[sku.lower()] = product_name
+                known_product_names.setdefault(product_name.lower(), product_name)
+        c.close()
+    except Exception:
+        try:
+            c.close()
+        except Exception:
+            pass
+
+    def display_customer_name(row):
+        email = _email_key(row.get("customer_email"))
+        raw_name = norm(row.get("customer_name"))
+        for candidate in (customer_name_by_email.get(email), order_name_by_email.get(email), raw_name):
+            candidate = norm(candidate)
+            if candidate and not _order_name_is_fallback(candidate, email) and "@" not in candidate:
+                return candidate
+        return "-"
+
+    def canonical_product_name(row):
+        product_name = norm(row.get("product_name"))
+        if product_name and product_name != "-":
+            return product_name
+        product_sku = norm(row.get("product_sku")).lower()
+        product_model = norm(row.get("product_model")).lower()
+        query_key = norm(row.get("query")).lower()
+        if product_sku and product_sku in product_name_by_sku:
+            return product_name_by_sku[product_sku]
+        if product_model and product_model in product_name_by_sku:
+            return product_name_by_sku[product_model]
+        if query_key and query_key in known_product_names:
+            return known_product_names[query_key]
+        return ""
+
+    for row in rows:
+        row["_client_label"] = display_customer_name(row)
+        row["_product_label"] = canonical_product_name(row)
+
+    if q:
+        needle = q.lower()
+        rows = [
+            r for r in rows
+            if needle in (r.get("query") or "").lower()
+            or needle in (r.get("customer_name") or "").lower()
+            or needle in (r.get("_client_label") or "").lower()
+            or needle in (r.get("_product_label") or "").lower()
+            or needle in (r.get("product_sku") or "").lower()
+            or needle in (r.get("product_model") or "").lower()
+        ]
+
+    phrase_stats = {}
+    name_stats = {}
+    client_stats = {}
+    phrase_events_seen = set()
+    name_events_seen = set()
+
+    for r in rows:
+        query = norm(r.get("query"))
+        if not query:
+            continue
+        email = norm(r.get("customer_email")).lower()
+        client_label = norm(r.get("_client_label"))
+        client_key = email or client_label or "anon"
+        product_name = norm(r.get("_product_label"))
+        results_count = to_int(r.get("results_count"), 0)
+        created_at = norm(r.get("created_at"))
+
+        name_key = product_name.lower()
+        name_event_key = (client_key, query.lower(), name_key, created_at)
+        if name_key and results_count > 0 and name_event_key not in name_events_seen:
+            name_events_seen.add(name_event_key)
+            item = name_stats.setdefault(name_key, {
+                "product_name": product_name,
+                "searches_count": 0,
+                "clients": set(),
+                "last_at": "",
+            })
+            item["searches_count"] += 1
+            item["clients"].add(client_key)
+            if created_at > item["last_at"]:
+                item["last_at"] = created_at
+
+        phrase_event_key = (client_key, query.lower(), created_at)
+        if phrase_event_key in phrase_events_seen:
+            continue
+        phrase_events_seen.add(phrase_event_key)
+
+        phrase = phrase_stats.setdefault(query, {
+            "query": query,
+            "searches_count": 0,
+            "clients": set(),
+            "no_result_count": 0,
+            "max_results": 0,
+            "last_at": "",
+        })
+        phrase["searches_count"] += 1
+        phrase["clients"].add(client_key)
+        if results_count == 0:
+            phrase["no_result_count"] += 1
+        phrase["max_results"] = max(phrase["max_results"], results_count)
+        if created_at > phrase["last_at"]:
+            phrase["last_at"] = created_at
+
+        summary_name = client_label if client_label and client_label != "-" else "Nieznany klient"
+        skey = (summary_name, query)
+        summary = client_stats.setdefault(skey, {
+            "client_label": summary_name,
+            "query": query,
+            "searches_count": 0,
+            "no_result_count": 0,
+            "max_results": 0,
+            "last_at": "",
+        })
+        summary["searches_count"] += 1
+        if results_count == 0:
+            summary["no_result_count"] += 1
+        summary["max_results"] = max(summary["max_results"], results_count)
+        if created_at > summary["last_at"]:
+            summary["last_at"] = created_at
+
+    name_rows = []
+    for r in name_stats.values():
+        item = dict(r)
+        item["clients_count"] = len(item.pop("clients"))
+        name_rows.append(item)
+    name_rows.sort(key=lambda r: (r["searches_count"], r["last_at"]), reverse=True)
+    name_rows = name_rows[:10]
+
+    phrase_rows = []
+    for r in phrase_stats.values():
+        item = dict(r)
+        item["clients_count"] = len(item.pop("clients"))
+        phrase_rows.append(item)
+    phrase_rows.sort(key=lambda r: (r["searches_count"], r["last_at"]), reverse=True)
+    phrase_rows = phrase_rows[:10]
+
+    summary_rows = list(client_stats.values())
+    summary_rows.sort(key=lambda r: r["last_at"], reverse=True)
+    summary_rows = summary_rows[:50]
+
+    latest_rows = rows[:50]
+    total_count = len(rows)
+
+    tpl = r"""
+    {% extends "base.html" %}
+    {% block content %}
+      <div class="card">
+        <div class="flex">
+          <h1 style="margin:0;">Top wyszukiwania</h1>
+          <span class="badge">Łącznie: {{ total_count }}</span>
+          <span class="badge">{{ source_label }}</span>
+        </div>
+        <form method="get" class="grid3" style="margin-top:10px;">
+          <input name="q" value="{{ q }}" placeholder="Szukaj: klient / fraza / nazwa">
+          <button class="btn primary" type="submit">Szukaj</button>
+          <a class="btn" href="{{ url_for('client_searches') }}">Wyczyść</a>
+        </form>
+      </div>
+
+      <div class="card">
+        <h2>TOP 10 nazw zwyczajowych</h2>
+        <div class="muted" style="margin-bottom:8px;">
+          Ranking jest zsumowany po nazwie zwyczajowej, np. Winsor, Carl, Cerne — bez rozbijania na każdy rozmiar SKU.
+        </div>
+        <table>
+          <thead>
+            <tr><th>Nazwa zwyczajowa</th><th>Ile razy</th><th>Klientów</th><th>Ostatnio</th></tr>
+          </thead>
+          <tbody>
+            {% for r in name_rows %}
+              <tr>
+                <td><b>{{ r.product_name or '-' }}</b></td>
+                <td><span class="badge">{{ r.searches_count }}</span></td>
+                <td>{{ r.clients_count }}</td>
+                <td class="muted">{{ r.last_at }}</td>
+              </tr>
+            {% endfor %}
+            {% if not name_rows %}
+              <tr><td colspan="4" class="muted">Brak zapisanych wyszukiwań.</td></tr>
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
+
+      <details class="card">
+        <summary style="cursor:pointer;font-weight:700;font-size:16px;">Pokaż szczegóły: frazy, klienci i ostatnie wpisy</summary>
+
+        <div style="margin-top:14px;">
+          <h2>Frazy klientów</h2>
+          <div class="muted" style="margin-bottom:8px;">
+            Tu zostają wpisane teksty klienta. Pomaga sprawdzić, jak klienci szukają produktów i gdzie pojawiają się literówki albo brakujące nazwy.
+          </div>
+          <table>
+            <thead>
+              <tr><th>Fraza</th><th>Wyszukań</th><th>Klientów</th><th>Bez wyników</th><th>Najwięcej wyników</th><th>Ostatnio</th></tr>
+            </thead>
+            <tbody>
+              {% for r in phrase_rows %}
+                <tr>
+                  <td><b>{{ r.query }}</b></td>
+                  <td><span class="badge">{{ r.searches_count }}</span></td>
+                  <td>{{ r.clients_count }}</td>
+                  <td>{% if r.no_result_count %}<span class="badge">{{ r.no_result_count }}</span>{% else %}-{% endif %}</td>
+                  <td>{{ r.max_results }}</td>
+                  <td class="muted">{{ r.last_at }}</td>
+                </tr>
+              {% endfor %}
+              {% if not phrase_rows %}
+                <tr><td colspan="6" class="muted">Brak zapisanych fraz.</td></tr>
+              {% endif %}
+            </tbody>
+          </table>
+        </div>
+
+        <div style="margin-top:18px;">
+          <h2>Wyszukiwania według klienta</h2>
+          <div class="muted" style="margin-bottom:8px;">Tu zobaczysz, która firma szukała danej frazy.</div>
+          <table>
+            <thead>
+              <tr><th>Klient</th><th>Fraza</th><th>Ile razy</th><th>Bez wyników</th><th>Ostatnio</th></tr>
+            </thead>
+            <tbody>
+              {% for r in summary_rows %}
+                <tr>
+                  <td><b>{{ r.client_label }}</b></td>
+                  <td>{{ r.query }}</td>
+                  <td><span class="badge">{{ r.searches_count }}</span></td>
+                  <td>{% if r.no_result_count %}<span class="badge">{{ r.no_result_count }}</span>{% else %}-{% endif %}</td>
+                  <td class="muted">{{ r.last_at }}</td>
+                </tr>
+              {% endfor %}
+              {% if not summary_rows %}
+                <tr><td colspan="5" class="muted">Brak zapisanych wyszukiwań.</td></tr>
+              {% endif %}
+            </tbody>
+          </table>
+        </div>
+
+        <div style="margin-top:18px;">
+          <h2>Ostatnie wpisy</h2>
+          <table>
+            <thead>
+              <tr><th>Czas</th><th>Klient</th><th>Fraza</th><th>Nazwa</th><th>Model / SKU</th><th>Wyniki</th></tr>
+            </thead>
+            <tbody>
+              {% for r in latest_rows %}
+                <tr>
+                  <td class="muted">{{ r.created_at }}</td>
+                  <td>{{ r._client_label or '-' }}</td>
+                  <td><b>{{ r.query }}</b></td>
+                  <td>{{ r._product_label or '-' }}</td>
+                  <td>{{ r.product_model or r.product_sku or '-' }}</td>
+                  <td>{{ r.results_count }}</td>
+                </tr>
+              {% endfor %}
+              {% if not latest_rows %}
+                <tr><td colspan="6" class="muted">Brak wpisów.</td></tr>
+              {% endif %}
+            </tbody>
+          </table>
+        </div>
+      </details>
+    {% endblock %}
+    """
+    return render_template_string(tpl, title="Top wyszukiwania", base_url=BASE_URL, db_path=DB_PATH,
+                                  name_rows=name_rows, phrase_rows=phrase_rows, summary_rows=summary_rows, latest_rows=latest_rows,
+                                  total_count=total_count, q=q, source_label=source_label)
+
+
+app.view_functions["client_searches"] = client_searches_v2
+
+
 register_cash_flow(app, {
     "conn": conn,
     "now_iso": now_iso,
