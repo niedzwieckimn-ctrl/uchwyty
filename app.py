@@ -43,20 +43,29 @@ except Exception:
     def ksef_config_summary():
         return {"configured": False, "missing": ["ksef_api.py"], "env": "", "base_url": ""}
 
+_EMAIL_IMPORT_ERROR = ""
 try:
     from email_module import (
         email_config_summary,
+        send_email,
         send_order_confirmation,
         send_invoice_available,
         send_payment_reminder,
     )
-except Exception:
+except Exception as exc:
+    _EMAIL_IMPORT_ERROR = str(exc)
+    send_email = None
     send_order_confirmation = None
     send_invoice_available = None
     send_payment_reminder = None
 
     def email_config_summary():
-        return {"configured": False, "missing": ["email_module.py"], "enabled": False}
+        return {
+            "configured": False,
+            "missing": ["email_module.py"],
+            "enabled": False,
+            "import_error": _EMAIL_IMPORT_ERROR,
+        }
 
 
 # =========================
@@ -2564,6 +2573,7 @@ BASE = r"""
           <a href="{{ url_for('pricing') }}">Cennik</a>
           <a href="{{ url_for('company') }}">Dane mojej firmy</a>
           <a href="{{ url_for('cash_flow') }}">Cash flow</a>
+          <a href="{{ url_for('email_test') }}">Test maili</a>
         </div>
       </div>
     </div>
@@ -5864,6 +5874,77 @@ def api_client_order_email():
     except Exception as exc:
         result = {"ok": False, "error": str(exc)}
     return jsonify(ok=True, email=result)
+
+
+@app.route("/email-test", methods=["GET", "POST"])
+def email_test():
+    cfg = email_config_summary()
+    cfg = dict(cfg or {})
+    cfg["module_loaded"] = bool(send_email)
+    cfg["import_error"] = _EMAIL_IMPORT_ERROR
+    cfg["api_key_set"] = "RESEND_API_KEY" not in (cfg.get("missing") or [])
+    result = None
+    test_to = norm(request.form.get("to")) or norm(cfg.get("admin_email")) or "biuro@niedzwieccy.com"
+
+    if request.method == "POST":
+        if not send_email:
+            result = {
+                "ok": False,
+                "error": "Moduł email_module.py nie jest załadowany. Wgraj email_module.py do repo obok app.py i zrób deploy.",
+                "import_error": _EMAIL_IMPORT_ERROR,
+            }
+        else:
+            try:
+                result = send_email(
+                    test_to,
+                    "Test maili z Niedźwieccy Orders",
+                    "<div style='font-family:Arial,sans-serif'><h2>Test maili działa</h2><p>Jeśli widzisz tę wiadomość, Resend jest poprawnie podpięty do aplikacji.</p></div>",
+                    "Test maili działa. Jeśli widzisz tę wiadomość, Resend jest poprawnie podpięty do aplikacji.",
+                )
+            except Exception as exc:
+                result = {"ok": False, "error": str(exc)}
+
+    tpl = r"""
+    {% extends "base.html" %}
+    {% block content %}
+      <div class="card">
+        <h1>Test maili</h1>
+        <p class="muted">Ta strona sprawdza konfigurację Resend po stronie Rendera. API key nie jest tutaj wyświetlany.</p>
+        <div class="kpi">
+          <span class="pill">Moduł: <b>{{ 'załadowany' if cfg.module_loaded else 'brak' }}</b></span>
+          <span class="pill">Wysyłka: <b>{{ 'włączona' if cfg.enabled else 'wyłączona' }}</b></span>
+          <span class="pill">Konfiguracja: <b>{{ 'OK' if cfg.configured else 'brakuje danych' }}</b></span>
+          <span class="pill">API key: <b>{{ 'ustawiony' if cfg.api_key_set else 'brak' }}</b></span>
+        </div>
+        <div class="line"></div>
+        <p><b>EMAIL_FROM:</b> {{ cfg['from'] or '-' }}</p>
+        <p><b>ADMIN_EMAIL:</b> {{ cfg.admin_email or '-' }}</p>
+        {% if cfg.missing %}
+          <p class="hint"><b>Brakuje:</b> {{ cfg.missing|join(', ') }}</p>
+        {% endif %}
+        {% if cfg.import_error %}
+          <p class="hint"><b>Błąd importu:</b> {{ cfg.import_error }}</p>
+        {% endif %}
+        <form method="post" class="flex" style="margin-top:12px">
+          <input name="to" value="{{ test_to }}" placeholder="email do testu" style="max-width:420px">
+          <button class="btn primary" type="submit">Wyślij test</button>
+        </form>
+      </div>
+
+      {% if result %}
+        <div class="card">
+          <h2>Wynik testu</h2>
+          {% if result.ok %}
+            <p class="badge" style="background:#dcfce7;border-color:#86efac">Mail wysłany</p>
+          {% else %}
+            <p class="badge" style="background:#fee2e2;border-color:#fecaca">Mail nie wysłany</p>
+          {% endif %}
+          <pre style="white-space:pre-wrap;background:#111;color:#fff;padding:12px;border-radius:12px;overflow:auto">{{ result|tojson(indent=2) }}</pre>
+        </div>
+      {% endif %}
+    {% endblock %}
+    """
+    return render_template_string(tpl, title="Test maili", base_url=BASE_URL, db_path=DB_PATH, cfg=cfg, result=result, test_to=test_to)
 
 
 @app.get("/api/order_lookup")
