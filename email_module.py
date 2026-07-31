@@ -4,10 +4,12 @@ Moduł maili dla Niedźwieccy Orders.
 
 Sekrety trzymamy wyłącznie po stronie Rendera:
 - RESEND_API_KEY
-- EMAIL_FROM, np. "Niedźwieccy <faktury@twojadomena.pl>"
+- EMAIL_FROM, np. "Niedźwieccy <biuro@niedzwieccy.com>"
 - ADMIN_EMAIL, np. "biuro@niedzwieccy.com"
 - EMAIL_ENABLED=1/0
 """
+
+from __future__ import annotations
 
 import html
 import json
@@ -15,6 +17,7 @@ import os
 import urllib.error
 import urllib.request
 from decimal import Decimal, ROUND_HALF_UP
+from typing import Iterable
 
 
 RESEND_API_URL = "https://api.resend.com/emails"
@@ -36,9 +39,9 @@ def _esc(value) -> str:
     return html.escape(str(value or ""), quote=True)
 
 
-def _uniq_emails(values) -> list[str]:
-    out = []
-    seen = set()
+def _uniq_emails(values: Iterable[str] | None) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
     for value in values or []:
         email = str(value or "").strip().lower()
         if not email or "@" not in email or email in seen:
@@ -50,7 +53,7 @@ def _uniq_emails(values) -> list[str]:
 
 def email_config_summary() -> dict:
     api_key = _env("RESEND_API_KEY")
-    sender = _env("EMAIL_FROM", "Niedźwieccy Orders <onboarding@resend.dev>")
+    sender = _env("EMAIL_FROM", "Niedzwieccy Orders <onboarding@resend.dev>")
     admin = _env("ADMIN_EMAIL", _env("ADMIN_MAIL", "biuro@niedzwieccy.com"))
     enabled = _env("EMAIL_ENABLED", "1").lower() not in {"0", "false", "no", "off"}
     missing = []
@@ -64,7 +67,20 @@ def email_config_summary() -> dict:
         "missing": missing,
         "from": sender,
         "admin_email": admin,
+        "api_key_set": bool(api_key),
     }
+
+
+def _decode_resend_error(exc: urllib.error.HTTPError) -> tuple[str, dict]:
+    raw = exc.read().decode("utf-8", errors="replace")
+    if not raw:
+        return f"HTTP {exc.code}", {}
+    try:
+        body = json.loads(raw)
+        message = body.get("message") or body.get("error") or raw
+        return str(message), body
+    except Exception:
+        return raw[:1200], {"raw": raw[:1200]}
 
 
 def send_email(to, subject: str, html_body: str, text_body: str = "") -> dict:
@@ -93,7 +109,10 @@ def send_email(to, subject: str, html_body: str, text_body: str = "") -> dict:
         method="POST",
         headers={
             "Authorization": f"Bearer {_env('RESEND_API_KEY')}",
-            "Content-Type": "application/json",
+            "Content-Type": "application/json; charset=utf-8",
+            "Accept": "application/json",
+            # Resend stoi za Cloudflare. Domyślny Python-urllib bywa odrzucany jako bot.
+            "User-Agent": "NiedzwieccyOrders/1.0 (+https://niedzwieccy.com)",
         },
     )
     try:
@@ -105,8 +124,8 @@ def send_email(to, subject: str, html_body: str, text_body: str = "") -> dict:
                 body = {"raw": raw}
             return {"ok": 200 <= int(resp.status) < 300, "status": int(resp.status), "body": body, "to": recipients}
     except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")
-        return {"ok": False, "status": exc.code, "error": raw[:800], "to": recipients}
+        message, body = _decode_resend_error(exc)
+        return {"ok": False, "status": exc.code, "error": message, "body": body, "to": recipients}
     except Exception as exc:
         return {"ok": False, "error": str(exc), "to": recipients}
 
@@ -167,7 +186,12 @@ def send_invoice_available(invoice: dict, pdf_url: str = "", admin_email: str = 
     buyer_name = invoice.get("buyer_name") or invoice.get("customer_name") or "Klient"
     buyer_email = invoice.get("buyer_email") or invoice.get("customer_email") or ""
     recipients = _uniq_emails([buyer_email, admin_email or email_config_summary().get("admin_email")])
-    link_html = f"<p><a href='{_esc(pdf_url)}' style='display:inline-block;background:#111;color:#fff;padding:10px 14px;border-radius:10px;text-decoration:none'>Pobierz PDF</a></p>" if pdf_url else ""
+    link_html = (
+        f"<p><a href='{_esc(pdf_url)}' style='display:inline-block;background:#111;color:#fff;"
+        "padding:10px 14px;border-radius:10px;text-decoration:none'>Pobierz PDF</a></p>"
+        if pdf_url
+        else ""
+    )
     subject = f"Nowa faktura {invoice_no}"
     html_body = f"""
     <div style="font-family:Arial,sans-serif;color:#111;line-height:1.45">
@@ -182,7 +206,11 @@ def send_invoice_available(invoice: dict, pdf_url: str = "", admin_email: str = 
       <p style="color:#555">To jest automatyczna wiadomość z panelu zamówień.</p>
     </div>
     """
-    text_body = f"Masz nową fakturę {invoice_no}. Kwota brutto: {_money(invoice.get('total_gross'))}. Termin płatności: {invoice.get('payment_to') or '-'}"
+    text_body = (
+        f"Masz nową fakturę {invoice_no}. "
+        f"Kwota brutto: {_money(invoice.get('total_gross'))}. "
+        f"Termin płatności: {invoice.get('payment_to') or '-'}"
+    )
     return send_email(recipients, subject, html_body, text_body)
 
 
@@ -191,7 +219,12 @@ def send_payment_reminder(invoice: dict, pdf_url: str = "", admin_email: str = "
     buyer_name = invoice.get("buyer_name") or invoice.get("customer_name") or "Klient"
     buyer_email = invoice.get("buyer_email") or invoice.get("customer_email") or ""
     recipients = _uniq_emails([buyer_email, admin_email or email_config_summary().get("admin_email")])
-    link_html = f"<p><a href='{_esc(pdf_url)}' style='display:inline-block;background:#dc2626;color:#fff;padding:10px 14px;border-radius:10px;text-decoration:none'>Pobierz fakturę PDF</a></p>" if pdf_url else ""
+    link_html = (
+        f"<p><a href='{_esc(pdf_url)}' style='display:inline-block;background:#dc2626;color:#fff;"
+        "padding:10px 14px;border-radius:10px;text-decoration:none'>Pobierz fakturę PDF</a></p>"
+        if pdf_url
+        else ""
+    )
     subject = f"Przypomnienie o płatności: {invoice_no}"
     html_body = f"""
     <div style="font-family:Arial,sans-serif;color:#111;line-height:1.45">
@@ -206,5 +239,9 @@ def send_payment_reminder(invoice: dict, pdf_url: str = "", admin_email: str = "
       <p>Prosimy o uregulowanie zaległej płatności.</p>
     </div>
     """
-    text_body = f"Przypomnienie o płatności za {invoice_no}. Kwota brutto: {_money(invoice.get('total_gross'))}. Termin: {invoice.get('payment_to') or '-'}"
+    text_body = (
+        f"Przypomnienie o płatności za {invoice_no}. "
+        f"Kwota brutto: {_money(invoice.get('total_gross'))}. "
+        f"Termin: {invoice.get('payment_to') or '-'}"
+    )
     return send_email(recipients, subject, html_body, text_body)
