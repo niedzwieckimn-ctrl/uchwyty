@@ -1222,6 +1222,17 @@ def sqlite_upsert_rows(table: str, rows: list, conflict_col: str):
     cur = c.cursor()
     cnt = 0
     for row in rows:
+        # Nie pozwól, żeby starszy rekord z Supabase nadpisał świeżą zmianę lokalną
+        # np. kliknięcie "Faktura opłacona" zapisane sekundę wcześniej.
+        if table == "invoice_meta":
+            key_val = row.get(conflict_col)
+            incoming_updated = row.get("updated_at")
+            if key_val is not None and incoming_updated:
+                cur.execute(f"SELECT updated_at FROM {table} WHERE {conflict_col}=?", (key_val,))
+                existing = cur.fetchone()
+                existing_updated = existing[0] if existing else None
+                if existing_updated and str(existing_updated) > str(incoming_updated):
+                    continue
         values = [row.get(col) for col in usable_cols]
         cur.execute(sql, values)
         cnt += 1
@@ -2201,16 +2212,37 @@ def sync_invoice_meta_to_supabase(invoice_id: int):
     except Exception:
         pass
 
-    # Fallback dla Supabase bez najnowszych kolumn payment_reminder/paid/paid_at.
-    legacy = {
+    # Fallback dla Supabase, gdy pełny sync lokalnej tabeli nie przejdzie.
+    # Najpierw próbujemy wersję z polami płatności, bo panel klienta i magazyn
+    # muszą widzieć ten sam status: opłacona / nieopłacona / przypomnienie.
+    shared = {
         "invoice_id": meta.get("invoice_id"),
         "pdf_path": meta.get("pdf_path") or "",
         "invoice_items_json": meta.get("invoice_items_json") or "",
         "sent_to_client": int(meta.get("sent_to_client") or 0),
         "seen_by_client": int(meta.get("seen_by_client") or 0),
+        "payment_reminder": int(meta.get("payment_reminder") or 0),
+        "paid": int(meta.get("paid") or 0),
+        "paid_at": meta.get("paid_at"),
         "seen_at": meta.get("seen_at"),
         "updated_at": meta.get("updated_at") or now_iso(),
     }
+    try:
+        supabase_upsert_rows("invoice_meta", [shared], "invoice_id")
+        return
+    except Exception:
+        pass
+
+    # Ostateczny fallback dla bardzo starej struktury Supabase bez kolumn płatności.
+    legacy = {k: shared[k] for k in (
+        "invoice_id",
+        "pdf_path",
+        "invoice_items_json",
+        "sent_to_client",
+        "seen_by_client",
+        "seen_at",
+        "updated_at",
+    )}
     supabase_upsert_rows("invoice_meta", [legacy], "invoice_id")
 
 def prepare_invoice_items(order_items: list[dict], form):
