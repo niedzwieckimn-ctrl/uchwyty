@@ -5,6 +5,7 @@ import csv
 import base64
 import re
 import json
+import hashlib
 import glob
 import sqlite3
 import socket
@@ -312,8 +313,6 @@ def init_db():
         payment_reminder INTEGER NOT NULL DEFAULT 0,
         paid INTEGER NOT NULL DEFAULT 0,
         paid_at TEXT,
-        auto_payment_reminder_sent_at TEXT,
-        auto_payment_reminder_count INTEGER NOT NULL DEFAULT 0,
         seen_at TEXT,
         updated_at TEXT NOT NULL,
         FOREIGN KEY(invoice_id) REFERENCES invoices(id)
@@ -372,6 +371,18 @@ def init_db():
         created_at TEXT NOT NULL
     )
     """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS email_events(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_key TEXT UNIQUE,
+        event_type TEXT NOT NULL,
+        ref_id TEXT,
+        recipient TEXT,
+        ok INTEGER NOT NULL DEFAULT 0,
+        result_json TEXT,
+        created_at TEXT NOT NULL
+    )
+    """)
 
     cur.execute("PRAGMA table_info(client_search_logs)")
     search_cols = {r["name"] for r in cur.fetchall()}
@@ -394,10 +405,6 @@ def init_db():
         cur.execute("ALTER TABLE invoice_meta ADD COLUMN paid INTEGER NOT NULL DEFAULT 0")
     if "paid_at" not in invoice_meta_cols:
         cur.execute("ALTER TABLE invoice_meta ADD COLUMN paid_at TEXT")
-    if "auto_payment_reminder_sent_at" not in invoice_meta_cols:
-        cur.execute("ALTER TABLE invoice_meta ADD COLUMN auto_payment_reminder_sent_at TEXT")
-    if "auto_payment_reminder_count" not in invoice_meta_cols:
-        cur.execute("ALTER TABLE invoice_meta ADD COLUMN auto_payment_reminder_count INTEGER NOT NULL DEFAULT 0")
 
     # migracja: starsze bazy mogÄ… nie mieÄ‡ kolumny NIP u klientĂłw
     cur.execute("PRAGMA table_info(customers)")
@@ -419,6 +426,8 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_client_search_logs_created ON client_search_logs(created_at)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_client_search_logs_email_query ON client_search_logs(customer_email, query)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_client_search_logs_model ON client_search_logs(product_model)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_email_events_key ON email_events(event_key)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_email_events_type_created ON email_events(event_type, created_at)")
 
     c.commit()
     c.close()
@@ -1222,17 +1231,6 @@ def sqlite_upsert_rows(table: str, rows: list, conflict_col: str):
     cur = c.cursor()
     cnt = 0
     for row in rows:
-        # Nie pozwól, żeby starszy rekord z Supabase nadpisał świeżą zmianę lokalną
-        # np. kliknięcie "Faktura opłacona" zapisane sekundę wcześniej.
-        if table == "invoice_meta":
-            key_val = row.get(conflict_col)
-            incoming_updated = row.get("updated_at")
-            if key_val is not None and incoming_updated:
-                cur.execute(f"SELECT updated_at FROM {table} WHERE {conflict_col}=?", (key_val,))
-                existing = cur.fetchone()
-                existing_updated = existing[0] if existing else None
-                if existing_updated and str(existing_updated) > str(incoming_updated):
-                    continue
         values = [row.get(col) for col in usable_cols]
         cur.execute(sql, values)
         cnt += 1
@@ -2139,9 +2137,7 @@ def upsert_invoice_meta(
     seen_at: str | None = None,
     payment_reminder: int | None = None,
     paid: int | None = None,
-    paid_at: str | None = None,
-    auto_payment_reminder_sent_at: str | None = None,
-    auto_payment_reminder_count: int | None = None
+    paid_at: str | None = None
 ):
     current = load_invoice_meta(invoice_id) or {}
     if sent_to_client is None:
@@ -2156,20 +2152,12 @@ def upsert_invoice_meta(
         paid = int(current.get("paid") or 0)
     if paid_at is None:
         paid_at = current.get("paid_at")
-    if auto_payment_reminder_sent_at is None:
-        auto_payment_reminder_sent_at = current.get("auto_payment_reminder_sent_at")
-    if auto_payment_reminder_count is None:
-        auto_payment_reminder_count = int(current.get("auto_payment_reminder_count") or 0)
 
     c = conn()
     cur = c.cursor()
     cur.execute("""
-      INSERT INTO invoice_meta(
-        invoice_id, pdf_path, invoice_items_json, sent_to_client, seen_by_client,
-        payment_reminder, paid, paid_at, auto_payment_reminder_sent_at,
-        auto_payment_reminder_count, seen_at, updated_at
-      )
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+      INSERT INTO invoice_meta(invoice_id, pdf_path, invoice_items_json, sent_to_client, seen_by_client, payment_reminder, paid, paid_at, seen_at, updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?)
       ON CONFLICT(invoice_id) DO UPDATE SET
         pdf_path=excluded.pdf_path,
         invoice_items_json=excluded.invoice_items_json,
@@ -2178,24 +2166,9 @@ def upsert_invoice_meta(
         payment_reminder=excluded.payment_reminder,
         paid=excluded.paid,
         paid_at=excluded.paid_at,
-        auto_payment_reminder_sent_at=excluded.auto_payment_reminder_sent_at,
-        auto_payment_reminder_count=excluded.auto_payment_reminder_count,
         seen_at=excluded.seen_at,
         updated_at=excluded.updated_at
-    """, (
-        invoice_id,
-        pdf_path,
-        invoice_items_json,
-        int(sent_to_client),
-        int(seen_by_client),
-        int(payment_reminder),
-        int(paid),
-        paid_at,
-        auto_payment_reminder_sent_at,
-        int(auto_payment_reminder_count or 0),
-        seen_at,
-        now_iso()
-    ))
+    """, (invoice_id, pdf_path, invoice_items_json, int(sent_to_client), int(seen_by_client), int(payment_reminder), int(paid), paid_at, seen_at, now_iso()))
     c.commit()
     c.close()
 
@@ -2212,37 +2185,16 @@ def sync_invoice_meta_to_supabase(invoice_id: int):
     except Exception:
         pass
 
-    # Fallback dla Supabase, gdy pełny sync lokalnej tabeli nie przejdzie.
-    # Najpierw próbujemy wersję z polami płatności, bo panel klienta i magazyn
-    # muszą widzieć ten sam status: opłacona / nieopłacona / przypomnienie.
-    shared = {
+    # Fallback dla Supabase bez najnowszych kolumn payment_reminder/paid/paid_at.
+    legacy = {
         "invoice_id": meta.get("invoice_id"),
         "pdf_path": meta.get("pdf_path") or "",
         "invoice_items_json": meta.get("invoice_items_json") or "",
         "sent_to_client": int(meta.get("sent_to_client") or 0),
         "seen_by_client": int(meta.get("seen_by_client") or 0),
-        "payment_reminder": int(meta.get("payment_reminder") or 0),
-        "paid": int(meta.get("paid") or 0),
-        "paid_at": meta.get("paid_at"),
         "seen_at": meta.get("seen_at"),
         "updated_at": meta.get("updated_at") or now_iso(),
     }
-    try:
-        supabase_upsert_rows("invoice_meta", [shared], "invoice_id")
-        return
-    except Exception:
-        pass
-
-    # Ostateczny fallback dla bardzo starej struktury Supabase bez kolumn płatności.
-    legacy = {k: shared[k] for k in (
-        "invoice_id",
-        "pdf_path",
-        "invoice_items_json",
-        "sent_to_client",
-        "seen_by_client",
-        "seen_at",
-        "updated_at",
-    )}
     supabase_upsert_rows("invoice_meta", [legacy], "invoice_id")
 
 def prepare_invoice_items(order_items: list[dict], form):
@@ -5865,6 +5817,52 @@ def api_client_search_log():
     return jsonify(ok=True, cloud=bool(cloud_ok), rows=len(deduped_rows))
 
 
+def _email_event_already_ok(event_key):
+    if not event_key:
+        return False
+    c = conn()
+    try:
+        cur = c.cursor()
+        cur.execute("SELECT ok FROM email_events WHERE event_key=? LIMIT 1", (event_key,))
+        row = cur.fetchone()
+        return bool(row and to_int(row["ok"], 0) == 1)
+    except Exception:
+        return False
+    finally:
+        c.close()
+
+
+def _record_email_event(event_key, event_type, ref_id, recipient, result):
+    if not event_key:
+        return
+    ok = 1 if isinstance(result, dict) and result.get("ok") else 0
+    try:
+        payload = json.dumps(result or {}, ensure_ascii=False)[:6000]
+    except Exception:
+        payload = json.dumps({"raw": str(result)}, ensure_ascii=False)[:6000]
+    c = conn()
+    try:
+        cur = c.cursor()
+        cur.execute("SELECT id FROM email_events WHERE event_key=? LIMIT 1", (event_key,))
+        row = cur.fetchone()
+        if row:
+            cur.execute("""
+                UPDATE email_events
+                SET event_type=?, ref_id=?, recipient=?, ok=?, result_json=?, created_at=?
+                WHERE event_key=?
+            """, (event_type, str(ref_id or ""), recipient or "", ok, payload, now_iso(), event_key))
+        else:
+            cur.execute("""
+                INSERT INTO email_events(event_key,event_type,ref_id,recipient,ok,result_json,created_at)
+                VALUES(?,?,?,?,?,?,?)
+            """, (event_key, event_type, str(ref_id or ""), recipient or "", ok, payload, now_iso()))
+        c.commit()
+    except Exception:
+        pass
+    finally:
+        c.close()
+
+
 @app.route("/api/client_order_email", methods=["POST", "OPTIONS"])
 def api_client_order_email():
     if request.method == "OPTIONS":
@@ -5873,7 +5871,7 @@ def api_client_order_email():
     data = request.get_json(silent=True) or {}
     order_id = to_int(data.get("order_id"), 0)
     order_no = norm(data.get("order_no"))
-    fallback_email = norm(data.get("email") or data.get("customer_email")).lower()
+    fallback_email = norm(data.get("customer_email") or data.get("email")).lower()
     fallback_name = norm(data.get("customer_name")) or (fallback_email.split("@")[0] if fallback_email else "")
     fallback_note = norm(data.get("note"))
     fallback_items = data.get("items") if isinstance(data.get("items"), list) else []
@@ -5904,15 +5902,17 @@ def api_client_order_email():
             cur.execute("SELECT * FROM orders WHERE 1=0")
         row = cur.fetchone()
         if row:
-            order = dict(row)
-            if fallback_email and not norm(order.get("customer_email")):
-                order["customer_email"] = fallback_email
-            if fallback_name and not norm(order.get("customer_name")):
-                order["customer_name"] = fallback_name
-            if fallback_note and not norm(order.get("note")):
-                order["note"] = fallback_note
-            if order_no and not norm(order.get("order_no")):
-                order["order_no"] = order_no
+            db_order = dict(row)
+            # Panel klienta jest źródłem prawdy dla adresu odbiorcy maila.
+            # Lokalna baza na Renderze może mieć starszy rekord po synchronizacji,
+            # więc nie wolno blokować podmiany, jeśli email już istnieje.
+            if fallback_email:
+                db_order["customer_email"] = fallback_email
+            if fallback_name:
+                db_order["customer_name"] = fallback_name
+            if fallback_note and not norm(db_order.get("note")):
+                db_order["note"] = fallback_note
+            order = db_order
             cur.execute("""
               SELECT oi.sku, oi.qty, COALESCE(p.name, pr.name, '') AS name
               FROM order_items oi
@@ -5932,19 +5932,39 @@ def api_client_order_email():
             if not isinstance(item, dict):
                 continue
             items.append({
-                "sku": norm(item.get("sku") or item.get("product_sku") or item.get("model")),
-                "name": norm(item.get("name") or item.get("product_name") or item.get("model_name")),
-                "qty": to_int(item.get("qty") or item.get("quantity") or item.get("ilosc"), 0),
+                "sku": norm(item.get("sku")),
+                "name": norm(item.get("name")),
+                "qty": to_int(item.get("qty"), 0),
             })
 
+    if fallback_email:
+        order["customer_email"] = fallback_email
+    if fallback_name:
+        order["customer_name"] = fallback_name
+
+    event_ref = norm(order.get("id")) or norm(order_id) or norm(order.get("order_no")) or order_no
+    try:
+        admin_email = norm(email_config_summary().get("admin_email"))
+    except Exception:
+        admin_email = ""
+    recipient = ", ".join([x for x in [norm(order.get("customer_email")), admin_email] if x])
+    recipient_hash = hashlib.sha1(recipient.lower().encode("utf-8")).hexdigest()[:12] if recipient else "no-recipient"
+    event_key = f"order_confirmation:{event_ref}:{recipient_hash}" if event_ref else ""
+
+    if _email_event_already_ok(event_key):
+        return jsonify(ok=True, email={"ok": True, "duplicate": True, "skipped": True, "to": recipient, "order_email": norm(order.get("customer_email"))})
+
     if not send_order_confirmation:
-        return jsonify(ok=True, email={"ok": False, "skipped": True, "error": "Brak modułu email_module.py"})
+        result = {"ok": False, "skipped": True, "error": "Brak modułu email_module.py"}
+        _record_email_event(event_key, "order_confirmation", event_ref, recipient, result)
+        return jsonify(ok=True, email=result)
 
     try:
-        result = send_order_confirmation(order, items)
+        result = send_order_confirmation(order, items, admin_email=admin_email)
     except Exception as exc:
         result = {"ok": False, "error": str(exc)}
-    return jsonify(ok=True, email=result)
+    _record_email_event(event_key, "order_confirmation", event_ref, recipient, result)
+    return jsonify(ok=True, email=result, to=recipient, order_email=norm(order.get("customer_email")))
 
 
 @app.route("/email-test", methods=["GET", "POST"])
