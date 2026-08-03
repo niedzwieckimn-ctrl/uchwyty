@@ -267,7 +267,12 @@ def register_cash_flow(app, deps):
         forecast_30_sales = avg_daily_gross * 30 * growth_factor
         forecast_7_total = due_7_total + forecast_7_sales
         forecast_30_total = due_30_total + forecast_30_sales
-        safe_to_spend = account_balance + due_7_total - month_vat - monthly_zus - cash_buffer - planned_china_budget
+        # Realna kwota do wydania na Chiny liczona jest tylko z gotówki na koncie.
+        # Prognozy oraz niezapłacone faktury to informacja pomocnicza, ale nie kasa,
+        # którą można dziś bezpiecznie wydać.
+        real_cash_for_china = account_balance - month_vat - monthly_zus - cash_buffer - planned_china_budget
+        safe_to_spend = max(0.0, real_cash_for_china)
+        cash_shortage = max(0.0, -real_cash_for_china)
 
         overdue_clients = sorted(overdue_clients_map.values(), key=lambda r: (r["days_late"], r["gross"]), reverse=True)[:10]
         paid_clients = sorted(paid_clients_map.values(), key=lambda r: r["gross"], reverse=True)[:10]
@@ -294,7 +299,9 @@ def register_cash_flow(app, deps):
             "forecast_30_total": forecast_30_total,
             "forecast_7_sales": forecast_7_sales,
             "forecast_30_sales": forecast_30_sales,
+            "real_cash_for_china": real_cash_for_china,
             "safe_to_spend": safe_to_spend,
+            "cash_shortage": cash_shortage,
         }
 
         tpl = r"""
@@ -335,7 +342,7 @@ def register_cash_flow(app, deps):
 
             <div class="card"><h2>Prognoza 7 dni</h2><div style="font-size:24px;font-weight:800;">{{ "%.2f"|format(k.forecast_7_total) }} PLN</div><div class="muted">terminy płatności + sprzedaż wg ostatnich 30 dni</div></div>
             <div class="card"><h2>Prognoza 30 dni</h2><div style="font-size:24px;font-weight:800;">{{ "%.2f"|format(k.forecast_30_total) }} PLN</div><div class="muted">uwzględnia korektę wzrostu</div></div>
-            <div class="card"><h2>Możesz dziś wydać na Chiny</h2><div style="font-size:24px;font-weight:800;color:{% if k.safe_to_spend<0 %}#b00020{% else %}#067a2d{% endif %};">{{ "%.2f"|format(k.safe_to_spend) }} PLN</div><div class="muted">po VAT, ZUS, buforze i rezerwie</div></div>
+<div class="card"><h2>Możesz dziś wydać na Chiny</h2><div style="font-size:24px;font-weight:800;color:{% if k.safe_to_spend<=0 %}#b00020{% else %}#067a2d{% endif %};">{{ "%.2f"|format(k.safe_to_spend) }} PLN</div><div class="muted">realnie z konta: po VAT, ZUS, buforze i rezerwie</div>{% if k.cash_shortage > 0 %}<div class="muted" style="color:#b00020;font-weight:700;">Brakuje {{ "%.2f"|format(k.cash_shortage) }} PLN do bufora/kosztów.</div>{% endif %}</div>
           </div>
 
           <div class="card">
