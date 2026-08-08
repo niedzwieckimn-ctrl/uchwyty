@@ -1,4 +1,192 @@
-__pycache__/
-*.pyc
-data/
-node_modules/
+			<xsd:documentation>Wartość kwotowa wykazana w zł i gr</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="xsd:decimal">
+			<xsd:totalDigits value="16"/>
+			<xsd:whiteSpace value="collapse"/>
+			<xsd:fractionDigits value="2"/>
+		</xsd:restriction>
+	</xsd:simpleType>
+	<xsd:simpleType name="TKwotaC">
+		<xsd:annotation>
+			<xsd:documentation>Wartość kwotowa wykazana w zł</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="xsd:integer">
+			<xsd:totalDigits value="14"/>
+		</xsd:restriction>
+	</xsd:simpleType>
+	<xsd:simpleType name="TKwota2Nieujemna">
+		<xsd:annotation>
+			<xsd:documentation>Wartość kwotowa nieujemna wykazana w zł i gr</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="etd:TKwota2">
+			<xsd:minInclusive value="0"/>
+		</xsd:restriction>
+	</xsd:simpleType>
+	<xsd:simpleType name="TKwotaCNieujemna">
+		<xsd:annotation>
+			<xsd:documentation>Wartość kwotowa nieujemna wykazana w zł</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="etd:TKwotaC">
+			<xsd:minInclusive value="0"/>
+		</xsd:restriction>
+	</xsd:simpleType>
+	<xsd:simpleType name="TData" id="TData">
+		<xsd:annotation>
+			<xsd:documentation>Typ daty</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="xsd:date">
+			<xsd:minInclusive value="1900-01-01"/>
+			<xsd:maxInclusive value="2050-12-31"/>
+			<xsd:pattern value="((\d{4})-(\d{2})-(\d{2}))"/>
+		</xsd:restriction>
+	</xsd:simpleType>
+	<xsd:simpleType name="TDataCzas" id="TDataCzas">
+		<xsd:annotation>
+			<xsd:documentation>Typ daty i godziny</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="xsd:dateTime">
+			<xsd:whiteSpace value="collapse"/>
+		</xsd:restriction>
+	</xsd:simpleType>
+	<xsd:simpleType name="TRok">
+		<xsd:annotation>
+			<xsd:documentation>Oznaczenie roku</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="xsd:gYear">
+			<xsd:minInclusive value="1900"/>
+			<xsd:maxInclusive value="2050"/>
+		</xsd:restriction>
+	</xsd:simpleType>
+	<xsd:simpleType name="TMiesiac">
+		<xsd:annotation>
+			<xsd:documentation>Element będący numerem miesiąca</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="xsd:byte">
+			<xsd:maxInclusive value="12"/>
+			<xsd:minInclusive value="1"/>
+		</xsd:restriction>
+	</xsd:simpleType>
+	<xsd:simpleType name="TKwartal">
+		<xsd:annotation>
+			<xsd:documentation>Element będący numerem kwartału</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="xsd:byte">
+			<xsd:minInclusive value="1"/>
+			<xsd:maxInclusive value="4"/>
+		</xsd:restriction>
+	</xsd:simpleType>
+	<xsd:simpleType name="TAdresEmail">
+		<xsd:annotation>
+			<xsd:documentation>Adres e-mail</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="xsd:token">
+			<xsd:minLength value="3"/>
+			<xsd:maxLength value="255"/>
+			<xsd:pattern value="(.)+@(.)+"/>
+		</xsd:restriction>
+	</xsd:simpleType>
+	<xsd:simpleType name="TNrNIP">
+		<xsd:annotation>
+			<xsd:documentation>Identyfikator podatkowy NIP</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="xsd:string">
+			<xsd:pattern value="[1-9]((\d[1-9])|([1-9]\d))\d{7}"/>
+		</xsd:restriction>
+	</xsd:simpleType>
+	<xsd:simpleType name="TNrPESEL">
+		<xsd:annotation>
+			<xsd:documentation>Identyfikator podatkowy numer PESEL</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="xsd:string">
+			<xsd:pattern value="\d{11}"/>
+		</xsd:restriction>
+	</xsd:simpleType>
+	<xsd:simpleType name="TNrREGON">
+		<xsd:annotation>
+			<xsd:documentation>Numer REGON</xsd:documentation>
+		</xsd:annotation>
+		<xsd:union>
+			<xsd:simpleType>
+				<xsd:restriction base="xsd:string">
+					<xsd:pattern value="\d{9}"/>
+				</xsd:restriction>
+			</xsd:simpleType>
+			<xsd:simpleType>
+				<xsd:restriction base="xsd:string">
+					<xsd:pattern value="\d{14}"/>
+				</xsd:restriction>
+			</xsd:simpleType>
+		</xsd:union>
+	</xsd:simpleType>
+	<xsd:simpleType name="TNrAKC">
+		<xsd:annotation>
+			<xsd:documentation>Numer akcyzowy</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="xsd:string">
+			<xsd:pattern value="[A-Z]{2}\d{11}"/>
+		</xsd:restriction>
+	</xsd:simpleType>
+	<xsd:simpleType name="TNrKRS">
+		<xsd:annotation>
+			<xsd:documentation>Numer Krajowego Rejestru Sądowego</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="xsd:string">
+			<xsd:pattern value="\d{10}"/>
+		</xsd:restriction>
+	</xsd:simpleType>
+	<xsd:simpleType name="TNrIdentyfikacjiPodatkowej">
+		<xsd:annotation>
+			<xsd:documentation>Numer służący identyfikacji dla celów podatkowych</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="xsd:string">
+			<xsd:whiteSpace value="replace"/>
+			<xsd:minLength value="1"/>
+			<xsd:maxLength value="50"/>
+		</xsd:restriction>
+	</xsd:simpleType>
+	<xsd:simpleType name="TNrDokumentuStwierdzajacegoTozsamosc">
+		<xsd:annotation>
+			<xsd:documentation>Numer dokumentu stwierdzającego tożsamość</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="xsd:string">
+			<xsd:minLength value="1"/>
+			<xsd:maxLength value="50"/>
+			<xsd:whiteSpace value="replace"/>
+		</xsd:restriction>
+	</xsd:simpleType>
+	<xsd:simpleType name="TImie">
+		<xsd:annotation>
+			<xsd:documentation>Pierwsze imię</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="xsd:token">
+			<xsd:minLength value="1"/>
+			<xsd:maxLength value="30"/>
+		</xsd:restriction>
+	</xsd:simpleType>
+	<xsd:simpleType name="TMiejscowosc">
+		<xsd:annotation>
+			<xsd:documentation>Typ określający nazwę miejscowości</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="xsd:token">
+			<xsd:maxLength value="56"/>
+			<xsd:minLength value="1"/>
+		</xsd:restriction>
+	</xsd:simpleType>
+	<xsd:simpleType name="TNazwisko">
+		<xsd:annotation>
+			<xsd:documentation>Nazwisko</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="xsd:token">
+			<xsd:maxLength value="81"/>
+			<xsd:minLength value="1"/>
+		</xsd:restriction>
+	</xsd:simpleType>
+	<xsd:simpleType name="TJednAdmin">
+		<xsd:annotation>
+			<xsd:documentation>Typ określający nazwę województwa, nazwę powiatu lub nazwę gminy</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="xsd:token">
+			<xsd:maxLength value="36"/>
+			<xsd:minLength value="1"/>
+		</xsd:restriction>
+	</xsd:simpleType>
