@@ -5918,8 +5918,6 @@ def api_client_search_log():
     if results_count < 0:
         results_count = 0
     matches = data.get("matches") if isinstance(data.get("matches"), list) else []
-    if results_count < 1:
-        return jsonify(ok=True, skipped=True, no_results=True)
     rows_to_save = []
     created_at = now_iso()
     seen_products = set()
@@ -5968,6 +5966,7 @@ def api_client_search_log():
               SELECT 1
               FROM client_search_logs
               WHERE LOWER(COALESCE(customer_email,''))=?
+                AND LOWER(COALESCE(query,''))=?
                 AND LOWER(COALESCE(product_sku,''))=?
                 AND LOWER(COALESCE(product_model,''))=?
                 AND COALESCE(source,'stock')=?
@@ -5975,6 +5974,7 @@ def api_client_search_log():
               LIMIT 1
             """, (
                 row.get("customer_email", "").lower(),
+                row.get("query", "").lower(),
                 row.get("product_sku", "").lower(),
                 row.get("product_model", "").lower(),
                 row.get("source", "stock"),
