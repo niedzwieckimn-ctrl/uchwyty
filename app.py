@@ -1,7 +1,6 @@
 import uuid
 from unittest.mock import Mock
 
-import pytest
 
 import app as backend
 
