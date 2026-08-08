@@ -1362,7 +1362,9 @@ def pull_shared_tables_from_supabase(force: bool = False):
 
 def maybe_pull_shared_from_supabase(force: bool = False):
     try:
-        if request.method == "GET":
+        # `force=True` jest używane również przez chronione akcje POST
+        # (np. ponowna wysyłka potwierdzenia po restarcie Rendera).
+        if force or request.method == "GET":
             pull_shared_tables_from_supabase(force=force)
     except Exception:
         pass
