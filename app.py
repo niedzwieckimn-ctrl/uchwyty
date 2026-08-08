@@ -824,6 +824,7 @@ def ensure_stock_row(product_id):
 
 SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "https://qfzawzkynmqkbjlbtkjd.supabase.co").strip().rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "").strip()
 CLIENT_ALLOWED_ORIGINS = {
     value.strip().rstrip("/")
     for value in os.environ.get("CLIENT_ALLOWED_ORIGINS", "").split(",")
@@ -6115,7 +6116,13 @@ def _authenticated_client_user() -> dict | None:
     if not token:
         return None
     req = urllib.request.Request(f"{SUPABASE_URL}/auth/v1/user", method="GET")
-    req.add_header("apikey", SUPABASE_SERVICE_ROLE_KEY)
+    # Endpoint Auth powinien dostać publiczny klucz projektu jako `apikey`.
+    # Token użytkownika pozostaje osobno w nagłówku Authorization.
+    api_key = SUPABASE_ANON_KEY or SUPABASE_SERVICE_ROLE_KEY
+    if not api_key:
+        app.logger.error("Weryfikacja klienta niemożliwa: brak SUPABASE_ANON_KEY")
+        return None
+    req.add_header("apikey", api_key)
     req.add_header("Authorization", f"Bearer {token}")
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
@@ -6129,7 +6136,11 @@ def _authenticated_client_user() -> dict | None:
             "email": email,
             "name": norm(metadata.get("full_name") or metadata.get("name")) or email.split("@")[0],
         }
-    except Exception:
+    except urllib.error.HTTPError as exc:
+        app.logger.warning("Supabase odrzucił token klienta: HTTP %s", exc.code)
+        return None
+    except Exception as exc:
+        app.logger.warning("Nie udało się zweryfikować tokenu klienta: %s", type(exc).__name__)
         return None
 
 
