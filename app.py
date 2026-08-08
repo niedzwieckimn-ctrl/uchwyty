@@ -11,6 +11,7 @@ import sqlite3
 import socket
 import time
 import threading
+import uuid
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -419,6 +420,8 @@ def init_db():
         cur.execute("ALTER TABLE orders ADD COLUMN qr_data_url TEXT")
     if "warehouse_issued" not in order_cols:
         cur.execute("ALTER TABLE orders ADD COLUMN warehouse_issued INTEGER NOT NULL DEFAULT 0")
+    if "idempotency_key" not in order_cols:
+        cur.execute("ALTER TABLE orders ADD COLUMN idempotency_key TEXT")
 
     # UĹ‚atwia agregowanie "w dostawie" po statusach paczek
     cur.execute("CREATE INDEX IF NOT EXISTS idx_china_items_package_id ON china_items(package_id)")
@@ -428,6 +431,7 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_client_search_logs_model ON client_search_logs(product_model)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_email_events_key ON email_events(event_key)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_email_events_type_created ON email_events(event_type, created_at)")
+    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_idempotency_key ON orders(idempotency_key) WHERE idempotency_key IS NOT NULL")
 
     c.commit()
     c.close()
@@ -809,7 +813,17 @@ def ensure_stock_row(product_id):
 # =========================
 
 SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "https://qfzawzkynmqkbjlbtkjd.supabase.co").strip().rstrip("/")
-SUPABASE_SERVICE_ROLE_KEY = (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFmemF3emt5bm1xa2JqbGJ0a2pkIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NDUyNDgxMCwiZXhwIjoyMDkwMTAwODEwfQ.DcyQuZL4atOlbsgSWBmgl-nvQ0eJOTrcu6ciU59O7zU").strip()
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+CLIENT_ALLOWED_ORIGINS = {
+    value.strip().rstrip("/")
+    for value in os.environ.get("CLIENT_ALLOWED_ORIGINS", "").split(",")
+    if value.strip()
+}
+ADMIN_ACTION_TOKEN = os.environ.get("ADMIN_ACTION_TOKEN", "").strip()
+if not SUPABASE_SERVICE_ROLE_KEY:
+    app.logger.error("Brak SUPABASE_SERVICE_ROLE_KEY; funkcje synchronizacji i zamówień klienta będą niedostępne.")
+if not CLIENT_ALLOWED_ORIGINS:
+    app.logger.warning("CLIENT_ALLOWED_ORIGINS jest puste; przeglądarkowe żądania tworzenia zamówień będą odrzucane.")
 SUPABASE_STORAGE_BUCKET = (os.environ.get("SUPABASE_STORAGE_BUCKET") or "invoice-pdfs").strip()
 SUPABASE_AUTO_SYNC_ON_WRITE = (os.environ.get("SUPABASE_AUTO_SYNC_ON_WRITE") or "1").strip().lower() in ("1", "true", "yes", "on")
 SUPABASE_MIN_SYNC_INTERVAL_SEC = float((os.environ.get("SUPABASE_MIN_SYNC_INTERVAL_SEC") or "2").strip())
@@ -1391,9 +1405,9 @@ def remote_first_create_customer(name: str, address: str, phone: str, email: str
     return customer_id
 
 
-def remote_first_create_order(customer_id, customer_name, customer_address, customer_phone, customer_email, note, items):
+def remote_first_create_order(customer_id, customer_name, customer_address, customer_phone, customer_email, note, items, idempotency_key=None):
     created_at = now_iso()
-    created_order = supabase_insert_row("orders", {
+    order_payload = {
         "order_no": "TEMP",
         "customer_id": customer_id if customer_id else None,
         "customer_name": customer_name,
@@ -1404,7 +1418,10 @@ def remote_first_create_order(customer_id, customer_name, customer_address, cust
         "note": note,
         "created_at": created_at,
         "qr_data_url": "",
-    })
+    }
+    if idempotency_key:
+        order_payload["idempotency_key"] = idempotency_key
+    created_order = supabase_insert_row("orders", order_payload)
     if not created_order or "id" not in created_order:
         raise RuntimeError("Supabase nie zwrĂłciĹ‚ ID dla zamĂłwienia")
 
@@ -1414,33 +1431,42 @@ def remote_first_create_order(customer_id, customer_name, customer_address, cust
     supabase_update_rows("orders", {"order_no": order_no, "qr_data_url": qr_data_url}, {"id": order_id})
 
     c = conn()
-    cur = c.cursor()
-    cur.execute(
-        "INSERT INTO orders(id, order_no, customer_id, customer_name, customer_address, customer_phone, customer_email, status, note, created_at, qr_data_url) VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET order_no=excluded.order_no, customer_id=excluded.customer_id, customer_name=excluded.customer_name, customer_address=excluded.customer_address, customer_phone=excluded.customer_phone, customer_email=excluded.customer_email, status=excluded.status, note=excluded.note, created_at=excluded.created_at, qr_data_url=excluded.qr_data_url",
-        (order_id, order_no, customer_id if customer_id else None, customer_name, customer_address, customer_phone, customer_email, "new", note, created_at, qr_data_url)
-    )
-
-    for pid, qty in items:
-        cur.execute("SELECT sku FROM products WHERE id=?", (pid,))
-        p = cur.fetchone()
-        if not p:
-            continue
-        created_item = supabase_insert_row("order_items", {
-            "order_id": order_id,
-            "product_id": pid,
-            "sku": p["sku"],
-            "qty": qty,
-            "created_at": now_iso(),
-        })
-        if not created_item or "id" not in created_item:
-            raise RuntimeError("Supabase nie zwrĂłciĹ‚ ID dla pozycji zamĂłwienia")
+    try:
+        cur = c.cursor()
         cur.execute(
-            "INSERT INTO order_items(id, order_id, product_id, sku, qty, created_at) VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET order_id=excluded.order_id, product_id=excluded.product_id, sku=excluded.sku, qty=excluded.qty, created_at=excluded.created_at",
-            (int(created_item["id"]), order_id, pid, p["sku"], qty, created_item.get("created_at") or now_iso())
+            "INSERT INTO orders(id, order_no, customer_id, customer_name, customer_address, customer_phone, customer_email, status, note, created_at, qr_data_url, idempotency_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET order_no=excluded.order_no, customer_id=excluded.customer_id, customer_name=excluded.customer_name, customer_address=excluded.customer_address, customer_phone=excluded.customer_phone, customer_email=excluded.customer_email, status=excluded.status, note=excluded.note, created_at=excluded.created_at, qr_data_url=excluded.qr_data_url, idempotency_key=excluded.idempotency_key",
+            (order_id, order_no, customer_id if customer_id else None, customer_name, customer_address, customer_phone, customer_email, "new", note, created_at, qr_data_url, idempotency_key)
         )
 
-    c.commit()
-    c.close()
+        for pid, qty in items:
+            cur.execute("SELECT sku FROM products WHERE id=?", (pid,))
+            p = cur.fetchone()
+            if not p:
+                raise ValueError(f"Nie istnieje produkt ID {pid}")
+            created_item = supabase_insert_row("order_items", {
+                "order_id": order_id,
+                "product_id": pid,
+                "sku": p["sku"],
+                "qty": qty,
+                "created_at": now_iso(),
+            })
+            if not created_item or "id" not in created_item:
+                raise RuntimeError("Supabase nie zwrócił ID dla pozycji zamówienia")
+            cur.execute(
+                "INSERT INTO order_items(id, order_id, product_id, sku, qty, created_at) VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET order_id=excluded.order_id, product_id=excluded.product_id, sku=excluded.sku, qty=excluded.qty, created_at=excluded.created_at",
+                (int(created_item["id"]), order_id, pid, p["sku"], qty, created_item.get("created_at") or now_iso())
+            )
+        c.commit()
+    except Exception:
+        c.rollback()
+        try:
+            supabase_delete_rows("order_items", {"order_id": order_id})
+            supabase_delete_rows("orders", {"id": order_id})
+        except Exception as rollback_exc:
+            app.logger.error("Niepełny rollback zamówienia order_id=%s: %s", order_id, rollback_exc)
+        raise
+    finally:
+        c.close()
     try:
         normalize_temp_order_numbers()
     except Exception:
@@ -2528,57 +2554,39 @@ BASE = r"""
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ title or "NiedĹşwieccy Orders" }}</title>
   <style>
-    body{font-family:Arial, sans-serif; margin:0; background:#f6f7fb; color:#111;}
-    .top{background:#111; color:#fff; padding:12px 14px; display:flex; gap:10px; flex-wrap:wrap; align-items:center;}
-    .brand{font-weight:700; letter-spacing:.2px;}
-    .nav a,.nav-drop-btn{color:#fff; text-decoration:none; padding:7px 10px; border:1px solid rgba(255,255,255,.25); border-radius:10px; background:transparent; font:inherit; cursor:pointer;}
-    .nav a:hover,.nav-drop-btn:hover{background:rgba(255,255,255,.08)}
-    .nav-dropdown{position:relative; display:inline-flex;}
-    .nav-dropdown-menu{display:none; position:absolute; top:calc(100% + 6px); left:0; min-width:190px; background:#111; border:1px solid rgba(255,255,255,.25); border-radius:12px; padding:6px; z-index:1000; box-shadow:0 12px 30px rgba(0,0,0,.35);}
-    .nav-dropdown:hover .nav-dropdown-menu,.nav-dropdown:focus-within .nav-dropdown-menu{display:grid; gap:6px;}
-    .nav-dropdown-menu a{display:block; white-space:nowrap; border-color:rgba(255,255,255,.18);}
-    .wrap{max-width:1100px; margin:16px auto; padding:0 12px;}
-    .card{background:#fff; border:1px solid #e7e7ee; border-radius:14px; padding:14px; box-shadow:0 8px 22px rgba(0,0,0,.04); margin-bottom:12px;}
-    .row{display:grid; grid-template-columns:1fr 1fr; gap:12px;}
-    @media (max-width:860px){ .row{grid-template-columns:1fr;} }
-    h1{font-size:22px; margin:0 0 12px;}
-    h2{font-size:16px; margin:0 0 10px;}
-    .muted{color:#666; font-size:12px;}
-    .btn{display:inline-block; padding:9px 12px; border:1px solid #ddd; border-radius:10px; background:#fff; color:#111; text-decoration:none; cursor:pointer;}
-    .btn.primary{background:#111; color:#fff; border-color:#111;}
-    .btn.danger{background:#b00020; color:#fff; border-color:#b00020;}
-    .btn.ok{background:#0a7a34; color:#fff; border-color:#0a7a34;}
-    input, select, textarea{width:100%; padding:10px; border:1px solid #ddd; border-radius:10px; font-size:14px;}
-    textarea{min-height:90px;}
-    table{width:100%; border-collapse:collapse;}
-    th,td{border-bottom:1px solid #eee; padding:10px; text-align:left; vertical-align:top;}
-    th{background:#fafafa;}
-    .badge{display:inline-block; padding:4px 8px; border-radius:999px; border:1px solid #ddd; font-size:12px;}
-    .flex{display:flex; gap:10px; flex-wrap:wrap; align-items:center;}
-    .right{margin-left:auto;}
-    .small{font-size:12px;}
-    .grid3{display:grid; grid-template-columns: 2fr 1fr 1fr; gap:12px;}
-    @media (max-width:860px){ .grid3{grid-template-columns:1fr;} }
-    .line{height:1px; background:#eee; margin:12px 0;}
-    .hint{background:#fff7d6; border:1px solid #ffe08a; padding:10px; border-radius:12px; font-size:13px;}
-    .kpi{display:flex; gap:12px; flex-wrap:wrap;}
-    .kpi .pill{background:#fafafa; border:1px solid #eee; padding:8px 10px; border-radius:999px; font-size:13px;}
-    .items-row{display:grid; grid-template-columns: 2fr 120px 120px 120px; gap:10px; align-items:center;}
-    @media (max-width:860px){ .items-row{grid-template-columns:1fr 1fr;} }
+    :root{--navy:#12213d;--navy2:#0b1730;--blue:#5577ee;--blue2:#3f63dc;--mint:#31b98b;--amber:#f5a524;--red:#e05263;--ink:#17233c;--muted:#718096;--bg:#f5f6fa;--line:#e7eaf2;--card:#fff;--radius:22px;--shadow:0 12px 35px rgba(31,45,78,.07)}
+    *{box-sizing:border-box}html{background:var(--bg)}body{font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;background:radial-gradient(circle at 85% -10%,#eaf0ff 0,transparent 28%),var(--bg);color:var(--ink);line-height:1.45}
+    .top{position:fixed;inset:10px auto 10px 10px;width:238px;background:linear-gradient(165deg,var(--navy),var(--navy2));color:#fff;padding:22px 14px;border-radius:26px;display:flex;flex-direction:column;z-index:1100;box-shadow:0 24px 50px rgba(10,24,54,.22);overflow-y:auto}
+    .brand{font-size:19px;font-weight:800;letter-spacing:-.3px;padding:4px 10px 20px;display:flex;align-items:center;gap:10px}.brand:before{content:"◇";display:grid;place-items:center;width:36px;height:36px;border:1px solid rgba(255,255,255,.32);border-radius:12px;background:rgba(255,255,255,.08);font-size:20px}
+    .nav{display:flex!important;flex-direction:column;align-items:stretch!important;gap:5px!important;flex-wrap:nowrap!important;width:100%}.nav a,.nav-drop-btn{display:flex;align-items:center;color:#dce5f7;text-decoration:none;padding:11px 12px;border:0;border-radius:13px;background:transparent;font:inherit;font-size:14px;font-weight:600;cursor:pointer;transition:.18s ease}.nav a:hover,.nav-drop-btn:hover,.nav a.active{background:rgba(93,128,246,.24);color:#fff;transform:translateX(2px)}
+    .nav a:before{width:25px;font-size:16px;opacity:.9}.nav a:nth-child(1):before{content:"⌂"}.nav a:nth-child(2):before{content:"▣"}.nav a:nth-child(3):before{content:"＋"}.nav a:nth-child(4):before{content:"▤"}.nav a:nth-child(5):before{content:"K"}.nav a:nth-child(6):before{content:"⌕"}.nav a:nth-child(7):before{content:"▦"}.nav a:nth-child(8):before{content:"◇"}.nav a:nth-child(9):before{content:"▧"}
+    .nav-dropdown{position:relative;display:block}.nav-drop-btn{width:100%;text-align:left}.nav-drop-btn:before{content:"⚙";width:25px}.nav-dropdown-menu{display:none;margin:4px 0 2px 12px;border-left:1px solid rgba(255,255,255,.16);padding:2px 0 2px 8px}.nav-dropdown:hover .nav-dropdown-menu,.nav-dropdown:focus-within .nav-dropdown-menu{display:grid;gap:2px}.nav-dropdown-menu a{font-size:13px;padding:8px 10px}.nav-dropdown-menu a:before{display:none}
+    .top>.right{margin:auto 8px 0!important;padding-top:16px;border-top:1px solid rgba(255,255,255,.13);color:#91a1bd!important;font-size:10px;overflow-wrap:anywhere}
+    .mobile-toggle{display:none}.wrap{max-width:1500px;margin:0 0 0 258px;padding:28px 28px 18px;min-height:100vh}
+    .card{background:rgba(255,255,255,.94);border:1px solid rgba(226,230,239,.9);border-radius:var(--radius);padding:20px;box-shadow:var(--shadow);margin-bottom:16px;overflow-x:auto}.card:hover{border-color:#dce2f1}
+    .row{display:grid;grid-template-columns:1fr 1fr;gap:16px}h1{font-size:26px;letter-spacing:-.7px;margin:0 0 16px}h2{font-size:17px;letter-spacing:-.2px;margin:0 0 13px}.muted{color:var(--muted);font-size:12px}
+    .btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:10px 14px;border:1px solid #dce1eb;border-radius:13px;background:#fff;color:var(--ink);font-weight:650;text-decoration:none;cursor:pointer;box-shadow:0 3px 10px rgba(30,44,75,.04);transition:.18s ease}.btn:hover{transform:translateY(-1px);border-color:#bfc9df;box-shadow:0 7px 16px rgba(30,44,75,.09)}.btn.primary{background:linear-gradient(135deg,var(--blue),var(--blue2));color:#fff;border-color:transparent}.btn.danger{background:#fff0f2;color:#b92d43;border-color:#ffd6dc}.btn.ok{background:#e9faf4;color:#14835f;border-color:#c6f0e2}
+    input,select,textarea{width:100%;padding:11px 13px;border:1px solid #dfe3ec;border-radius:13px;background:#fbfcfe;color:var(--ink);font:inherit;font-size:14px;outline:none;transition:.18s}input:focus,select:focus,textarea:focus{border-color:#7892f3;background:#fff;box-shadow:0 0 0 4px rgba(85,119,238,.11)}textarea{min-height:90px}
+    table{width:100%;border-collapse:separate;border-spacing:0;min-width:660px}th,td{border-bottom:1px solid #edf0f5;padding:12px 11px;text-align:left;vertical-align:middle}th{background:#f8f9fc;color:#64718a;font-size:11px;text-transform:uppercase;letter-spacing:.45px;font-weight:750}thead th:first-child{border-radius:12px 0 0 12px}thead th:last-child{border-radius:0 12px 12px 0}tbody tr{transition:.15s}tbody tr:hover{background:#fafbff}
+    .badge{display:inline-block;padding:5px 10px;border-radius:999px;border:1px solid #dfe4ef;background:#f8faff;color:#526079;font-size:11px;font-weight:700}.st-confirmed,.badge-paid{background:#e8f9f3!important;color:#16835f!important;border-color:#c9efe2!important}.st-unconfirmed{background:#fff1f2!important;color:#be3b50!important;border-color:#ffd7dc!important}.st-delivery{background:#edf3ff!important;color:#4166d3!important;border-color:#d9e4ff!important}.st-issued{background:#f0f2f6!important;color:#667085!important}
+    .flex{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.right{margin-left:auto}.small{font-size:12px}.grid3{display:grid;grid-template-columns:2fr 1fr 1fr;gap:16px}.line{height:1px;background:#edf0f5;margin:16px 0}.hint{background:#fff9e9;border:1px solid #f8e6ae;padding:12px 14px;border-radius:14px;color:#7e641b;font-size:13px}.kpi{display:flex;gap:10px;flex-wrap:wrap}.kpi .pill{background:#f4f7ff;border:1px solid #e1e8fb;padding:8px 11px;border-radius:999px;color:#516582;font-size:12px}.items-row{display:grid;grid-template-columns:2fr 120px 120px 120px;gap:10px;align-items:center}
+    @media(max-width:980px){.top{transform:translateX(-110%);transition:.25s}.top.open{transform:translateX(0)}.mobile-toggle{display:grid;place-items:center;position:fixed;right:14px;bottom:14px;z-index:1200;width:52px;height:52px;border:0;border-radius:17px;background:var(--navy);color:#fff;font-size:22px;box-shadow:0 12px 28px rgba(12,28,58,.28)}.wrap{margin-left:0;padding:18px 14px 80px}.row,.grid3{grid-template-columns:1fr}.items-row{grid-template-columns:1fr 1fr}}
+    @media(max-width:560px){.card{padding:15px;border-radius:18px}.items-row{grid-template-columns:1fr}.flex>.right{margin-left:0}h1{font-size:22px}}
   </style>
 </head>
 <body>
+  <button class="mobile-toggle" type="button" onclick="document.querySelector('.top').classList.toggle('open')">☰</button>
   <div class="top">
-    <div class="brand">NiedĹşwieccy Orders</div>
+    <div class="brand">Niedźwieccy</div>
     <div class="nav flex">
-      <a href="{{ url_for('home') }}">Start</a>
-      <a href="{{ url_for('orders') }}">ZamĂłwienia</a>
-      <a href="{{ url_for('order_new') }}">Nowe zamĂłwienie</a>
+      <a class="{% if request.endpoint == 'home' %}active{% endif %}" href="{{ url_for('home') }}">Pulpit</a>
+      <a class="{% if request.endpoint in ['orders','order_view'] %}active{% endif %}" href="{{ url_for('orders') }}">Zamówienia</a>
+      <a class="{% if request.endpoint == 'order_new' %}active{% endif %}" href="{{ url_for('order_new') }}">Nowe zamówienie</a>
       <a href="{{ url_for('invoices') }}">Faktury</a>
       <a href="{{ url_for('ksef_dashboard') }}">KSeF</a>
       <a href="{{ url_for('client_searches') }}">Wyszukiwania</a>
-      <a href="{{ url_for('stock') }}">Magazyn</a>
-      <a href="{{ url_for('china') }}">Chiny (P/O)</a>
+      <a href="{{ url_for('stock') }}">Stan magazynu</a>
+      <a href="{{ url_for('china') }}">Dostawy (P/O)</a>
       <a href="{{ url_for('order_scan') }}">Skan QR</a>
       <div class="nav-dropdown">
         <button class="nav-drop-btn" type="button">Ustawienia ▾</button>
@@ -2592,7 +2600,7 @@ BASE = r"""
         </div>
       </div>
     </div>
-    <div class="right muted">Lokalnie â€˘ {{ base_url }}</div>
+    <div class="right muted">Magazyn główny<br>{{ base_url }}</div>
   </div>
 
   <div class="wrap">
@@ -2683,36 +2691,29 @@ def home():
     {% extends "base.html" %}
     {% block content %}
       <style>
-        .start-kpi .pill{
-          font-size:20px;
-          padding:14px 18px;
-          line-height:1.35;
-        }
-        .start-kpi .pill b{
-          font-size:28px;
-        }
+        .dashboard-head{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:20px}.dashboard-head h1{margin:0}.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;margin-bottom:16px}.metric{position:relative;overflow:hidden;background:#fff;border:1px solid #e7eaf2;border-radius:22px;padding:20px;box-shadow:var(--shadow)}.metric:after{content:"";position:absolute;right:-25px;top:-30px;width:95px;height:95px;border-radius:50%;background:var(--glow,#edf3ff)}.metric .icon{position:relative;z-index:1;display:grid;place-items:center;width:45px;height:45px;border-radius:15px;background:var(--soft,#edf3ff);color:var(--tone,#5577ee);font-size:21px;margin-bottom:15px}.metric span{color:#718096;font-size:12px;font-weight:650}.metric b{display:block;margin-top:4px;font-size:27px;letter-spacing:-.7px}.metric small{display:block;margin-top:7px;color:#8a96aa}.quick-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:12px}.quick-grid .btn{min-height:74px;flex-direction:column;background:#f8faff;border-color:#e8ecf6}.quick-grid .btn:first-child{background:#edf3ff;color:#4166d3}.quick-grid .btn:nth-child(2){background:#eaf9f4;color:#16835f}@media(max-width:1100px){.metrics{grid-template-columns:1fr 1fr}.quick-grid{grid-template-columns:1fr 1fr}}@media(max-width:560px){.metrics,.quick-grid{grid-template-columns:1fr}}
       </style>
 
-      <div class="card">
-        <h1>Start</h1>
-        <div class="muted">Szybki podglÄ…d najwaĹĽniejszych, bieĹĽÄ…cych danych.</div>
+      <div class="dashboard-head">
+        <div><h1>Pulpit</h1><div class="muted">Najważniejsze informacje z magazynu w jednym miejscu.</div></div>
+        <a class="btn primary right" href="{{ url_for('order_new') }}">＋ Nowe zamówienie</a>
+      </div>
+
+      <div class="metrics">
+        <div class="metric"><div class="icon">▣</div><span>Aktywne zamówienia</span><b>{{ n_orders_current }}</b><small>W toku i do realizacji</small></div>
+        <div class="metric" style="--soft:#eaf9f4;--tone:#1aa176;--glow:#eaf9f4"><div class="icon">◇</div><span>Towar na stanie</span><b>{{ n_stock_qty }} szt.</b><small>{{ n_products }} produktów</small></div>
+        <div class="metric" style="--soft:#fff6e6;--tone:#db8a13;--glow:#fff6e6"><div class="icon">⇢</div><span>W drodze</span><b>{{ n_in_delivery_qty }} szt.</b><small>{{ n_china_active }} aktywnych dostaw</small></div>
+        <div class="metric" style="--soft:#f2edff;--tone:#7453d9;--glow:#f2edff"><div class="icon">₿</div><span>Wartość netto</span><b>{{ "%.2f"|format(inventory_value_net) }} zł</b><small>Magazyn i dostawy</small></div>
       </div>
 
       <div class="card">
-        <h2>ZamĂłwienia i paczki (aktualne)</h2>
-        <div class="kpi start-kpi">
-          <div class="pill">ZamĂłwienia aktualne (new/packed/confirmed/in_delivery): <b>{{ n_orders_current }}</b></div>
-          <div class="pill">Paczki Chiny aktywne (planned/ordered/shipped): <b>{{ n_china_active }}</b></div>
-        </div>
-      </div>
-
-      <div class="card">
-        <h2>Stan asortymentu</h2>
-        <div class="kpi start-kpi">
-          <div class="pill">Produkty: <b>{{ n_products }}</b></div>
-          <div class="pill">Uchwyty na stanie: <b>{{ n_stock_qty }}</b> szt.</div>
-          <div class="pill">Uchwyty w drodze: <b>{{ n_in_delivery_qty }}</b> szt.</div>
-          <div class="pill">WartoĹ›Ä‡ magazynu + w drodze (netto): <b>{{ "%.2f"|format(inventory_value_net) }} PLN</b></div>
+        <h2>Szybkie akcje</h2>
+        <div class="quick-grid">
+          <a class="btn" href="{{ url_for('order_new') }}">＋<span>Nowe zamówienie</span></a>
+          <a class="btn" href="{{ url_for('stock') }}">▦<span>Stan magazynu</span></a>
+          <a class="btn" href="{{ url_for('china') }}">⇢<span>Przyjęcie dostawy</span></a>
+          <a class="btn" href="{{ url_for('invoices') }}">▤<span>Faktury</span></a>
+          <a class="btn" href="{{ url_for('order_scan') }}">▧<span>Skanuj QR</span></a>
         </div>
       </div>
     {% endblock %}
@@ -3290,7 +3291,14 @@ register_cash_flow(app, {
 @app.after_request
 def auto_sync_after_write(response):
     try:
-        if request.path.startswith("/api/"):
+        if request.path in {"/api/client/orders", "/api/client_order_email"}:
+            origin = norm(request.headers.get("Origin")).rstrip("/")
+            if origin and origin in CLIENT_ALLOWED_ORIGINS:
+                response.headers["Access-Control-Allow-Origin"] = origin
+                response.headers["Vary"] = "Origin"
+            response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, Idempotency-Key"
+        elif request.path.startswith("/api/"):
             response.headers["Access-Control-Allow-Origin"] = "*"
             response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
             response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
@@ -4706,6 +4714,9 @@ def order_view(order_id):
           <div class="right flex">
             <a class="btn" href="{{ url_for('orders') }}">â† Lista</a>
             <a class="btn primary" href="{{ url_for('order_invoice', order_id=o['id']) }}">Faktura</a>
+            <form method="post" action="{{ url_for('order_confirmation_resend', order_id=o['id']) }}">
+              <button class="btn" type="submit">Wyślij ponownie potwierdzenie</button>
+            </form>
             <form method="post" action="{{ url_for('order_status_update', order_id=o['id']) }}" class="flex">
                 <select name="status" style="width:190px;">
                   <option value="new" {% if o['status'] in ['new','pending','unconfirmed'] %}selected{% endif %}>Niepotwierdzone</option>
@@ -4725,6 +4736,11 @@ def order_view(order_id):
           </div>
         </div>
         <div class="muted" style="margin-top:6px;">{{ o['created_at'] }}</div>
+        {% if request.args.get('confirmation_sent') == '1' %}
+          <div class="hint" style="margin-top:10px;">Potwierdzenie zamówienia zostało wysłane ponownie.</div>
+        {% elif request.args.get('confirmation_error') %}
+          <div class="hint" style="margin-top:10px; border-color:#fecaca; background:#fff1f2;">Nie udało się wysłać potwierdzenia: {{ request.args.get('confirmation_error') }}</div>
+        {% endif %}
       </div>
 
       <div class="row">
@@ -4846,6 +4862,18 @@ def order_view(order_id):
     {% endblock %}
     """
     return render_template_string(tpl, title=canonical_order_no(o["id"], o["created_at"], o["order_no"]), base_url=BASE_URL, db_path=DB_PATH, o=o, items=items, order_url=order_url, products=products_rows, locked=(int(o["warehouse_issued"] or 0)==1), order_status_label=order_status_label, order_status_css=order_status_css, canonical_order_no=canonical_order_no)
+
+
+@app.post("/orders/<int:order_id>/confirmation/resend")
+def order_confirmation_resend(order_id):
+    try:
+        maybe_pull_shared_from_supabase(force=True)
+    except Exception:
+        pass
+    result = _send_saved_order_confirmation(order_id, force=True)
+    if result.get("ok"):
+        return redirect(url_for("order_view", order_id=order_id, confirmation_sent="1"))
+    return redirect(url_for("order_view", order_id=order_id, confirmation_error=norm(result.get("error")) or "Nieznany błąd"))
 
 @app.post("/orders/<int:order_id>/items/add")
 def order_item_add(order_id):
@@ -5863,10 +5891,204 @@ def _record_email_event(event_key, event_type, ref_id, recipient, result):
         c.close()
 
 
-@app.route("/api/client_order_email", methods=["POST", "OPTIONS"])
-def api_client_order_email():
+def _send_saved_order_confirmation(order_id: int, force: bool = False) -> dict:
+    """Send a confirmation using the order saved by the warehouse backend."""
+    c = conn()
+    try:
+        cur = c.cursor()
+        cur.execute("SELECT * FROM orders WHERE id=? LIMIT 1", (order_id,))
+        row = cur.fetchone()
+        if not row:
+            return {"ok": False, "error": "Nie znaleziono zamówienia"}
+        order = dict(row)
+        cur.execute("""
+          SELECT oi.sku, oi.qty, COALESCE(p.name, pr.name, '') AS name
+          FROM order_items oi
+          LEFT JOIN products p ON p.id = oi.product_id
+          LEFT JOIN products pr ON pr.sku = oi.sku
+          WHERE oi.order_id=?
+          ORDER BY oi.id
+        """, (order_id,))
+        items = [dict(x) for x in cur.fetchall()]
+    finally:
+        c.close()
+
+    try:
+        admin_email = norm(email_config_summary().get("admin_email"))
+    except Exception:
+        admin_email = ""
+    recipient = ", ".join([x for x in [norm(order.get("customer_email")), admin_email] if x])
+    recipient_hash = hashlib.sha1(recipient.lower().encode("utf-8")).hexdigest()[:12] if recipient else "no-recipient"
+    event_key = f"order_confirmation:{order_id}:{recipient_hash}"
+
+    if not force and _email_event_already_ok(event_key):
+        return {"ok": True, "duplicate": True, "skipped": True, "to": recipient}
+    if not send_order_confirmation:
+        result = {"ok": False, "skipped": True, "error": "Brak modułu email_module.py"}
+    else:
+        try:
+            result = send_order_confirmation(order, items, admin_email=admin_email)
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+    _record_email_event(event_key, "order_confirmation", order_id, recipient, result)
+    return result
+
+
+def _authenticated_client_user() -> dict | None:
+    auth = norm(request.headers.get("Authorization"))
+    if not auth.lower().startswith("bearer "):
+        return None
+    token = auth.split(None, 1)[1].strip()
+    if not token:
+        return None
+    req = urllib.request.Request(f"{SUPABASE_URL}/auth/v1/user", method="GET")
+    req.add_header("apikey", SUPABASE_SERVICE_ROLE_KEY)
+    req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        email = norm(payload.get("email")).lower()
+        if not payload.get("id") or not email:
+            return None
+        metadata = payload.get("user_metadata") if isinstance(payload.get("user_metadata"), dict) else {}
+        return {
+            "id": str(payload.get("id")),
+            "email": email,
+            "name": norm(metadata.get("full_name") or metadata.get("name")) or email.split("@")[0],
+        }
+    except Exception:
+        return None
+
+
+def _order_by_idempotency_key(idempotency_key: str) -> dict | None:
+    c = conn()
+    try:
+        cur = c.cursor()
+        cur.execute("SELECT id, order_no, customer_email FROM orders WHERE idempotency_key=? LIMIT 1", (idempotency_key,))
+        row = cur.fetchone()
+        if row:
+            return dict(row)
+    finally:
+        c.close()
+    if not supabase_enabled():
+        return None
+    rows = supabase_request(
+        "/rest/v1/orders",
+        params={"select": "id,order_no,customer_email", "idempotency_key": f"eq.{idempotency_key}", "limit": 1},
+    )
+    return dict(rows[0]) if isinstance(rows, list) and rows else None
+
+
+def _client_order_origin_allowed() -> bool:
+    origin = norm(request.headers.get("Origin")).rstrip("/")
+    return not origin or origin in CLIENT_ALLOWED_ORIGINS
+
+
+@app.route("/api/client/orders", methods=["POST", "OPTIONS"])
+def api_client_orders_create():
+    """Create the complete order and send its email in one backend request."""
+    if not _client_order_origin_allowed():
+        return jsonify(ok=False, error="Niedozwolone źródło żądania"), 403
     if request.method == "OPTIONS":
         return ("", 204)
+
+    if not supabase_enabled():
+        app.logger.error("Odrzucono zamówienie klienta: brak konfiguracji Supabase")
+        return jsonify(ok=False, error="Brak konfiguracji połączenia z Supabase"), 503
+
+    data = request.get_json(silent=True) or {}
+    client_user = _authenticated_client_user()
+    if not client_user:
+        app.logger.warning("Odrzucono zamówienie klienta: brak lub nieważny token")
+        return jsonify(ok=False, error="Brak autoryzacji"), 401
+
+    customer_email = client_user["email"]
+    customer_name = client_user["name"]
+    note = norm(data.get("note"))
+    idempotency_key = norm(request.headers.get("Idempotency-Key"))
+    try:
+        uuid.UUID(idempotency_key)
+    except Exception:
+        return jsonify(ok=False, error="Brak lub niepoprawny Idempotency-Key"), 400
+
+    try:
+        maybe_pull_shared_from_supabase(force=True)
+    except Exception as exc:
+        app.logger.error("Nie udało się odświeżyć danych Supabase przed zamówieniem: %s", exc)
+        return jsonify(ok=False, error="Nie udało się odświeżyć danych produktów"), 503
+
+    existing = _order_by_idempotency_key(idempotency_key)
+    if existing:
+        if norm(existing.get("customer_email")).lower() != customer_email:
+            return jsonify(ok=False, error="Konflikt Idempotency-Key"), 409
+        app.logger.info("Ponowiono request user_id=%s order_id=%s idempotency_key=%s", client_user["id"], existing["id"], idempotency_key)
+        return jsonify(ok=True, duplicate=True, order={"id": existing["id"], "order_no": existing["order_no"]}, email=_send_saved_order_confirmation(int(existing["id"])))
+
+    raw_items = data.get("items")
+    if not isinstance(raw_items, list) or not raw_items:
+        return jsonify(ok=False, error="Zamówienie nie zawiera pozycji"), 400
+    if len(raw_items) > 100:
+        return jsonify(ok=False, error="Zamówienie może zawierać maksymalnie 100 pozycji"), 400
+
+    items = []
+    c = conn()
+    try:
+        cur = c.cursor()
+        for item in raw_items:
+            if not isinstance(item, dict):
+                return jsonify(ok=False, error="Nieprawidłowa pozycja zamówienia"), 400
+            product_id = item.get("product_id")
+            qty = item.get("qty")
+            if isinstance(product_id, bool) or not isinstance(product_id, int) or product_id <= 0:
+                return jsonify(ok=False, error="Nieprawidłowy identyfikator produktu"), 400
+            if isinstance(qty, bool) or not isinstance(qty, int) or qty <= 0:
+                label = norm(item.get("sku")) or str(product_id)
+                return jsonify(ok=False, error=f"Nieprawidłowa ilość dla produktu {label}"), 400
+            cur.execute("SELECT id, sku, name FROM products WHERE id=? LIMIT 1", (product_id,))
+            product = cur.fetchone()
+            if not product:
+                return jsonify(ok=False, error=f"Nie istnieje produkt ID {product_id}"), 400
+            submitted_sku = norm(item.get("sku"))
+            if submitted_sku and submitted_sku.lower() != norm(product["sku"]).lower():
+                return jsonify(ok=False, error=f"Produkt ID {product_id} nie odpowiada SKU {submitted_sku}"), 400
+            items.append((product_id, qty))
+    finally:
+        c.close()
+
+    try:
+        order_id = remote_first_create_order(None, customer_name, "", "", customer_email, note, items, idempotency_key=idempotency_key)
+        email_result = _send_saved_order_confirmation(order_id)
+        if not email_result.get("ok"):
+            email_result["pending_retry"] = True
+        c = conn()
+        try:
+            cur = c.cursor()
+            cur.execute("SELECT order_no FROM orders WHERE id=?", (order_id,))
+            row = cur.fetchone()
+            order_no = row["order_no"] if row else make_order_no(order_id, now_iso())
+        finally:
+            c.close()
+        app.logger.info("Utworzono zamówienie user_id=%s order_id=%s order_no=%s items=%s email_ok=%s", client_user["id"], order_id, order_no, len(items), bool(email_result.get("ok")))
+        return jsonify(ok=True, order={"id": order_id, "order_no": order_no}, email=email_result)
+    except Exception as exc:
+        existing = _order_by_idempotency_key(idempotency_key)
+        if existing:
+            if norm(existing.get("customer_email")).lower() != customer_email:
+                return jsonify(ok=False, error="Konflikt Idempotency-Key"), 409
+            app.logger.info("Konflikt idempotencji user_id=%s order_id=%s", client_user["id"], existing["id"])
+            return jsonify(ok=True, duplicate=True, order={"id": existing["id"], "order_no": existing["order_no"]}, email=_send_saved_order_confirmation(int(existing["id"])))
+        app.logger.exception("Błąd tworzenia zamówienia user_id=%s items=%s", client_user["id"], len(items))
+        return jsonify(ok=False, error=str(exc)), 500
+
+
+@app.route("/api/client_order_email", methods=["POST", "OPTIONS"])
+def api_client_order_email():
+    if not _client_order_origin_allowed():
+        return jsonify(ok=False, error="Niedozwolone źródło żądania"), 403
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    app.logger.warning("Użyto przestarzałego endpointu /api/client_order_email; zaktualizuj panel do /api/client/orders")
 
     data = request.get_json(silent=True) or {}
     order_id = to_int(data.get("order_id"), 0)
@@ -5965,6 +6187,38 @@ def api_client_order_email():
         result = {"ok": False, "error": str(exc)}
     _record_email_event(event_key, "order_confirmation", event_ref, recipient, result)
     return jsonify(ok=True, email=result, to=recipient, order_email=norm(order.get("customer_email")))
+
+
+@app.post("/email/order-confirmations/retry-failed")
+def retry_failed_order_confirmations():
+    supplied_token = norm(request.headers.get("X-Admin-Token"))
+    if not ADMIN_ACTION_TOKEN or supplied_token != ADMIN_ACTION_TOKEN:
+        return jsonify(ok=False, error="Brak autoryzacji"), 401
+    c = conn()
+    try:
+        cur = c.cursor()
+        cur.execute("""
+          SELECT ref_id
+          FROM email_events
+          WHERE event_type='order_confirmation' AND ok=0
+          ORDER BY created_at
+          LIMIT 50
+        """)
+        order_ids = [to_int(row["ref_id"], 0) for row in cur.fetchall()]
+    finally:
+        c.close()
+
+    retried = 0
+    sent = 0
+    for order_id in order_ids:
+        if order_id <= 0:
+            continue
+        retried += 1
+        result = _send_saved_order_confirmation(order_id)
+        if result.get("ok"):
+            sent += 1
+    app.logger.info("Retry potwierdzeń zamówień retried=%s sent=%s", retried, sent)
+    return jsonify(ok=True, retried=retried, sent=sent)
 
 
 @app.route("/email-test", methods=["GET", "POST"])
