@@ -1,3 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xsd:schema xmlns:etd="http://crd.gov.pl/xml/schematy/dziedzinowe/mf/2022/01/05/eD/DefinicjeTypy/" xmlns:xsd="http://www.w3.org/2001/XMLSchema" targetNamespace="http://crd.gov.pl/xml/schematy/dziedzinowe/mf/2022/01/05/eD/DefinicjeTypy/" elementFormDefault="qualified" attributeFormDefault="unqualified" version="1.0" xml:lang="pl">
+	<xsd:include schemaLocation="http://crd.gov.pl/xml/schematy/dziedzinowe/mf/2022/01/05/eD/DefinicjeTypy/KodyKrajow_v10-0E.xsd"/>
+	<xsd:annotation>
+		<xsd:documentation>Definicje podstawowych typów używanych w deklaracjach elektronicznych. Na podstawie poniższych typów można budować deklaracje</xsd:documentation>
+	</xsd:annotation>
+	<xsd:simpleType name="TZnakowy">
+		<xsd:annotation>
+			<xsd:documentation>Typ znakowy ograniczony do jednej linii</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="xsd:token">
+			<xsd:minLength value="1"/>
+			<xsd:maxLength value="240"/>
+		</xsd:restriction>
+	</xsd:simpleType>
+	<xsd:simpleType name="TTekstowy">
+		<xsd:annotation>
+			<xsd:documentation>Typ znakowy ograniczony do 3500 znaków</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="xsd:string">
+			<xsd:minLength value="1"/>
+			<xsd:maxLength value="3500"/>
+		</xsd:restriction>
+	</xsd:simpleType>
+	<xsd:simpleType name="TProcentowy">
+		<xsd:annotation>
+			<xsd:documentation>Wartość procentowa z dokładnością do 2 miejsc po przecinku</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="xsd:decimal">
+			<xsd:totalDigits value="5"/>
+			<xsd:fractionDigits value="2"/>
+			<xsd:minInclusive value="0"/>
+			<xsd:maxInclusive value="100"/>
+			<xsd:whiteSpace value="collapse"/>
+		</xsd:restriction>
+	</xsd:simpleType>
+	<xsd:simpleType name="TCalkowity">
+		<xsd:annotation>
+			<xsd:documentation>Liczby naturalne</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="xsd:int">
+			<xsd:whiteSpace value="collapse"/>
+			<xsd:totalDigits value="14"/>
+		</xsd:restriction>
+	</xsd:simpleType>
+	<xsd:simpleType name="TNaturalny">
+		<xsd:annotation>
+			<xsd:documentation>Liczby naturalne</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="xsd:nonNegativeInteger">
+			<xsd:whiteSpace value="collapse"/>
+			<xsd:totalDigits value="14"/>
+		</xsd:restriction>
+	</xsd:simpleType>
+	<xsd:simpleType name="TRzeczywisty">
+		<xsd:annotation>
+			<xsd:documentation>Liczby wykazywane z dokładnością do dwóch miejsc po przecinku</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="etd:TKwota2">
+			<xsd:minInclusive value="0"/>
+		</xsd:restriction>
+	</xsd:simpleType>
+	<xsd:simpleType name="TKwota2">
+		<xsd:annotation>
 			<xsd:documentation>Wartość kwotowa wykazana w zł i gr</xsd:documentation>
 		</xsd:annotation>
 		<xsd:restriction base="xsd:decimal">
@@ -190,3 +254,107 @@
 			<xsd:minLength value="1"/>
 		</xsd:restriction>
 	</xsd:simpleType>
+	<xsd:simpleType name="TUlica">
+		<xsd:annotation>
+			<xsd:documentation>Nazwa ulicy</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="etd:TZnakowy">
+			<xsd:maxLength value="65"/>
+		</xsd:restriction>
+	</xsd:simpleType>
+	<xsd:simpleType name="TNrBudynku">
+		<xsd:annotation>
+			<xsd:documentation>Numer budynku</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="etd:TZnakowy">
+			<xsd:maxLength value="9"/>
+		</xsd:restriction>
+	</xsd:simpleType>
+	<xsd:simpleType name="TNrLokalu">
+		<xsd:annotation>
+			<xsd:documentation>Numer lokalu</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="etd:TZnakowy">
+			<xsd:maxLength value="10"/>
+		</xsd:restriction>
+	</xsd:simpleType>
+	<xsd:simpleType name="TKodPocztowy">
+		<xsd:annotation>
+			<xsd:documentation>Kod pocztowy</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="etd:TZnakowy">
+			<xsd:maxLength value="8"/>
+		</xsd:restriction>
+	</xsd:simpleType>
+	<xsd:simpleType name="TKodKrajuUrodzenia">
+		<xsd:annotation>
+			<xsd:documentation>Kod kraju urodzenia</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="xsd:string">
+			<xsd:length value="2"/>
+			<xsd:pattern value="[A-Z]{2}"/>
+		</xsd:restriction>
+	</xsd:simpleType>
+	<xsd:simpleType name="TKodKrajuWydania">
+		<xsd:annotation>
+			<xsd:documentation>Kod kraju wydania numeru identyfikacyjnego</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="etd:TKodKraju">
+			<xsd:pattern value="P[A-KM-Z]"/>
+			<xsd:pattern value="[A-OQ-Z][A-Z]"/>
+		</xsd:restriction>
+	</xsd:simpleType>
+	<xsd:simpleType name="TCelZlozenia">
+		<xsd:annotation>
+			<xsd:documentation>Określa, czy to jest złożenie, czy korekta dokumentu</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="xsd:byte">
+			<xsd:enumeration value="1">
+				<xsd:annotation>
+					<xsd:documentation>złożenie po raz pierwszy deklaracji za dany okres</xsd:documentation>
+				</xsd:annotation>
+			</xsd:enumeration>
+			<xsd:enumeration value="2">
+				<xsd:annotation>
+					<xsd:documentation>korekta deklaracji za dany okres</xsd:documentation>
+				</xsd:annotation>
+			</xsd:enumeration>
+		</xsd:restriction>
+	</xsd:simpleType>
+	<xsd:simpleType name="TNrDokumentu">
+		<xsd:annotation>
+			<xsd:documentation>Numer dokumentu</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="etd:TZnakowy">
+			<xsd:length value="5"/>
+			<xsd:pattern value="\d{2}/\d{2}"/>
+		</xsd:restriction>
+	</xsd:simpleType>
+	<xsd:simpleType name="TWybor1">
+		<xsd:annotation>
+			<xsd:documentation>Pojedyncze pole wyboru</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="xsd:byte">
+			<xsd:enumeration value="1"/>
+		</xsd:restriction>
+	</xsd:simpleType>
+	<xsd:simpleType name="TWybor1_2">
+		<xsd:annotation>
+			<xsd:documentation>Podwójne pole wyboru</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="xsd:byte">
+			<xsd:enumeration value="1"/>
+			<xsd:enumeration value="2"/>
+		</xsd:restriction>
+	</xsd:simpleType>
+	<xsd:simpleType name="TWybor1_3">
+		<xsd:annotation>
+			<xsd:documentation>Potrójne pole wyboru</xsd:documentation>
+		</xsd:annotation>
+		<xsd:restriction base="xsd:byte">
+			<xsd:enumeration value="1"/>
+			<xsd:enumeration value="2"/>
+			<xsd:enumeration value="3"/>
+		</xsd:restriction>
+	</xsd:simpleType>
+</xsd:schema>
