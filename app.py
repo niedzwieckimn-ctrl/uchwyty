@@ -40,6 +40,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from ksef_module import build_ksef_draft_xml, validate_fa3_xml, validate_ksef_invoice, xml_filename
 from cash_flow_module import register_cash_flow
+from inventory_analytics import build_replenishment_analysis
 try:
     from ksef_api import ksef_config_summary, send_invoice_to_ksef
 except Exception:
@@ -434,6 +435,10 @@ def init_db():
         cur.execute("ALTER TABLE orders ADD COLUMN idempotency_key TEXT")
 
     # UĹ‚atwia agregowanie "w dostawie" po statusach paczek
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_items(order_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_order_items_product_id ON order_items(product_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_status_issued_created ON orders(status, warehouse_issued, created_at)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_china_packages_status ON china_packages(status)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_china_items_package_id ON china_items(package_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_china_items_product_id ON china_items(product_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_client_search_logs_created ON client_search_logs(created_at)")
@@ -857,6 +862,7 @@ SUPABASE_SYNC_TABLES = [
     ("invoice_meta", "invoice_id"),
     ("invoice_allocations", "id"),
     ("ksef_documents", "invoice_id"),
+    ("cash_flow_settings", "key"),
 ]
 
 # KolejnoĹ›Ä‡ PULL jest waĹĽna: najpierw rodzice, potem dzieci.
@@ -874,6 +880,7 @@ SUPABASE_PULL_TABLES = [
     ("invoice_meta", "invoice_id"),
     ("invoice_allocations", "id"),
     ("ksef_documents", "invoice_id"),
+    ("cash_flow_settings", "key"),
 ]
 
 _supabase_sync_lock = threading.Lock()
@@ -4136,75 +4143,14 @@ def products_import():
 def stock():
     maybe_pull_shared_from_supabase()
     q = norm(request.args.get("q"))
-    c = conn()
-    cur = c.cursor()
-
+    rows = build_replenishment_analysis(conn, today=app_now().date(), horizon_days=60)
     if q:
-        like = f"%{q}%"
-        cur.execute("""
-          SELECT x.*,
-                 CASE WHEN x.ordered_new - x.qty > 0 THEN x.ordered_new - x.qty ELSE 0 END AS reserved_in_delivery,
-                 CASE WHEN x.in_delivery - (CASE WHEN x.ordered_new - x.qty > 0 THEN x.ordered_new - x.qty ELSE 0 END) > 0
-                      THEN x.in_delivery - (CASE WHEN x.ordered_new - x.qty > 0 THEN x.ordered_new - x.qty ELSE 0 END)
-                      ELSE 0
-                 END AS available_in_delivery
-          FROM (
-            SELECT p.id, p.sku, p.model, p.ean, p.name,
-                   COALESCE(s.qty,0) AS qty,
-                   COALESCE((
-                      SELECT SUM(ci.qty)
-                      FROM china_items ci
-                      JOIN china_packages cp ON cp.id=ci.package_id
-                      WHERE ci.product_id=p.id
-                        AND cp.status IN ('planned', 'ordered', 'shipped')
-                   ), 0) AS in_delivery,
-                   COALESCE((
-                      SELECT SUM(oi.qty)
-                      FROM order_items oi
-                      JOIN orders o ON o.id=oi.order_id
-                      WHERE oi.product_id=p.id
-                        AND o.status='new'
-                   ), 0) AS ordered_new
-            FROM products p
-            LEFT JOIN stock s ON s.product_id=p.id
-            WHERE p.sku LIKE ? OR p.model LIKE ? OR p.ean LIKE ? OR p.name LIKE ?
-          ) x
-          ORDER BY x.sku
-          LIMIT 1000
-        """, (like, like, like, like))
-    else:
-        cur.execute("""
-          SELECT x.*,
-                 CASE WHEN x.ordered_new - x.qty > 0 THEN x.ordered_new - x.qty ELSE 0 END AS reserved_in_delivery,
-                 CASE WHEN x.in_delivery - (CASE WHEN x.ordered_new - x.qty > 0 THEN x.ordered_new - x.qty ELSE 0 END) > 0
-                      THEN x.in_delivery - (CASE WHEN x.ordered_new - x.qty > 0 THEN x.ordered_new - x.qty ELSE 0 END)
-                      ELSE 0
-                 END AS available_in_delivery
-          FROM (
-            SELECT p.id, p.sku, p.model, p.ean, p.name,
-                   COALESCE(s.qty,0) AS qty,
-                   COALESCE((
-                      SELECT SUM(ci.qty)
-                      FROM china_items ci
-                      JOIN china_packages cp ON cp.id=ci.package_id
-                      WHERE ci.product_id=p.id
-                        AND cp.status IN ('planned', 'ordered', 'shipped')
-                   ), 0) AS in_delivery,
-                   COALESCE((
-                      SELECT SUM(oi.qty)
-                      FROM order_items oi
-                      JOIN orders o ON o.id=oi.order_id
-                      WHERE oi.product_id=p.id
-                        AND o.status='new'
-                   ), 0) AS ordered_new
-            FROM products p
-            LEFT JOIN stock s ON s.product_id=p.id
-          ) x
-          ORDER BY x.sku
-          LIMIT 1000
-        """)
-    rows = cur.fetchall()
-    c.close()
+        query = q.casefold()
+        rows = [
+            row for row in rows
+            if any(query in norm(row.get(field)).casefold() for field in ("sku", "model", "ean", "name"))
+        ]
+    rows = sorted(rows, key=lambda row: norm(row.get("sku")).casefold())[:1000]
 
     tpl = r"""
     {% extends "base.html" %}
@@ -4246,11 +4192,11 @@ def stock():
       <div class="card">
         <h2>Stany (max 1000)</h2>
         <div class="muted" style="margin-bottom:8px;">
-          Najpierw realizowane sÄ… iloĹ›ci z magazynu. Niedobory z otwartych zamĂłwieĹ„ (status <b>new</b>) rezerwujÄ… towar â€žw drodzeâ€ť.
+          Rezerwacje obejmują wszystkie aktywne, niewydane zamówienia. Jeżeli bieżący stan nie wystarcza, brakująca część rezerwuje towar w drodze.
         </div>
         <table>
           <thead>
-            <tr><th>SKU</th><th>Model</th><th>EAN</th><th>Nazwa</th><th>Stan</th><th>W drodze</th><th>Zarezerwowane w drodze</th><th>DostÄ™pne w drodze</th></tr>
+            <tr><th>SKU</th><th>Model</th><th>EAN</th><th>Nazwa</th><th>Stan</th><th>Rezerwacje</th><th>Dostępne</th><th>W drodze</th><th>Zarezerwowane w drodze</th><th>Dostępne w drodze</th></tr>
           </thead>
           <tbody>
             {% for r in rows %}
@@ -4259,14 +4205,16 @@ def stock():
                 <td>{{ r['model'] or "" }}</td>
                 <td>{{ r['ean'] or "" }}</td>
                 <td>{{ r['name'] or "" }}</td>
-                <td><span class="badge">{{ r['qty'] }}</span></td>
-                <td><span class="badge">{{ r['in_delivery'] }}</span></td>
-                <td><span class="badge">{{ r['reserved_in_delivery'] }}</span></td>
-                <td><span class="badge">{{ r['available_in_delivery'] }}</span></td>
+                <td><span class="badge">{{ r['stock_qty'] }}</span></td>
+                <td><span class="badge">{{ r['reserved_qty'] }}</span></td>
+                <td><span class="badge">{{ r['available_qty'] }}</span></td>
+                <td><span class="badge">{{ r['incoming_qty'] }}</span></td>
+                <td><span class="badge">{{ r['reserved_incoming'] }}</span></td>
+                <td><span class="badge">{{ r['available_incoming'] }}</span></td>
               </tr>
             {% endfor %}
             {% if not rows %}
-              <tr><td colspan="8" class="muted">Brak produktĂłw.</td></tr>
+              <tr><td colspan="10" class="muted">Brak produktów.</td></tr>
             {% endif %}
           </tbody>
         </table>

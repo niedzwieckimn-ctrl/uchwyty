@@ -5,6 +5,8 @@ from datetime import datetime, timedelta
 from flask import request, redirect, url_for
 from flask import render_template_string
 
+from inventory_analytics import build_replenishment_analysis, recommended_replenishments
+
 
 CASH_FLOW_SETTING_KEYS = {
     "account_balance": "0",
@@ -12,6 +14,7 @@ CASH_FLOW_SETTING_KEYS = {
     "cash_buffer": "0",
     "planned_china_budget": "0",
     "growth_percent": "0",
+    "reorder_horizon_days": "60",
 }
 
 
@@ -103,6 +106,9 @@ def register_cash_flow(app, deps):
         planned_china_budget = to_float(settings.get("planned_china_budget"), 0)
         growth_percent = to_float(settings.get("growth_percent"), 0)
         growth_factor = max(0, 1 + (growth_percent / 100.0))
+        reorder_horizon_days = int(to_float(settings.get("reorder_horizon_days"), 60))
+        if reorder_horizon_days not in (45, 60, 90):
+            reorder_horizon_days = 60
 
         c = conn()
         cur = c.cursor()
@@ -209,58 +215,12 @@ def register_cash_flow(app, deps):
         china_qty = int(china_row["qty"] or 0)
         china_cost_est = to_float(china_row["cost_est"], 0)
 
-        cutoff_30 = (today - timedelta(days=30)).isoformat()
-        cutoff_90 = (today - timedelta(days=90)).isoformat()
-        cur.execute("""
-          WITH demand AS (
-            SELECT
-              oi.product_id,
-              SUM(CASE WHEN date(o.created_at) >= date(?) THEN oi.qty ELSE 0 END) AS ordered_30,
-              SUM(CASE WHEN date(o.created_at) >= date(?) THEN oi.qty ELSE 0 END) AS ordered_90
-            FROM order_items oi
-            JOIN orders o ON o.id=oi.order_id
-            WHERE lower(COALESCE(o.status,'')) NOT IN ('cancelled','canceled','deleted','usuniete','anulowane')
-            GROUP BY oi.product_id
-          ),
-          china_incoming AS (
-            SELECT
-              ci.product_id,
-              SUM(ci.qty) AS incoming_qty
-            FROM china_items ci
-            JOIN china_packages cp ON cp.id=ci.package_id
-            WHERE lower(COALESCE(cp.status,'')) IN ('planned','ordered','shipped')
-            GROUP BY ci.product_id
-          )
-          SELECT
-            p.sku,
-            p.model,
-            p.name,
-            COALESCE(d.ordered_30,0) AS ordered_30,
-            COALESCE(d.ordered_90,0) AS ordered_90,
-            COALESCE(s.qty,0) AS stock_qty,
-            COALESCE(ci.incoming_qty,0) AS incoming_qty,
-            MAX(0, COALESCE(d.ordered_90,0) - COALESCE(s.qty,0) - COALESCE(ci.incoming_qty,0)) AS suggested_qty,
-            CASE
-              WHEN COALESCE(d.ordered_90,0) <= 0 THEN 0
-              ELSE ROUND((COALESCE(s.qty,0) + COALESCE(ci.incoming_qty,0)) * 100.0 / COALESCE(d.ordered_90,0), 0)
-            END AS coverage_pct
-          FROM demand d
-          JOIN products p ON p.id=d.product_id
-          LEFT JOIN stock s ON s.product_id=p.id
-          LEFT JOIN china_incoming ci ON ci.product_id=p.id
-          WHERE COALESCE(d.ordered_90,0) > 0
-            AND (
-              COALESCE(s.qty,0) + COALESCE(ci.incoming_qty,0) < COALESCE(d.ordered_90,0)
-              OR COALESCE(s.qty,0) <= COALESCE(d.ordered_30,0)
-            )
-          ORDER BY
-            COALESCE(d.ordered_90,0) DESC,
-            suggested_qty DESC,
-            coverage_pct ASC
-          LIMIT 10
-        """, (cutoff_30, cutoff_90))
-        reorder_rows = cur.fetchall()
         c.close()
+
+        replenishment_rows = build_replenishment_analysis(
+            conn, today=today, horizon_days=reorder_horizon_days
+        )
+        reorder_rows = recommended_replenishments(replenishment_rows, limit=10)
 
         avg_daily_gross = (last_30_net * 1.23) / 30.0 if last_30_net else 0.0
         forecast_7_sales = avg_daily_gross * 7 * growth_factor
@@ -327,6 +287,7 @@ def register_cash_flow(app, deps):
               <div><label class="muted small">Bufor bezpieczeństwa</label><input name="cash_buffer" value="{{ settings.cash_buffer }}"></div>
               <div><label class="muted small">Zarezerwowane na Chiny</label><input name="planned_china_budget" value="{{ settings.planned_china_budget }}"></div>
               <div><label class="muted small">Korekta wzrostu prognozy %</label><input name="growth_percent" value="{{ settings.growth_percent }}"></div>
+              <div><label class="muted small">Docelowy zapas</label><select name="reorder_horizon_days"><option value="45" {% if reorder_horizon_days == 45 %}selected{% endif %}>45 dni</option><option value="60" {% if reorder_horizon_days == 60 %}selected{% endif %}>60 dni</option><option value="90" {% if reorder_horizon_days == 90 %}selected{% endif %}>90 dni</option></select></div>
               <div class="flex" style="align-items:flex-end;"><button class="btn primary" type="submit">Zapisz cash flow</button></div>
             </form>
           </div>
@@ -375,23 +336,24 @@ def register_cash_flow(app, deps):
             </div>
 
             <div class="card">
-              <h2>Popularne SKU z niskim zapasem</h2>
-              <p class="muted">Ranking pokazuje uchwyty najczęściej zamawiane w ostatnich 90 dniach, przy których stan magazynu jest niski. Towar w drodze z Chin zmniejsza sugerowaną ilość do domówienia.</p>
+              <h2>Inteligentny ranking uzupełniania</h2>
+              <p class="muted">Łączy faktyczne wydania, dostępny stan, rezerwacje, niezarezerwowany towar w drodze i zainteresowanie klientów. Cel: zapas na {{ reorder_horizon_days }} dni.</p>
               <table>
-                <thead><tr><th>SKU</th><th>Nazwa</th><th>30 dni</th><th>90 dni</th><th>Stan</th><th>W drodze</th><th>Sugeruj</th></tr></thead>
+                <thead><tr><th>SKU / produkt</th><th>Priorytet</th><th>30 / 90 dni</th><th>Wyszuk. / klienci</th><th>Dostępne</th><th>W drodze</th><th>Zapas</th><th>Sugeruj</th></tr></thead>
                 <tbody>
                   {% for r in reorder_rows %}
                     <tr>
-                      <td><b>{{ r.sku }}</b></td>
-                      <td>{{ r.name or r.model or '-' }}</td>
-                      <td>{{ r.ordered_30 }}</td>
-                      <td>{{ r.ordered_90 }}</td>
-                      <td>{{ r.stock_qty }}</td>
-                      <td>{{ r.incoming_qty }}</td>
-                      <td><b>{{ r.suggested_qty }}</b></td>
+                      <td><b>{{ r.sku }}</b><div class="muted">{{ r.name or r.model or '-' }}</div><details><summary class="muted" style="cursor:pointer">Dlaczego?</summary>{% for reason in r.reasons %}<div class="muted">• {{ reason }}</div>{% endfor %}</details></td>
+                      <td><span class="badge">{{ r.priority_label }} · {{ r.reorder_score }}</span><div class="muted">Pewność: {{ r.confidence_label|lower }}</div></td>
+                      <td>{{ r.sales_30 }} / {{ r.sales_90 }}<div class="muted">{{ r.sale_days_90 }} dni sprzedaży</div></td>
+                      <td>{{ r.searches_30 }} / {{ r.search_clients_30 }}</td>
+                      <td>{{ r.available_qty }}<div class="muted">stan {{ r.stock_qty }}, rez. {{ r.reserved_qty }}</div></td>
+                      <td>{{ r.available_incoming }}<div class="muted">łącznie {{ r.incoming_qty }}</div></td>
+                      <td>{% if r.coverage_days is not none %}~{{ r.coverage_days }} dni{% else %}brak tempa{% endif %}</td>
+                      <td><b>{{ r.suggested_qty }}</b><div class="muted">{{ r.target_days }} dni</div></td>
                     </tr>
                   {% endfor %}
-                  {% if not reorder_rows %}<tr><td colspan="7" class="muted">Brak popularnych SKU z niskim zapasem według ostatnich zamówień.</td></tr>{% endif %}
+                  {% if not reorder_rows %}<tr><td colspan="8" class="muted">Brak SKU wymagających uzupełnienia na podstawie realnego popytu.</td></tr>{% endif %}
                 </tbody>
               </table>
             </div>
@@ -429,4 +391,4 @@ def register_cash_flow(app, deps):
         return render_template_string(tpl, title="Cash flow", base_url=base_url, db_path=db_path,
                                       settings=settings, k=kpis, inflow_rows=inflow_rows,
                                       overdue_clients=overdue_clients, paid_clients=paid_clients,
-                                      reorder_rows=reorder_rows)
+                                      reorder_rows=reorder_rows, reorder_horizon_days=reorder_horizon_days)
