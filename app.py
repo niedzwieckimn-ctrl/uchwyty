@@ -40,7 +40,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from ksef_module import build_ksef_draft_xml, validate_fa3_xml, validate_ksef_invoice, xml_filename
 from cash_flow_module import register_cash_flow
-from inventory_analytics import build_replenishment_analysis
+from inventory_analytics import build_replenishment_analysis, recommended_replenishments
 try:
     from ksef_api import ksef_config_summary, send_invoice_to_ksef
 except Exception:
@@ -2823,13 +2823,15 @@ def home():
     n_orders_today = int(cur.fetchone()["n"] or 0)
     cur.execute("SELECT COUNT(*) AS n FROM orders WHERE status='issued' AND date(created_at)=date('now','localtime')")
     n_issued_today = int(cur.fetchone()["n"] or 0)
-    cur.execute("""
-      SELECT p.id, p.sku, COALESCE(p.model,p.name,p.sku) AS label, COALESCE(s.qty,0) AS qty
-      FROM products p LEFT JOIN stock s ON s.product_id=p.id
-      WHERE COALESCE(s.qty,0) <= 10
-      ORDER BY COALESCE(s.qty,0), p.sku LIMIT 5
-    """)
-    low_stock_rows = [dict(r) for r in cur.fetchall()]
+    reorder_horizon_days = 60
+    try:
+        cur.execute("SELECT value FROM cash_flow_settings WHERE key='reorder_horizon_days'")
+        horizon_row = cur.fetchone()
+        reorder_horizon_days = int(float(horizon_row["value"])) if horizon_row else 60
+    except Exception:
+        reorder_horizon_days = 60
+    if reorder_horizon_days not in (45, 60, 90):
+        reorder_horizon_days = 60
     cur.execute("""
       SELECT o.id,o.order_no,o.customer_name,o.created_at,o.status,
              COALESCE(SUM(oi.qty * COALESCE(pr.net_price,0)),0) AS total_net
@@ -2850,6 +2852,15 @@ def home():
     status_divisor = max(1, status_total)
     c.close()
 
+    replenishment_analysis = build_replenishment_analysis(
+        conn, today=app_now().date(), horizon_days=reorder_horizon_days
+    )
+    all_replenishment_rows = recommended_replenishments(
+        replenishment_analysis, limit=max(10, len(replenishment_analysis))
+    )
+    replenishment_rows = all_replenishment_rows[:5]
+    replenishment_count = len(all_replenishment_rows)
+
     tpl = r"""
     {% extends "base.html" %}
     {% block content %}
@@ -2866,7 +2877,7 @@ def home():
       <div class="metrics">
         <div class="metric"><div class="icon">▣</div><div><span>Nowe zamówienia</span><b>{{ n_orders_today }}</b><small>{{ n_orders_current }} aktualnie w toku</small></div></div>
         <div class="metric" style="--soft:#eaf9f4;--tone:#1aa176"><div class="icon">◇</div><div><span>Wydane dzisiaj</span><b>{{ n_issued_today }}</b><small>{{ n_stock_qty }} szt. na stanie</small></div></div>
-        <div class="metric" style="--soft:#fff6e6;--tone:#db8a13"><div class="icon">△</div><div><span>Niski stan</span><b>{{ low_stock_rows|length }}</b><small>Wymaga uwagi</small></div></div>
+        <div class="metric" style="--soft:#fff6e6;--tone:#db8a13"><div class="icon">△</div><div><span>Trzeba uzupełnić</span><b>{{ replenishment_count }}</b><small>Według rankingu zakupowego</small></div></div>
         <div class="metric" style="--soft:#edf3ff;--tone:#5577ee"><div class="icon">▤</div><div><span>Wartość magazynu</span><b>{{ "{:,.0f}".format(inventory_value_net).replace(',', ' ') }} zł</b><small>Netto z towarem w drodze</small></div></div>
       </div>
 
@@ -2879,9 +2890,9 @@ def home():
           </tbody></table>
         </div>
         <div class="side-stack">
-          <div class="card"><div class="panel-title"><span style="color:#e69a20">△</span><h2>Niski stan</h2><a class="btn" href="{{ url_for('stock') }}">Wszystkie</a></div><div class="stock-list">
-            {% for p in low_stock_rows %}<div class="stock-item"><div class="stock-icon">◇</div><div><div class="stock-name">{{ p.label }}</div><div class="stock-sku">SKU: {{ p.sku }}</div></div><div class="stock-qty">{{ p.qty }} szt.</div></div>{% endfor %}
-            {% if not low_stock_rows %}<div class="muted">Wszystkie stany są bezpieczne.</div>{% endif %}
+          <div class="card"><div class="panel-title"><span style="color:#e69a20">△</span><h2>Trzeba uzupełnić:</h2><a class="btn" href="{{ url_for('cash_flow') }}">Wszystkie</a></div><div class="stock-list">
+            {% for p in replenishment_rows %}<div class="stock-item"><div class="stock-icon">◇</div><div><div class="stock-name">{{ p.model or p.name or p.sku }}</div><div class="stock-sku">SKU: {{ p.sku }} · wynik {{ p.reorder_score }} · dostępne {{ p.available_qty }}</div></div><div class="stock-qty">+{{ p.suggested_qty }} szt.</div></div>{% endfor %}
+            {% if not replenishment_rows %}<div class="muted">Brak produktów wymagających uzupełnienia.</div>{% endif %}
           </div></div>
           <div class="card"><div class="panel-title"><h2>Status zamówień</h2></div><div class="donut-wrap"><div class="donut" style="--p1:{{ status_new*100/status_divisor }};--p2:{{ status_work*100/status_divisor }};--p3:{{ status_done*100/status_divisor }}"><div class="donut-label"><b>{{ status_total }}</b>łącznie</div></div><div class="legend">
             <div class="legend-row"><i class="legend-dot" style="background:#5577ee"></i><span>Nowe</span><b>{{ status_new }}</b></div><div class="legend-row"><i class="legend-dot" style="background:#65a7ec"></i><span>W realizacji</span><b>{{ status_work }}</b></div><div class="legend-row"><i class="legend-dot" style="background:#31b98b"></i><span>Zrealizowane</span><b>{{ status_done }}</b></div><div class="legend-row"><i class="legend-dot" style="background:#e05263"></i><span>Anulowane</span><b>{{ status_cancelled }}</b></div>
@@ -2898,7 +2909,8 @@ def home():
                                   n_products=n_products, n_orders_current=n_orders_current, n_china_active=n_china_active,
                                   n_stock_qty=n_stock_qty, n_in_delivery_qty=n_in_delivery_qty,
                                   inventory_value_net=inventory_value_net, n_orders_today=n_orders_today,
-                                  n_issued_today=n_issued_today, low_stock_rows=low_stock_rows,
+                                  n_issued_today=n_issued_today, replenishment_rows=replenishment_rows,
+                                  replenishment_count=replenishment_count,
                                   recent_orders=recent_orders, status_new=status_new, status_work=status_work,
                                   status_done=status_done, status_cancelled=status_cancelled, status_total=status_total,
                                   status_divisor=status_divisor)
