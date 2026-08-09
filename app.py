@@ -2869,7 +2869,7 @@ def home():
       </style>
 
       <div class="dashboard-head">
-        <div><h1>Pulpit</h1><div class="muted">Dzień dobry — oto dzisiejszy obraz magazynu.</div></div>
+        <div><h1>Pulpit</h1><div class="muted">Przewagę buduje się codziennie — jedną dobrą decyzją naraz.</div></div>
         <form class="search-shell" action="{{ url_for('orders') }}"><input name="q" placeholder="Szukaj zamówień, produktów, klientów..."></form>
         <a class="btn primary" href="{{ url_for('order_new') }}">＋ Nowe zamówienie</a>
       </div>
