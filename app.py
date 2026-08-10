@@ -444,6 +444,7 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_client_search_logs_created ON client_search_logs(created_at)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_client_search_logs_email_query ON client_search_logs(customer_email, query)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_client_search_logs_model ON client_search_logs(product_model)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_pricing_model_norm ON pricing(TRIM(LOWER(model)))")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_email_events_key ON email_events(event_key)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_email_events_type_created ON email_events(event_type, created_at)")
     cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_idempotency_key ON orders(idempotency_key) WHERE idempotency_key IS NOT NULL")
@@ -1314,7 +1315,6 @@ def pull_shared_tables_from_supabase(force: bool = False):
     result = {"ok": True, "tables": {}, "pulled_at": now_iso()}
     fetched = {}
 
-    # 1) pobierz wszystko z Supabase
     for table, conflict_col in SUPABASE_PULL_TABLES:
         try:
             fetched[(table, conflict_col)] = supabase_select_rows(table, order_by=conflict_col)
@@ -1322,7 +1322,6 @@ def pull_shared_tables_from_supabase(force: bool = False):
             result["ok"] = False
             result["tables"][table] = {"status": "error", "stage": "fetch", "error": str(e)}
 
-    # 2) upsert do lokalnego SQLite
     for table, conflict_col in SUPABASE_PULL_TABLES:
         if (table, conflict_col) not in fetched:
             continue
@@ -1336,7 +1335,6 @@ def pull_shared_tables_from_supabase(force: bool = False):
             result["tables"].setdefault(table, {})
             result["tables"][table].update({"status": "error", "stage": "upsert", "error": str(e)})
 
-    # 3) usuĹ„ lokalne rekordy, ktĂłrych juĹĽ nie ma w Supabase
     for table, conflict_col in reversed(SUPABASE_PULL_TABLES):
         if (table, conflict_col) not in fetched:
             continue
@@ -5820,45 +5818,39 @@ def order_label(order_id):
 
 @app.get("/api/client_stock_catalog")
 def api_client_stock_catalog():
-    maybe_pull_shared_from_supabase()
+    if not supabase_enabled():
+        return jsonify(ok=False, error="Brak konfiguracji Supabase na serwerze"), 503
 
-    c = conn()
-    cur = c.cursor()
-    cur.execute("""
-      SELECT
-        p.id AS product_id,
-        p.sku,
-        p.model,
-        p.name,
-        COALESCE(s.qty, 0) AS qty_physical,
-        COALESCE(r.reserved_qty, 0) AS qty_reserved,
-        CASE
-          WHEN COALESCE(s.qty, 0) - COALESCE(r.reserved_qty, 0) > 0
-          THEN COALESCE(s.qty, 0) - COALESCE(r.reserved_qty, 0)
-          ELSE 0
-        END AS qty_on_stock,
-        COALESCE(pr.net_price, 0) AS net_price,
-        COALESCE(pr.gross_price, 0) AS gross_price
-      FROM products p
-      LEFT JOIN stock s ON s.product_id = p.id
-      LEFT JOIN (
-        SELECT oi.product_id, SUM(oi.qty) AS reserved_qty
-        FROM order_items oi
-        JOIN orders o ON o.id = oi.order_id
-        WHERE LOWER(COALESCE(o.status,'')) IN ('new','pending','unconfirmed','confirmed','packed','in_delivery','shipped')
-          AND COALESCE(o.warehouse_issued,0) = 0
-        GROUP BY oi.product_id
-      ) r ON r.product_id = p.id
-      LEFT JOIN pricing pr
-        ON (TRIM(LOWER(pr.model)) = TRIM(LOWER(p.model))
-            OR TRIM(LOWER(pr.model)) = TRIM(LOWER(p.sku)))
-      ORDER BY p.sku
-      LIMIT 5000
-    """)
-    rows = [dict(r) for r in cur.fetchall()]
-    c.close()
+    try:
+        rows = supabase_request(
+            "/rest/v1/client_stock_catalog_v",
+            method="GET",
+            params={
+                "select": (
+                    "product_id,sku,model,name,qty_physical,qty_reserved,"
+                    "qty_on_stock,net_price,gross_price"
+                ),
+                "order": "sku.asc",
+                "limit": 5000,
+            },
+            timeout=30,
+        ) or []
+        if not isinstance(rows, list):
+            raise RuntimeError("Nieprawidłowa odpowiedź katalogu magazynowego")
+    except Exception as exc:
+        app.logger.error(
+            "Nie udało się pobrać aktualnych stanów bezpośrednio z Supabase: %s",
+            type(exc).__name__,
+        )
+        return jsonify(
+            ok=False,
+            error="Nie udało się pobrać aktualnych stanów z Supabase",
+        ), 503
 
-    return jsonify(ok=True, rows=rows)
+    response = jsonify(ok=True, rows=rows, source="supabase")
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return response
 
 
 @app.route("/api/client_search_log", methods=["POST", "OPTIONS"])
