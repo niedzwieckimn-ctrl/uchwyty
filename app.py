@@ -1924,21 +1924,25 @@ def generate_client_order_pdf(order_row: dict, items: list[dict], language: str)
             footer()
             pdf.showPage()
         page_no += 1
-        pdf.setFillColorRGB(0.07, 0.13, 0.24)
-        pdf.rect(0, page_height - 31 * mm, page_width, 31 * mm, fill=1, stroke=0)
+        # Czysty, biały nagłówek. Logo i typografia tworzą hierarchię bez
+        # ciężkiego, ciemnego pasa zajmującego całą szerokość dokumentu.
         logo_path = find_logo_path()
         if logo_path:
             try:
-                pdf.drawImage(ImageReader(logo_path), left, page_height - 25 * mm, 24 * mm, 15 * mm,
+                pdf.drawImage(ImageReader(logo_path), left, page_height - 27 * mm, 28 * mm, 18 * mm,
                               preserveAspectRatio=True, anchor="w", mask="auto")
             except Exception:
                 pass
-        pdf.setFillColorRGB(1, 1, 1)
-        pdf.setFont(bold_font, 19)
-        pdf.drawRightString(right, page_height - 16 * mm, order_pdf_text(language, "title"))
+        pdf.setFillColorRGB(0.07, 0.13, 0.24)
+        pdf.setFont(bold_font, 18)
+        pdf.drawRightString(right, page_height - 15 * mm, order_pdf_text(language, "title"))
+        pdf.setFillColorRGB(0.34, 0.39, 0.49)
         pdf.setFont(regular_font, 9)
-        pdf.drawRightString(right, page_height - 23 * mm, fit(order_number, regular_font, 9, 80 * mm))
-        return page_height - 40 * mm
+        pdf.drawRightString(right, page_height - 21 * mm, fit(order_number, regular_font, 9, 80 * mm))
+        pdf.setStrokeColorRGB(0.86, 0.89, 0.94)
+        pdf.setLineWidth(0.7)
+        pdf.line(left, page_height - 31 * mm, right, page_height - 31 * mm)
+        return page_height - 41 * mm
 
     def draw_table_header(y):
         pdf.setFillColorRGB(0.94, 0.96, 1)
