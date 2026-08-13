@@ -2490,83 +2490,139 @@ def upload_invoice_pdfs_to_supabase(invoice_id: int, invoice_no: str, invoice_pd
 def generate_invoice_packing_list_pdf(order_row, items, meta, invoice_pdf_path: str = "") -> str:
     customer_dir = invoice_dir_for_customer(meta.get("buyer_name") or (order_row["customer_name"] if order_row and "customer_name" in order_row.keys() else "") or "Klient")
     fpath = packing_list_pdf_path_for_invoice(invoice_pdf_path or os.path.join(customer_dir, f"{safe_filename(meta['invoice_no'])}.pdf"), meta["invoice_no"])
-
-    w = 210 * mm
-    h = 297 * mm
+    w, h = 210 * mm, 297 * mm
     cpdf = canvas.Canvas(fpath, pagesize=(w, h))
     pdf_font, pdf_font_bold = get_pdf_font_names()
+    navy, muted, blue = (0.07, 0.13, 0.24), (0.34, 0.39, 0.49), (0.25, 0.39, 0.87)
+    pale_blue, line_color = (0.94, 0.96, 1.0), (0.86, 0.89, 0.95)
 
-    y = h - 18 * mm
-    cpdf.setFont(pdf_font_bold, 15)
-    cpdf.drawString(15 * mm, y, "Lista pakowania")
-    y -= 7 * mm
-    cpdf.setFont(pdf_font, 10)
-    cpdf.drawString(15 * mm, y, f"Do faktury: {meta.get('invoice_no') or '-'}")
-    y -= 5 * mm
-    if order_row:
-        cpdf.drawString(15 * mm, y, f"Klient: {order_row['customer_name']}")
-        y -= 5 * mm
-    cpdf.drawString(15 * mm, y, f"Data: {meta.get('issue_date') or app_now().strftime('%Y-%m-%d')}")
-    y -= 8 * mm
+    def order_value(key, default=""):
+        if not order_row:
+            return default
+        try:
+            return order_row[key] if key in order_row.keys() else default
+        except (AttributeError, KeyError, TypeError):
+            return order_row.get(key, default) if isinstance(order_row, dict) else default
 
     def fit_text(text, max_width, font_name, font_size):
-        text = norm(text or "")
-        if not text:
-            return "-"
+        text = norm(text or "") or "-"
         if cpdf.stringWidth(text, font_name, font_size) <= max_width:
             return text
-        ell = "..."
-        while text and cpdf.stringWidth(text + ell, font_name, font_size) > max_width:
+        while text and cpdf.stringWidth(text + "...", font_name, font_size) > max_width:
             text = text[:-1]
-        return (text + ell) if text else ell
+        return (text + "...") if text else "..."
 
     def strip_note_from_order_no(order_no, note):
-        order_no = norm(order_no or "")
-        note = norm(note or "")
+        order_no, note = norm(order_no or ""), norm(note or "")
         if note and order_no.lower().endswith((" " + note).lower()):
             return order_no[:-(len(note) + 1)].strip()
         return order_no
 
-    cpdf.setFont(pdf_font_bold, 9)
-    headers = [("Lp.", 15), ("Zamówienie", 27), ("Notatka", 62), ("SKU", 92), ("Model / nazwa", 122), ("Ilość", 184)]
-    for label, x_mm in headers:
-        cpdf.drawString(x_mm * mm, y, label)
-    y -= 3 * mm
-    cpdf.line(15 * mm, y, 198 * mm, y)
-    y -= 5 * mm
+    def draw_header(continuation=False):
+        logo_path = find_logo_path()
+        if logo_path:
+            try:
+                cpdf.drawImage(ImageReader(logo_path), 15 * mm, h - 27 * mm, 28 * mm, 18 * mm,
+                               preserveAspectRatio=True, anchor="w", mask="auto")
+            except Exception:
+                pass
+        cpdf.setFillColorRGB(*navy)
+        cpdf.setFont(pdf_font_bold, 18)
+        cpdf.drawRightString(195 * mm, h - 15 * mm, "LISTA PAKOWANIA")
+        cpdf.setFillColorRGB(*muted)
+        cpdf.setFont(pdf_font, 9)
+        subtitle = f"Faktura: {norm(meta.get('invoice_no') or '-')}"
+        if continuation:
+            subtitle += "  |  dalszy ciąg"
+        cpdf.drawRightString(195 * mm, h - 23 * mm, subtitle)
+        cpdf.setStrokeColorRGB(*line_color)
+        cpdf.line(15 * mm, h - 31 * mm, 195 * mm, h - 31 * mm)
+        return h - 41 * mm
 
-    cpdf.setFont(pdf_font, 9)
+    def draw_table_header(current_y):
+        cpdf.setFillColorRGB(*pale_blue)
+        cpdf.roundRect(15 * mm, current_y - 7 * mm, 180 * mm, 10 * mm, 3 * mm, fill=1, stroke=0)
+        cpdf.setFillColorRGB(*blue)
+        cpdf.setFont(pdf_font_bold, 8)
+        for label, x_mm in (("✓", 19), ("LP.", 29), ("SKU", 42), ("MODEL / NAZWA", 91), ("ZAMÓWIENIE / NOTATKA", 132)):
+            cpdf.drawString(x_mm * mm, current_y - 3.5 * mm, label)
+        cpdf.drawRightString(190 * mm, current_y - 3.5 * mm, "ILOŚĆ")
+        return current_y - 13 * mm
+
+    y = draw_header()
+    customer_name = norm(meta.get("buyer_name") or order_value("customer_name") or "-")
+    main_order_no = norm(order_value("order_no") or order_value("number") or "-")
+    issue_date = norm(meta.get("issue_date") or app_now().strftime("%Y-%m-%d"))
+    cpdf.setFillColorRGB(*muted)
+    cpdf.setFont(pdf_font_bold, 8)
+    cpdf.drawString(15 * mm, y, "ZAMÓWIENIE")
+    cpdf.drawString(72 * mm, y, "DATA")
+    cpdf.drawString(122 * mm, y, "KLIENT")
+    y -= 6 * mm
+    cpdf.setFillColorRGB(*navy)
+    cpdf.setFont(pdf_font, 10)
+    cpdf.drawString(15 * mm, y, fit_text(main_order_no, 50 * mm, pdf_font, 10))
+    cpdf.drawString(72 * mm, y, issue_date)
+    cpdf.drawString(122 * mm, y, fit_text(customer_name, 73 * mm, pdf_font, 10))
+    y = draw_table_header(y - 11 * mm)
+
     total_qty = 0
-    for lp, it in enumerate(items, 1):
+    item_count = 0
+    for it in items:
         qty = int(it.get("qty") or 0)
         if qty <= 0:
             continue
+        item_count += 1
         total_qty += qty
-        order_no = norm(it.get("source_order_no") or "")
+        source_order_no = norm(it.get("source_order_no") or "")
         note = norm(it.get("source_order_note") or "")
+        source_order_no = strip_note_from_order_no(source_order_no, note)
+        source_text = " · ".join(x for x in (source_order_no, note) if x) or "-"
         sku = norm(it.get("sku") or "")
         model_name = norm(it.get("model") or it.get("name") or "")
-        order_no = strip_note_from_order_no(order_no, note)
-        product_text = (sku + "  " + model_name).strip()
-
-        if y < 22 * mm:
+        if y < 36 * mm:
             cpdf.showPage()
-            y = h - 18 * mm
-            cpdf.setFont(pdf_font, 8.5)
+            y = draw_table_header(draw_header(continuation=True))
+        cpdf.setStrokeColorRGB(0.65, 0.71, 0.82)
+        cpdf.roundRect(18 * mm, y - 2.5 * mm, 5 * mm, 5 * mm, 1 * mm, fill=0, stroke=1)
+        cpdf.setFillColorRGB(*navy)
+        cpdf.setFont(pdf_font, 9)
+        cpdf.drawString(29 * mm, y, str(item_count))
+        cpdf.setFont(pdf_font_bold, 9)
+        cpdf.drawString(42 * mm, y, fit_text(sku, 44 * mm, pdf_font_bold, 9))
+        cpdf.setFont(pdf_font, 9)
+        cpdf.drawString(91 * mm, y, fit_text(model_name, 36 * mm, pdf_font, 9))
+        cpdf.setFillColorRGB(*muted)
+        cpdf.setFont(pdf_font, 8)
+        cpdf.drawString(132 * mm, y, fit_text(source_text, 43 * mm, pdf_font, 8))
+        cpdf.setFillColorRGB(*navy)
+        cpdf.setFont(pdf_font_bold, 12)
+        cpdf.drawRightString(190 * mm, y, str(qty))
+        cpdf.setStrokeColorRGB(*line_color)
+        cpdf.line(15 * mm, y - 5.5 * mm, 195 * mm, y - 5.5 * mm)
+        y -= 11 * mm
 
-        cpdf.drawString(15 * mm, y, str(lp))
-        cpdf.drawString(27 * mm, y, fit_text(order_no, 32 * mm, pdf_font, 8.5))
-        cpdf.drawString(62 * mm, y, fit_text(note if note else "-", 27 * mm, pdf_font, 8.5))
-        cpdf.drawString(92 * mm, y, fit_text(product_text, 86 * mm, pdf_font, 8.5))
-        cpdf.drawRightString(198 * mm, y, str(qty))
-        y -= 5 * mm
-
-    y -= 4 * mm
-    cpdf.line(15 * mm, y, 198 * mm, y)
-    y -= 6 * mm
+    if y < 50 * mm:
+        cpdf.showPage()
+        y = draw_header(continuation=True)
+    y -= 2 * mm
+    cpdf.setFillColorRGB(*pale_blue)
+    cpdf.roundRect(15 * mm, y - 13 * mm, 180 * mm, 18 * mm, 4 * mm, fill=1, stroke=0)
+    cpdf.setFillColorRGB(*navy)
     cpdf.setFont(pdf_font_bold, 10)
-    cpdf.drawRightString(198 * mm, y, f"Razem szt.: {total_qty}")
-
+    cpdf.drawString(21 * mm, y - 5 * mm, f"Pozycje: {item_count}")
+    cpdf.drawString(70 * mm, y - 5 * mm, f"Razem sztuk: {total_qty}")
+    cpdf.drawString(128 * mm, y - 5 * mm, "Liczba paczek:  ______")
+    y -= 28 * mm
+    cpdf.setFillColorRGB(*muted)
+    cpdf.setFont(pdf_font, 9)
+    cpdf.drawString(15 * mm, y, "Spakował(a):")
+    cpdf.drawString(91 * mm, y, "Data:")
+    cpdf.drawString(145 * mm, y, "Podpis:")
+    cpdf.setStrokeColorRGB(*line_color)
+    cpdf.line(37 * mm, y - 1 * mm, 82 * mm, y - 1 * mm)
+    cpdf.line(103 * mm, y - 1 * mm, 134 * mm, y - 1 * mm)
+    cpdf.line(159 * mm, y - 1 * mm, 195 * mm, y - 1 * mm)
     cpdf.save()
     return fpath
 
@@ -6936,37 +6992,11 @@ def api_client_profile():
 
     if request.method == "GET":
         return jsonify(ok=True, customer=profile)
-
-    language = normalize_client_language((request.get_json(silent=True) or {}).get("language"))
-    price_list = price_list_for_language(language)
-    if not profile.get("id"):
-        return jsonify(
-            ok=False,
-            error="Nie znaleziono profilu klienta, dlatego wybór języka nie został zapisany",
-        ), 404
-    try:
-        supabase_update_rows(
-            "customers",
-            {"language": language, "price_list": price_list},
-            {"id": profile["id"]},
-        )
-        c = conn()
-        try:
-            c.execute(
-                "UPDATE customers SET language=?, price_list=? WHERE id=?",
-                (language, price_list, profile["id"]),
-            )
-            c.commit()
-        finally:
-            c.close()
-    except Exception as exc:
-        app.logger.error("Nie udało się zapisać języka klienta: %s", type(exc).__name__)
-        return jsonify(ok=False, error="Nie udało się zapisać języka klienta"), 503
-
-    profile["language"] = language
-    profile["price_list"] = price_list
-    profile["currency"] = price_list_currency(price_list)
-    return jsonify(ok=True, customer=profile)
+    # Język określa również cennik (PLN albo EUR), dlatego klient nie może
+    # zmieniać go samodzielnie. Ustawienie jest dostępne tylko administratorowi
+    # w panelu magazynu. Blokada po stronie serwera chroni również przed ręcznym
+    # wywołaniem endpointu poza interfejsem.
+    return jsonify(ok=False, error="Język i cennik konta może zmienić wyłącznie administrator"), 403
 
 
 def _order_by_idempotency_key(idempotency_key: str) -> dict | None:
