@@ -1802,6 +1802,11 @@ def normalize_client_price_list(value) -> str:
     return price_list if price_list in CLIENT_PRICE_LISTS else "pln"
 
 
+def price_list_for_language(language) -> str:
+    """Polish accounts use PLN; every supported foreign language uses EUR."""
+    return "pln" if normalize_client_language(language) == "pl" else "eu_eur"
+
+
 def price_list_currency(value) -> str:
     return "EUR" if normalize_client_price_list(value) == "eu_eur" else "PLN"
 
@@ -4509,7 +4514,7 @@ def customers_create():
     email = norm(request.form.get("email"))
     nip = norm(request.form.get("nip"))
     language = normalize_client_language(request.form.get("language"))
-    price_list = normalize_client_price_list(request.form.get("price_list"))
+    price_list = price_list_for_language(language)
     if not name:
         return "Brak nazwy klienta", 400
 
@@ -4604,7 +4609,7 @@ def customers_update(customer_id):
     email = norm(request.form.get("email"))
     nip = norm(request.form.get("nip"))
     language = normalize_client_language(request.form.get("language"))
-    price_list = normalize_client_price_list(request.form.get("price_list"))
+    price_list = price_list_for_language(language)
     if not name:
         return "Brak nazwy klienta", 400
 
@@ -6882,7 +6887,24 @@ def _client_profile_for_email(email: str) -> dict:
     if not isinstance(rows, list) or not rows:
         return fallback
     row = dict(rows[0])
-    price_list = normalize_client_price_list(row.get("price_list"))
+    language = normalize_client_language(row.get("language"))
+    price_list = price_list_for_language(language)
+    # Reguła jest egzekwowana także dla istniejących kont. Aktualizacja jest
+    # wykonywana podczas logowania, więc nie trzeba ręcznie poprawiać klientów.
+    stored_price_list = normalize_client_price_list(row.get("price_list"))
+    if row.get("id") is not None and stored_price_list != price_list:
+        try:
+            supabase_update_rows("customers", {"price_list": price_list}, {"id": row["id"]})
+            c = conn()
+            try:
+                c.execute("UPDATE customers SET price_list=? WHERE id=?", (price_list, row["id"]))
+                c.commit()
+            finally:
+                c.close()
+        except Exception as exc:
+            # Profil nadal zwracamy z poprawnym cennikiem; błąd zapisu jest
+            # widoczny w logu Rendera i zostanie ponowiony przy kolejnym odczycie.
+            app.logger.warning("Nie udało się automatycznie zapisać cennika klienta id=%s: %s", row.get("id"), exc)
     return {
         "id": row.get("id"),
         "name": norm(row.get("name")) or fallback["name"],
@@ -6890,7 +6912,7 @@ def _client_profile_for_email(email: str) -> dict:
         "phone": norm(row.get("phone")),
         "email": _email_key(row.get("email")) or email,
         "nip": norm(row.get("nip")),
-        "language": normalize_client_language(row.get("language")),
+        "language": language,
         "price_list": price_list,
         "currency": price_list_currency(price_list),
     }
@@ -6912,16 +6934,24 @@ def api_client_profile():
         return jsonify(ok=True, customer=profile)
 
     language = normalize_client_language((request.get_json(silent=True) or {}).get("language"))
+    price_list = price_list_for_language(language)
     if not profile.get("id"):
         return jsonify(
             ok=False,
             error="Nie znaleziono profilu klienta, dlatego wybór języka nie został zapisany",
         ), 404
     try:
-        supabase_update_rows("customers", {"language": language}, {"id": profile["id"]})
+        supabase_update_rows(
+            "customers",
+            {"language": language, "price_list": price_list},
+            {"id": profile["id"]},
+        )
         c = conn()
         try:
-            c.execute("UPDATE customers SET language=? WHERE id=?", (language, profile["id"]))
+            c.execute(
+                "UPDATE customers SET language=?, price_list=? WHERE id=?",
+                (language, price_list, profile["id"]),
+            )
             c.commit()
         finally:
             c.close()
@@ -6930,6 +6960,8 @@ def api_client_profile():
         return jsonify(ok=False, error="Nie udało się zapisać języka klienta"), 503
 
     profile["language"] = language
+    profile["price_list"] = price_list
+    profile["currency"] = price_list_currency(price_list)
     return jsonify(ok=True, customer=profile)
 
 
