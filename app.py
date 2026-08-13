@@ -6931,6 +6931,24 @@ def _send_saved_order_confirmation(order_id: int, force: bool = False) -> dict:
     return result
 
 
+def _safe_saved_order_confirmation(order_id: int, force: bool = False) -> dict:
+    """Email is secondary: it must never turn a saved order into an HTTP 500."""
+    try:
+        result = (
+            _send_saved_order_confirmation(order_id, force=True)
+            if force
+            else _send_saved_order_confirmation(order_id)
+        )
+        if not isinstance(result, dict):
+            return {"ok": False, "pending_retry": True, "error": "Nieprawidłowa odpowiedź modułu e-mail"}
+        if not result.get("ok"):
+            result["pending_retry"] = True
+        return result
+    except Exception as exc:
+        app.logger.exception("Zamówienie %s zapisane, ale potwierdzenie e-mail nie powiodło się", order_id)
+        return {"ok": False, "pending_retry": True, "error": str(exc)}
+
+
 def _authenticated_client_user() -> dict | None:
     auth = norm(request.headers.get("Authorization"))
     if not auth.lower().startswith("bearer "):
@@ -7116,7 +7134,7 @@ def api_client_orders_create():
         if norm(existing.get("customer_email")).lower() != customer_email:
             return jsonify(ok=False, error="Konflikt Idempotency-Key"), 409
         app.logger.info("Ponowiono request user_id=%s order_id=%s idempotency_key=%s", client_user["id"], existing["id"], idempotency_key)
-        return jsonify(ok=True, duplicate=True, order={"id": existing["id"], "order_no": existing["order_no"]}, email=_send_saved_order_confirmation(int(existing["id"])))
+        return jsonify(ok=True, duplicate=True, order={"id": existing["id"], "order_no": existing["order_no"]}, email=_safe_saved_order_confirmation(int(existing["id"])))
 
     raw_items = data.get("items")
     if not isinstance(raw_items, list) or not raw_items:
@@ -7181,9 +7199,7 @@ def api_client_orders_create():
             price_list=profile.get("price_list", "pln"),
             currency=profile.get("currency", "PLN"),
         )
-        email_result = _send_saved_order_confirmation(order_id)
-        if not email_result.get("ok"):
-            email_result["pending_retry"] = True
+        email_result = _safe_saved_order_confirmation(order_id)
         c = conn()
         try:
             cur = c.cursor()
@@ -7195,12 +7211,20 @@ def api_client_orders_create():
         app.logger.info("Utworzono zamówienie user_id=%s order_id=%s order_no=%s items=%s email_ok=%s", client_user["id"], order_id, order_no, len(items), bool(email_result.get("ok")))
         return jsonify(ok=True, order={"id": order_id, "order_no": order_no}, email=email_result)
     except Exception as exc:
+        # remote_first_create_order może zdążyć zapisać rekord w Supabase, a
+        # następnie utracić połączenie podczas lokalnego odświeżenia. Pobieramy
+        # stan ponownie i rozpoznajemy zamówienie po niezmiennym kluczu, zamiast
+        # zwracać klientowi fałszywy błąd 500.
+        try:
+            maybe_pull_shared_from_supabase(force=True)
+        except Exception:
+            pass
         existing = _order_by_idempotency_key(idempotency_key)
         if existing:
             if norm(existing.get("customer_email")).lower() != customer_email:
                 return jsonify(ok=False, error="Konflikt Idempotency-Key"), 409
             app.logger.info("Konflikt idempotencji user_id=%s order_id=%s", client_user["id"], existing["id"])
-            return jsonify(ok=True, duplicate=True, order={"id": existing["id"], "order_no": existing["order_no"]}, email=_send_saved_order_confirmation(int(existing["id"])))
+            return jsonify(ok=True, duplicate=True, recovered=True, order={"id": existing["id"], "order_no": existing["order_no"]}, email=_safe_saved_order_confirmation(int(existing["id"])))
         app.logger.exception("Błąd tworzenia zamówienia user_id=%s items=%s", client_user["id"], len(items))
         return jsonify(ok=False, error=str(exc)), 500
 
