@@ -41,6 +41,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from ksef_module import build_ksef_draft_xml, validate_fa3_xml, validate_ksef_invoice, xml_filename
 from cash_flow_module import register_cash_flow
 from inventory_analytics import build_replenishment_analysis, recommended_replenishments
+from proforma_module import generate_proforma_pdf
 try:
     from ksef_api import ksef_config_summary, send_invoice_to_ksef
 except Exception:
@@ -1791,6 +1792,44 @@ ORDER_PDF_TRANSLATIONS = {
     },
 }
 
+PACKING_LIST_TRANSLATIONS = {
+    "pl": {
+        "title": "LISTA PAKOWANIA", "invoice": "Faktura", "continued": "dalszy ciąg",
+        "order": "ZAMÓWIENIE", "date": "DATA", "customer": "KLIENT", "checked": "✓",
+        "line": "LP.", "product": "MODEL / NAZWA", "source": "ZAMÓWIENIE / NOTATKA",
+        "quantity": "ILOŚĆ", "positions": "Pozycje", "total_qty": "Razem sztuk",
+        "packages": "Liczba paczek", "packed_by": "Spakował(a)", "signature": "Podpis",
+    },
+    "de": {
+        "title": "PACKLISTE", "invoice": "Rechnung", "continued": "Fortsetzung",
+        "order": "BESTELLUNG", "date": "DATUM", "customer": "KUNDE", "checked": "✓",
+        "line": "POS.", "product": "MODELL / BEZEICHNUNG", "source": "BESTELLUNG / NOTIZ",
+        "quantity": "MENGE", "positions": "Positionen", "total_qty": "Gesamtmenge",
+        "packages": "Anzahl Pakete", "packed_by": "Gepackt von", "signature": "Unterschrift",
+    },
+    "en": {
+        "title": "PACKING LIST", "invoice": "Invoice", "continued": "continued",
+        "order": "ORDER", "date": "DATE", "customer": "CUSTOMER", "checked": "✓",
+        "line": "NO.", "product": "MODEL / PRODUCT", "source": "ORDER / NOTE",
+        "quantity": "QTY", "positions": "Items", "total_qty": "Total quantity",
+        "packages": "Packages", "packed_by": "Packed by", "signature": "Signature",
+    },
+    "es": {
+        "title": "LISTA DE EMBALAJE", "invoice": "Factura", "continued": "continuación",
+        "order": "PEDIDO", "date": "FECHA", "customer": "CLIENTE", "checked": "✓",
+        "line": "N.º", "product": "MODELO / PRODUCTO", "source": "PEDIDO / NOTA",
+        "quantity": "CANT.", "positions": "Artículos", "total_qty": "Cantidad total",
+        "packages": "Número de paquetes", "packed_by": "Preparado por", "signature": "Firma",
+    },
+    "it": {
+        "title": "LISTA DI IMBALLAGGIO", "invoice": "Fattura", "continued": "continua",
+        "order": "ORDINE", "date": "DATA", "customer": "CLIENTE", "checked": "✓",
+        "line": "N.", "product": "MODELLO / PRODOTTO", "source": "ORDINE / NOTA",
+        "quantity": "Q.TÀ", "positions": "Articoli", "total_qty": "Quantità totale",
+        "packages": "Numero colli", "packed_by": "Preparato da", "signature": "Firma",
+    },
+}
+
 
 def normalize_client_language(value) -> str:
     language = norm(value).lower()
@@ -1818,6 +1857,11 @@ def normalize_order_currency(value) -> str:
 def order_pdf_text(language: str, key: str) -> str:
     language = normalize_client_language(language)
     return ORDER_PDF_TRANSLATIONS.get(language, {}).get(key) or ORDER_PDF_TRANSLATIONS["pl"].get(key, "")
+
+
+def packing_list_text(language: str, key: str) -> str:
+    language = normalize_client_language(language)
+    return PACKING_LIST_TRANSLATIONS.get(language, {}).get(key) or PACKING_LIST_TRANSLATIONS["pl"].get(key, "")
 
 
 def localized_pdf_money(value, language: str) -> str:
@@ -2518,6 +2562,16 @@ def generate_invoice_packing_list_pdf(order_row, items, meta, invoice_pdf_path: 
             return order_no[:-(len(note) + 1)].strip()
         return order_no
 
+    language = normalize_client_language(meta.get("language") or order_value("language"))
+    if not (meta.get("language") or order_value("language")):
+        customer_email = norm(order_value("customer_email") or meta.get("buyer_email"))
+        if customer_email:
+            try:
+                language = normalize_client_language(_client_profile_for_email(customer_email).get("language"))
+            except Exception as exc:
+                app.logger.warning("Nie udało się ustalić języka listy pakowania dla %s: %s", customer_email, type(exc).__name__)
+    tr = lambda key: packing_list_text(language, key)
+
     def draw_header(continuation=False):
         logo_path = find_logo_path()
         if logo_path:
@@ -2528,12 +2582,12 @@ def generate_invoice_packing_list_pdf(order_row, items, meta, invoice_pdf_path: 
                 pass
         cpdf.setFillColorRGB(*navy)
         cpdf.setFont(pdf_font_bold, 18)
-        cpdf.drawRightString(195 * mm, h - 15 * mm, "LISTA PAKOWANIA")
+        cpdf.drawRightString(195 * mm, h - 15 * mm, tr("title"))
         cpdf.setFillColorRGB(*muted)
         cpdf.setFont(pdf_font, 9)
-        subtitle = f"Faktura: {norm(meta.get('invoice_no') or '-')}"
+        subtitle = f"{tr('invoice')}: {norm(meta.get('invoice_no') or '-')}"
         if continuation:
-            subtitle += "  |  dalszy ciąg"
+            subtitle += f"  |  {tr('continued')}"
         cpdf.drawRightString(195 * mm, h - 23 * mm, subtitle)
         cpdf.setStrokeColorRGB(*line_color)
         cpdf.line(15 * mm, h - 31 * mm, 195 * mm, h - 31 * mm)
@@ -2544,9 +2598,9 @@ def generate_invoice_packing_list_pdf(order_row, items, meta, invoice_pdf_path: 
         cpdf.roundRect(15 * mm, current_y - 7 * mm, 180 * mm, 10 * mm, 3 * mm, fill=1, stroke=0)
         cpdf.setFillColorRGB(*blue)
         cpdf.setFont(pdf_font_bold, 8)
-        for label, x_mm in (("✓", 19), ("LP.", 29), ("SKU", 42), ("MODEL / NAZWA", 91), ("ZAMÓWIENIE / NOTATKA", 132)):
+        for label, x_mm in ((tr("checked"), 19), (tr("line"), 29), ("SKU", 42), (tr("product"), 91), (tr("source"), 132)):
             cpdf.drawString(x_mm * mm, current_y - 3.5 * mm, label)
-        cpdf.drawRightString(190 * mm, current_y - 3.5 * mm, "ILOŚĆ")
+        cpdf.drawRightString(190 * mm, current_y - 3.5 * mm, tr("quantity"))
         return current_y - 13 * mm
 
     y = draw_header()
@@ -2555,9 +2609,9 @@ def generate_invoice_packing_list_pdf(order_row, items, meta, invoice_pdf_path: 
     issue_date = norm(meta.get("issue_date") or app_now().strftime("%Y-%m-%d"))
     cpdf.setFillColorRGB(*muted)
     cpdf.setFont(pdf_font_bold, 8)
-    cpdf.drawString(15 * mm, y, "ZAMÓWIENIE")
-    cpdf.drawString(72 * mm, y, "DATA")
-    cpdf.drawString(122 * mm, y, "KLIENT")
+    cpdf.drawString(15 * mm, y, tr("order"))
+    cpdf.drawString(72 * mm, y, tr("date"))
+    cpdf.drawString(122 * mm, y, tr("customer"))
     y -= 6 * mm
     cpdf.setFillColorRGB(*navy)
     cpdf.setFont(pdf_font, 10)
@@ -2610,15 +2664,15 @@ def generate_invoice_packing_list_pdf(order_row, items, meta, invoice_pdf_path: 
     cpdf.roundRect(15 * mm, y - 13 * mm, 180 * mm, 18 * mm, 4 * mm, fill=1, stroke=0)
     cpdf.setFillColorRGB(*navy)
     cpdf.setFont(pdf_font_bold, 10)
-    cpdf.drawString(21 * mm, y - 5 * mm, f"Pozycje: {item_count}")
-    cpdf.drawString(70 * mm, y - 5 * mm, f"Razem sztuk: {total_qty}")
-    cpdf.drawString(128 * mm, y - 5 * mm, "Liczba paczek:  ______")
+    cpdf.drawString(21 * mm, y - 5 * mm, f"{tr('positions')}: {item_count}")
+    cpdf.drawString(70 * mm, y - 5 * mm, f"{tr('total_qty')}: {total_qty}")
+    cpdf.drawString(128 * mm, y - 5 * mm, f"{tr('packages')}:  ______")
     y -= 28 * mm
     cpdf.setFillColorRGB(*muted)
     cpdf.setFont(pdf_font, 9)
-    cpdf.drawString(15 * mm, y, "Spakował(a):")
-    cpdf.drawString(91 * mm, y, "Data:")
-    cpdf.drawString(145 * mm, y, "Podpis:")
+    cpdf.drawString(15 * mm, y, f"{tr('packed_by')}:")
+    cpdf.drawString(91 * mm, y, f"{tr('date').title()}:")
+    cpdf.drawString(145 * mm, y, f"{tr('signature')}:")
     cpdf.setStrokeColorRGB(*line_color)
     cpdf.line(37 * mm, y - 1 * mm, 82 * mm, y - 1 * mm)
     cpdf.line(103 * mm, y - 1 * mm, 134 * mm, y - 1 * mm)
@@ -5578,7 +5632,8 @@ def order_view(order_id):
           <div class="right flex">
             <a class="btn" href="{{ url_for('orders') }}">â† Lista</a>
             {% if (o['currency'] or 'PLN') == 'EUR' %}
-              <span class="badge" title="Moduł polskiej faktury i KSeF pracuje w PLN. Fakturę EUR wystaw oddzielnie.">Faktura EUR — ręcznie</span>
+              <a class="btn primary" href="{{ url_for('order_proforma', order_id=o['id']) }}" target="_blank">Proforma EUR</a>
+              <span class="badge" title="Dokument końcowy wystawiasz ręcznie poza modułem KSeF.">Faktura końcowa — ręcznie</span>
             {% else %}
               <a class="btn primary" href="{{ url_for('order_invoice', order_id=o['id']) }}">Faktura</a>
             {% endif %}
@@ -7662,6 +7717,49 @@ def _api_client_order_pdf_impl(order_id: int):
     )
     response.headers["Cache-Control"] = "no-store"
     return response
+
+
+@app.get("/orders/<int:order_id>/proforma")
+def order_proforma(order_id: int):
+    """Generate a foreign-customer proforma without creating a Polish invoice/KSeF record."""
+    maybe_pull_shared_from_supabase()
+    c = conn()
+    try:
+        cur = c.cursor()
+        cur.execute("SELECT * FROM orders WHERE id=? LIMIT 1", (order_id,))
+        row = cur.fetchone()
+        if not row:
+            return "Nie znaleziono zamówienia", 404
+        order = dict(row)
+        if normalize_order_currency(order.get("currency")) != "EUR":
+            return "Proforma EUR jest dostępna wyłącznie dla zamówień zagranicznych", 400
+        items = _client_order_items_local(c, order)
+        company_row = cur.execute("SELECT * FROM company_profile WHERE id=1").fetchone()
+        company = dict(company_row) if company_row else {}
+    finally:
+        c.close()
+    try:
+        profile = _client_profile_for_email(order.get("customer_email"))
+        language = normalize_client_language(profile.get("language"))
+        order["customer_tax_no"] = profile.get("nip") or ""
+        order["customer_name"] = profile.get("name") or order.get("customer_name")
+        order["customer_address"] = profile.get("address") or order.get("customer_address")
+        order["customer_phone"] = profile.get("phone") or order.get("customer_phone")
+    except Exception:
+        language = "en"
+    company["pdf_font"], company["pdf_font_bold"] = get_pdf_font_names()
+    pdf_buffer, filename = generate_proforma_pdf(
+        order,
+        items,
+        company,
+        language=language,
+        logo_path=find_logo_path(),
+        iban=norm(os.environ.get("PROFORMA_EUR_IBAN") or company.get("bank_account")),
+        bic=norm(os.environ.get("PROFORMA_EUR_BIC")),
+        bank_name=norm(os.environ.get("PROFORMA_EUR_BANK")),
+        place=norm(os.environ.get("PROFORMA_PLACE") or "Kotusów"),
+    )
+    return send_file(pdf_buffer, mimetype="application/pdf", as_attachment=True, download_name=filename, max_age=0)
 
 
 @app.get("/api/client_invoices")
