@@ -209,6 +209,7 @@ def init_db():
         phone TEXT,
         email TEXT,
         nip TEXT,
+        language TEXT NOT NULL DEFAULT 'pl',
         created_at TEXT NOT NULL
     )
     """)
@@ -423,6 +424,13 @@ def init_db():
     customer_cols = {r[1] for r in cur.fetchall()}
     if "nip" not in customer_cols:
         cur.execute("ALTER TABLE customers ADD COLUMN nip TEXT")
+    if "language" not in customer_cols:
+        cur.execute("ALTER TABLE customers ADD COLUMN language TEXT NOT NULL DEFAULT 'pl'")
+    cur.execute("""
+      UPDATE customers
+      SET language='pl'
+      WHERE language IS NULL OR LOWER(TRIM(language)) NOT IN ('pl','de','en','es','it')
+    """)
 
     # migracja: QR zamĂłwieĹ„
     cur.execute("PRAGMA table_info(orders)")
@@ -1402,13 +1410,15 @@ def sync_order_to_supabase(order_id: int):
         sync_local_rows_to_supabase("order_items", "id", item_ids)
 
 
-def remote_first_create_customer(name: str, address: str, phone: str, email: str, nip: str):
+def remote_first_create_customer(name: str, address: str, phone: str, email: str, nip: str, language: str = "pl"):
+    language = normalize_client_language(language)
     created = supabase_insert_row("customers", {
         "name": name,
         "address": address,
         "phone": phone,
         "email": email,
         "nip": nip,
+        "language": language,
         "created_at": now_iso(),
     })
     if not created or "id" not in created:
@@ -1418,8 +1428,8 @@ def remote_first_create_customer(name: str, address: str, phone: str, email: str
     c = conn()
     cur = c.cursor()
     cur.execute(
-        "INSERT INTO customers(id, name, address, phone, email, nip, created_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, address=excluded.address, phone=excluded.phone, email=excluded.email, nip=excluded.nip, created_at=excluded.created_at",
-        (customer_id, name, address, phone, email, nip, created.get("created_at") or now_iso())
+        "INSERT INTO customers(id, name, address, phone, email, nip, language, created_at) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, address=excluded.address, phone=excluded.phone, email=excluded.email, nip=excluded.nip, language=excluded.language, created_at=excluded.created_at",
+        (customer_id, name, address, phone, email, nip, language, created.get("created_at") or now_iso())
     )
     c.commit()
     c.close()
@@ -1532,6 +1542,7 @@ def get_pdf_font_names():
     regular_candidates = [
         # Lokalne fonty aplikacji (najwyĹĽszy priorytet)
         ("AppFont-Regular", os.path.join(APP_DIR, "fonts", "regular.ttf")),
+        ("AppFontRoot-Regular", os.path.join(APP_DIR, "regular.ttf")),
 
         # Linux
         ("DejaVuSans", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
@@ -1550,6 +1561,7 @@ def get_pdf_font_names():
     ]
     bold_candidates = [
         ("AppFont-Bold", os.path.join(APP_DIR, "fonts", "bold.ttf")),
+        ("AppFontRoot-Bold", os.path.join(APP_DIR, "bold.ttf")),
 
         # Linux
         ("DejaVuSans-Bold", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
@@ -1600,6 +1612,302 @@ def get_pdf_font_names():
         bold = reg
 
     return regular, bold
+
+
+CLIENT_LANGUAGES = {"pl", "de", "en", "es", "it"}
+
+ORDER_PDF_TRANSLATIONS = {
+    "pl": {
+        "title": "ZAMÓWIENIE", "order_number": "Numer zamówienia", "date": "Data",
+        "customer": "Klient", "delivery_address": "Adres dostawy", "status": "Status",
+        "email": "E-mail", "phone": "Telefon", "notes": "Uwagi klienta",
+        "sku": "SKU", "product": "Model / nazwa", "quantity": "Ilość",
+        "unit_net": "Cena jedn. netto", "line_net": "Wartość netto",
+        "net_total": "Razem netto", "vat": "VAT", "gross_total": "Razem brutto",
+        "currency": "PLN", "page": "Strona",
+        "status_unconfirmed": "Niepotwierdzone", "status_confirmed": "Potwierdzone",
+        "status_in_delivery": "W dostawie", "status_completed": "Zrealizowane",
+        "status_cancelled": "Anulowane", "status_other": "Inny",
+    },
+    "de": {
+        "title": "BESTELLUNG", "order_number": "Bestellnummer", "date": "Datum",
+        "customer": "Kunde", "delivery_address": "Lieferadresse", "status": "Status",
+        "email": "E-Mail", "phone": "Telefon", "notes": "Kundenhinweise",
+        "sku": "SKU", "product": "Modell / Bezeichnung", "quantity": "Menge",
+        "unit_net": "Nettostückpreis", "line_net": "Nettowert",
+        "net_total": "Nettobetrag", "vat": "MwSt.", "gross_total": "Gesamtbetrag",
+        "currency": "PLN", "page": "Seite",
+        "status_unconfirmed": "Unbestätigt", "status_confirmed": "Bestätigt",
+        "status_in_delivery": "In Lieferung", "status_completed": "Abgeschlossen",
+        "status_cancelled": "Storniert", "status_other": "Sonstiger",
+    },
+    "en": {
+        "title": "ORDER", "order_number": "Order number", "date": "Date",
+        "customer": "Customer", "delivery_address": "Delivery address", "status": "Status",
+        "email": "Email", "phone": "Phone", "notes": "Customer notes",
+        "sku": "SKU", "product": "Model / product", "quantity": "Quantity",
+        "unit_net": "Net unit price", "line_net": "Net value",
+        "net_total": "Net total", "vat": "VAT", "gross_total": "Gross total",
+        "currency": "PLN", "page": "Page",
+        "status_unconfirmed": "Unconfirmed", "status_confirmed": "Confirmed",
+        "status_in_delivery": "In delivery", "status_completed": "Completed",
+        "status_cancelled": "Cancelled", "status_other": "Other",
+    },
+    "es": {
+        "title": "PEDIDO", "order_number": "Número de pedido", "date": "Fecha",
+        "customer": "Cliente", "delivery_address": "Dirección de entrega", "status": "Estado",
+        "email": "Correo electrónico", "phone": "Teléfono", "notes": "Notas del cliente",
+        "sku": "SKU", "product": "Modelo / producto", "quantity": "Cantidad",
+        "unit_net": "Precio unitario neto", "line_net": "Importe neto",
+        "net_total": "Total neto", "vat": "IVA", "gross_total": "Total bruto",
+        "currency": "PLN", "page": "Página",
+        "status_unconfirmed": "Sin confirmar", "status_confirmed": "Confirmado",
+        "status_in_delivery": "En entrega", "status_completed": "Completado",
+        "status_cancelled": "Cancelado", "status_other": "Otro",
+    },
+    "it": {
+        "title": "ORDINE", "order_number": "Numero ordine", "date": "Data",
+        "customer": "Cliente", "delivery_address": "Indirizzo di consegna", "status": "Stato",
+        "email": "E-mail", "phone": "Telefono", "notes": "Note del cliente",
+        "sku": "SKU", "product": "Modello / prodotto", "quantity": "Quantità",
+        "unit_net": "Prezzo unitario netto", "line_net": "Valore netto",
+        "net_total": "Totale netto", "vat": "IVA", "gross_total": "Totale lordo",
+        "currency": "PLN", "page": "Pagina",
+        "status_unconfirmed": "Non confermato", "status_confirmed": "Confermato",
+        "status_in_delivery": "In consegna", "status_completed": "Completato",
+        "status_cancelled": "Annullato", "status_other": "Altro",
+    },
+}
+
+
+def normalize_client_language(value) -> str:
+    language = norm(value).lower()
+    return language if language in CLIENT_LANGUAGES else "pl"
+
+
+def order_pdf_text(language: str, key: str) -> str:
+    language = normalize_client_language(language)
+    return ORDER_PDF_TRANSLATIONS.get(language, {}).get(key) or ORDER_PDF_TRANSLATIONS["pl"].get(key, "")
+
+
+def localized_pdf_money(value, language: str) -> str:
+    amount = money_dec(value)
+    raw = f"{amount:,.2f}"
+    if normalize_client_language(language) == "en":
+        return raw
+    return raw.replace(",", "\u0000").replace(".", ",").replace("\u0000", " ")
+
+
+def localized_pdf_date(value, language: str) -> str:
+    raw = norm(value).replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except Exception:
+        try:
+            parsed = datetime.strptime(raw[:10], "%Y-%m-%d")
+        except Exception:
+            return norm(value)
+    if normalize_client_language(language) in {"es", "en"}:
+        return parsed.strftime("%d/%m/%Y")
+    return parsed.strftime("%d.%m.%Y")
+
+
+def order_pdf_status(status, language: str) -> str:
+    key = norm(status).lower()
+    if key in {"new", "pending", "unconfirmed"}:
+        label_key = "status_unconfirmed"
+    elif key in {"confirmed", "packed"}:
+        label_key = "status_confirmed"
+    elif key in {"in_delivery", "shipped"}:
+        label_key = "status_in_delivery"
+    elif key in {"issued", "completed"}:
+        label_key = "status_completed"
+    elif key == "cancelled":
+        label_key = "status_cancelled"
+    else:
+        label_key = "status_other"
+    return order_pdf_text(language, label_key)
+
+
+def generate_client_order_pdf(order_row: dict, items: list[dict], language: str) -> tuple[io.BytesIO, str]:
+    """Create one localized order PDF without persisting a second document copy."""
+    language = normalize_client_language(language)
+    regular_font, bold_font = get_pdf_font_names()
+    page_width, page_height = 210 * mm, 297 * mm
+    left, right = 15 * mm, 195 * mm
+    buffer = io.BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=(page_width, page_height))
+
+    c = conn()
+    try:
+        company_row = c.execute("SELECT * FROM company_profile WHERE id=1").fetchone()
+        company = dict(company_row) if company_row else {}
+    finally:
+        c.close()
+
+    def txt(value) -> str:
+        return fix_polish_mojibake(norm(value))
+
+    def fit(value, font_name, size, max_width) -> str:
+        value = txt(value)
+        if pdfmetrics.stringWidth(value, font_name, size) <= max_width:
+            return value
+        suffix = "…"
+        while value and pdfmetrics.stringWidth(value + suffix, font_name, size) > max_width:
+            value = value[:-1]
+        return value + suffix if value else ""
+
+    def wrap(value, font_name, size, max_width, max_lines=3):
+        words = txt(value).split()
+        lines, current = [], ""
+        for word in words:
+            candidate = word if not current else f"{current} {word}"
+            if pdfmetrics.stringWidth(candidate, font_name, size) <= max_width:
+                current = candidate
+            else:
+                if current:
+                    lines.append(current)
+                current = fit(word, font_name, size, max_width)
+                if len(lines) >= max_lines:
+                    break
+        if current and len(lines) < max_lines:
+            lines.append(current)
+        return lines or ["-"]
+
+    page_no = 0
+    order_number = canonical_order_no(
+        order_row.get("id"), order_row.get("created_at"), order_row.get("order_no")
+    )
+
+    def footer():
+        pdf.setStrokeColorRGB(0.88, 0.90, 0.94)
+        pdf.line(left, 12 * mm, right, 12 * mm)
+        pdf.setFont(regular_font, 7.5)
+        pdf.setFillColorRGB(0.42, 0.47, 0.58)
+        pdf.drawString(left, 7.5 * mm, txt(company.get("company_name") or "Niedźwieccy"))
+        pdf.drawRightString(right, 7.5 * mm, f"{order_pdf_text(language, 'page')} {page_no}")
+
+    def new_page(first=False):
+        nonlocal page_no
+        if not first:
+            footer()
+            pdf.showPage()
+        page_no += 1
+        pdf.setFillColorRGB(0.07, 0.13, 0.24)
+        pdf.rect(0, page_height - 31 * mm, page_width, 31 * mm, fill=1, stroke=0)
+        logo_path = find_logo_path()
+        if logo_path:
+            try:
+                pdf.drawImage(ImageReader(logo_path), left, page_height - 25 * mm, 24 * mm, 15 * mm,
+                              preserveAspectRatio=True, anchor="w", mask="auto")
+            except Exception:
+                pass
+        pdf.setFillColorRGB(1, 1, 1)
+        pdf.setFont(bold_font, 19)
+        pdf.drawRightString(right, page_height - 16 * mm, order_pdf_text(language, "title"))
+        pdf.setFont(regular_font, 9)
+        pdf.drawRightString(right, page_height - 23 * mm, fit(order_number, regular_font, 9, 80 * mm))
+        return page_height - 40 * mm
+
+    def draw_table_header(y):
+        pdf.setFillColorRGB(0.94, 0.96, 1)
+        pdf.roundRect(left, y - 7 * mm, right - left, 8 * mm, 2 * mm, fill=1, stroke=0)
+        pdf.setFillColorRGB(0.22, 0.31, 0.52)
+        pdf.setFont(bold_font, 7.4)
+        pdf.drawString(left + 2 * mm, y - 4 * mm, order_pdf_text(language, "sku"))
+        pdf.drawString(left + 34 * mm, y - 4 * mm, order_pdf_text(language, "product"))
+        pdf.drawRightString(left + 122 * mm, y - 4 * mm, order_pdf_text(language, "quantity"))
+        pdf.drawRightString(left + 152 * mm, y - 4 * mm, order_pdf_text(language, "unit_net"))
+        pdf.drawRightString(right - 2 * mm, y - 4 * mm, order_pdf_text(language, "line_net"))
+        return y - 10 * mm
+
+    y = new_page(first=True)
+    pdf.setFillColorRGB(0.10, 0.15, 0.26)
+    pdf.setFont(bold_font, 9)
+    pdf.drawString(left, y, order_pdf_text(language, "order_number"))
+    pdf.drawString(left + 72 * mm, y, order_pdf_text(language, "date"))
+    pdf.drawString(left + 117 * mm, y, order_pdf_text(language, "status"))
+    pdf.setFont(regular_font, 9)
+    pdf.drawString(left, y - 5 * mm, fit(order_number, regular_font, 9, 65 * mm))
+    pdf.drawString(left + 72 * mm, y - 5 * mm, localized_pdf_date(order_row.get("created_at"), language))
+    pdf.drawString(left + 117 * mm, y - 5 * mm, order_pdf_status(order_row.get("status"), language))
+    y -= 15 * mm
+
+    customer_name = order_row.get("customer_name") or "-"
+    customer_address = order_row.get("customer_address") or ""
+    pdf.setFont(bold_font, 9)
+    pdf.drawString(left, y, order_pdf_text(language, "customer"))
+    pdf.drawString(left + 95 * mm, y, order_pdf_text(language, "delivery_address"))
+    pdf.setFont(regular_font, 8.5)
+    customer_lines = wrap(customer_name, regular_font, 8.5, 82 * mm, 2)
+    contact = " · ".join(x for x in [txt(order_row.get("customer_email")), txt(order_row.get("customer_phone"))] if x)
+    if contact:
+        customer_lines.extend(wrap(contact, regular_font, 7.5, 82 * mm, 2))
+    address_lines = wrap(customer_address or "-", regular_font, 8.5, 82 * mm, 3)
+    max_lines = max(len(customer_lines), len(address_lines))
+    for idx in range(max_lines):
+        if idx < len(customer_lines):
+            pdf.drawString(left, y - (idx + 1) * 4.5 * mm, customer_lines[idx])
+        if idx < len(address_lines):
+            pdf.drawString(left + 95 * mm, y - (idx + 1) * 4.5 * mm, address_lines[idx])
+    y -= (max_lines + 2) * 4.5 * mm
+
+    y = draw_table_header(y)
+    total_net = Decimal("0.00")
+    total_gross = Decimal("0.00")
+    for item in items:
+        qty = to_int(item.get("qty"), 0)
+        unit_net = money_dec(item.get("net_price"))
+        unit_gross = money_dec(item.get("gross_price"))
+        line_net = (unit_net * qty).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
+        line_gross = (unit_gross * qty).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
+        total_net += line_net
+        total_gross += line_gross
+        if y < 31 * mm:
+            y = new_page()
+            y = draw_table_header(y)
+        pdf.setFillColorRGB(0.10, 0.15, 0.26)
+        pdf.setFont(regular_font, 7.8)
+        product_label = " / ".join(x for x in [txt(item.get("model")), txt(item.get("name"))] if x) or "-"
+        pdf.drawString(left + 2 * mm, y, fit(item.get("sku"), regular_font, 7.8, 29 * mm))
+        pdf.drawString(left + 34 * mm, y, fit(product_label, regular_font, 7.8, 54 * mm))
+        pdf.drawRightString(left + 122 * mm, y, str(qty))
+        pdf.drawRightString(left + 152 * mm, y, localized_pdf_money(unit_net, language))
+        pdf.drawRightString(right - 2 * mm, y, localized_pdf_money(line_net, language))
+        pdf.setStrokeColorRGB(0.91, 0.92, 0.95)
+        pdf.line(left, y - 2.5 * mm, right, y - 2.5 * mm)
+        y -= 7 * mm
+
+    total_net = total_net.quantize(MONEY_Q, rounding=ROUND_HALF_UP)
+    total_gross = total_gross.quantize(MONEY_Q, rounding=ROUND_HALF_UP)
+    vat_value = (total_gross - total_net).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
+    if y < 48 * mm:
+        y = new_page()
+    y -= 3 * mm
+    pdf.setFillColorRGB(0.10, 0.15, 0.26)
+    for key, value, is_bold in (
+        ("net_total", total_net, False), ("vat", vat_value, False), ("gross_total", total_gross, True)
+    ):
+        pdf.setFont(bold_font if is_bold else regular_font, 10 if is_bold else 9)
+        pdf.drawRightString(right, y, f"{order_pdf_text(language, key)}: {localized_pdf_money(value, language)} {order_pdf_text(language, 'currency')}")
+        y -= 5.5 * mm
+
+    note = norm(order_row.get("note"))
+    if note:
+        if y < 34 * mm:
+            y = new_page()
+        pdf.setFont(bold_font, 9)
+        pdf.drawString(left, y, order_pdf_text(language, "notes"))
+        pdf.setFont(regular_font, 8.5)
+        for line in wrap(note, regular_font, 8.5, right - left, 5):
+            y -= 4.5 * mm
+            pdf.drawString(left, y, line)
+
+    footer()
+    pdf.save()
+    buffer.seek(0)
+    filename = f"ORDER_{safe_filename(order_number)}_{language}.pdf"
+    return buffer, filename
 
 
 def generate_sales_invoice(order_row, items):
@@ -2570,6 +2878,7 @@ def prepare_invoice_edit_items(edit_items: list[dict], form):
 CLIENT_API_PATHS = {
     "/api/client_stock_catalog", "/api/client_search_log", "/api/client/orders",
     "/api/order_lookup", "/api/client_invoices", "/api/client_order_email",
+    "/api/client/profile",
 }
 _rate_lock = threading.Lock()
 _rate_hits = {}
@@ -2604,7 +2913,11 @@ def security_gate():
             return "Zbyt wiele prób logowania. Spróbuj później.", 429
         return None
 
-    is_client_api = path in CLIENT_API_PATHS or path.startswith("/api/invoices/")
+    is_client_api = (
+        path in CLIENT_API_PATHS
+        or path.startswith("/api/invoices/")
+        or path.startswith("/api/client/orders/")
+    )
     if is_client_api:
         if request.method == "OPTIONS":
             return None
@@ -3481,20 +3794,26 @@ register_cash_flow(app, {
 @app.after_request
 def auto_sync_after_write(response):
     try:
-        is_client_api = request.path in CLIENT_API_PATHS or request.path.startswith("/api/invoices/")
+        is_client_api = (
+            request.path in CLIENT_API_PATHS
+            or request.path.startswith("/api/invoices/")
+            or request.path.startswith("/api/client/orders/")
+        )
         if is_client_api:
             origin = norm(request.headers.get("Origin")).rstrip("/")
             if origin and origin in CLIENT_ALLOWED_ORIGINS:
                 response.headers["Access-Control-Allow-Origin"] = origin
                 response.headers["Vary"] = "Origin"
-            response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, OPTIONS"
             response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, Idempotency-Key"
         elif request.path.startswith("/api/"):
             response.headers["Access-Control-Allow-Origin"] = "*"
             response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
             response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
 
-        no_auto_sync_paths = {"/api/client_search_log", "/api/client_order_email"}
+        no_auto_sync_paths = {
+            "/api/client_search_log", "/api/client_order_email", "/api/client/profile"
+        }
         if response.status_code < 400 and request.method in ("POST", "PUT", "PATCH", "DELETE") and request.path not in no_auto_sync_paths:
             trigger_background_supabase_sync(reason=f"{request.method} {request.path}")
     except Exception:
@@ -3817,6 +4136,14 @@ def customers():
             <label class="muted small">Adres</label>
             <textarea name="address" placeholder="Ulica, kod, miasto"></textarea>
           </div>
+          <div>
+            <label class="muted small">Język panelu klienta</label>
+            <select name="language">
+              <option value="pl">PL — polski</option><option value="de">DE — niemiecki</option>
+              <option value="en">EN — angielski</option><option value="es">ES — hiszpański</option>
+              <option value="it">IT — włoski</option>
+            </select>
+          </div>
           <div class="flex" style="align-items:flex-end;">
             <button class="btn primary" type="submit">Zapisz klienta</button>
           </div>
@@ -3827,7 +4154,7 @@ def customers():
         <h2>Lista klientĂłw</h2>
         <table>
           <thead>
-            <tr><th>Nazwa</th><th>Telefon</th><th>Email</th><th>NIP</th><th>Adres</th><th>Akcje</th></tr>
+            <tr><th>Nazwa</th><th>Telefon</th><th>Email</th><th>NIP</th><th>Język</th><th>Adres</th><th>Akcje</th></tr>
           </thead>
           <tbody>
             {% for r in rows %}
@@ -3836,6 +4163,7 @@ def customers():
                 <td>{{ r['phone'] or '-' }}</td>
                 <td>{{ r['email'] or '-' }}</td>
                 <td>{{ r['nip'] or '-' }}</td>
+                <td><span class="badge">{{ (r['language'] or 'pl')|upper }}</span></td>
                 <td style="white-space:pre-line;">{{ r['address'] or '-' }}</td>
                 <td>
                   <div class="flex">
@@ -3848,7 +4176,7 @@ def customers():
               </tr>
             {% endfor %}
             {% if not rows %}
-              <tr><td colspan="6" class="muted">Brak klientĂłw.</td></tr>
+              <tr><td colspan="7" class="muted">Brak klientĂłw.</td></tr>
             {% endif %}
           </tbody>
         </table>
@@ -3864,17 +4192,18 @@ def customers_create():
     phone = norm(request.form.get("phone"))
     email = norm(request.form.get("email"))
     nip = norm(request.form.get("nip"))
+    language = normalize_client_language(request.form.get("language"))
     if not name:
         return "Brak nazwy klienta", 400
 
     if supabase_enabled():
-        remote_first_create_customer(name, address, phone, email, nip)
+        remote_first_create_customer(name, address, phone, email, nip, language)
     else:
         c = conn()
         cur = c.cursor()
         cur.execute(
-            "INSERT INTO customers(name, address, phone, email, nip, created_at) VALUES (?,?,?,?,?,?)",
-            (name, address, phone, email, nip, now_iso())
+            "INSERT INTO customers(name, address, phone, email, nip, language, created_at) VALUES (?,?,?,?,?,?,?)",
+            (name, address, phone, email, nip, language, now_iso())
         )
         c.commit()
         c.close()
@@ -3925,6 +4254,14 @@ def customers_edit(customer_id):
             <label class="muted small">Adres</label>
             <textarea name="address" placeholder="Ulica, kod, miasto">{{ row['address'] or '' }}</textarea>
           </div>
+          <div>
+            <label class="muted small">Język panelu klienta</label>
+            <select name="language">
+              {% for code, label in [('pl','PL — polski'),('de','DE — niemiecki'),('en','EN — angielski'),('es','ES — hiszpański'),('it','IT — włoski')] %}
+                <option value="{{ code }}" {% if (row['language'] or 'pl') == code %}selected{% endif %}>{{ label }}</option>
+              {% endfor %}
+            </select>
+          </div>
           <div class="flex" style="align-items:flex-end;">
             <button class="btn primary" type="submit">Zapisz zmiany</button>
             <a class="btn" href="{{ url_for('customers') }}">PowrĂłt</a>
@@ -3942,6 +4279,7 @@ def customers_update(customer_id):
     phone = norm(request.form.get("phone"))
     email = norm(request.form.get("email"))
     nip = norm(request.form.get("nip"))
+    language = normalize_client_language(request.form.get("language"))
     if not name:
         return "Brak nazwy klienta", 400
 
@@ -3949,9 +4287,9 @@ def customers_update(customer_id):
     cur = c.cursor()
     cur.execute("""
       UPDATE customers
-      SET name=?, address=?, phone=?, email=?, nip=?
+      SET name=?, address=?, phone=?, email=?, nip=?, language=?
       WHERE id=?
-    """, (name, address, phone, email, nip, customer_id))
+    """, (name, address, phone, email, nip, language, customer_id))
     c.commit()
     c.close()
 
@@ -3962,6 +4300,7 @@ def customers_update(customer_id):
             "phone": phone,
             "email": email,
             "nip": nip,
+            "language": language,
         }, {"id": customer_id})
 
     try:
@@ -6098,6 +6437,87 @@ def _authenticated_client_user() -> dict | None:
         return None
 
 
+def _client_profile_for_email(email: str) -> dict:
+    email = _email_key(email)
+    fallback = {
+        "id": None,
+        "name": email.split("@")[0] if email else "",
+        "address": "",
+        "phone": "",
+        "email": email,
+        "nip": "",
+        "language": "pl",
+    }
+    if not email or not supabase_enabled():
+        return fallback
+
+    params = {
+        "select": "id,name,address,phone,email,nip,language",
+        "email": f"ilike.{email}",
+        "order": "id.desc",
+        "limit": 1,
+    }
+    try:
+        rows = supabase_request("/rest/v1/customers", params=params, timeout=20) or []
+    except urllib.error.HTTPError as exc:
+        # Bezpieczny fallback podczas wdrażania, zanim kolumna language zostanie dodana.
+        if exc.code != 400:
+            raise
+        fallback_params = dict(params)
+        fallback_params["select"] = "id,name,address,phone,email,nip"
+        rows = supabase_request("/rest/v1/customers", params=fallback_params, timeout=20) or []
+
+    if not isinstance(rows, list) or not rows:
+        return fallback
+    row = dict(rows[0])
+    return {
+        "id": row.get("id"),
+        "name": norm(row.get("name")) or fallback["name"],
+        "address": norm(row.get("address")),
+        "phone": norm(row.get("phone")),
+        "email": _email_key(row.get("email")) or email,
+        "nip": norm(row.get("nip")),
+        "language": normalize_client_language(row.get("language")),
+    }
+
+
+@app.route("/api/client/profile", methods=["GET", "PATCH", "OPTIONS"])
+def api_client_profile():
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    email = _email_key(g.client_user.get("email"))
+    try:
+        profile = _client_profile_for_email(email)
+    except Exception as exc:
+        app.logger.error("Nie udało się pobrać profilu klienta: %s", type(exc).__name__)
+        return jsonify(ok=False, error="Nie udało się pobrać profilu klienta"), 503
+
+    if request.method == "GET":
+        return jsonify(ok=True, customer=profile)
+
+    language = normalize_client_language((request.get_json(silent=True) or {}).get("language"))
+    if not profile.get("id"):
+        return jsonify(
+            ok=False,
+            error="Nie znaleziono profilu klienta, dlatego wybór języka nie został zapisany",
+        ), 404
+    try:
+        supabase_update_rows("customers", {"language": language}, {"id": profile["id"]})
+        c = conn()
+        try:
+            c.execute("UPDATE customers SET language=? WHERE id=?", (language, profile["id"]))
+            c.commit()
+        finally:
+            c.close()
+    except Exception as exc:
+        app.logger.error("Nie udało się zapisać języka klienta: %s", type(exc).__name__)
+        return jsonify(ok=False, error="Nie udało się zapisać języka klienta"), 503
+
+    profile["language"] = language
+    return jsonify(ok=True, customer=profile)
+
+
 def _order_by_idempotency_key(idempotency_key: str) -> dict | None:
     c = conn()
     try:
@@ -6598,6 +7018,64 @@ def api_order_lookup():
         },
         items=items
     )
+
+
+@app.get("/api/client/orders/<int:order_id>/pdf")
+def api_client_order_pdf(order_id: int):
+    maybe_pull_shared_from_supabase(force=True)
+    email = _email_key(g.client_user.get("email"))
+
+    c = conn()
+    try:
+        cur = c.cursor()
+        cur.execute("SELECT * FROM orders WHERE id=? LIMIT 1", (order_id,))
+        row = cur.fetchone()
+        if not row:
+            return jsonify(ok=False, error="Nie znaleziono zamówienia"), 404
+        order = dict(row)
+        if _email_key(order.get("customer_email")) != email:
+            return jsonify(ok=False, error="Brak dostępu"), 403
+
+        cur.execute("""
+          SELECT
+            oi.id, oi.order_id, oi.product_id, oi.sku, oi.qty,
+            COALESCE(p.model, '') AS model,
+            COALESCE(p.name, '') AS name,
+            COALESCE((
+              SELECT pr.net_price FROM pricing pr
+              WHERE TRIM(LOWER(pr.model)) IN (TRIM(LOWER(p.model)), TRIM(LOWER(p.sku)))
+              ORDER BY CASE WHEN TRIM(LOWER(pr.model))=TRIM(LOWER(p.model)) THEN 0 ELSE 1 END
+              LIMIT 1
+            ), 0) AS net_price,
+            COALESCE((
+              SELECT pr.gross_price FROM pricing pr
+              WHERE TRIM(LOWER(pr.model)) IN (TRIM(LOWER(p.model)), TRIM(LOWER(p.sku)))
+              ORDER BY CASE WHEN TRIM(LOWER(pr.model))=TRIM(LOWER(p.model)) THEN 0 ELSE 1 END
+              LIMIT 1
+            ), 0) AS gross_price
+          FROM order_items oi
+          JOIN products p ON p.id=oi.product_id
+          WHERE oi.order_id=?
+          ORDER BY oi.id
+        """, (order_id,))
+        items = [dict(item) for item in cur.fetchall()]
+    finally:
+        c.close()
+
+    try:
+        language = _client_profile_for_email(email).get("language", "pl")
+    except Exception:
+        language = "pl"
+    pdf_buffer, filename = generate_client_order_pdf(order, items, language)
+    response = send_file(
+        pdf_buffer,
+        mimetype="application/pdf",
+        as_attachment=True,
+        download_name=filename,
+        max_age=0,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.get("/api/client_invoices")
