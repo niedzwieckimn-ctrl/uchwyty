@@ -963,9 +963,23 @@ def supabase_upsert_rows(table: str, rows: list, on_conflict: str):
     req.add_header("Authorization", f"Bearer {SUPABASE_SERVICE_ROLE_KEY}")
     req.add_header("Content-Type", "application/json")
     req.add_header("Prefer", "resolution=merge-duplicates,return=minimal")
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        if resp.status >= 300:
-            raise RuntimeError(f"Supabase HTTP {resp.status}")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            if resp.status >= 300:
+                raise RuntimeError(f"Supabase HTTP {resp.status}")
+    except urllib.error.HTTPError as exc:
+        raw_error = exc.read().decode("utf-8", errors="replace")[:1200]
+        try:
+            error_payload = json.loads(raw_error)
+            detail = norm(
+                error_payload.get("message")
+                or error_payload.get("details")
+                or error_payload.get("hint")
+                or raw_error
+            )
+        except Exception:
+            detail = norm(raw_error)
+        raise RuntimeError(f"Supabase HTTP {exc.code}: {detail or 'brak szczegółów'}") from exc
 
 def sqlite_table_rows(table: str):
     c = conn()
@@ -1439,6 +1453,16 @@ def sync_local_rows_to_supabase(table: str, conflict_col: str, ids: list):
     c.close()
     if rows:
         supabase_upsert_rows(table, rows, conflict_col)
+    return len(rows)
+
+
+def sync_local_table_to_supabase(table: str, conflict_col: str, chunk_size: int = 250):
+    """Synchronizuj całą tabelę partiami, bez przekraczania limitu żądania."""
+    if not supabase_enabled():
+        return 0
+    rows = sqlite_table_rows(table)
+    for pack in _chunks(rows, max(1, int(chunk_size or 250))):
+        supabase_upsert_rows(table, pack, conflict_col)
     return len(rows)
 
 
@@ -3995,6 +4019,9 @@ def company_save():
 def pricing():
     maybe_pull_shared_from_supabase()
     q = norm(request.args.get("q"))
+    eur_imported = max(0, int(to_float(request.args.get("eur_imported"), 0)))
+    eur_import_error = norm(request.args.get("eur_import_error"))
+    eur_local_saved = max(0, int(to_float(request.args.get("eur_local_saved"), 0)))
     c = conn()
     cur = c.cursor()
     if q:
@@ -4017,6 +4044,17 @@ def pricing():
     tpl = r"""
     {% extends "base.html" %}
     {% block content %}
+      {% if eur_imported %}
+        <div class="card" style="border-color:#9ad9c4;background:#f0fff9;">
+          <b>Cennik UE zapisany w Supabase: {{ eur_imported }} pozycji.</b>
+        </div>
+      {% endif %}
+      {% if eur_import_error %}
+        <div class="card" style="border-color:#f3b8b8;background:#fff4f4;">
+          <b>Cennik zapisano lokalnie ({{ eur_local_saved }} pozycji), ale Supabase odrzucił synchronizację.</b>
+          <div class="muted" style="margin-top:8px;word-break:break-word;">{{ eur_import_error }}</div>
+        </div>
+      {% endif %}
       <div class="card">
         <h1>Cennik</h1>
         <div class="muted">Import pliku cen (kolumny: model, netto, brutto). ObsĹ‚uga CSV i XLSX (jeĹ›li dostÄ™pny openpyxl).</div>
@@ -4104,6 +4142,9 @@ def pricing():
         rows=rows,
         eur_rows=eur_rows,
         q=q,
+        eur_imported=eur_imported,
+        eur_import_error=eur_import_error,
+        eur_local_saved=eur_local_saved,
     )
 
 @app.post("/pricing/import")
@@ -4335,8 +4376,13 @@ def pricing_eur_import():
         try:
             sync_local_table_to_supabase("pricing_eur", "sku")
         except Exception as exc:
-            app.logger.error("Nie udało się zsynchronizować cennika UE z Supabase: %s", type(exc).__name__)
-            return "Cennik zapisano lokalnie, ale synchronizacja z Supabase nie powiodła się", 503
+            error_detail = norm(str(exc))[:600] or type(exc).__name__
+            app.logger.exception("Nie udało się zsynchronizować cennika UE z Supabase")
+            return redirect(url_for(
+                "pricing",
+                eur_local_saved=len(parsed_rows),
+                eur_import_error=error_detail,
+            ))
     return redirect(url_for("pricing", eur_imported=len(parsed_rows)))
 
 
