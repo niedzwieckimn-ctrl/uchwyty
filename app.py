@@ -210,6 +210,7 @@ def init_db():
         email TEXT,
         nip TEXT,
         language TEXT NOT NULL DEFAULT 'pl',
+        price_list TEXT NOT NULL DEFAULT 'pln',
         created_at TEXT NOT NULL
     )
     """)
@@ -227,6 +228,8 @@ def init_db():
         note TEXT,
         created_at TEXT NOT NULL,
         warehouse_issued INTEGER NOT NULL DEFAULT 0,
+        currency TEXT NOT NULL DEFAULT 'PLN',
+        price_list TEXT NOT NULL DEFAULT 'pln',
         FOREIGN KEY(customer_id) REFERENCES customers(id)
     )
     """)
@@ -238,6 +241,10 @@ def init_db():
         product_id INTEGER NOT NULL,
         sku TEXT NOT NULL,
         qty INTEGER NOT NULL,
+        unit_net_price REAL,
+        unit_gross_price REAL,
+        unit_retail_price REAL,
+        currency TEXT,
         created_at TEXT NOT NULL,
         FOREIGN KEY(order_id) REFERENCES orders(id),
         FOREIGN KEY(product_id) REFERENCES products(id)
@@ -426,10 +433,28 @@ def init_db():
         cur.execute("ALTER TABLE customers ADD COLUMN nip TEXT")
     if "language" not in customer_cols:
         cur.execute("ALTER TABLE customers ADD COLUMN language TEXT NOT NULL DEFAULT 'pl'")
+    if "price_list" not in customer_cols:
+        cur.execute("ALTER TABLE customers ADD COLUMN price_list TEXT NOT NULL DEFAULT 'pln'")
     cur.execute("""
       UPDATE customers
       SET language='pl'
       WHERE language IS NULL OR LOWER(TRIM(language)) NOT IN ('pl','de','en','es','it')
+    """)
+    cur.execute("""
+      UPDATE customers
+      SET price_list='pln'
+      WHERE price_list IS NULL OR LOWER(TRIM(price_list)) NOT IN ('pln','eu_eur')
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS pricing_eur(
+        sku TEXT PRIMARY KEY,
+        ean TEXT,
+        price_eur REAL NOT NULL DEFAULT 0,
+        uvp_eur REAL NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
     """)
 
     # migracja: QR zamĂłwieĹ„
@@ -441,6 +466,21 @@ def init_db():
         cur.execute("ALTER TABLE orders ADD COLUMN warehouse_issued INTEGER NOT NULL DEFAULT 0")
     if "idempotency_key" not in order_cols:
         cur.execute("ALTER TABLE orders ADD COLUMN idempotency_key TEXT")
+    if "currency" not in order_cols:
+        cur.execute("ALTER TABLE orders ADD COLUMN currency TEXT NOT NULL DEFAULT 'PLN'")
+    if "price_list" not in order_cols:
+        cur.execute("ALTER TABLE orders ADD COLUMN price_list TEXT NOT NULL DEFAULT 'pln'")
+
+    cur.execute("PRAGMA table_info(order_items)")
+    order_item_cols = {r[1] for r in cur.fetchall()}
+    if "unit_net_price" not in order_item_cols:
+        cur.execute("ALTER TABLE order_items ADD COLUMN unit_net_price REAL")
+    if "unit_gross_price" not in order_item_cols:
+        cur.execute("ALTER TABLE order_items ADD COLUMN unit_gross_price REAL")
+    if "unit_retail_price" not in order_item_cols:
+        cur.execute("ALTER TABLE order_items ADD COLUMN unit_retail_price REAL")
+    if "currency" not in order_item_cols:
+        cur.execute("ALTER TABLE order_items ADD COLUMN currency TEXT")
 
     # UĹ‚atwia agregowanie "w dostawie" po statusach paczek
     cur.execute("CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_items(order_id)")
@@ -453,6 +493,7 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_client_search_logs_email_query ON client_search_logs(customer_email, query)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_client_search_logs_model ON client_search_logs(product_model)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_pricing_model_norm ON pricing(TRIM(LOWER(model)))")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_pricing_eur_sku_norm ON pricing_eur(TRIM(LOWER(sku)))")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_email_events_key ON email_events(event_key)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_email_events_type_created ON email_events(event_type, created_at)")
     cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_idempotency_key ON orders(idempotency_key) WHERE idempotency_key IS NOT NULL")
@@ -866,6 +907,7 @@ SUPABASE_SYNC_TABLES = [
     ("china_packages", "id"),
     ("china_items", "id"),
     ("pricing", "model"),
+    ("pricing_eur", "sku"),
     ("company_profile", "id"),
     ("invoices", "id"),
     ("invoice_meta", "invoice_id"),
@@ -878,6 +920,7 @@ SUPABASE_SYNC_TABLES = [
 SUPABASE_PULL_TABLES = [
     ("company_profile", "id"),
     ("pricing", "model"),
+    ("pricing_eur", "sku"),
     ("customers", "id"),
     ("products", "id"),
     ("orders", "id"),
@@ -1410,8 +1453,17 @@ def sync_order_to_supabase(order_id: int):
         sync_local_rows_to_supabase("order_items", "id", item_ids)
 
 
-def remote_first_create_customer(name: str, address: str, phone: str, email: str, nip: str, language: str = "pl"):
+def remote_first_create_customer(
+    name: str,
+    address: str,
+    phone: str,
+    email: str,
+    nip: str,
+    language: str = "pl",
+    price_list: str = "pln",
+):
     language = normalize_client_language(language)
+    price_list = normalize_client_price_list(price_list)
     created = supabase_insert_row("customers", {
         "name": name,
         "address": address,
@@ -1419,6 +1471,7 @@ def remote_first_create_customer(name: str, address: str, phone: str, email: str
         "email": email,
         "nip": nip,
         "language": language,
+        "price_list": price_list,
         "created_at": now_iso(),
     })
     if not created or "id" not in created:
@@ -1428,16 +1481,29 @@ def remote_first_create_customer(name: str, address: str, phone: str, email: str
     c = conn()
     cur = c.cursor()
     cur.execute(
-        "INSERT INTO customers(id, name, address, phone, email, nip, language, created_at) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, address=excluded.address, phone=excluded.phone, email=excluded.email, nip=excluded.nip, language=excluded.language, created_at=excluded.created_at",
-        (customer_id, name, address, phone, email, nip, language, created.get("created_at") or now_iso())
+        "INSERT INTO customers(id, name, address, phone, email, nip, language, price_list, created_at) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, address=excluded.address, phone=excluded.phone, email=excluded.email, nip=excluded.nip, language=excluded.language, price_list=excluded.price_list, created_at=excluded.created_at",
+        (customer_id, name, address, phone, email, nip, language, price_list, created.get("created_at") or now_iso())
     )
     c.commit()
     c.close()
     return customer_id
 
 
-def remote_first_create_order(customer_id, customer_name, customer_address, customer_phone, customer_email, note, items, idempotency_key=None):
+def remote_first_create_order(
+    customer_id,
+    customer_name,
+    customer_address,
+    customer_phone,
+    customer_email,
+    note,
+    items,
+    idempotency_key=None,
+    price_list="pln",
+    currency="PLN",
+):
     created_at = now_iso()
+    price_list = normalize_client_price_list(price_list)
+    currency = normalize_order_currency(currency or price_list_currency(price_list))
     order_payload = {
         "order_no": "TEMP",
         "customer_id": customer_id if customer_id else None,
@@ -1449,6 +1515,8 @@ def remote_first_create_order(customer_id, customer_name, customer_address, cust
         "note": note,
         "created_at": created_at,
         "qr_data_url": "",
+        "price_list": price_list,
+        "currency": currency,
     }
     if idempotency_key:
         order_payload["idempotency_key"] = idempotency_key
@@ -1465,27 +1533,46 @@ def remote_first_create_order(customer_id, customer_name, customer_address, cust
     try:
         cur = c.cursor()
         cur.execute(
-            "INSERT INTO orders(id, order_no, customer_id, customer_name, customer_address, customer_phone, customer_email, status, note, created_at, qr_data_url, idempotency_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET order_no=excluded.order_no, customer_id=excluded.customer_id, customer_name=excluded.customer_name, customer_address=excluded.customer_address, customer_phone=excluded.customer_phone, customer_email=excluded.customer_email, status=excluded.status, note=excluded.note, created_at=excluded.created_at, qr_data_url=excluded.qr_data_url, idempotency_key=excluded.idempotency_key",
-            (order_id, order_no, customer_id if customer_id else None, customer_name, customer_address, customer_phone, customer_email, "new", note, created_at, qr_data_url, idempotency_key)
+            "INSERT INTO orders(id, order_no, customer_id, customer_name, customer_address, customer_phone, customer_email, status, note, created_at, qr_data_url, idempotency_key, price_list, currency) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET order_no=excluded.order_no, customer_id=excluded.customer_id, customer_name=excluded.customer_name, customer_address=excluded.customer_address, customer_phone=excluded.customer_phone, customer_email=excluded.customer_email, status=excluded.status, note=excluded.note, created_at=excluded.created_at, qr_data_url=excluded.qr_data_url, idempotency_key=excluded.idempotency_key, price_list=excluded.price_list, currency=excluded.currency",
+            (order_id, order_no, customer_id if customer_id else None, customer_name, customer_address, customer_phone, customer_email, "new", note, created_at, qr_data_url, idempotency_key, price_list, currency)
         )
 
-        for pid, qty in items:
+        for raw_item in items:
+            if isinstance(raw_item, dict):
+                pid = to_int(raw_item.get("product_id"), 0)
+                qty = to_int(raw_item.get("qty"), 0)
+                unit_net_price = money_float(raw_item.get("unit_net_price"))
+                unit_gross_price = money_float(raw_item.get("unit_gross_price"))
+                unit_retail_price = money_float(raw_item.get("unit_retail_price"))
+                item_currency = normalize_order_currency(raw_item.get("currency") or currency)
+            else:
+                pid, qty = raw_item[:2]
+                unit_net_price = unit_gross_price = unit_retail_price = None
+                item_currency = currency
             cur.execute("SELECT sku FROM products WHERE id=?", (pid,))
             p = cur.fetchone()
             if not p:
                 raise ValueError(f"Nie istnieje produkt ID {pid}")
-            created_item = supabase_insert_row("order_items", {
+            item_payload = {
                 "order_id": order_id,
                 "product_id": pid,
                 "sku": p["sku"],
                 "qty": qty,
                 "created_at": now_iso(),
-            })
+                "currency": item_currency,
+            }
+            if unit_net_price is not None:
+                item_payload.update({
+                    "unit_net_price": unit_net_price,
+                    "unit_gross_price": unit_gross_price,
+                    "unit_retail_price": unit_retail_price,
+                })
+            created_item = supabase_insert_row("order_items", item_payload)
             if not created_item or "id" not in created_item:
                 raise RuntimeError("Supabase nie zwrócił ID dla pozycji zamówienia")
             cur.execute(
-                "INSERT INTO order_items(id, order_id, product_id, sku, qty, created_at) VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET order_id=excluded.order_id, product_id=excluded.product_id, sku=excluded.sku, qty=excluded.qty, created_at=excluded.created_at",
-                (int(created_item["id"]), order_id, pid, p["sku"], qty, created_item.get("created_at") or now_iso())
+                "INSERT INTO order_items(id, order_id, product_id, sku, qty, unit_net_price, unit_gross_price, unit_retail_price, currency, created_at) VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET order_id=excluded.order_id, product_id=excluded.product_id, sku=excluded.sku, qty=excluded.qty, unit_net_price=excluded.unit_net_price, unit_gross_price=excluded.unit_gross_price, unit_retail_price=excluded.unit_retail_price, currency=excluded.currency, created_at=excluded.created_at",
+                (int(created_item["id"]), order_id, pid, p["sku"], qty, unit_net_price, unit_gross_price, unit_retail_price, item_currency, created_item.get("created_at") or now_iso())
             )
         c.commit()
     except Exception:
@@ -1615,6 +1702,7 @@ def get_pdf_font_names():
 
 
 CLIENT_LANGUAGES = {"pl", "de", "en", "es", "it"}
+CLIENT_PRICE_LISTS = {"pln", "eu_eur"}
 
 ORDER_PDF_TRANSLATIONS = {
     "pl": {
@@ -1685,6 +1773,19 @@ def normalize_client_language(value) -> str:
     return language if language in CLIENT_LANGUAGES else "pl"
 
 
+def normalize_client_price_list(value) -> str:
+    price_list = norm(value).lower()
+    return price_list if price_list in CLIENT_PRICE_LISTS else "pln"
+
+
+def price_list_currency(value) -> str:
+    return "EUR" if normalize_client_price_list(value) == "eu_eur" else "PLN"
+
+
+def normalize_order_currency(value) -> str:
+    return "EUR" if norm(value).upper() == "EUR" else "PLN"
+
+
 def order_pdf_text(language: str, key: str) -> str:
     language = normalize_client_language(language)
     return ORDER_PDF_TRANSLATIONS.get(language, {}).get(key) or ORDER_PDF_TRANSLATIONS["pl"].get(key, "")
@@ -1732,6 +1833,7 @@ def order_pdf_status(status, language: str) -> str:
 def generate_client_order_pdf(order_row: dict, items: list[dict], language: str) -> tuple[io.BytesIO, str]:
     """Create one localized order PDF without persisting a second document copy."""
     language = normalize_client_language(language)
+    currency = normalize_order_currency(order_row.get("currency"))
     regular_font, bold_font = get_pdf_font_names()
     page_width, page_height = 210 * mm, 297 * mm
     left, right = 15 * mm, 195 * mm
@@ -1872,8 +1974,8 @@ def generate_client_order_pdf(order_row: dict, items: list[dict], language: str)
         pdf.drawString(left + 2 * mm, y, fit(item.get("sku"), regular_font, 7.8, 29 * mm))
         pdf.drawString(left + 34 * mm, y, fit(product_label, regular_font, 7.8, 54 * mm))
         pdf.drawRightString(left + 122 * mm, y, str(qty))
-        pdf.drawRightString(left + 152 * mm, y, localized_pdf_money(unit_net, language))
-        pdf.drawRightString(right - 2 * mm, y, localized_pdf_money(line_net, language))
+        pdf.drawRightString(left + 152 * mm, y, f"{localized_pdf_money(unit_net, language)} {currency}")
+        pdf.drawRightString(right - 2 * mm, y, f"{localized_pdf_money(line_net, language)} {currency}")
         pdf.setStrokeColorRGB(0.91, 0.92, 0.95)
         pdf.line(left, y - 2.5 * mm, right, y - 2.5 * mm)
         y -= 7 * mm
@@ -1889,7 +1991,7 @@ def generate_client_order_pdf(order_row: dict, items: list[dict], language: str)
         ("net_total", total_net, False), ("vat", vat_value, False), ("gross_total", total_gross, True)
     ):
         pdf.setFont(bold_font if is_bold else regular_font, 10 if is_bold else 9)
-        pdf.drawRightString(right, y, f"{order_pdf_text(language, key)}: {localized_pdf_money(value, language)} {order_pdf_text(language, 'currency')}")
+        pdf.drawRightString(right, y, f"{order_pdf_text(language, key)}: {localized_pdf_money(value, language)} {currency}")
         y -= 5.5 * mm
 
     note = norm(order_row.get("note"))
@@ -3144,8 +3246,8 @@ def home():
     if reorder_horizon_days not in (45, 60, 90):
         reorder_horizon_days = 60
     cur.execute("""
-      SELECT o.id,o.order_no,o.customer_name,o.created_at,o.status,
-             COALESCE(SUM(oi.qty * COALESCE(pr.net_price,0)),0) AS total_net
+      SELECT o.id,o.order_no,o.customer_name,o.created_at,o.status,o.currency,
+             COALESCE(SUM(oi.qty * COALESCE(oi.unit_net_price,pr.net_price,0)),0) AS total_net
       FROM orders o
       LEFT JOIN order_items oi ON oi.order_id=o.id
       LEFT JOIN products p ON p.id=oi.product_id
@@ -3196,7 +3298,7 @@ def home():
         <div class="card orders-card">
           <div class="panel-title"><span>▣</span><h2>Ostatnie zamówienia</h2><a class="btn" href="{{ url_for('orders') }}">Zobacz wszystkie</a></div>
           <table><thead><tr><th>Nr zamówienia</th><th>Klient</th><th>Data</th><th>Wartość</th><th>Status</th><th></th></tr></thead><tbody>
-          {% for o in recent_orders %}<tr><td><a class="order-no" href="{{ url_for('order_view',order_id=o.id) }}">{{ canonical_order_no(o.id,o.created_at,o.order_no) }}</a></td><td class="customer-name">{{ o.customer_name or '-' }}</td><td>{{ o.created_at[:16] }}</td><td>{{ "%.2f"|format(o.total_net) }} zł</td><td><span class="badge {{ order_status_css(o.status) }}">{{ order_status_label(o.status) }}</span></td><td><a class="btn" href="{{ url_for('order_view',order_id=o.id) }}">•••</a></td></tr>{% endfor %}
+          {% for o in recent_orders %}<tr><td><a class="order-no" href="{{ url_for('order_view',order_id=o.id) }}">{{ canonical_order_no(o.id,o.created_at,o.order_no) }}</a></td><td class="customer-name">{{ o.customer_name or '-' }}</td><td>{{ o.created_at[:16] }}</td><td>{{ "%.2f"|format(o.total_net) }} {{ o.currency or 'PLN' }}</td><td><span class="badge {{ order_status_css(o.status) }}">{{ order_status_label(o.status) }}</span></td><td><a class="btn" href="{{ url_for('order_view',order_id=o.id) }}">•••</a></td></tr>{% endfor %}
           {% if not recent_orders %}<tr><td colspan="6" class="muted">Brak zamówień do wyświetlenia.</td></tr>{% endif %}
           </tbody></table>
         </div>
@@ -3901,6 +4003,15 @@ def pricing():
     else:
         cur.execute("SELECT * FROM pricing ORDER BY model LIMIT 2000")
     rows = cur.fetchall()
+    if q:
+        like = f"%{q}%"
+        cur.execute(
+            "SELECT * FROM pricing_eur WHERE sku LIKE ? OR ean LIKE ? ORDER BY sku LIMIT 2000",
+            (like, like),
+        )
+    else:
+        cur.execute("SELECT * FROM pricing_eur ORDER BY sku LIMIT 2000")
+    eur_rows = cur.fetchall()
     c.close()
 
     tpl = r"""
@@ -3921,6 +4032,23 @@ def pricing():
             <button class="btn primary" type="submit">Importuj cennik</button>
           </div>
         </form>
+      </div>
+
+      <div class="card">
+        <h2>Cennik UE — EUR</h2>
+        <div class="muted" style="margin-bottom:12px;">
+          Import arkusza Preisliste.xlsx. Wymagane kolumny: Articel (SKU), PREIS EUR i UVP; GTIN/EAN jest opcjonalny.
+          Import nie zmienia polskiego cennika ani stanów magazynowych.
+        </div>
+        <form method="post" action="{{ url_for('pricing_eur_import') }}" enctype="multipart/form-data" class="row">
+          <div>
+            <input type="file" name="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required>
+          </div>
+          <div class="flex" style="align-items:flex-end;">
+            <button class="btn primary" type="submit">Importuj cennik UE</button>
+          </div>
+        </form>
+        <div class="muted small" style="margin-top:10px;">Aktualnie zapisanych pozycji: {{ eur_rows|length }}</div>
       </div>
 
       <div class="card">
@@ -3946,9 +4074,37 @@ def pricing():
           </tbody>
         </table>
       </div>
+
+      <div class="card">
+        <h2>Pozycje cennika UE</h2>
+        <table>
+          <thead><tr><th>SKU</th><th>EAN</th><th>Cena EUR</th><th>UVP EUR</th></tr></thead>
+          <tbody>
+            {% for r in eur_rows %}
+              <tr>
+                <td><b>{{ r['sku'] }}</b></td>
+                <td>{{ r['ean'] or '-' }}</td>
+                <td>{{ "%.2f"|format(r['price_eur']) }} EUR</td>
+                <td>{{ "%.2f"|format(r['uvp_eur']) }} EUR</td>
+              </tr>
+            {% endfor %}
+            {% if not eur_rows %}
+              <tr><td colspan="4" class="muted">Cennik UE nie został jeszcze zaimportowany.</td></tr>
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
     {% endblock %}
     """
-    return render_template_string(tpl, title="Cennik", base_url=BASE_URL, db_path=DB_PATH, rows=rows, q=q)
+    return render_template_string(
+        tpl,
+        title="Cennik",
+        base_url=BASE_URL,
+        db_path=DB_PATH,
+        rows=rows,
+        eur_rows=eur_rows,
+        q=q,
+    )
 
 @app.post("/pricing/import")
 def pricing_import():
@@ -4078,6 +4234,112 @@ def pricing_import():
     return redirect(url_for("pricing"))
 
 
+def parse_eur_pricing_xlsx(file_obj) -> list[tuple[str, str, float, float]]:
+    """Read the supplier EU price list without changing products or stock."""
+    try:
+        from openpyxl import load_workbook
+    except Exception as exc:
+        raise ValueError("Brak biblioteki openpyxl do odczytu XLSX") from exc
+
+    try:
+        wb = load_workbook(file_obj, data_only=True, read_only=True)
+        ws = wb.active
+        raw_rows = list(ws.iter_rows(values_only=True))
+    except Exception as exc:
+        raise ValueError("Nie udało się odczytać pliku XLSX") from exc
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+    if not raw_rows:
+        raise ValueError("Pusty plik")
+
+    header_index = None
+    indexes = None
+    for row_index, raw_header in enumerate(raw_rows[:20]):
+        headers = [norm(value) for value in (raw_header or ())]
+        i_sku = guess_col(headers, ["articel", "artikel", "article", "sku"])
+        i_ean = guess_col(headers, ["gtin", "ean"])
+        i_price = guess_col(headers, ["preis eur", "price eur", "cena eur"])
+        i_uvp = guess_col(headers, ["uvp"])
+        if i_sku is not None and i_price is not None:
+            header_index = row_index
+            indexes = (i_sku, i_ean, i_price, i_uvp)
+            break
+
+    if header_index is None or indexes is None:
+        raise ValueError("Nie znaleziono kolumn Articel/SKU i PREIS EUR")
+
+    i_sku, i_ean, i_price, i_uvp = indexes
+    parsed = []
+    seen_skus = set()
+    for excel_row_no, row in enumerate(raw_rows[header_index + 1 :], start=header_index + 2):
+        row = tuple(row or ())
+        sku = norm(row[i_sku]) if len(row) > i_sku else ""
+        if not sku:
+            continue
+        sku_key = sku.casefold()
+        if sku_key in seen_skus:
+            raise ValueError(f"Powtórzony SKU w wierszu {excel_row_no}: {sku}")
+        price_value = row[i_price] if len(row) > i_price else None
+        price_eur = money_float(to_float(price_value, -1))
+        if price_eur <= 0:
+            raise ValueError(f"Nieprawidłowa cena EUR w wierszu {excel_row_no}: {sku}")
+        uvp_value = row[i_uvp] if i_uvp is not None and len(row) > i_uvp else None
+        uvp_eur = money_float(to_float(uvp_value, price_eur * 1.45))
+        if uvp_eur <= 0:
+            uvp_eur = money_float(price_eur * 1.45)
+        ean = norm(row[i_ean]) if i_ean is not None and len(row) > i_ean else ""
+        parsed.append((sku, ean, price_eur, uvp_eur))
+        seen_skus.add(sku_key)
+
+    if not parsed:
+        raise ValueError("Plik nie zawiera żadnych pozycji cennika UE")
+    return parsed
+
+
+@app.post("/pricing/eur/import")
+def pricing_eur_import():
+    uploaded = request.files.get("file")
+    if not uploaded or not norm(uploaded.filename).lower().endswith(".xlsx"):
+        return "Wybierz plik XLSX z cennikiem UE", 400
+    try:
+        parsed_rows = parse_eur_pricing_xlsx(uploaded)
+    except ValueError as exc:
+        return str(exc), 400
+
+    timestamp = now_iso()
+    c = conn()
+    try:
+        cur = c.cursor()
+        for sku, ean, price_eur, uvp_eur in parsed_rows:
+            cur.execute(
+                """
+                INSERT INTO pricing_eur(sku, ean, price_eur, uvp_eur, created_at, updated_at)
+                VALUES(?,?,?,?,?,?)
+                ON CONFLICT(sku) DO UPDATE SET
+                  ean=excluded.ean,
+                  price_eur=excluded.price_eur,
+                  uvp_eur=excluded.uvp_eur,
+                  updated_at=excluded.updated_at
+                """,
+                (sku, ean, price_eur, uvp_eur, timestamp, timestamp),
+            )
+        c.commit()
+    finally:
+        c.close()
+
+    if supabase_enabled():
+        try:
+            sync_local_table_to_supabase("pricing_eur", "sku")
+        except Exception as exc:
+            app.logger.error("Nie udało się zsynchronizować cennika UE z Supabase: %s", type(exc).__name__)
+            return "Cennik zapisano lokalnie, ale synchronizacja z Supabase nie powiodła się", 503
+    return redirect(url_for("pricing", eur_imported=len(parsed_rows)))
+
+
 # -------------------------
 # CUSTOMERS
 # -------------------------
@@ -4144,6 +4406,13 @@ def customers():
               <option value="it">IT — włoski</option>
             </select>
           </div>
+          <div>
+            <label class="muted small">Cennik klienta</label>
+            <select name="price_list">
+              <option value="pln">Polska — PLN</option>
+              <option value="eu_eur">UE — EUR</option>
+            </select>
+          </div>
           <div class="flex" style="align-items:flex-end;">
             <button class="btn primary" type="submit">Zapisz klienta</button>
           </div>
@@ -4154,7 +4423,7 @@ def customers():
         <h2>Lista klientĂłw</h2>
         <table>
           <thead>
-            <tr><th>Nazwa</th><th>Telefon</th><th>Email</th><th>NIP</th><th>Język</th><th>Adres</th><th>Akcje</th></tr>
+            <tr><th>Nazwa</th><th>Telefon</th><th>Email</th><th>NIP</th><th>Język</th><th>Cennik</th><th>Adres</th><th>Akcje</th></tr>
           </thead>
           <tbody>
             {% for r in rows %}
@@ -4164,6 +4433,7 @@ def customers():
                 <td>{{ r['email'] or '-' }}</td>
                 <td>{{ r['nip'] or '-' }}</td>
                 <td><span class="badge">{{ (r['language'] or 'pl')|upper }}</span></td>
+                <td><span class="badge">{{ 'UE — EUR' if r['price_list'] == 'eu_eur' else 'Polska — PLN' }}</span></td>
                 <td style="white-space:pre-line;">{{ r['address'] or '-' }}</td>
                 <td>
                   <div class="flex">
@@ -4176,7 +4446,7 @@ def customers():
               </tr>
             {% endfor %}
             {% if not rows %}
-              <tr><td colspan="7" class="muted">Brak klientĂłw.</td></tr>
+              <tr><td colspan="8" class="muted">Brak klientĂłw.</td></tr>
             {% endif %}
           </tbody>
         </table>
@@ -4193,17 +4463,18 @@ def customers_create():
     email = norm(request.form.get("email"))
     nip = norm(request.form.get("nip"))
     language = normalize_client_language(request.form.get("language"))
+    price_list = normalize_client_price_list(request.form.get("price_list"))
     if not name:
         return "Brak nazwy klienta", 400
 
     if supabase_enabled():
-        remote_first_create_customer(name, address, phone, email, nip, language)
+        remote_first_create_customer(name, address, phone, email, nip, language, price_list)
     else:
         c = conn()
         cur = c.cursor()
         cur.execute(
-            "INSERT INTO customers(name, address, phone, email, nip, language, created_at) VALUES (?,?,?,?,?,?,?)",
-            (name, address, phone, email, nip, language, now_iso())
+            "INSERT INTO customers(name, address, phone, email, nip, language, price_list, created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (name, address, phone, email, nip, language, price_list, now_iso())
         )
         c.commit()
         c.close()
@@ -4262,6 +4533,13 @@ def customers_edit(customer_id):
               {% endfor %}
             </select>
           </div>
+          <div>
+            <label class="muted small">Cennik klienta</label>
+            <select name="price_list">
+              <option value="pln" {% if (row['price_list'] or 'pln') == 'pln' %}selected{% endif %}>Polska — PLN</option>
+              <option value="eu_eur" {% if row['price_list'] == 'eu_eur' %}selected{% endif %}>UE — EUR</option>
+            </select>
+          </div>
           <div class="flex" style="align-items:flex-end;">
             <button class="btn primary" type="submit">Zapisz zmiany</button>
             <a class="btn" href="{{ url_for('customers') }}">PowrĂłt</a>
@@ -4280,6 +4558,7 @@ def customers_update(customer_id):
     email = norm(request.form.get("email"))
     nip = norm(request.form.get("nip"))
     language = normalize_client_language(request.form.get("language"))
+    price_list = normalize_client_price_list(request.form.get("price_list"))
     if not name:
         return "Brak nazwy klienta", 400
 
@@ -4287,9 +4566,9 @@ def customers_update(customer_id):
     cur = c.cursor()
     cur.execute("""
       UPDATE customers
-      SET name=?, address=?, phone=?, email=?, nip=?, language=?
+      SET name=?, address=?, phone=?, email=?, nip=?, language=?, price_list=?
       WHERE id=?
-    """, (name, address, phone, email, nip, language, customer_id))
+    """, (name, address, phone, email, nip, language, price_list, customer_id))
     c.commit()
     c.close()
 
@@ -4301,6 +4580,7 @@ def customers_update(customer_id):
             "email": email,
             "nip": nip,
             "language": language,
+            "price_list": price_list,
         }, {"id": customer_id})
 
     try:
@@ -4683,7 +4963,7 @@ def orders():
     sql = f"""
       SELECT o.*,
              COALESCE((
-               SELECT SUM(oi.qty * COALESCE(pr.net_price, 0))
+               SELECT SUM(oi.qty * COALESCE(oi.unit_net_price, pr.net_price, 0))
                FROM order_items oi
                LEFT JOIN products p ON p.id=oi.product_id
                LEFT JOIN pricing pr ON (TRIM(LOWER(pr.model)) = TRIM(LOWER(p.model)) OR TRIM(LOWER(pr.model)) = TRIM(LOWER(p.sku)))
@@ -4823,7 +5103,7 @@ def orders():
                 <td><b>{{ order_display_no(r['id'], r['created_at'], r['order_no'], r['note']) }}</b></td>
                 <td>{{ r['customer_name'] }}</td>
                 <td><span class="badge {{ order_status_css(r['status']) }}">{{ order_status_label(r['status']) }}</span></td>
-                <td><span class="badge">{{ "%.2f"|format(r['order_value_net']) }} PLN</span></td>
+                <td><span class="badge">{{ "%.2f"|format(r['order_value_net']) }} {{ r['currency'] or 'PLN' }}</span></td>
                 <td class="muted">{{ r['created_at'] }}</td>
                 <td class="flex">
                   <a class="btn" href="{{ url_for('order_view', order_id=r['id']) }}">SzczegĂłĹ‚y</a>
@@ -5079,10 +5359,11 @@ def order_view(order_id):
     cur.execute("""
       SELECT oi.*, p.model, p.ean, p.name,
              COALESCE(s.qty, 0) AS stock_qty,
-             COALESCE(pr.net_price, 0) AS net_price,
-             COALESCE(pr.gross_price, 0) AS gross_price,
-             (oi.qty * COALESCE(pr.net_price, 0)) AS line_value_net,
-             (oi.qty * COALESCE(pr.gross_price, 0)) AS line_value_gross,
+             COALESCE(oi.unit_net_price, pr.net_price, 0) AS net_price,
+             COALESCE(oi.unit_gross_price, pr.gross_price, 0) AS gross_price,
+             COALESCE(oi.currency, ord.currency, 'PLN') AS currency,
+             (oi.qty * COALESCE(oi.unit_net_price, pr.net_price, 0)) AS line_value_net,
+             (oi.qty * COALESCE(oi.unit_gross_price, pr.gross_price, 0)) AS line_value_gross,
              COALESCE(s.qty,0) AS stock,
              COALESCE((
                 SELECT SUM(ci.qty)
@@ -5092,6 +5373,7 @@ def order_view(order_id):
                   AND cp.status IN ('planned', 'ordered', 'shipped')
              ), 0) AS in_delivery
       FROM order_items oi
+      JOIN orders ord ON ord.id=oi.order_id
       JOIN products p ON p.id=oi.product_id
       LEFT JOIN stock s ON s.product_id=p.id
       LEFT JOIN pricing pr ON (TRIM(LOWER(pr.model)) = TRIM(LOWER(p.model)) OR TRIM(LOWER(pr.model)) = TRIM(LOWER(p.sku)))
@@ -5184,7 +5466,11 @@ def order_view(order_id):
           <span class="badge {{ order_status_css(o['status']) }}">{{ order_status_label(o['status']) }}</span>
           <div class="right flex">
             <a class="btn" href="{{ url_for('orders') }}">â† Lista</a>
-            <a class="btn primary" href="{{ url_for('order_invoice', order_id=o['id']) }}">Faktura</a>
+            {% if (o['currency'] or 'PLN') == 'EUR' %}
+              <span class="badge" title="Moduł polskiej faktury i KSeF pracuje w PLN. Fakturę EUR wystaw oddzielnie.">Faktura EUR — ręcznie</span>
+            {% else %}
+              <a class="btn primary" href="{{ url_for('order_invoice', order_id=o['id']) }}">Faktura</a>
+            {% endif %}
             <form method="post" action="{{ url_for('order_confirmation_resend', order_id=o['id']) }}">
               <button class="btn" type="submit">Wyślij ponownie potwierdzenie</button>
             </form>
@@ -5287,10 +5573,10 @@ def order_view(order_id):
                     </form>
                   {% endif %}
                 </td>
-                <td><span class="badge">{{ "%.2f"|format(it['net_price']) }} PLN</span></td>
-                <td><span class="badge">{{ "%.2f"|format(it['gross_price']) }} PLN</span></td>
-                <td><span class="badge">{{ "%.2f"|format(it['line_value_net']) }} PLN</span></td>
-                <td><span class="badge">{{ "%.2f"|format(it['line_value_gross']) }} PLN</span></td>
+                <td><span class="badge">{{ "%.2f"|format(it['net_price']) }} {{ it['currency'] or o['currency'] or 'PLN' }}</span></td>
+                <td><span class="badge">{{ "%.2f"|format(it['gross_price']) }} {{ it['currency'] or o['currency'] or 'PLN' }}</span></td>
+                <td><span class="badge">{{ "%.2f"|format(it['line_value_net']) }} {{ it['currency'] or o['currency'] or 'PLN' }}</span></td>
+                <td><span class="badge">{{ "%.2f"|format(it['line_value_gross']) }} {{ it['currency'] or o['currency'] or 'PLN' }}</span></td>
                 <td><span class="badge">{{ it['stock'] }}</span></td>
                 <td><span class="badge">{{ it['in_delivery_available'] }}</span></td>
                 <td>
@@ -5316,12 +5602,12 @@ def order_view(order_id):
             {% if items %}
               <tr>
                 <td colspan="5" style="text-align:right;"><b>Suma netto:</b></td>
-                <td><span class="badge"><b>{{ "%.2f"|format(ns.total_net) }} PLN</b></span></td>
+                <td><span class="badge"><b>{{ "%.2f"|format(ns.total_net) }} {{ o['currency'] or 'PLN' }}</b></span></td>
                 <td colspan="5"></td>
               </tr>
               <tr>
                 <td colspan="6" style="text-align:right;"><b>Suma brutto:</b></td>
-                <td><span class="badge"><b>{{ "%.2f"|format(ns.total_gross) }} PLN</b></span></td>
+                <td><span class="badge"><b>{{ "%.2f"|format(ns.total_gross) }} {{ o['currency'] or 'PLN' }}</b></span></td>
                 <td colspan="4"></td>
               </tr>
             {% else %}
@@ -5597,6 +5883,13 @@ def order_invoice(order_id):
     if not o:
         c.close()
         abort(404)
+    if normalize_order_currency(o["currency"]) == "EUR":
+        c.close()
+        return (
+            "Faktura EUR nie jest wystawiana przez polski moduł KSeF. "
+            "Zamówienie i jego potwierdzenie pozostają poprawnie zapisane w EUR.",
+            409,
+        )
 
     related_orders = [dict(o)] if norm(o["status"]).lower() in CURRENT_ORDER_STATUSES else []
     customer_email_key = _email_key(o["customer_email"])
@@ -6155,38 +6448,90 @@ def order_label(order_id):
     return send_file(buf, mimetype="application/pdf", as_attachment=True, download_name=fname)
 
 
+def _client_stock_catalog_rows(profile: dict) -> list[dict]:
+    """Return live Supabase stock with the server-selected customer price list."""
+    price_list = normalize_client_price_list((profile or {}).get("price_list"))
+    currency = price_list_currency(price_list)
+    rows = supabase_request(
+        "/rest/v1/client_stock_catalog_v",
+        method="GET",
+        params={
+            "select": (
+                "product_id,sku,model,name,qty_physical,qty_reserved,"
+                "qty_on_stock,net_price,gross_price"
+            ),
+            "order": "sku.asc",
+            "limit": 5000,
+        },
+        timeout=30,
+    ) or []
+    if not isinstance(rows, list):
+        raise RuntimeError("Nieprawidłowa odpowiedź katalogu magazynowego")
+
+    eur_by_sku = {}
+    if price_list == "eu_eur":
+        eur_rows = supabase_request(
+            "/rest/v1/pricing_eur",
+            method="GET",
+            params={"select": "sku,price_eur,uvp_eur", "order": "sku.asc", "limit": 5000},
+            timeout=30,
+        ) or []
+        if not isinstance(eur_rows, list):
+            raise RuntimeError("Nieprawidłowa odpowiedź cennika EUR")
+        eur_by_sku = {norm(row.get("sku")).lower(): row for row in eur_rows}
+
+    catalog = []
+    for raw in rows:
+        row = dict(raw)
+        sku_key = norm(row.get("sku")).lower()
+        if price_list == "eu_eur":
+            price = eur_by_sku.get(sku_key) or {}
+            net_price = money_float(price.get("price_eur"))
+            # Cennik UE jest cennikiem B2B. Kwota zamówienia brutto jest równa
+            # cenie transakcyjnej; UVP pozostaje osobną ceną sugerowaną.
+            gross_price = net_price
+            retail_price = money_float(price.get("uvp_eur"))
+        else:
+            net_price = money_float(row.get("net_price"))
+            gross_price = money_float(row.get("gross_price"))
+            retail_price = money_float(money_dec(net_price) * Decimal("1.45") * Decimal("1.23"))
+        row.update({
+            "net_price": net_price,
+            "gross_price": gross_price,
+            "retail_price": retail_price,
+            "currency": currency,
+            "price_list": price_list,
+            "price_available": bool(net_price > 0),
+        })
+        catalog.append(row)
+    return catalog
+
+
 @app.get("/api/client_stock_catalog")
 def api_client_stock_catalog():
     if not supabase_enabled():
         return jsonify(ok=False, error="Brak konfiguracji Supabase na serwerze"), 503
 
     try:
-        rows = supabase_request(
-            "/rest/v1/client_stock_catalog_v",
-            method="GET",
-            params={
-                "select": (
-                    "product_id,sku,model,name,qty_physical,qty_reserved,"
-                    "qty_on_stock,net_price,gross_price"
-                ),
-                "order": "sku.asc",
-                "limit": 5000,
-            },
-            timeout=30,
-        ) or []
-        if not isinstance(rows, list):
-            raise RuntimeError("Nieprawidłowa odpowiedź katalogu magazynowego")
+        profile = _client_profile_for_email(g.client_user.get("email"))
+        rows = _client_stock_catalog_rows(profile)
     except Exception as exc:
         app.logger.error(
-            "Nie udało się pobrać aktualnych stanów bezpośrednio z Supabase: %s",
+            "Nie udało się pobrać aktualnych stanów lub cennika bezpośrednio z Supabase: %s",
             type(exc).__name__,
         )
         return jsonify(
             ok=False,
-            error="Nie udało się pobrać aktualnych stanów z Supabase",
+            error="Nie udało się pobrać aktualnych stanów i cen z Supabase",
         ), 503
 
-    response = jsonify(ok=True, rows=rows, source="supabase")
+    response = jsonify(
+        ok=True,
+        rows=rows,
+        source="supabase",
+        price_list=profile.get("price_list", "pln"),
+        currency=profile.get("currency", "PLN"),
+    )
     response.headers["Cache-Control"] = "no-store"
     response.headers["Pragma"] = "no-cache"
     return response
@@ -6369,16 +6714,35 @@ def _send_saved_order_confirmation(order_id: int, force: bool = False) -> dict:
             return {"ok": False, "error": "Nie znaleziono zamówienia"}
         order = dict(row)
         cur.execute("""
-          SELECT oi.sku, oi.qty, COALESCE(p.name, pr.name, '') AS name
+          SELECT
+            oi.sku,
+            oi.qty,
+            COALESCE(p.name, fallback_product.name, '') AS name,
+            COALESCE(oi.unit_net_price, (
+              SELECT price.net_price FROM pricing price
+              WHERE TRIM(LOWER(price.model)) IN (TRIM(LOWER(p.model)), TRIM(LOWER(p.sku)))
+              ORDER BY CASE WHEN TRIM(LOWER(price.model))=TRIM(LOWER(p.model)) THEN 0 ELSE 1 END
+              LIMIT 1
+            ), 0) AS net_price,
+            COALESCE(oi.currency, o.currency, 'PLN') AS currency
           FROM order_items oi
+          JOIN orders o ON o.id=oi.order_id
           LEFT JOIN products p ON p.id = oi.product_id
-          LEFT JOIN products pr ON pr.sku = oi.sku
+          LEFT JOIN products fallback_product ON fallback_product.sku = oi.sku
           WHERE oi.order_id=?
           ORDER BY oi.id
         """, (order_id,))
         items = [dict(x) for x in cur.fetchall()]
     finally:
         c.close()
+
+    try:
+        profile = _client_profile_for_email(order.get("customer_email"))
+        order["language"] = profile.get("language", "pl")
+        order["currency"] = normalize_order_currency(order.get("currency") or profile.get("currency"))
+    except Exception:
+        order["language"] = "pl"
+        order["currency"] = normalize_order_currency(order.get("currency"))
 
     try:
         admin_email = norm(email_config_summary().get("admin_email"))
@@ -6447,12 +6811,14 @@ def _client_profile_for_email(email: str) -> dict:
         "email": email,
         "nip": "",
         "language": "pl",
+        "price_list": "pln",
+        "currency": "PLN",
     }
     if not email or not supabase_enabled():
         return fallback
 
     params = {
-        "select": "id,name,address,phone,email,nip,language",
+        "select": "id,name,address,phone,email,nip,language,price_list",
         "email": f"ilike.{email}",
         "order": "id.desc",
         "limit": 1,
@@ -6464,12 +6830,13 @@ def _client_profile_for_email(email: str) -> dict:
         if exc.code != 400:
             raise
         fallback_params = dict(params)
-        fallback_params["select"] = "id,name,address,phone,email,nip"
+        fallback_params["select"] = "id,name,address,phone,email,nip,language"
         rows = supabase_request("/rest/v1/customers", params=fallback_params, timeout=20) or []
 
     if not isinstance(rows, list) or not rows:
         return fallback
     row = dict(rows[0])
+    price_list = normalize_client_price_list(row.get("price_list"))
     return {
         "id": row.get("id"),
         "name": norm(row.get("name")) or fallback["name"],
@@ -6478,6 +6845,8 @@ def _client_profile_for_email(email: str) -> dict:
         "email": _email_key(row.get("email")) or email,
         "nip": norm(row.get("nip")),
         "language": normalize_client_language(row.get("language")),
+        "price_list": price_list,
+        "currency": price_list_currency(price_list),
     }
 
 
@@ -6588,6 +6957,15 @@ def api_client_orders_create():
     if len(raw_items) > 100:
         return jsonify(ok=False, error="Zamówienie może zawierać maksymalnie 100 pozycji"), 400
 
+    try:
+        profile = _client_profile_for_email(customer_email)
+        catalog_rows = _client_stock_catalog_rows(profile)
+    except Exception as exc:
+        app.logger.error("Nie udało się ustalić cennika klienta przed zamówieniem: %s", type(exc).__name__)
+        return jsonify(ok=False, error="Nie udało się pobrać aktualnego cennika klienta"), 503
+    customer_name = norm(profile.get("name")) or customer_name
+    catalog_by_product_id = {to_int(row.get("product_id"), 0): row for row in catalog_rows}
+
     items = []
     c = conn()
     try:
@@ -6609,12 +6987,33 @@ def api_client_orders_create():
             submitted_sku = norm(item.get("sku"))
             if submitted_sku and submitted_sku.lower() != norm(product["sku"]).lower():
                 return jsonify(ok=False, error=f"Produkt ID {product_id} nie odpowiada SKU {submitted_sku}"), 400
-            items.append((product_id, qty))
+            catalog_row = catalog_by_product_id.get(product_id) or {}
+            if not catalog_row.get("price_available"):
+                return jsonify(ok=False, error=f"Brak ceny w cenniku klienta dla SKU {product['sku']}"), 400
+            items.append({
+                "product_id": product_id,
+                "qty": qty,
+                "unit_net_price": money_float(catalog_row.get("net_price")),
+                "unit_gross_price": money_float(catalog_row.get("gross_price")),
+                "unit_retail_price": money_float(catalog_row.get("retail_price")),
+                "currency": normalize_order_currency(catalog_row.get("currency")),
+            })
     finally:
         c.close()
 
     try:
-        order_id = remote_first_create_order(None, customer_name, "", "", customer_email, note, items, idempotency_key=idempotency_key)
+        order_id = remote_first_create_order(
+            profile.get("id"),
+            customer_name,
+            norm(profile.get("address")),
+            norm(profile.get("phone")),
+            customer_email,
+            note,
+            items,
+            idempotency_key=idempotency_key,
+            price_list=profile.get("price_list", "pln"),
+            currency=profile.get("currency", "PLN"),
+        )
         email_result = _send_saved_order_confirmation(order_id)
         if not email_result.get("ok"):
             email_result["pending_retry"] = True
@@ -6891,14 +7290,44 @@ def api_order_lookup():
                 WHERE ci.product_id=oi.product_id
                   AND cp.status IN ('planned', 'ordered', 'shipped')
              ), 0) AS in_delivery,
-             COALESCE(pr.net_price, 0) AS net_price,
-             COALESCE(pr.gross_price, 0) AS gross_price,
-             (oi.qty * COALESCE(pr.net_price, 0)) AS line_value_net,
-             (oi.qty * COALESCE(pr.gross_price, 0)) AS line_value_gross
+             COALESCE(oi.unit_net_price, (
+               SELECT pr.net_price FROM pricing pr
+               WHERE TRIM(LOWER(pr.model)) IN (TRIM(LOWER(p.model)), TRIM(LOWER(p.sku)))
+               ORDER BY CASE WHEN TRIM(LOWER(pr.model))=TRIM(LOWER(p.model)) THEN 0 ELSE 1 END
+               LIMIT 1
+             ), 0) AS net_price,
+             COALESCE(oi.unit_gross_price, (
+               SELECT pr.gross_price FROM pricing pr
+               WHERE TRIM(LOWER(pr.model)) IN (TRIM(LOWER(p.model)), TRIM(LOWER(p.sku)))
+               ORDER BY CASE WHEN TRIM(LOWER(pr.model))=TRIM(LOWER(p.model)) THEN 0 ELSE 1 END
+               LIMIT 1
+             ), 0) AS gross_price,
+             COALESCE(oi.unit_retail_price, (
+               SELECT pr.net_price * 1.45 * 1.23 FROM pricing pr
+               WHERE TRIM(LOWER(pr.model)) IN (TRIM(LOWER(p.model)), TRIM(LOWER(p.sku)))
+               ORDER BY CASE WHEN TRIM(LOWER(pr.model))=TRIM(LOWER(p.model)) THEN 0 ELSE 1 END
+               LIMIT 1
+             ), 0) AS retail_price,
+             COALESCE(oi.currency, ord.currency, 'PLN') AS currency,
+             (oi.qty * COALESCE(oi.unit_net_price, (
+               SELECT pr.net_price FROM pricing pr
+               WHERE TRIM(LOWER(pr.model)) IN (TRIM(LOWER(p.model)), TRIM(LOWER(p.sku)))
+               ORDER BY CASE WHEN TRIM(LOWER(pr.model))=TRIM(LOWER(p.model)) THEN 0 ELSE 1 END LIMIT 1
+             ), 0)) AS line_value_net,
+             (oi.qty * COALESCE(oi.unit_gross_price, (
+               SELECT pr.gross_price FROM pricing pr
+               WHERE TRIM(LOWER(pr.model)) IN (TRIM(LOWER(p.model)), TRIM(LOWER(p.sku)))
+               ORDER BY CASE WHEN TRIM(LOWER(pr.model))=TRIM(LOWER(p.model)) THEN 0 ELSE 1 END LIMIT 1
+             ), 0)) AS line_value_gross,
+             (oi.qty * COALESCE(oi.unit_retail_price, (
+               SELECT pr.net_price * 1.45 * 1.23 FROM pricing pr
+               WHERE TRIM(LOWER(pr.model)) IN (TRIM(LOWER(p.model)), TRIM(LOWER(p.sku)))
+               ORDER BY CASE WHEN TRIM(LOWER(pr.model))=TRIM(LOWER(p.model)) THEN 0 ELSE 1 END LIMIT 1
+             ), 0)) AS line_value_retail
       FROM order_items oi
+      JOIN orders ord ON ord.id=oi.order_id
       JOIN products p ON p.id=oi.product_id
       LEFT JOIN stock s ON s.product_id=p.id
-      LEFT JOIN pricing pr ON (TRIM(LOWER(pr.model)) = TRIM(LOWER(p.model)) OR TRIM(LOWER(pr.model)) = TRIM(LOWER(p.sku)))
       WHERE oi.order_id=?
       ORDER BY oi.id
     """, (o["id"],))
@@ -6998,6 +7427,9 @@ def api_order_lookup():
 
     total_net = round(sum(float(it.get("line_value_net") or 0) for it in items), 2)
     total_gross = round(sum(float(it.get("line_value_gross") or 0) for it in items), 2)
+    total_retail = round(sum(float(it.get("line_value_retail") or 0) for it in items), 2)
+    order_currency = normalize_order_currency(o["currency"])
+    order_price_list = normalize_client_price_list(o["price_list"])
 
     return jsonify(
         ok=True,
@@ -7013,8 +7445,11 @@ def api_order_lookup():
             "note": o["note"],
             "qr_data_url": o["qr_data_url"] or "",
             "warehouse_issued": int(o["warehouse_issued"] or 0),
+            "currency": order_currency,
+            "price_list": order_price_list,
             "total_net": total_net,
             "total_gross": total_gross,
+            "total_retail": total_retail,
         },
         items=items
     )
@@ -7041,19 +7476,27 @@ def api_client_order_pdf(order_id: int):
             oi.id, oi.order_id, oi.product_id, oi.sku, oi.qty,
             COALESCE(p.model, '') AS model,
             COALESCE(p.name, '') AS name,
-            COALESCE((
+            COALESCE(oi.unit_net_price, (
               SELECT pr.net_price FROM pricing pr
               WHERE TRIM(LOWER(pr.model)) IN (TRIM(LOWER(p.model)), TRIM(LOWER(p.sku)))
               ORDER BY CASE WHEN TRIM(LOWER(pr.model))=TRIM(LOWER(p.model)) THEN 0 ELSE 1 END
               LIMIT 1
             ), 0) AS net_price,
-            COALESCE((
+            COALESCE(oi.unit_gross_price, (
               SELECT pr.gross_price FROM pricing pr
               WHERE TRIM(LOWER(pr.model)) IN (TRIM(LOWER(p.model)), TRIM(LOWER(p.sku)))
               ORDER BY CASE WHEN TRIM(LOWER(pr.model))=TRIM(LOWER(p.model)) THEN 0 ELSE 1 END
               LIMIT 1
-            ), 0) AS gross_price
+            ), 0) AS gross_price,
+            COALESCE(oi.unit_retail_price, (
+              SELECT pr.net_price * 1.45 * 1.23 FROM pricing pr
+              WHERE TRIM(LOWER(pr.model)) IN (TRIM(LOWER(p.model)), TRIM(LOWER(p.sku)))
+              ORDER BY CASE WHEN TRIM(LOWER(pr.model))=TRIM(LOWER(p.model)) THEN 0 ELSE 1 END
+              LIMIT 1
+            ), 0) AS retail_price,
+            COALESCE(oi.currency, o.currency, 'PLN') AS currency
           FROM order_items oi
+          JOIN orders o ON o.id=oi.order_id
           JOIN products p ON p.id=oi.product_id
           WHERE oi.order_id=?
           ORDER BY oi.id
