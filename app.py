@@ -7300,8 +7300,112 @@ def email_test():
     return render_template_string(tpl, title="Test maili", base_url=BASE_URL, db_path=DB_PATH, cfg=cfg, result=result, test_to=test_to)
 
 
+def _client_order_items_local(c, order: dict) -> list[dict]:
+    """Load order lines without assuming that an old SQLite file has new EUR columns.
+
+    Prices saved on an order line always win.  Historical PLN orders fall back to
+    the PLN price list, while historical EUR orders fall back to the imported EUR
+    price list.  Keeping the optional columns out of SQL also makes this safe on
+    Render during a rolling schema upgrade.
+    """
+    order_id = to_int(order.get("id"), 0)
+    if order_id <= 0:
+        return []
+
+    cur = c.cursor()
+    cur.execute("""
+      SELECT
+        oi.*,
+        COALESCE(p.model, '') AS model,
+        COALESCE(p.ean, '') AS ean,
+        COALESCE(p.name, '') AS name,
+        COALESCE(s.qty, 0) AS stock_qty,
+        COALESCE(s.qty, 0) AS stock,
+        COALESCE((
+          SELECT SUM(ci.qty)
+          FROM china_items ci
+          JOIN china_packages cp ON cp.id=ci.package_id
+          WHERE ci.product_id=oi.product_id
+            AND cp.status IN ('planned', 'ordered', 'shipped')
+        ), 0) AS in_delivery
+      FROM order_items oi
+      LEFT JOIN products p ON p.id=oi.product_id
+      LEFT JOIN stock s ON s.product_id=oi.product_id
+      WHERE oi.order_id=?
+      ORDER BY oi.id
+    """, (order_id,))
+    items = [dict(row) for row in cur.fetchall()]
+    if not items:
+        return []
+
+    cur.execute("SELECT model, net_price, gross_price FROM pricing")
+    pricing = {}
+    for row in cur.fetchall():
+        key = norm(row["model"]).strip().lower()
+        if key:
+            pricing[key] = dict(row)
+
+    eur_pricing = {}
+    try:
+        cur.execute("SELECT sku, price_eur, uvp_eur FROM pricing_eur")
+        for row in cur.fetchall():
+            key = norm(row["sku"]).strip().lower()
+            if key:
+                eur_pricing[key] = dict(row)
+    except sqlite3.OperationalError:
+        # The table is optional only for databases created before EU pricing.
+        eur_pricing = {}
+
+    order_currency = normalize_order_currency(order.get("currency"))
+    for item in items:
+        item_currency = normalize_order_currency(item.get("currency") or order_currency)
+        sku_key = norm(item.get("sku")).strip().lower()
+        model_key = norm(item.get("model")).strip().lower()
+
+        snapshot_net = item.get("unit_net_price")
+        snapshot_gross = item.get("unit_gross_price")
+        snapshot_retail = item.get("unit_retail_price")
+
+        if item_currency == "EUR":
+            price_row = eur_pricing.get(sku_key) or {}
+            fallback_net = money_float(price_row.get("price_eur"))
+            fallback_gross = fallback_net
+            fallback_retail = money_float(price_row.get("uvp_eur"))
+        else:
+            price_row = pricing.get(model_key) or pricing.get(sku_key) or {}
+            fallback_net = money_float(price_row.get("net_price"))
+            fallback_gross = money_float(price_row.get("gross_price"))
+            fallback_retail = money_float(
+                Decimal(str(fallback_net or 0)) * Decimal("1.45") * Decimal("1.23")
+            )
+
+        net_price = money_float(snapshot_net) if snapshot_net is not None else fallback_net
+        gross_price = money_float(snapshot_gross) if snapshot_gross is not None else fallback_gross
+        retail_price = money_float(snapshot_retail) if snapshot_retail is not None else fallback_retail
+        qty = to_int(item.get("qty"), 0)
+
+        item.update({
+            "net_price": net_price,
+            "gross_price": gross_price,
+            "retail_price": retail_price,
+            "currency": item_currency,
+            "line_value_net": money_float(Decimal(str(net_price or 0)) * qty),
+            "line_value_gross": money_float(Decimal(str(gross_price or 0)) * qty),
+            "line_value_retail": money_float(Decimal(str(retail_price or 0)) * qty),
+        })
+    return items
+
+
 @app.get("/api/order_lookup")
 def api_order_lookup():
+    try:
+        return _api_order_lookup_impl()
+    except Exception as exc:
+        app.logger.exception("Błąd szczegółów zamówienia klienta: %s", exc)
+        return jsonify(ok=False, error="Nie udało się pobrać szczegółów zamówienia"), 500
+
+
+def _api_order_lookup_impl():
     maybe_pull_shared_from_supabase(force=True)
     token = norm(request.args.get("token"))
     if not token:
@@ -7321,71 +7425,20 @@ def api_order_lookup():
     if not o:
         c.close()
         return jsonify(ok=False, error="Nie znaleziono zamĂłwienia"), 404
-    if _email_key(o["customer_email"]) != _email_key(g.client_user["email"]):
+    order = dict(o)
+    if _email_key(order.get("customer_email")) != _email_key(g.client_user["email"]):
         c.close()
         return jsonify(ok=False, error="Brak dostępu"), 403
 
-    cur.execute("""
-      SELECT oi.*, p.model, p.ean, p.name,
-             COALESCE(s.qty, 0) AS stock_qty,
-             COALESCE(s.qty, 0) AS stock,
-             COALESCE((
-                SELECT SUM(ci.qty)
-                FROM china_items ci
-                JOIN china_packages cp ON cp.id=ci.package_id
-                WHERE ci.product_id=oi.product_id
-                  AND cp.status IN ('planned', 'ordered', 'shipped')
-             ), 0) AS in_delivery,
-             COALESCE(oi.unit_net_price, (
-               SELECT pr.net_price FROM pricing pr
-               WHERE TRIM(LOWER(pr.model)) IN (TRIM(LOWER(p.model)), TRIM(LOWER(p.sku)))
-               ORDER BY CASE WHEN TRIM(LOWER(pr.model))=TRIM(LOWER(p.model)) THEN 0 ELSE 1 END
-               LIMIT 1
-             ), 0) AS net_price,
-             COALESCE(oi.unit_gross_price, (
-               SELECT pr.gross_price FROM pricing pr
-               WHERE TRIM(LOWER(pr.model)) IN (TRIM(LOWER(p.model)), TRIM(LOWER(p.sku)))
-               ORDER BY CASE WHEN TRIM(LOWER(pr.model))=TRIM(LOWER(p.model)) THEN 0 ELSE 1 END
-               LIMIT 1
-             ), 0) AS gross_price,
-             COALESCE(oi.unit_retail_price, (
-               SELECT pr.net_price * 1.45 * 1.23 FROM pricing pr
-               WHERE TRIM(LOWER(pr.model)) IN (TRIM(LOWER(p.model)), TRIM(LOWER(p.sku)))
-               ORDER BY CASE WHEN TRIM(LOWER(pr.model))=TRIM(LOWER(p.model)) THEN 0 ELSE 1 END
-               LIMIT 1
-             ), 0) AS retail_price,
-             COALESCE(oi.currency, ord.currency, 'PLN') AS currency,
-             (oi.qty * COALESCE(oi.unit_net_price, (
-               SELECT pr.net_price FROM pricing pr
-               WHERE TRIM(LOWER(pr.model)) IN (TRIM(LOWER(p.model)), TRIM(LOWER(p.sku)))
-               ORDER BY CASE WHEN TRIM(LOWER(pr.model))=TRIM(LOWER(p.model)) THEN 0 ELSE 1 END LIMIT 1
-             ), 0)) AS line_value_net,
-             (oi.qty * COALESCE(oi.unit_gross_price, (
-               SELECT pr.gross_price FROM pricing pr
-               WHERE TRIM(LOWER(pr.model)) IN (TRIM(LOWER(p.model)), TRIM(LOWER(p.sku)))
-               ORDER BY CASE WHEN TRIM(LOWER(pr.model))=TRIM(LOWER(p.model)) THEN 0 ELSE 1 END LIMIT 1
-             ), 0)) AS line_value_gross,
-             (oi.qty * COALESCE(oi.unit_retail_price, (
-               SELECT pr.net_price * 1.45 * 1.23 FROM pricing pr
-               WHERE TRIM(LOWER(pr.model)) IN (TRIM(LOWER(p.model)), TRIM(LOWER(p.sku)))
-               ORDER BY CASE WHEN TRIM(LOWER(pr.model))=TRIM(LOWER(p.model)) THEN 0 ELSE 1 END LIMIT 1
-             ), 0)) AS line_value_retail
-      FROM order_items oi
-      JOIN orders ord ON ord.id=oi.order_id
-      JOIN products p ON p.id=oi.product_id
-      LEFT JOIN stock s ON s.product_id=p.id
-      WHERE oi.order_id=?
-      ORDER BY oi.id
-    """, (o["id"],))
-    items = [dict(r) for r in cur.fetchall()]
+    items = _client_order_items_local(c, order)
 
     for it in items:
         it["in_delivery_available"] = int(it.get("in_delivery", 0) or 0)
         it["delivery_used"] = 0
         it["line_shortage"] = 0
 
-    order_id = int(o["id"])
-    if o["status"] in ("new", "packed", "confirmed", "in_delivery"):
+    order_id = int(order["id"])
+    if order.get("status") in ("new", "packed", "confirmed", "in_delivery"):
         cur.execute("SELECT id FROM orders WHERE status IN ('new','packed','confirmed','in_delivery') AND id<=? ORDER BY id", (order_id,))
         scoped_order_ids = [int(r["id"]) for r in cur.fetchall()]
         if scoped_order_ids:
@@ -7460,7 +7513,7 @@ def api_order_lookup():
         stock_qty = int(it.get("stock_qty") or 0)
         delivery_used = int(it.get("delivery_used") or 0)
         line_shortage = int(it.get("line_shortage") or 0)
-        if o["status"] in ("new", "packed", "confirmed", "in_delivery"):
+        if order.get("status") in ("new", "packed", "confirmed", "in_delivery"):
             it["availability_label"] = "dostępne" if stock_qty >= ordered_qty else "10/20 dni"
         else:
             it["availability_label"] = "dostępne" if stock_qty >= ordered_qty else "10/20 dni"
@@ -7474,23 +7527,23 @@ def api_order_lookup():
     total_net = round(sum(float(it.get("line_value_net") or 0) for it in items), 2)
     total_gross = round(sum(float(it.get("line_value_gross") or 0) for it in items), 2)
     total_retail = round(sum(float(it.get("line_value_retail") or 0) for it in items), 2)
-    order_currency = normalize_order_currency(o["currency"])
-    order_price_list = normalize_client_price_list(o["price_list"])
+    order_currency = normalize_order_currency(order.get("currency"))
+    order_price_list = normalize_client_price_list(order.get("price_list"))
 
     return jsonify(
         ok=True,
         order={
-            "id": o["id"],
-            "order_no": o["order_no"],
-            "status": o["status"],
-            "created_at": o["created_at"],
-            "customer_name": o["customer_name"],
-            "customer_address": o["customer_address"],
-            "customer_phone": o["customer_phone"],
-            "customer_email": o["customer_email"],
-            "note": o["note"],
-            "qr_data_url": o["qr_data_url"] or "",
-            "warehouse_issued": int(o["warehouse_issued"] or 0),
+            "id": order.get("id"),
+            "order_no": order.get("order_no"),
+            "status": order.get("status"),
+            "created_at": order.get("created_at"),
+            "customer_name": order.get("customer_name"),
+            "customer_address": order.get("customer_address"),
+            "customer_phone": order.get("customer_phone"),
+            "customer_email": order.get("customer_email"),
+            "note": order.get("note"),
+            "qr_data_url": order.get("qr_data_url") or "",
+            "warehouse_issued": int(order.get("warehouse_issued") or 0),
             "currency": order_currency,
             "price_list": order_price_list,
             "total_net": total_net,
@@ -7503,6 +7556,14 @@ def api_order_lookup():
 
 @app.get("/api/client/orders/<int:order_id>/pdf")
 def api_client_order_pdf(order_id: int):
+    try:
+        return _api_client_order_pdf_impl(order_id)
+    except Exception as exc:
+        app.logger.exception("Błąd PDF zamówienia klienta order_id=%s: %s", order_id, exc)
+        return jsonify(ok=False, error="Nie udało się przygotować PDF zamówienia"), 500
+
+
+def _api_client_order_pdf_impl(order_id: int):
     maybe_pull_shared_from_supabase(force=True)
     email = _email_key(g.client_user.get("email"))
 
@@ -7517,37 +7578,7 @@ def api_client_order_pdf(order_id: int):
         if _email_key(order.get("customer_email")) != email:
             return jsonify(ok=False, error="Brak dostępu"), 403
 
-        cur.execute("""
-          SELECT
-            oi.id, oi.order_id, oi.product_id, oi.sku, oi.qty,
-            COALESCE(p.model, '') AS model,
-            COALESCE(p.name, '') AS name,
-            COALESCE(oi.unit_net_price, (
-              SELECT pr.net_price FROM pricing pr
-              WHERE TRIM(LOWER(pr.model)) IN (TRIM(LOWER(p.model)), TRIM(LOWER(p.sku)))
-              ORDER BY CASE WHEN TRIM(LOWER(pr.model))=TRIM(LOWER(p.model)) THEN 0 ELSE 1 END
-              LIMIT 1
-            ), 0) AS net_price,
-            COALESCE(oi.unit_gross_price, (
-              SELECT pr.gross_price FROM pricing pr
-              WHERE TRIM(LOWER(pr.model)) IN (TRIM(LOWER(p.model)), TRIM(LOWER(p.sku)))
-              ORDER BY CASE WHEN TRIM(LOWER(pr.model))=TRIM(LOWER(p.model)) THEN 0 ELSE 1 END
-              LIMIT 1
-            ), 0) AS gross_price,
-            COALESCE(oi.unit_retail_price, (
-              SELECT pr.net_price * 1.45 * 1.23 FROM pricing pr
-              WHERE TRIM(LOWER(pr.model)) IN (TRIM(LOWER(p.model)), TRIM(LOWER(p.sku)))
-              ORDER BY CASE WHEN TRIM(LOWER(pr.model))=TRIM(LOWER(p.model)) THEN 0 ELSE 1 END
-              LIMIT 1
-            ), 0) AS retail_price,
-            COALESCE(oi.currency, o.currency, 'PLN') AS currency
-          FROM order_items oi
-          JOIN orders o ON o.id=oi.order_id
-          JOIN products p ON p.id=oi.product_id
-          WHERE oi.order_id=?
-          ORDER BY oi.id
-        """, (order_id,))
-        items = [dict(item) for item in cur.fetchall()]
+        items = _client_order_items_local(c, order)
     finally:
         c.close()
 
