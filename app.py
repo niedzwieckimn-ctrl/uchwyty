@@ -414,6 +414,13 @@ def init_db():
     if "product_name" not in search_cols:
         cur.execute("ALTER TABLE client_search_logs ADD COLUMN product_name TEXT")
 
+    # migracja: pierwsze wersje magazynu miały w products tylko SKU, EAN i nazwę.
+    # Potwierdzenie e-mail korzysta również z modelu przy awaryjnym odczycie ceny.
+    cur.execute("PRAGMA table_info(products)")
+    product_cols = {r[1] for r in cur.fetchall()}
+    if "model" not in product_cols:
+        cur.execute("ALTER TABLE products ADD COLUMN model TEXT")
+
     cur.execute("PRAGMA table_info(invoice_meta)")
     invoice_meta_cols = {r[1] for r in cur.fetchall()}
     if "seen_by_client" not in invoice_meta_cols:
@@ -5793,7 +5800,7 @@ def order_confirmation_resend(order_id):
         maybe_pull_shared_from_supabase(force=True)
     except Exception:
         pass
-    result = _send_saved_order_confirmation(order_id, force=True)
+    result = _safe_saved_order_confirmation(order_id, force=True)
     if result.get("ok"):
         return redirect(url_for("order_view", order_id=order_id, confirmation_sent="1"))
     return redirect(url_for("order_view", order_id=order_id, confirmation_error=norm(result.get("error")) or "Nieznany błąd"))

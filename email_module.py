@@ -27,12 +27,12 @@ def _env(name: str, default: str = "") -> str:
     return (os.environ.get(name) or default or "").strip()
 
 
-def _money(value) -> str:
+def _money(value, currency: str = "PLN") -> str:
     try:
         amount = Decimal(str(value or 0)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        return f"{amount:.2f} PLN"
+        return f"{amount:.2f} {str(currency or 'PLN').upper()}"
     except Exception:
-        return f"{value or 0} PLN"
+        return f"{value or 0} {str(currency or 'PLN').upper()}"
 
 
 def _esc(value) -> str:
@@ -130,31 +130,86 @@ def send_email(to, subject: str, html_body: str, text_body: str = "") -> dict:
         return {"ok": False, "error": str(exc), "to": recipients}
 
 
-def _items_table(items) -> str:
+ORDER_COPY = {
+    "pl": {
+        "subject": "Przyjęliśmy zamówienie {order_no}", "title": "Dziękujemy za zamówienie",
+        "intro": "Zamówienie <b>{order_no}</b> zostało przyjęte. Poniżej przesyłamy podsumowanie.",
+        "customer": "Klient", "email": "Email", "note": "Notatka", "name": "Nazwa", "qty": "Ilość",
+        "unit": "Cena/szt.", "value": "Wartość", "total": "Razem",
+        "empty": "Brak pozycji", "reply": "Jeśli coś się nie zgadza, odpowiedz na tę wiadomość — sprawdzimy to od razu.",
+        "regards": "Pozdrawiamy",
+    },
+    "de": {
+        "subject": "Wir haben Ihre Bestellung {order_no} erhalten", "title": "Vielen Dank für Ihre Bestellung",
+        "intro": "Ihre Bestellung <b>{order_no}</b> ist bei uns eingegangen. Unten finden Sie die Zusammenfassung.",
+        "customer": "Kunde", "email": "E-Mail", "note": "Anmerkung", "name": "Bezeichnung", "qty": "Menge",
+        "unit": "Preis/Stk.", "value": "Wert", "total": "Gesamt",
+        "empty": "Keine Positionen", "reply": "Falls etwas nicht stimmt, antworten Sie bitte auf diese Nachricht — wir prüfen es sofort.",
+        "regards": "Viele Grüße",
+    },
+    "en": {
+        "subject": "We received your order {order_no}", "title": "Thank you for your order",
+        "intro": "Your order <b>{order_no}</b> has been received. A summary is shown below.",
+        "customer": "Customer", "email": "Email", "note": "Note", "name": "Name", "qty": "Quantity",
+        "unit": "Unit price", "value": "Value", "total": "Total",
+        "empty": "No items", "reply": "If anything is incorrect, reply to this message and we will check it right away.",
+        "regards": "Kind regards",
+    },
+    "es": {
+        "subject": "Hemos recibido su pedido {order_no}", "title": "Gracias por su pedido",
+        "intro": "Hemos recibido el pedido <b>{order_no}</b>. A continuación encontrará el resumen.",
+        "customer": "Cliente", "email": "Email", "note": "Nota", "name": "Nombre", "qty": "Cantidad",
+        "unit": "Precio/ud.", "value": "Importe", "total": "Total",
+        "empty": "Sin artículos", "reply": "Si algo no es correcto, responda a este mensaje y lo revisaremos de inmediato.",
+        "regards": "Saludos",
+    },
+    "it": {
+        "subject": "Abbiamo ricevuto l'ordine {order_no}", "title": "Grazie per il suo ordine",
+        "intro": "L'ordine <b>{order_no}</b> è stato ricevuto. Di seguito trova il riepilogo.",
+        "customer": "Cliente", "email": "Email", "note": "Nota", "name": "Nome", "qty": "Quantità",
+        "unit": "Prezzo/pz.", "value": "Valore", "total": "Totale",
+        "empty": "Nessun articolo", "reply": "Se qualcosa non è corretto, risponda a questo messaggio e lo verificheremo subito.",
+        "regards": "Cordiali saluti",
+    },
+}
+
+
+def _items_table(items, copy: dict, currency: str) -> tuple[str, Decimal]:
     rows = []
+    total = Decimal("0.00")
     for item in items or []:
         sku = item.get("sku") or item.get("product_sku") or item.get("model") or ""
         name = item.get("name") or item.get("product_name") or item.get("model_name") or ""
         qty = item.get("qty") or item.get("quantity") or item.get("invoice_qty") or 0
+        unit_price = Decimal(str(item.get("net_price") or item.get("unit_net_price") or 0))
+        line_value = (unit_price * Decimal(str(qty or 0))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        total += line_value
         rows.append(
             "<tr>"
             f"<td style='padding:8px;border-bottom:1px solid #eee'>{_esc(sku)}</td>"
             f"<td style='padding:8px;border-bottom:1px solid #eee'>{_esc(name)}</td>"
             f"<td style='padding:8px;border-bottom:1px solid #eee;text-align:right'>{_esc(qty)}</td>"
+            f"<td style='padding:8px;border-bottom:1px solid #eee;text-align:right'>{_esc(_money(unit_price, currency))}</td>"
+            f"<td style='padding:8px;border-bottom:1px solid #eee;text-align:right'>{_esc(_money(line_value, currency))}</td>"
             "</tr>"
         )
     if not rows:
-        rows.append("<tr><td colspan='3' style='padding:8px;border-bottom:1px solid #eee'>Brak pozycji</td></tr>")
-    return (
+        rows.append(f"<tr><td colspan='5' style='padding:8px;border-bottom:1px solid #eee'>{_esc(copy['empty'])}</td></tr>")
+    table = (
         "<table style='border-collapse:collapse;width:100%;max-width:760px'>"
         "<thead><tr>"
         "<th style='text-align:left;padding:8px;border-bottom:2px solid #111'>SKU</th>"
-        "<th style='text-align:left;padding:8px;border-bottom:2px solid #111'>Nazwa</th>"
-        "<th style='text-align:right;padding:8px;border-bottom:2px solid #111'>Ilość</th>"
+        f"<th style='text-align:left;padding:8px;border-bottom:2px solid #111'>{_esc(copy['name'])}</th>"
+        f"<th style='text-align:right;padding:8px;border-bottom:2px solid #111'>{_esc(copy['qty'])}</th>"
+        f"<th style='text-align:right;padding:8px;border-bottom:2px solid #111'>{_esc(copy['unit'])}</th>"
+        f"<th style='text-align:right;padding:8px;border-bottom:2px solid #111'>{_esc(copy['value'])}</th>"
         "</tr></thead><tbody>"
         + "".join(rows)
-        + "</tbody></table>"
+        + "</tbody>"
+        f"<tfoot><tr><th colspan='4' style='padding:10px 8px;text-align:right'>{_esc(copy['total'])}</th>"
+        f"<th style='padding:10px 8px;text-align:right'>{_esc(_money(total, currency))}</th></tr></tfoot></table>"
     )
+    return table, total
 
 
 def send_order_confirmation(order: dict, items: list[dict], admin_email: str = "") -> dict:
@@ -162,29 +217,33 @@ def send_order_confirmation(order: dict, items: list[dict], admin_email: str = "
     customer_name = order.get("customer_name") or order.get("name") or order.get("customer_email") or "Klient"
     customer_email = order.get("customer_email") or order.get("email") or ""
     note = order.get("note") or "-"
+    language = str(order.get("language") or "pl").lower()
+    copy = ORDER_COPY.get(language, ORDER_COPY["pl"])
+    currency = str(order.get("currency") or "PLN").upper()
     recipients = _uniq_emails([customer_email, admin_email or email_config_summary().get("admin_email")])
-    subject = f"Przyjęliśmy zamówienie {order_no}"
+    subject = copy["subject"].format(order_no=order_no)
+    items_table, total = _items_table(items, copy, currency)
     html_body = f"""
     <div style="font-family:Arial,sans-serif;color:#111;line-height:1.5;max-width:760px">
-      <h2 style="margin-bottom:8px">Dziękujemy za zamówienie</h2>
-      <p>Zamówienie <b>{_esc(order_no)}</b> zostało przyjęte. Poniżej przesyłamy krótkie podsumowanie.</p>
+      <h2 style="margin-bottom:8px">{_esc(copy['title'])}</h2>
+      <p>{copy['intro'].format(order_no=_esc(order_no))}</p>
       <p>
-        <b>Klient:</b> {_esc(customer_name)}<br>
-        <b>Email:</b> {_esc(customer_email)}<br>
-        <b>Notatka:</b> {_esc(note)}
+        <b>{_esc(copy['customer'])}:</b> {_esc(customer_name)}<br>
+        <b>{_esc(copy['email'])}:</b> {_esc(customer_email)}<br>
+        <b>{_esc(copy['note'])}:</b> {_esc(note)}
       </p>
-      {_items_table(items)}
-      <p style="margin-top:18px">Jeśli coś się nie zgadza, odpowiedz na tę wiadomość — sprawdzimy to od razu.</p>
-      <p style="color:#555;margin-top:18px">Pozdrawiamy,<br>Niedźwieccy</p>
+      {items_table}
+      <p style="margin-top:18px">{_esc(copy['reply'])}</p>
+      <p style="color:#555;margin-top:18px">{_esc(copy['regards'])},<br>Niedźwieccy</p>
     </div>
     """
     text_body = (
-        f"Przyjęliśmy zamówienie {order_no}\n"
-        f"Klient: {customer_name}\n"
-        f"Email: {customer_email}\n"
-        f"Notatka: {note}\n\n"
-        "Jeśli coś się nie zgadza, odpowiedz na tę wiadomość — sprawdzimy to od razu.\n"
-        "Pozdrawiamy, Niedźwieccy"
+        f"{copy['title']}: {order_no}\n"
+        f"{copy['customer']}: {customer_name}\n"
+        f"{copy['email']}: {customer_email}\n"
+        f"{copy['note']}: {note}\n"
+        f"{copy['total']}: {_money(total, currency)}\n\n"
+        f"{copy['reply']}\n{copy['regards']}, Niedźwieccy"
     )
     return send_email(recipients, subject, html_body, text_body)
 
