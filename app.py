@@ -4083,6 +4083,31 @@ def auto_sync_after_write(response):
 # COMPANY
 # -------------------------
 
+def normalize_company_bank_fields(bank_account, bank_swift=""):
+    """Separate a legacy `IBAN BIC` value and store both fields canonically."""
+    account_raw = norm(bank_account).upper()
+    swift_raw = norm(bank_swift).upper()
+
+    # Starsze instalacje przechowywały czasem IBAN i SWIFT w jednym polu.
+    match = re.fullmatch(
+        r"\s*(PL)?(\d{26})(?:\s+([A-Z]{6}[A-Z0-9]{2}(?:[A-Z0-9]{3})?))?\s*",
+        account_raw,
+    )
+    if match:
+        account_raw = match.group(2)
+        if not swift_raw and match.group(3):
+            swift_raw = match.group(3)
+
+    # Numer konta zapisujemy bez PL, spacji i myślników. Walidację sumy
+    # kontrolnej nadal wykonuje moduł KSeF przed utworzeniem XML.
+    compact_account = re.sub(r"[\s-]+", "", account_raw)
+    if compact_account.startswith("PL"):
+        compact_account = compact_account[2:]
+    if re.fullmatch(r"\d{26}", compact_account):
+        account_raw = compact_account
+
+    return account_raw, re.sub(r"\s+", "", swift_raw)
+
 @app.get("/company")
 def company():
     maybe_pull_shared_from_supabase()
@@ -4090,6 +4115,18 @@ def company():
     cur = c.cursor()
     cur.execute("SELECT * FROM company_profile WHERE id=1")
     row = cur.fetchone()
+    if row:
+        clean_account, clean_swift = normalize_company_bank_fields(
+            row["bank_account"], row["bank_swift"]
+        )
+        if clean_account != norm(row["bank_account"]) or clean_swift != norm(row["bank_swift"]):
+            cur.execute(
+                "UPDATE company_profile SET bank_account=?, bank_swift=?, updated_at=? WHERE id=1",
+                (clean_account, clean_swift, now_iso()),
+            )
+            c.commit()
+            cur.execute("SELECT * FROM company_profile WHERE id=1")
+            row = cur.fetchone()
     c.close()
 
     tpl = r"""
@@ -4123,8 +4160,9 @@ def company_save():
     nip = norm(request.form.get("nip"))
     phone = norm(request.form.get("phone"))
     email = norm(request.form.get("email"))
-    bank_account = norm(request.form.get("bank_account"))
-    bank_swift = norm(request.form.get("bank_swift")).upper()
+    bank_account, bank_swift = normalize_company_bank_fields(
+        request.form.get("bank_account"), request.form.get("bank_swift")
+    )
 
     c = conn()
     cur = c.cursor()
