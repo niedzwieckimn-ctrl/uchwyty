@@ -295,6 +295,7 @@ def init_db():
         phone TEXT,
         email TEXT,
         bank_account TEXT,
+        bank_swift TEXT,
         updated_at TEXT NOT NULL
     )
     """)
@@ -420,6 +421,11 @@ def init_db():
     product_cols = {r[1] for r in cur.fetchall()}
     if "model" not in product_cols:
         cur.execute("ALTER TABLE products ADD COLUMN model TEXT")
+
+    cur.execute("PRAGMA table_info(company_profile)")
+    company_cols = {r[1] for r in cur.fetchall()}
+    if "bank_swift" not in company_cols:
+        cur.execute("ALTER TABLE company_profile ADD COLUMN bank_swift TEXT")
 
     cur.execute("PRAGMA table_info(invoice_meta)")
     invoice_meta_cols = {r[1] for r in cur.fetchall()}
@@ -4101,6 +4107,7 @@ def company():
           <div><label class="muted small">Telefon</label><input name="phone" value="{{ row['phone'] if row else '' }}"></div>
           <div><label class="muted small">Email</label><input name="email" value="{{ row['email'] if row else '' }}"></div>
           <div><label class="muted small">Konto bankowe</label><input name="bank_account" value="{{ row['bank_account'] if row else '' }}"></div>
+          <div><label class="muted small">SWIFT / BIC</label><input name="bank_swift" value="{{ row['bank_swift'] if row else '' }}" placeholder="np. ALBPPLPWXXX"></div>
           <div><label class="muted small">Adres</label><textarea name="address">{{ row['address'] if row else '' }}</textarea></div>
           <div class="flex" style="align-items:flex-end;"><button class="btn primary" type="submit">Zapisz dane firmy</button></div>
         </form>
@@ -4117,12 +4124,13 @@ def company_save():
     phone = norm(request.form.get("phone"))
     email = norm(request.form.get("email"))
     bank_account = norm(request.form.get("bank_account"))
+    bank_swift = norm(request.form.get("bank_swift")).upper()
 
     c = conn()
     cur = c.cursor()
     cur.execute("""
-      INSERT INTO company_profile(id, company_name, address, nip, phone, email, bank_account, updated_at)
-      VALUES(1,?,?,?,?,?,?,?)
+      INSERT INTO company_profile(id, company_name, address, nip, phone, email, bank_account, bank_swift, updated_at)
+      VALUES(1,?,?,?,?,?,?,?,?)
       ON CONFLICT(id) DO UPDATE SET
         company_name=excluded.company_name,
         address=excluded.address,
@@ -4130,8 +4138,9 @@ def company_save():
         phone=excluded.phone,
         email=excluded.email,
         bank_account=excluded.bank_account,
+        bank_swift=excluded.bank_swift,
         updated_at=excluded.updated_at
-    """, (company_name, address, nip, phone, email, bank_account, now_iso()))
+    """, (company_name, address, nip, phone, email, bank_account, bank_swift, now_iso()))
     c.commit()
     c.close()
     return redirect(url_for("company"))

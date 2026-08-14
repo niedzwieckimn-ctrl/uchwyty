@@ -42,6 +42,24 @@ def _nip(value) -> str:
     return re.sub(r"\D+", "", _text(value))
 
 
+def _pln_bank_account(value) -> str:
+    """Return a valid 26-digit Polish NRB, without spaces or the PL prefix."""
+    raw = re.sub(r"[\s-]+", "", _text(value).upper())
+    if raw.startswith("PL"):
+        raw = raw[2:]
+    if not re.fullmatch(r"\d{26}", raw):
+        return ""
+    # IBAN/NRB checksum: BBAN + numeric PL (2521) + the two check digits.
+    if int(raw[2:] + "2521" + raw[:2]) % 97 != 1:
+        return ""
+    return raw
+
+
+def _swift(value) -> str:
+    raw = re.sub(r"\s+", "", _text(value).upper())
+    return raw if re.fullmatch(r"[A-Z]{6}[A-Z0-9]{2}(?:[A-Z0-9]{3})?", raw) else ""
+
+
 def _date(value) -> str:
     raw = _text(value)
     if not raw:
@@ -214,6 +232,13 @@ def validate_ksef_invoice(invoice: dict, company: dict, items: list[dict]) -> li
         problems.append("NIP sprzedawcy musi mieć 10 cyfr.")
     if not _text(company.get("address")) and not _text(company.get("city")):
         problems.append("Brak adresu sprzedawcy w danych firmy.")
+    payment_code = _payment_code(_invoice_payment_type(invoice))
+    configured_bank_account = _text(company.get("bank_account"))
+    if payment_code == "6" and configured_bank_account and not _pln_bank_account(configured_bank_account):
+        problems.append("Numer rachunku bankowego sprzedawcy musi być poprawnym polskim NRB (26 cyfr).")
+    configured_swift = _text(company.get("bank_swift"))
+    if payment_code == "6" and configured_swift and not _swift(configured_swift):
+        problems.append("Kod SWIFT/BIC sprzedawcy ma niepoprawny format.")
 
     if not _text(invoice.get("buyer_name")):
         problems.append("Brak nazwy nabywcy.")
@@ -336,7 +361,15 @@ def build_ksef_draft_xml(invoice: dict, company: dict, items: list[dict]) -> str
     if due:
         due_node = SubElement(payment, _tag("TerminPlatnosci"))
         _add(due_node, "Termin", due)
-    _add(payment, "FormaPlatnosci", _payment_code(_invoice_payment_type(invoice)))
+    payment_code = _payment_code(_invoice_payment_type(invoice))
+    _add(payment, "FormaPlatnosci", payment_code)
+    bank_account = _pln_bank_account(company.get("bank_account"))
+    if payment_code == "6" and bank_account:
+        bank_node = SubElement(payment, _tag("RachunekBankowy"))
+        _add(bank_node, "NrRB", bank_account)
+        bank_swift = _swift(company.get("bank_swift"))
+        if bank_swift:
+            _add(bank_node, "SWIFT", bank_swift)
 
     rough = tostring(root, encoding="utf-8")
     return minidom.parseString(rough).toprettyxml(indent="  ", encoding="utf-8").decode("utf-8")
