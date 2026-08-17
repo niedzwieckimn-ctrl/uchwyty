@@ -8753,7 +8753,13 @@ def _set_invoice_payment_state(invoice_id: int, *, reminder: int | None = None, 
     next_paid_at = current_paid_at
     if next_paid:
         next_reminder = 0
-        next_paid_at = now_iso()
+        state_changed_at = now_iso()
+        next_paid_at = state_changed_at
+        # Opłacona faktura nie powinna nadal oczekiwać na potwierdzenie
+        # klienta. Zachowujemy jedną prawdę w invoice_meta/Supabase.
+        if not seen_by_client:
+            seen_by_client = 1
+            seen_at = state_changed_at
     elif paid == 0:
         next_paid_at = None
 
@@ -8829,10 +8835,6 @@ def api_invoice_seen(invoice_id):
         has_meta = row["meta_invoice_id"] is not None
         if (has_meta and int(row["sent_to_client"] or 0) != 1) or not (buyer_ok or order_ok):
             return jsonify(ok=False, error="Brak dostÄ™pu"), 403
-
-    ok_pdf, _ = invoice_pdf_exists(row["pdf_path"], row["invoice_no"])
-    if not ok_pdf:
-        return jsonify(ok=False, error="Brak pliku PDF"), 404
 
     meta = load_invoice_meta(invoice_id) or {}
     ts = now_iso()
