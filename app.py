@@ -6938,17 +6938,13 @@ def _send_saved_order_confirmation(order_id: int, force: bool = False) -> dict:
             oi.sku,
             oi.qty,
             COALESCE(p.name, fallback_product.name, '') AS name,
-            COALESCE(oi.unit_net_price, (
-              SELECT price.net_price FROM pricing price
-              WHERE TRIM(LOWER(price.model)) IN (TRIM(LOWER(p.model)), TRIM(LOWER(p.sku)))
-              ORDER BY CASE WHEN TRIM(LOWER(price.model))=TRIM(LOWER(p.model)) THEN 0 ELSE 1 END
-              LIMIT 1
-            ), 0) AS net_price,
+            COALESCE(oi.unit_net_price, price.net_price, 0) AS net_price,
             COALESCE(oi.currency, o.currency, 'PLN') AS currency
           FROM order_items oi
           JOIN orders o ON o.id=oi.order_id
           LEFT JOIN products p ON p.id = oi.product_id
           LEFT JOIN products fallback_product ON fallback_product.sku = oi.sku
+          LEFT JOIN pricing price ON TRIM(LOWER(price.model)) = TRIM(LOWER(oi.sku))
           WHERE oi.order_id=?
           ORDER BY oi.id
         """, (order_id,))
