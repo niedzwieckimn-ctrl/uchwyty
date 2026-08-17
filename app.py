@@ -1811,7 +1811,7 @@ PACKING_LIST_TRANSLATIONS = {
         "order": "ZAMÓWIENIE", "date": "DATA", "customer": "KLIENT", "checked": "✓",
         "line": "LP.", "product": "MODEL / NAZWA", "source": "ZAMÓWIENIE / NOTATKA",
         "quantity": "ILOŚĆ", "positions": "Pozycje", "total_qty": "Razem sztuk",
-        "packages": "Liczba paczek", "packed_by": "Spakował(a)", "signature": "Podpis",
+        "packages": "Liczba pudełek", "packed_by": "Spakował(a)", "signature": "Podpis",
     },
     "de": {
         "title": "PACKLISTE", "invoice": "Rechnung", "continued": "Fortsetzung",
