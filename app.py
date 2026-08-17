@@ -1001,6 +1001,7 @@ def sqlite_table_rows(table: str):
     cur.execute(f"SELECT * FROM {table}")
     rows = [dict(r) for r in cur.fetchall()]
     c.close()
+
     return rows
 
 def sync_all_to_supabase():
@@ -1968,6 +1969,15 @@ def generate_client_order_pdf(order_row: dict, items: list[dict], language: str)
             lines.append(current)
         return lines or ["-"]
 
+    def draw_complete(value, x, y, font_name, size, max_width, min_size=6.2):
+        """Draw the complete value, reducing the font instead of adding ellipsis."""
+        value = txt(value)
+        fitted_size = size
+        while fitted_size > min_size and pdfmetrics.stringWidth(value, font_name, fitted_size) > max_width:
+            fitted_size -= 0.2
+        pdf.setFont(font_name, max(fitted_size, min_size))
+        pdf.drawString(x, y, value)
+
     page_no = 0
     order_number = canonical_order_no(
         order_row.get("id"), order_row.get("created_at"), order_row.get("order_no")
@@ -2016,7 +2026,7 @@ def generate_client_order_pdf(order_row: dict, items: list[dict], language: str)
         pdf.setFillColorRGB(*ink)
         pdf.setFont(bold_font, 8.0)
         pdf.drawString(left + 2 * mm, y - 4 * mm, order_pdf_text(language, "sku"))
-        pdf.drawString(left + 34 * mm, y - 4 * mm, order_pdf_text(language, "product"))
+        pdf.drawString(left + 43 * mm, y - 4 * mm, order_pdf_text(language, "product"))
         pdf.drawRightString(left + 122 * mm, y - 4 * mm, order_pdf_text(language, "quantity"))
         pdf.drawRightString(left + 152 * mm, y - 4 * mm, order_pdf_text(language, "unit_net"))
         pdf.drawRightString(right - 2 * mm, y - 4 * mm, order_pdf_text(language, "line_net"))
@@ -2068,10 +2078,10 @@ def generate_client_order_pdf(order_row: dict, items: list[dict], language: str)
             y = new_page()
             y = draw_table_header(y)
         pdf.setFillColorRGB(*ink)
-        pdf.setFont(bold_font, 8.2)
         product_label = " / ".join(x for x in [txt(item.get("model")), txt(item.get("name"))] if x) or "-"
-        pdf.drawString(left + 2 * mm, y, fit(item.get("sku"), bold_font, 8.2, 29 * mm))
-        pdf.drawString(left + 34 * mm, y, fit(product_label, bold_font, 8.2, 54 * mm))
+        draw_complete(item.get("sku"), left + 2 * mm, y, bold_font, 8.2, 38 * mm)
+        pdf.setFont(bold_font, 8.2)
+        pdf.drawString(left + 43 * mm, y, fit(product_label, bold_font, 8.2, 45 * mm))
         pdf.drawRightString(left + 122 * mm, y, str(qty))
         pdf.drawRightString(left + 152 * mm, y, f"{localized_pdf_money(unit_net, language)} {currency}")
         pdf.drawRightString(right - 2 * mm, y, f"{localized_pdf_money(line_net, language)} {currency}")
@@ -6341,7 +6351,15 @@ def order_invoice(order_id):
                         sync_local_rows_to_supabase("stock", "product_id", changed_product_ids)
                     except Exception:
                         pass
-            return redirect(url_for("invoices", generated="1", invoice_id=invoice_id))
+            _order_id, email_ok, email_error = _send_invoice_to_client(invoice_id)
+            redirect_args = {
+                "generated": "1",
+                "invoice_id": invoice_id,
+                "email_sent": "1" if email_ok else "0",
+            }
+            if email_error:
+                redirect_args["email_error"] = email_error[:300]
+            return redirect(url_for("invoices", **redirect_args))
 
     tpl = r"""
     {% extends "base.html" %}
@@ -7989,6 +8007,17 @@ def invoices():
     rows = [dict(r) for r in cur.fetchall()]
     c.close()
 
+    notice = ""
+    notice_error = False
+    if request.args.get("generated") == "1":
+        if request.args.get("email_sent") == "1":
+            notice = "Faktura została zapisana i wysłano klientowi wiadomość e-mail."
+        elif request.args.get("email_sent") == "0":
+            notice = "Faktura została zapisana, ale wiadomość e-mail nie została wysłana: " + (
+                norm(request.args.get("email_error")) or "nieznany błąd wysyłki"
+            )
+            notice_error = True
+
     groups = []
     current_key = None
     current = None
@@ -8037,6 +8066,12 @@ def invoices():
           <a class="btn" href="{{ url_for('invoices') }}">Wyczyść</a>
         </form>
       </div>
+
+      {% if notice %}
+        <div class="card" style="{% if notice_error %}border-color:#fecaca;background:#fff1f2;color:#991b1b;{% endif %}">
+          {{ notice }}
+        </div>
+      {% endif %}
 
       {% for g in groups %}
         <div class="card">
@@ -8179,7 +8214,10 @@ def invoices():
       {% endif %}
     {% endblock %}
     """
-    return render_template_string(tpl, title="Faktury", base_url=BASE_URL, db_path=DB_PATH, groups=groups, q=q)
+    return render_template_string(
+        tpl, title="Faktury", base_url=BASE_URL, db_path=DB_PATH,
+        groups=groups, q=q, notice=notice, notice_error=notice_error
+    )
 
 
 def load_invoice_with_meta(invoice_id: int):
@@ -9158,7 +9196,7 @@ def _invoice_email_context(invoice_id: int):
     return invoice, pdf_url
 
 
-def _send_invoice_to_client(invoice_id: int) -> int:
+def _send_invoice_to_client(invoice_id: int) -> tuple[int, bool, str]:
     c = conn()
     cur = c.cursor()
     cur.execute("""
@@ -9236,26 +9274,46 @@ def _send_invoice_to_client(invoice_id: int) -> int:
         except Exception:
             pass
 
+    email_ok = False
+    email_error = ""
     try:
-        if send_invoice_available:
+        if not send_invoice_available:
+            email_error = "Brak modułu wysyłki e-mail."
+        else:
             invoice_row, pdf_url = _invoice_email_context(invoice_id)
-            send_invoice_available(invoice_row, pdf_url=pdf_url)
-    except Exception:
-        pass
+            result = send_invoice_available(invoice_row, pdf_url=pdf_url) or {}
+            email_ok = bool(result.get("ok"))
+            if not email_ok:
+                email_error = norm(result.get("error")) or "Usługa pocztowa odrzuciła wiadomość."
+    except Exception as exc:
+        email_error = str(exc) or type(exc).__name__
+        app.logger.exception("Nie udało się wysłać e-maila z fakturą %s", invoice_id)
 
-    return int(row["order_id"] or 0)
+    if not email_ok:
+        app.logger.error("Nie wysłano e-maila z fakturą %s: %s", invoice_id, email_error)
+
+    return int(row["order_id"] or 0), email_ok, email_error
 
 
 @app.post("/invoices/<int:invoice_id>/send")
 def invoice_send_admin(invoice_id):
-    _send_invoice_to_client(invoice_id)
-    return _redirect_after_invoice_action()
+    _order_id, email_ok, email_error = _send_invoice_to_client(invoice_id)
+    target = norm(request.values.get("next")) or request.referrer or url_for("invoices")
+    separator = "&" if "?" in target else "?"
+    if email_ok:
+        return redirect(target + separator + "email_sent=1")
+    return redirect(target + separator + "email_sent=0&email_error=" + urllib.parse.quote_plus(email_error[:300]))
 
 
 @app.post("/orders/<int:order_id>/invoice/<int:invoice_id>/send")
 def order_invoice_send(order_id, invoice_id):
-    _send_invoice_to_client(invoice_id)
-    return redirect(url_for("order_invoice", order_id=order_id, sent="1", invoice_id=invoice_id))
+    _order_id, email_ok, email_error = _send_invoice_to_client(invoice_id)
+    if email_ok:
+        return redirect(url_for("order_invoice", order_id=order_id, sent="1", invoice_id=invoice_id))
+    return redirect(url_for(
+        "order_invoice", order_id=order_id, invoice_id=invoice_id,
+        email_error=email_error[:300]
+    ))
 
 
 @app.route("/invoices/<int:invoice_id>/edit", methods=["GET", "POST"])
