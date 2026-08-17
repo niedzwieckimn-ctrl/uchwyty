@@ -2649,9 +2649,11 @@ def generate_invoice_packing_list_pdf(order_row, items, meta, invoice_pdf_path: 
     y = draw_header()
     customer_name = norm(meta.get("buyer_name") or order_value("customer_name") or "-")
     main_order_no = norm(order_value("order_no") or order_value("number") or "-")
-    # Na liscie pakowania pole DATA oznacza dzien przygotowania/wydruku
-    # dokumentu, a nie date wystawienia faktury.
-    issue_date = app_now().strftime("%Y-%m-%d")
+    # Data w naglowku pochodzi z zamowienia. Osobna data wydruku jest
+    # umieszczana na dole przy polu osoby pakujacej.
+    order_created_at = norm(order_value("created_at") or "")
+    order_date = order_created_at[:10] if len(order_created_at) >= 10 else app_now().strftime("%Y-%m-%d")
+    print_date = app_now().strftime("%Y-%m-%d")
     cpdf.setFillColorRGB(*muted)
     cpdf.setFont(pdf_font_bold, 9)
     cpdf.drawString(15 * mm, y, tr("order"))
@@ -2661,7 +2663,7 @@ def generate_invoice_packing_list_pdf(order_row, items, meta, invoice_pdf_path: 
     cpdf.setFillColorRGB(*navy)
     cpdf.setFont(pdf_font_bold, 10.5)
     cpdf.drawString(15 * mm, y, fit_text(main_order_no, 50 * mm, pdf_font_bold, 10.5))
-    cpdf.drawString(72 * mm, y, issue_date)
+    cpdf.drawString(72 * mm, y, order_date)
     cpdf.drawString(122 * mm, y, fit_text(customer_name, 73 * mm, pdf_font, 10))
     y = draw_table_header(y - 11 * mm)
 
@@ -2725,6 +2727,7 @@ def generate_invoice_packing_list_pdf(order_row, items, meta, invoice_pdf_path: 
     cpdf.setFont(pdf_font_bold, 9)
     cpdf.drawString(15 * mm, y, f"{tr('packed_by')}:")
     cpdf.drawString(91 * mm, y, f"{tr('date').title()}:")
+    cpdf.drawString(104 * mm, y, print_date)
     cpdf.drawString(145 * mm, y, f"{tr('signature')}:")
     cpdf.setStrokeColorRGB(*line_color)
     cpdf.setLineWidth(0.8)
