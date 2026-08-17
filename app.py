@@ -2550,8 +2550,11 @@ def generate_invoice_packing_list_pdf(order_row, items, meta, invoice_pdf_path: 
     w, h = 210 * mm, 297 * mm
     cpdf = canvas.Canvas(fpath, pagesize=(w, h))
     pdf_font, pdf_font_bold = get_pdf_font_names()
-    navy, muted, blue = (0.07, 0.13, 0.24), (0.34, 0.39, 0.49), (0.25, 0.39, 0.87)
-    pale_blue, line_color = (0.94, 0.96, 1.0), (0.86, 0.89, 0.95)
+    # Lista pakowania jest dokumentem roboczym. Kolory są celowo dużo
+    # ciemniejsze niż w ekranowych PDF-ach, aby pozostały czytelne także na
+    # kolorowych drukarkach laserowych i przy druku ekonomicznym.
+    navy, muted, blue = (0.0, 0.0, 0.0), (0.12, 0.12, 0.12), (0.0, 0.0, 0.0)
+    pale_blue, line_color = (0.91, 0.91, 0.91), (0.38, 0.38, 0.38)
 
     def order_value(key, default=""):
         if not order_row:
@@ -2589,7 +2592,7 @@ def generate_invoice_packing_list_pdf(order_row, items, meta, invoice_pdf_path: 
         logo_path = find_logo_path()
         if logo_path:
             try:
-                cpdf.drawImage(ImageReader(logo_path), 15 * mm, h - 27 * mm, 28 * mm, 18 * mm,
+                cpdf.drawImage(ImageReader(logo_path), 15 * mm, h - 28 * mm, 32 * mm, 20 * mm,
                                preserveAspectRatio=True, anchor="w", mask="auto")
             except Exception:
                 pass
@@ -2597,20 +2600,23 @@ def generate_invoice_packing_list_pdf(order_row, items, meta, invoice_pdf_path: 
         cpdf.setFont(pdf_font_bold, 18)
         cpdf.drawRightString(195 * mm, h - 15 * mm, tr("title"))
         cpdf.setFillColorRGB(*muted)
-        cpdf.setFont(pdf_font, 9)
+        cpdf.setFont(pdf_font_bold, 9)
         subtitle = f"{tr('invoice')}: {norm(meta.get('invoice_no') or '-')}"
         if continuation:
             subtitle += f"  |  {tr('continued')}"
         cpdf.drawRightString(195 * mm, h - 23 * mm, subtitle)
         cpdf.setStrokeColorRGB(*line_color)
+        cpdf.setLineWidth(0.8)
         cpdf.line(15 * mm, h - 31 * mm, 195 * mm, h - 31 * mm)
         return h - 41 * mm
 
     def draw_table_header(current_y):
         cpdf.setFillColorRGB(*pale_blue)
-        cpdf.roundRect(15 * mm, current_y - 7 * mm, 180 * mm, 10 * mm, 3 * mm, fill=1, stroke=0)
+        cpdf.setStrokeColorRGB(*line_color)
+        cpdf.setLineWidth(0.8)
+        cpdf.roundRect(15 * mm, current_y - 7 * mm, 180 * mm, 10 * mm, 2 * mm, fill=1, stroke=1)
         cpdf.setFillColorRGB(*blue)
-        cpdf.setFont(pdf_font_bold, 8)
+        cpdf.setFont(pdf_font_bold, 9)
         for label, x_mm in ((tr("checked"), 19), (tr("line"), 29), ("SKU", 42), (tr("product"), 91), (tr("source"), 132)):
             cpdf.drawString(x_mm * mm, current_y - 3.5 * mm, label)
         cpdf.drawRightString(190 * mm, current_y - 3.5 * mm, tr("quantity"))
@@ -2621,14 +2627,14 @@ def generate_invoice_packing_list_pdf(order_row, items, meta, invoice_pdf_path: 
     main_order_no = norm(order_value("order_no") or order_value("number") or "-")
     issue_date = norm(meta.get("issue_date") or app_now().strftime("%Y-%m-%d"))
     cpdf.setFillColorRGB(*muted)
-    cpdf.setFont(pdf_font_bold, 8)
+    cpdf.setFont(pdf_font_bold, 9)
     cpdf.drawString(15 * mm, y, tr("order"))
     cpdf.drawString(72 * mm, y, tr("date"))
     cpdf.drawString(122 * mm, y, tr("customer"))
     y -= 6 * mm
     cpdf.setFillColorRGB(*navy)
-    cpdf.setFont(pdf_font, 10)
-    cpdf.drawString(15 * mm, y, fit_text(main_order_no, 50 * mm, pdf_font, 10))
+    cpdf.setFont(pdf_font_bold, 10.5)
+    cpdf.drawString(15 * mm, y, fit_text(main_order_no, 50 * mm, pdf_font_bold, 10.5))
     cpdf.drawString(72 * mm, y, issue_date)
     cpdf.drawString(122 * mm, y, fit_text(customer_name, 73 * mm, pdf_font, 10))
     y = draw_table_header(y - 11 * mm)
@@ -2650,22 +2656,24 @@ def generate_invoice_packing_list_pdf(order_row, items, meta, invoice_pdf_path: 
         if y < 36 * mm:
             cpdf.showPage()
             y = draw_table_header(draw_header(continuation=True))
-        cpdf.setStrokeColorRGB(0.65, 0.71, 0.82)
+        cpdf.setStrokeColorRGB(0.05, 0.05, 0.05)
+        cpdf.setLineWidth(1.2)
         cpdf.roundRect(18 * mm, y - 2.5 * mm, 5 * mm, 5 * mm, 1 * mm, fill=0, stroke=1)
         cpdf.setFillColorRGB(*navy)
-        cpdf.setFont(pdf_font, 9)
+        cpdf.setFont(pdf_font_bold, 9.5)
         cpdf.drawString(29 * mm, y, str(item_count))
-        cpdf.setFont(pdf_font_bold, 9)
-        cpdf.drawString(42 * mm, y, fit_text(sku, 44 * mm, pdf_font_bold, 9))
-        cpdf.setFont(pdf_font, 9)
-        cpdf.drawString(91 * mm, y, fit_text(model_name, 36 * mm, pdf_font, 9))
+        cpdf.setFont(pdf_font_bold, 10)
+        cpdf.drawString(42 * mm, y, fit_text(sku, 44 * mm, pdf_font_bold, 10))
+        cpdf.setFont(pdf_font_bold, 9.5)
+        cpdf.drawString(91 * mm, y, fit_text(model_name, 36 * mm, pdf_font_bold, 9.5))
         cpdf.setFillColorRGB(*muted)
-        cpdf.setFont(pdf_font, 8)
-        cpdf.drawString(132 * mm, y, fit_text(source_text, 43 * mm, pdf_font, 8))
+        cpdf.setFont(pdf_font_bold, 8.5)
+        cpdf.drawString(132 * mm, y, fit_text(source_text, 43 * mm, pdf_font_bold, 8.5))
         cpdf.setFillColorRGB(*navy)
         cpdf.setFont(pdf_font_bold, 12)
         cpdf.drawRightString(190 * mm, y, str(qty))
         cpdf.setStrokeColorRGB(*line_color)
+        cpdf.setLineWidth(0.7)
         cpdf.line(15 * mm, y - 5.5 * mm, 195 * mm, y - 5.5 * mm)
         y -= 11 * mm
 
@@ -2674,7 +2682,9 @@ def generate_invoice_packing_list_pdf(order_row, items, meta, invoice_pdf_path: 
         y = draw_header(continuation=True)
     y -= 2 * mm
     cpdf.setFillColorRGB(*pale_blue)
-    cpdf.roundRect(15 * mm, y - 13 * mm, 180 * mm, 18 * mm, 4 * mm, fill=1, stroke=0)
+    cpdf.setStrokeColorRGB(*line_color)
+    cpdf.setLineWidth(0.8)
+    cpdf.roundRect(15 * mm, y - 13 * mm, 180 * mm, 18 * mm, 3 * mm, fill=1, stroke=1)
     cpdf.setFillColorRGB(*navy)
     cpdf.setFont(pdf_font_bold, 10)
     cpdf.drawString(21 * mm, y - 5 * mm, f"{tr('positions')}: {item_count}")
@@ -2682,11 +2692,12 @@ def generate_invoice_packing_list_pdf(order_row, items, meta, invoice_pdf_path: 
     cpdf.drawString(128 * mm, y - 5 * mm, f"{tr('packages')}:  ______")
     y -= 28 * mm
     cpdf.setFillColorRGB(*muted)
-    cpdf.setFont(pdf_font, 9)
+    cpdf.setFont(pdf_font_bold, 9)
     cpdf.drawString(15 * mm, y, f"{tr('packed_by')}:")
     cpdf.drawString(91 * mm, y, f"{tr('date').title()}:")
     cpdf.drawString(145 * mm, y, f"{tr('signature')}:")
     cpdf.setStrokeColorRGB(*line_color)
+    cpdf.setLineWidth(0.8)
     cpdf.line(37 * mm, y - 1 * mm, 82 * mm, y - 1 * mm)
     cpdf.line(103 * mm, y - 1 * mm, 134 * mm, y - 1 * mm)
     cpdf.line(159 * mm, y - 1 * mm, 195 * mm, y - 1 * mm)
