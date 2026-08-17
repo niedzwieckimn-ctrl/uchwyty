@@ -2572,6 +2572,14 @@ def generate_invoice_packing_list_pdf(order_row, items, meta, invoice_pdf_path: 
             text = text[:-1]
         return (text + "...") if text else "..."
 
+    def fit_font_size(text, max_width, font_name, preferred_size, minimum_size=6.0):
+        """Zmniejsza font bez obcinania tekstu (uzywane dla numeru zamowienia)."""
+        text = norm(text or "") or "-"
+        size = float(preferred_size)
+        while size > minimum_size and cpdf.stringWidth(text, font_name, size) > max_width:
+            size -= 0.25
+        return max(size, minimum_size)
+
     def strip_note_from_order_no(order_no, note):
         order_no, note = norm(order_no or ""), norm(note or "")
         if note and order_no.lower().endswith((" " + note).lower()):
@@ -2625,7 +2633,9 @@ def generate_invoice_packing_list_pdf(order_row, items, meta, invoice_pdf_path: 
     y = draw_header()
     customer_name = norm(meta.get("buyer_name") or order_value("customer_name") or "-")
     main_order_no = norm(order_value("order_no") or order_value("number") or "-")
-    issue_date = norm(meta.get("issue_date") or app_now().strftime("%Y-%m-%d"))
+    # Na liscie pakowania pole DATA oznacza dzien przygotowania/wydruku
+    # dokumentu, a nie date wystawienia faktury.
+    issue_date = app_now().strftime("%Y-%m-%d")
     cpdf.setFillColorRGB(*muted)
     cpdf.setFont(pdf_font_bold, 9)
     cpdf.drawString(15 * mm, y, tr("order"))
@@ -2667,8 +2677,12 @@ def generate_invoice_packing_list_pdf(order_row, items, meta, invoice_pdf_path: 
         cpdf.setFont(pdf_font_bold, 9.5)
         cpdf.drawString(91 * mm, y, fit_text(model_name, 36 * mm, pdf_font_bold, 9.5))
         cpdf.setFillColorRGB(*muted)
-        cpdf.setFont(pdf_font_bold, 8.5)
-        cpdf.drawString(132 * mm, y, fit_text(source_text, 43 * mm, pdf_font_bold, 8.5))
+        # Numer zamowienia jest identyfikatorem roboczym i nigdy nie moze byc
+        # zakonczony wielokropkiem. W razie dluzszego numeru zmniejszamy font,
+        # zachowujac cala wartosc wraz z dopiskiem/notatka.
+        source_font_size = fit_font_size(source_text, 43 * mm, pdf_font_bold, 8.5)
+        cpdf.setFont(pdf_font_bold, source_font_size)
+        cpdf.drawString(132 * mm, y, source_text)
         cpdf.setFillColorRGB(*navy)
         cpdf.setFont(pdf_font_bold, 12)
         cpdf.drawRightString(190 * mm, y, str(qty))
