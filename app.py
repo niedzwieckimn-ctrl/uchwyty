@@ -1925,6 +1925,12 @@ def generate_client_order_pdf(order_row: dict, items: list[dict], language: str)
     left, right = 15 * mm, 195 * mm
     buffer = io.BytesIO()
     pdf = canvas.Canvas(buffer, pagesize=(page_width, page_height))
+    # Wersja przyjazna drukarkom laserowym: wysoki kontrast, neutralne szarosci
+    # i grubsze linie zamiast delikatnych ekranowych odcieni niebieskiego.
+    ink = (0.0, 0.0, 0.0)
+    muted_ink = (0.12, 0.12, 0.12)
+    pale_gray = (0.91, 0.91, 0.91)
+    rule_gray = (0.38, 0.38, 0.38)
 
     c = conn()
     try:
@@ -1940,7 +1946,7 @@ def generate_client_order_pdf(order_row: dict, items: list[dict], language: str)
         value = txt(value)
         if pdfmetrics.stringWidth(value, font_name, size) <= max_width:
             return value
-        suffix = "…"
+        suffix = "..."
         while value and pdfmetrics.stringWidth(value + suffix, font_name, size) > max_width:
             value = value[:-1]
         return value + suffix if value else ""
@@ -1968,10 +1974,11 @@ def generate_client_order_pdf(order_row: dict, items: list[dict], language: str)
     )
 
     def footer():
-        pdf.setStrokeColorRGB(0.88, 0.90, 0.94)
+        pdf.setStrokeColorRGB(*rule_gray)
+        pdf.setLineWidth(0.7)
         pdf.line(left, 12 * mm, right, 12 * mm)
-        pdf.setFont(regular_font, 7.5)
-        pdf.setFillColorRGB(0.42, 0.47, 0.58)
+        pdf.setFont(bold_font, 7.5)
+        pdf.setFillColorRGB(*muted_ink)
         pdf.drawString(left, 7.5 * mm, txt(company.get("company_name") or "Niedźwieccy"))
         pdf.drawRightString(right, 7.5 * mm, f"{order_pdf_text(language, 'page')} {page_no}")
 
@@ -1986,26 +1993,28 @@ def generate_client_order_pdf(order_row: dict, items: list[dict], language: str)
         logo_path = find_logo_path()
         if logo_path:
             try:
-                pdf.drawImage(ImageReader(logo_path), left, page_height - 27 * mm, 28 * mm, 18 * mm,
+                pdf.drawImage(ImageReader(logo_path), left, page_height - 28 * mm, 32 * mm, 20 * mm,
                               preserveAspectRatio=True, anchor="w", mask="auto")
             except Exception:
                 pass
-        pdf.setFillColorRGB(0.07, 0.13, 0.24)
+        pdf.setFillColorRGB(*ink)
         pdf.setFont(bold_font, 18)
         pdf.drawRightString(right, page_height - 15 * mm, order_pdf_text(language, "title"))
-        pdf.setFillColorRGB(0.34, 0.39, 0.49)
-        pdf.setFont(regular_font, 9)
+        pdf.setFillColorRGB(*muted_ink)
+        pdf.setFont(bold_font, 9)
         pdf.drawRightString(right, page_height - 21 * mm, fit(order_number, regular_font, 9, 80 * mm))
-        pdf.setStrokeColorRGB(0.86, 0.89, 0.94)
-        pdf.setLineWidth(0.7)
+        pdf.setStrokeColorRGB(*rule_gray)
+        pdf.setLineWidth(0.8)
         pdf.line(left, page_height - 31 * mm, right, page_height - 31 * mm)
         return page_height - 41 * mm
 
     def draw_table_header(y):
-        pdf.setFillColorRGB(0.94, 0.96, 1)
-        pdf.roundRect(left, y - 7 * mm, right - left, 8 * mm, 2 * mm, fill=1, stroke=0)
-        pdf.setFillColorRGB(0.22, 0.31, 0.52)
-        pdf.setFont(bold_font, 7.4)
+        pdf.setFillColorRGB(*pale_gray)
+        pdf.setStrokeColorRGB(*rule_gray)
+        pdf.setLineWidth(0.8)
+        pdf.roundRect(left, y - 7 * mm, right - left, 8 * mm, 2 * mm, fill=1, stroke=1)
+        pdf.setFillColorRGB(*ink)
+        pdf.setFont(bold_font, 8.0)
         pdf.drawString(left + 2 * mm, y - 4 * mm, order_pdf_text(language, "sku"))
         pdf.drawString(left + 34 * mm, y - 4 * mm, order_pdf_text(language, "product"))
         pdf.drawRightString(left + 122 * mm, y - 4 * mm, order_pdf_text(language, "quantity"))
@@ -2014,13 +2023,13 @@ def generate_client_order_pdf(order_row: dict, items: list[dict], language: str)
         return y - 10 * mm
 
     y = new_page(first=True)
-    pdf.setFillColorRGB(0.10, 0.15, 0.26)
+    pdf.setFillColorRGB(*ink)
     pdf.setFont(bold_font, 9)
     pdf.drawString(left, y, order_pdf_text(language, "order_number"))
     pdf.drawString(left + 72 * mm, y, order_pdf_text(language, "date"))
     pdf.drawString(left + 117 * mm, y, order_pdf_text(language, "status"))
-    pdf.setFont(regular_font, 9)
-    pdf.drawString(left, y - 5 * mm, fit(order_number, regular_font, 9, 65 * mm))
+    pdf.setFont(bold_font, 9.5)
+    pdf.drawString(left, y - 5 * mm, fit(order_number, bold_font, 9.5, 65 * mm))
     pdf.drawString(left + 72 * mm, y - 5 * mm, localized_pdf_date(order_row.get("created_at"), language))
     pdf.drawString(left + 117 * mm, y - 5 * mm, order_pdf_status(order_row.get("status"), language))
     y -= 15 * mm
@@ -2030,9 +2039,9 @@ def generate_client_order_pdf(order_row: dict, items: list[dict], language: str)
     pdf.setFont(bold_font, 9)
     pdf.drawString(left, y, order_pdf_text(language, "customer"))
     pdf.drawString(left + 95 * mm, y, order_pdf_text(language, "delivery_address"))
-    pdf.setFont(regular_font, 8.5)
-    customer_lines = wrap(customer_name, regular_font, 8.5, 82 * mm, 2)
-    contact = " · ".join(x for x in [txt(order_row.get("customer_email")), txt(order_row.get("customer_phone"))] if x)
+    pdf.setFont(bold_font, 8.8)
+    customer_lines = wrap(customer_name, bold_font, 8.8, 82 * mm, 2)
+    contact = " - ".join(x for x in [txt(order_row.get("customer_email")), txt(order_row.get("customer_phone"))] if x)
     if contact:
         customer_lines.extend(wrap(contact, regular_font, 7.5, 82 * mm, 2))
     address_lines = wrap(customer_address or "-", regular_font, 8.5, 82 * mm, 3)
@@ -2058,15 +2067,16 @@ def generate_client_order_pdf(order_row: dict, items: list[dict], language: str)
         if y < 31 * mm:
             y = new_page()
             y = draw_table_header(y)
-        pdf.setFillColorRGB(0.10, 0.15, 0.26)
-        pdf.setFont(regular_font, 7.8)
+        pdf.setFillColorRGB(*ink)
+        pdf.setFont(bold_font, 8.2)
         product_label = " / ".join(x for x in [txt(item.get("model")), txt(item.get("name"))] if x) or "-"
-        pdf.drawString(left + 2 * mm, y, fit(item.get("sku"), regular_font, 7.8, 29 * mm))
-        pdf.drawString(left + 34 * mm, y, fit(product_label, regular_font, 7.8, 54 * mm))
+        pdf.drawString(left + 2 * mm, y, fit(item.get("sku"), bold_font, 8.2, 29 * mm))
+        pdf.drawString(left + 34 * mm, y, fit(product_label, bold_font, 8.2, 54 * mm))
         pdf.drawRightString(left + 122 * mm, y, str(qty))
         pdf.drawRightString(left + 152 * mm, y, f"{localized_pdf_money(unit_net, language)} {currency}")
         pdf.drawRightString(right - 2 * mm, y, f"{localized_pdf_money(line_net, language)} {currency}")
-        pdf.setStrokeColorRGB(0.91, 0.92, 0.95)
+        pdf.setStrokeColorRGB(*rule_gray)
+        pdf.setLineWidth(0.7)
         pdf.line(left, y - 2.5 * mm, right, y - 2.5 * mm)
         y -= 7 * mm
 
@@ -2076,7 +2086,7 @@ def generate_client_order_pdf(order_row: dict, items: list[dict], language: str)
     if y < 48 * mm:
         y = new_page()
     y -= 3 * mm
-    pdf.setFillColorRGB(0.10, 0.15, 0.26)
+    pdf.setFillColorRGB(*ink)
     for key, value, is_bold in (
         ("net_total", total_net, False), ("vat", vat_value, False), ("gross_total", total_gross, True)
     ):
@@ -2434,7 +2444,13 @@ def generate_order_invoice_pdf(order_row, items, meta):
         name = pdf_txt(it.get("name") or (product_row["name"] if product_row else ""))
         common_name = name or model
         pr = pricing_map.get(model) or pricing_map.get(sku)
-        net_dec = money_dec(pr["net_price"] if pr else it.get("net_price"))
+        # Faktura musi zachowac cene zapisana w chwili jej utworzenia.
+        # Aktualny cennik jest tylko awaryjnym zrodlem dla bardzo starych
+        # pozycji, w ktorych ceny jeszcze nie byly utrwalane w JSON-ie.
+        saved_net_price = it.get("net_price")
+        if saved_net_price is None or norm(saved_net_price) == "":
+            saved_net_price = pr["net_price"] if pr else 0
+        net_dec = money_dec(saved_net_price)
         qty = int(it["qty"])
         line_net_dec = (net_dec * Decimal(qty)).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
         if discount_pct > 0:
