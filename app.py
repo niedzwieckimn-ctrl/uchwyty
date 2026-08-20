@@ -2635,7 +2635,8 @@ def generate_invoice_packing_list_pdf(order_row, items, meta, invoice_pdf_path: 
         cpdf.drawRightString(195 * mm, h - 15 * mm, tr("title"))
         cpdf.setFillColorRGB(*muted)
         cpdf.setFont(pdf_font_bold, 9)
-        subtitle = f"{tr('invoice')}: {norm(meta.get('invoice_no') or '-')}"
+        document_label_key = norm(meta.get("document_label_key")) or "invoice"
+        subtitle = f"{tr(document_label_key)}: {norm(meta.get('invoice_no') or '-')}"
         if continuation:
             subtitle += f"  |  {tr('continued')}"
         cpdf.drawRightString(195 * mm, h - 23 * mm, subtitle)
@@ -3444,7 +3445,31 @@ def home():
     inventory_value_net = float(cur.fetchone()["v"] or 0)
     cur.execute("SELECT COUNT(*) AS n FROM orders WHERE date(created_at)=date('now','localtime')")
     n_orders_today = int(cur.fetchone()["n"] or 0)
-    cur.execute("SELECT COUNT(*) AS n FROM orders WHERE status='issued' AND date(created_at)=date('now','localtime')")
+    # "Wydane dzisiaj" ma opisywac dzien faktycznego wydania przez
+    # fakturowanie, a nie dzien utworzenia zamowienia. Jedna faktura moze
+    # zawierac wiele pozycji (a nawet kilka zamowien), dlatego liczymy
+    # unikalne zamowienia na podstawie zapisanych alokacji faktury.
+    # Druga czesc UNION jest zgodnosciowym fallbackiem dla starszych faktur,
+    # ktore powstaly przed wprowadzeniem invoice_allocations.
+    cur.execute("""
+      SELECT COUNT(DISTINCT issued.order_id) AS n
+      FROM (
+        SELECT ia.order_id, ia.created_at AS issued_at
+        FROM invoice_allocations ia
+
+        UNION ALL
+
+        SELECT i.order_id, i.created_at AS issued_at
+        FROM invoices i
+        WHERE i.order_id IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM invoice_allocations ia2 WHERE ia2.invoice_id=i.id
+          )
+      ) issued
+      JOIN orders o ON o.id=issued.order_id
+      WHERE COALESCE(o.warehouse_issued,0)=1
+        AND date(issued.issued_at)=date('now','localtime')
+    """)
     n_issued_today = int(cur.fetchone()["n"] or 0)
     reorder_horizon_days = 60
     try:
@@ -3803,6 +3828,23 @@ def client_searches_v2():
             company_name = norm(rr["name"])
             if email_key and company_name and not _order_name_is_fallback(company_name, email_key):
                 customer_name_by_email[email_key] = company_name
+
+        # Render moze miec niepelna lokalna kopie klientow. Supabase jest tutaj
+        # zrodlem prawdy, wiec uzupelniamy mape nazw jednym zbiorczym odczytem.
+        if supabase_enabled():
+            try:
+                cloud_customers = supabase_request(
+                    "/rest/v1/customers",
+                    params={"select": "email,name", "limit": 5000},
+                    timeout=20,
+                ) or []
+                for rr in cloud_customers:
+                    email_key = _email_key(rr.get("email"))
+                    company_name = norm(rr.get("name"))
+                    if email_key and company_name and not _order_name_is_fallback(company_name, email_key):
+                        customer_name_by_email[email_key] = company_name
+            except Exception as exc:
+                app.logger.warning("Nie udalo sie pobrac nazw klientow dla historii wyszukiwan: %s", type(exc).__name__)
 
         cur.execute("""
           SELECT customer_email, customer_name
@@ -5739,6 +5781,7 @@ def order_view(order_id):
           <span class="badge {{ order_status_css(o['status']) }}">{{ order_status_label(o['status']) }}</span>
           <div class="right flex">
             <a class="btn" href="{{ url_for('orders') }}">â† Lista</a>
+            <a class="btn primary" href="{{ url_for('order_packing_list_download_admin', order_id=o['id']) }}" target="_blank">Pakuj</a>
             {% if (o['currency'] or 'PLN') == 'EUR' %}
               <a class="btn primary" href="{{ url_for('order_proforma', order_id=o['id']) }}" target="_blank">Proforma EUR</a>
               <span class="badge" title="Dokument końcowy wystawiasz ręcznie poza modułem KSeF.">Faktura końcowa — ręcznie</span>
@@ -6832,7 +6875,17 @@ def api_client_search_log():
     # Tożsamość pochodzi wyłącznie ze zweryfikowanego tokenu Supabase,
     # nigdy z danych przesłanych przez przeglądarkę.
     email = norm(g.client_user.get("email")).lower()[:180]
-    name = email
+    name = ""
+    try:
+        profile_name = norm(_client_profile_for_email(email).get("name"))
+        if profile_name and "@" not in profile_name and not _order_name_is_fallback(profile_name, email):
+            name = profile_name
+    except Exception as exc:
+        app.logger.warning("Nie udalo sie ustalic nazwy klienta dla wyszukiwania %s: %s", email, type(exc).__name__)
+    if not name:
+        auth_name = norm(g.client_user.get("name"))
+        if auth_name and "@" not in auth_name and not _order_name_is_fallback(auth_name, email):
+            name = auth_name
     source = norm(data.get("source"))[:40] or "stock"
     results_count = to_int(data.get("results_count"), 0)
     if results_count < 0:
@@ -8725,6 +8778,49 @@ def invoice_download_admin(invoice_id):
         except Exception:
             pass
     return send_file(abs_path, mimetype="application/pdf", as_attachment=True, download_name=os.path.basename(abs_path))
+
+
+@app.get("/orders/<int:order_id>/packing-list")
+def order_packing_list_download_admin(order_id):
+    """Generuje liste pakowania bez wymogu uprzedniego wystawienia faktury."""
+    maybe_pull_shared_from_supabase()
+    c = conn()
+    cur = c.cursor()
+    cur.execute("SELECT * FROM orders WHERE id=?", (order_id,))
+    order_row = cur.fetchone()
+    if not order_row:
+        c.close()
+        return "Nie znaleziono zamowienia", 404
+    cur.execute("""
+      SELECT oi.qty, p.sku, p.model, p.name
+      FROM order_items oi
+      JOIN products p ON p.id=oi.product_id
+      WHERE oi.order_id=?
+      ORDER BY oi.id
+    """, (order_id,))
+    items = [dict(row) for row in cur.fetchall()]
+    c.close()
+    if not items:
+        return "Brak pozycji zamowienia", 400
+
+    order_no = canonical_order_no(order_row["id"], order_row["created_at"], order_row["order_no"])
+    note = norm(order_row["note"])
+    for item in items:
+        item["source_order_no"] = order_no
+        item["source_order_note"] = note
+    meta = {
+        "invoice_no": order_no,
+        "document_label_key": "order",
+        "buyer_name": norm(order_row["customer_name"]),
+        "buyer_email": norm(order_row["customer_email"]),
+    }
+    pack_path = generate_invoice_packing_list_pdf(order_row, items, meta)
+    return send_file(
+        pack_path,
+        mimetype="application/pdf",
+        as_attachment=True,
+        download_name=f"{safe_filename(order_no)}_lista_pakowania.pdf",
+    )
 
 
 @app.get("/invoices/<int:invoice_id>/packing-list")
