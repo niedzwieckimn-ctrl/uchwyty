@@ -30,6 +30,24 @@ def parse_date_safe(value):
     return None
 
 
+def recent_months(today, count=12):
+    month_names = ("sty", "lut", "mar", "kwi", "maj", "cze", "lip", "sie", "wrz", "paź", "lis", "gru")
+    result = []
+    year, month = today.year, today.month
+    for offset in range(count - 1, -1, -1):
+        absolute = year * 12 + (month - 1) - offset
+        item_year, item_month_zero = divmod(absolute, 12)
+        item_month = item_month_zero + 1
+        result.append({
+            "key": f"{item_year:04d}-{item_month:02d}",
+            "label": f"{month_names[item_month - 1]} {str(item_year)[2:]}",
+            "units": 0,
+            "value": 0.0,
+            "invoices": 0,
+        })
+    return result
+
+
 def ensure_cash_flow_tables(conn, now_iso):
     c = conn()
     cur = c.cursor()
@@ -132,6 +150,8 @@ def register_cash_flow(app, deps):
         overdue_clients_map = {}
         paid_clients_map = {}
         inflow_rows = []
+        sales_chart = recent_months(today, 12)
+        sales_chart_by_month = {row["key"]: row for row in sales_chart}
 
         for inv in invoices_rows:
             gross = to_float(inv["total_gross"], 0)
@@ -142,6 +162,11 @@ def register_cash_flow(app, deps):
             due_d = parse_date_safe(inv["payment_to"]) or issue_d or today
             buyer = inv["buyer_name"] or "-"
             invoice_no = inv["invoice_no"] or "-"
+
+            if issue_d:
+                chart_row = sales_chart_by_month.get(issue_d.strftime("%Y-%m"))
+                if chart_row is not None:
+                    chart_row["invoices"] += 1
 
             if issue_d and issue_d.year == today.year and issue_d.month == today.month:
                 month_net += net
@@ -188,6 +213,28 @@ def register_cash_flow(app, deps):
                 "overdue": due_d < today if due_d else False,
                 "reminder": int(inv["payment_reminder"] or 0) == 1,
             })
+
+        # Sztuki i wartosc pochodza z zamowien (nie z faktur), dzieki czemu
+        # wykres obejmuje sprzedaz takze przed wystawieniem dokumentu. Wartosc
+        # jest liczona wyłącznie dla PLN, aby nie sumowac PLN i EUR.
+        cur.execute("""
+          SELECT substr(o.created_at,1,7) AS month_key,
+                 COALESCE(SUM(oi.qty),0) AS units,
+                 COALESCE(SUM(
+                   CASE WHEN UPPER(COALESCE(oi.currency,o.currency,'PLN'))='PLN'
+                        THEN oi.qty * COALESCE(oi.unit_gross_price, oi.unit_net_price * 1.23, 0)
+                        ELSE 0 END
+                 ),0) AS order_value_pln
+          FROM orders o
+          JOIN order_items oi ON oi.order_id=o.id
+          WHERE lower(COALESCE(o.status,'')) <> 'cancelled'
+          GROUP BY substr(o.created_at,1,7)
+        """)
+        for order_month in cur.fetchall():
+            chart_row = sales_chart_by_month.get(order_month["month_key"])
+            if chart_row is not None:
+                chart_row["units"] = int(order_month["units"] or 0)
+                chart_row["value"] = to_float(order_month["order_value_pln"], 0)
 
         cur.execute("""
           SELECT COALESCE(SUM(s.qty),0) AS units,
@@ -237,6 +284,8 @@ def register_cash_flow(app, deps):
         overdue_clients = sorted(overdue_clients_map.values(), key=lambda r: (r["days_late"], r["gross"]), reverse=True)[:10]
         paid_clients = sorted(paid_clients_map.values(), key=lambda r: r["gross"], reverse=True)[:10]
         inflow_rows = sorted(inflow_rows, key=lambda r: (r["overdue"], r["due"]), reverse=True)[:25]
+        for row in sales_chart:
+            row["value"] = round(row["value"], 2)
 
         kpis = {
             "account_balance": account_balance,
@@ -305,6 +354,37 @@ def register_cash_flow(app, deps):
             <div class="card"><h2>Prognoza 30 dni</h2><div style="font-size:24px;font-weight:800;">{{ "%.2f"|format(k.forecast_30_total) }} PLN</div><div class="muted">uwzględnia korektę wzrostu</div></div>
 <div class="card"><h2>Możesz dziś wydać na Chiny</h2><div style="font-size:24px;font-weight:800;color:{% if k.safe_to_spend<=0 %}#b00020{% else %}#067a2d{% endif %};">{{ "%.2f"|format(k.safe_to_spend) }} PLN</div><div class="muted">realnie z konta: po VAT, ZUS, buforze i rezerwie</div>{% if k.cash_shortage > 0 %}<div class="muted" style="color:#b00020;font-weight:700;">Brakuje {{ "%.2f"|format(k.cash_shortage) }} PLN do bufora/kosztów.</div>{% endif %}</div>
           </div>
+
+          <div class="card">
+            <div class="flex" style="justify-content:space-between;align-items:flex-start;">
+              <div><h2 style="margin-bottom:4px;">Sprzedaż miesiąc po miesiącu</h2><div class="muted">Ostatnie 12 miesięcy według daty wystawienia faktury.</div></div>
+              <div class="flex small"><span><b style="color:#4f6feb;">●</b> Sztuki</span><span><b style="color:#10a37f;">●</b> Zamówienia brutto PLN</span><span><b style="color:#f59e0b;">●</b> Faktury</span></div>
+            </div>
+            <div style="margin-top:16px;overflow-x:auto;"><svg id="salesTrendChart" viewBox="0 0 1040 350" role="img" aria-label="Miesięczne statystyki sprzedaży" style="display:block;min-width:760px;width:100%;height:auto;"></svg></div>
+            <details style="margin-top:8px;">
+              <summary class="muted" style="cursor:pointer;">Pokaż dokładne dane</summary>
+              <table style="margin-top:10px;">
+                <thead><tr><th>Miesiąc</th><th>Liczba sztuk</th><th>Wartość zamówień brutto</th><th>Liczba faktur</th></tr></thead>
+                <tbody>{% for row in sales_chart %}<tr><td>{{ row.label }}</td><td>{{ row.units }}</td><td>{{ "%.2f"|format(row.value) }} PLN</td><td>{{ row.invoices }}</td></tr>{% endfor %}</tbody>
+              </table>
+            </details>
+          </div>
+          <script>
+          (() => {
+            const rows = {{ sales_chart_json|safe }};
+            const svg = document.getElementById('salesTrendChart');
+            if (!svg || !rows.length) return;
+            const NS = 'http://www.w3.org/2000/svg';
+            const W = 1040, H = 350, left = 58, right = 28, top = 28, bottom = 58;
+            const width = W-left-right, height = H-top-bottom;
+            const make = (tag, attrs, value) => { const node=document.createElementNS(NS,tag); Object.entries(attrs||{}).forEach(([k,v])=>node.setAttribute(k,v)); if(value!==undefined)node.textContent=value; svg.appendChild(node); return node; };
+            for(let i=0;i<=4;i++){const y=top+height*i/4;make('line',{x1:left,y1:y,x2:W-right,y2:y,stroke:'#e3e9f4','stroke-width':'1'});make('text',{x:8,y:y+4,fill:'#71809f','font-size':'12'},`${100-i*25}%`);}
+            const series=[{key:'units',color:'#4f6feb',label:'szt.'},{key:'value',color:'#10a37f',label:'PLN'},{key:'invoices',color:'#f59e0b',label:'faktur'}];
+            const x=i=>left+(rows.length===1?width/2:width*i/(rows.length-1));
+            rows.forEach((row,i)=>make('text',{x:x(i),y:H-25,fill:'#596987','font-size':'12','text-anchor':'middle'},row.label));
+            series.forEach(s=>{const max=Math.max(1,...rows.map(r=>Number(r[s.key])||0));const points=rows.map((r,i)=>({x:x(i),y:top+height-(Number(r[s.key])||0)/max*height,value:Number(r[s.key])||0,label:r.label}));make('polyline',{points:points.map(p=>`${p.x},${p.y}`).join(' '),fill:'none',stroke:s.color,'stroke-width':'4','stroke-linecap':'round','stroke-linejoin':'round'});points.forEach(p=>{const dot=make('circle',{cx:p.x,cy:p.y,r:'5',fill:'#fff',stroke:s.color,'stroke-width':'3'});const title=document.createElementNS(NS,'title');title.textContent=`${p.label}: ${s.key==='value'?p.value.toFixed(2):p.value} ${s.label}`;dot.appendChild(title);});});
+          })();
+          </script>
 
           <div class="card">
             <h2>Magazyn i marża</h2>
@@ -391,4 +471,6 @@ def register_cash_flow(app, deps):
         return render_template_string(tpl, title="Cash flow", base_url=base_url, db_path=db_path,
                                       settings=settings, k=kpis, inflow_rows=inflow_rows,
                                       overdue_clients=overdue_clients, paid_clients=paid_clients,
-                                      reorder_rows=reorder_rows, reorder_horizon_days=reorder_horizon_days)
+                                      reorder_rows=reorder_rows, reorder_horizon_days=reorder_horizon_days,
+                                      sales_chart=sales_chart,
+                                      sales_chart_json=json.dumps(sales_chart, ensure_ascii=False))
