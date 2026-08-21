@@ -6311,8 +6311,8 @@ def order_invoice(order_id):
             "place": "KotuszĂłw",
             "issue_date": default_issue,
             "sell_date": default_issue,
-            "payment_type": "gotowka",
-            "payment_to": (app_now() + timedelta(days=30)).strftime("%Y-%m-%d"),
+            "payment_type": "przelew",
+            "payment_to": (app_now() + timedelta(days=7)).strftime("%Y-%m-%d"),
             "buyer_name": o["customer_name"] or "",
             "buyer_tax_no": buyer_tax_no,
             "buyer_address": buyer_address_default,
@@ -6337,6 +6337,12 @@ def order_invoice(order_id):
             data["issue_date"] = default_issue
         if not data["sell_date"]:
             data["sell_date"] = data["issue_date"]
+        if not data["payment_to"]:
+            try:
+                issue_day = datetime.strptime(data["issue_date"], "%Y-%m-%d")
+            except (TypeError, ValueError):
+                issue_day = app_now()
+            data["payment_to"] = (issue_day + timedelta(days=7)).strftime("%Y-%m-%d")
 
         invoice_items = prepare_invoice_items(items, request.form)
         existing_invoice_id = invoice_no_exists(data["invoice_no"])
@@ -6421,16 +6427,16 @@ def order_invoice(order_id):
         <form method="post" class="row">
           <div><label class="muted small">Numer faktury</label><input name="invoice_no" value="{{ d['invoice_no'] }}" required></div>
           <div><label class="muted small">Miejsce</label><input name="place" value="{{ d['place'] }}"></div>
-          <div><label class="muted small">Data wystawienia</label><input name="issue_date" type="date" value="{{ d['issue_date'] }}"></div>
+          <div><label class="muted small">Data wystawienia</label><input id="invoice_issue_date" name="issue_date" type="date" value="{{ d['issue_date'] }}"></div>
           <div><label class="muted small">Data sprzedaĹĽy</label><input name="sell_date" type="date" value="{{ d['sell_date'] }}"></div>
           <div><label class="muted small">Forma pĹ‚atnoĹ›ci</label>
             <select name="payment_type">
-              <option value="gotowka" {% if d['payment_type'] in ['cash','gotowka'] %}selected{% endif %}>gotĂłwka</option>
               <option value="przelew" {% if d['payment_type'] in ['transfer','przelew'] %}selected{% endif %}>przelew</option>
+              <option value="gotowka" {% if d['payment_type'] in ['cash','gotowka'] %}selected{% endif %}>gotĂłwka</option>
               <option value="karta" {% if d['payment_type'] in ['card','karta'] %}selected{% endif %}>karta</option>
             </select>
           </div>
-          <div><label class="muted small">Termin pĹ‚atnoĹ›ci</label><input name="payment_to" type="date" value="{{ d['payment_to'] }}"></div>
+          <div><label class="muted small">Termin pĹ‚atnoĹ›ci</label><input id="invoice_payment_to" name="payment_to" type="date" value="{{ d['payment_to'] }}"></div>
           <div><label class="muted small">Rabat %</label><input name="discount_percent" value="{{ d['discount_percent'] or "0" }}"></div>
 
           <div><label class="muted small">Nabywca</label><input name="buyer_name" value="{{ d['buyer_name'] }}" required></div>
@@ -6473,6 +6479,22 @@ def order_invoice(order_id):
           </div>
         </form>
       </div>
+
+      <script>
+      (() => {
+        const issueDate = document.getElementById('invoice_issue_date');
+        const paymentTo = document.getElementById('invoice_payment_to');
+        if (!issueDate || !paymentTo) return;
+        issueDate.addEventListener('change', () => {
+          if (!issueDate.value) return;
+          const parts = issueDate.value.split('-').map(Number);
+          if (parts.length !== 3 || parts.some(Number.isNaN)) return;
+          const due = new Date(Date.UTC(parts[0], parts[1] - 1, parts[2]));
+          due.setUTCDate(due.getUTCDate() + 7);
+          paymentTo.value = due.toISOString().slice(0, 10);
+        });
+      })();
+      </script>
 
       <div class="card">
         <h2>Zapisane faktury</h2>
@@ -8792,16 +8814,36 @@ def order_packing_list_download_admin(order_id):
         c.close()
         return "Nie znaleziono zamowienia", 404
     cur.execute("""
-      SELECT oi.qty, p.sku, p.model, p.name
+      SELECT oi.id, oi.product_id, oi.qty, p.sku, p.model, p.name,
+             COALESCE(s.qty,0) AS stock_qty
       FROM order_items oi
       JOIN products p ON p.id=oi.product_id
+      LEFT JOIN stock s ON s.product_id=oi.product_id
       WHERE oi.order_id=?
       ORDER BY oi.id
     """, (order_id,))
-    items = [dict(row) for row in cur.fetchall()]
+    order_items = [dict(row) for row in cur.fetchall()]
     c.close()
-    if not items:
+    if not order_items:
         return "Brak pozycji zamowienia", 400
+
+    # Lista robocza ma zawierac wyłącznie to, co można teraz fizycznie
+    # spakować z magazynu. Wspólna pula dla product_id zapobiega pokazaniu
+    # tego samego stanu kilka razy, gdy produkt występuje w kilku pozycjach.
+    stock_pool = {}
+    items = []
+    for item in order_items:
+        product_id = int(item.get("product_id") or 0)
+        available = stock_pool.setdefault(product_id, max(0, int(item.get("stock_qty") or 0)))
+        pack_qty = min(max(0, int(item.get("qty") or 0)), available)
+        stock_pool[product_id] = available - pack_qty
+        if pack_qty <= 0:
+            continue
+        item["qty"] = pack_qty
+        items.append(item)
+
+    if not items:
+        return "Brak pozycji dostępnych obecnie na magazynie do spakowania", 400
 
     order_no = canonical_order_no(order_row["id"], order_row["created_at"], order_row["order_no"])
     note = norm(order_row["note"])
