@@ -167,6 +167,23 @@ def register_cash_flow(app, deps):
                 chart_row = sales_chart_by_month.get(issue_d.strftime("%Y-%m"))
                 if chart_row is not None:
                     chart_row["invoices"] += 1
+                    invoice_units = 0
+                    try:
+                        invoice_items = json.loads(inv["invoice_items_json"] or "[]")
+                        invoice_units = sum(
+                            int(item.get("qty") or item.get("invoice_qty") or item.get("current_invoice_qty") or 0)
+                            for item in invoice_items
+                        )
+                    except Exception:
+                        invoice_units = 0
+                    if invoice_units <= 0:
+                        cur.execute(
+                            "SELECT COALESCE(SUM(qty),0) AS qty FROM invoice_allocations WHERE invoice_id=?",
+                            (int(inv["id"]),),
+                        )
+                        allocation_row = cur.fetchone()
+                        invoice_units = int(allocation_row["qty"] or 0) if allocation_row else 0
+                    chart_row["units"] += invoice_units
 
             if issue_d and issue_d.year == today.year and issue_d.month == today.month:
                 month_net += net
@@ -214,22 +231,18 @@ def register_cash_flow(app, deps):
                 "reminder": int(inv["payment_reminder"] or 0) == 1,
             })
 
-        # Sztuki i wartosc pochodza z zamowien (nie z faktur), dzieki czemu
-        # wykres obejmuje sprzedaz takze przed wystawieniem dokumentu. Wartosc
-        # jest liczona wyłącznie dla PLN, aby nie sumowac PLN i EUR.
+        # Liczba zamowien pochodzi z daty ich zlozenia. Liczba sprzedanych
+        # sztuk jest wyzej liczona wylacznie z pozycji wystawionych faktur.
         cur.execute("""
           SELECT substr(o.created_at,1,7) AS month_key,
-                 COALESCE(SUM(oi.qty),0) AS units,
                  COUNT(DISTINCT o.id) AS orders_count
           FROM orders o
-          JOIN order_items oi ON oi.order_id=o.id
           WHERE lower(COALESCE(o.status,'')) <> 'cancelled'
           GROUP BY substr(o.created_at,1,7)
         """)
         for order_month in cur.fetchall():
             chart_row = sales_chart_by_month.get(order_month["month_key"])
             if chart_row is not None:
-                chart_row["units"] = int(order_month["units"] or 0)
                 chart_row["orders"] = int(order_month["orders_count"] or 0)
 
         cur.execute("""
@@ -350,7 +363,7 @@ def register_cash_flow(app, deps):
 
           <div class="card">
             <div class="flex" style="justify-content:space-between;align-items:flex-start;">
-              <div><h2 style="margin-bottom:4px;">Sprzedaż miesiąc po miesiącu</h2><div class="muted">Ostatnie 12 miesięcy: zamówienia według daty złożenia, faktury według daty wystawienia.</div></div>
+              <div><h2 style="margin-bottom:4px;">Sprzedaż miesiąc po miesiącu</h2><div class="muted">Sztuki i faktury według daty wystawienia faktury; zamówienia według daty złożenia.</div></div>
               <div class="flex small"><span><b style="color:#4f6feb;">●</b> Sztuki</span><span><b style="color:#10a37f;">●</b> Zamówienia</span><span><b style="color:#f59e0b;">●</b> Faktury</span></div>
             </div>
             <div style="margin-top:16px;overflow-x:auto;"><svg id="salesTrendChart" viewBox="0 0 1040 350" role="img" aria-label="Miesięczne statystyki sprzedaży" style="display:block;min-width:760px;width:100%;height:auto;"></svg></div>
