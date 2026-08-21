@@ -42,7 +42,7 @@ def recent_months(today, count=12):
             "key": f"{item_year:04d}-{item_month:02d}",
             "label": f"{month_names[item_month - 1]} {str(item_year)[2:]}",
             "units": 0,
-            "value": 0.0,
+            "orders": 0,
             "invoices": 0,
         })
     return result
@@ -220,11 +220,7 @@ def register_cash_flow(app, deps):
         cur.execute("""
           SELECT substr(o.created_at,1,7) AS month_key,
                  COALESCE(SUM(oi.qty),0) AS units,
-                 COALESCE(SUM(
-                   CASE WHEN UPPER(COALESCE(oi.currency,o.currency,'PLN'))='PLN'
-                        THEN oi.qty * COALESCE(oi.unit_gross_price, oi.unit_net_price * 1.23, 0)
-                        ELSE 0 END
-                 ),0) AS order_value_pln
+                 COUNT(DISTINCT o.id) AS orders_count
           FROM orders o
           JOIN order_items oi ON oi.order_id=o.id
           WHERE lower(COALESCE(o.status,'')) <> 'cancelled'
@@ -234,7 +230,7 @@ def register_cash_flow(app, deps):
             chart_row = sales_chart_by_month.get(order_month["month_key"])
             if chart_row is not None:
                 chart_row["units"] = int(order_month["units"] or 0)
-                chart_row["value"] = to_float(order_month["order_value_pln"], 0)
+                chart_row["orders"] = int(order_month["orders_count"] or 0)
 
         cur.execute("""
           SELECT COALESCE(SUM(s.qty),0) AS units,
@@ -284,9 +280,6 @@ def register_cash_flow(app, deps):
         overdue_clients = sorted(overdue_clients_map.values(), key=lambda r: (r["days_late"], r["gross"]), reverse=True)[:10]
         paid_clients = sorted(paid_clients_map.values(), key=lambda r: r["gross"], reverse=True)[:10]
         inflow_rows = sorted(inflow_rows, key=lambda r: (r["overdue"], r["due"]), reverse=True)[:25]
-        for row in sales_chart:
-            row["value"] = round(row["value"], 2)
-
         kpis = {
             "account_balance": account_balance,
             "unpaid_total": unpaid_total,
@@ -357,15 +350,15 @@ def register_cash_flow(app, deps):
 
           <div class="card">
             <div class="flex" style="justify-content:space-between;align-items:flex-start;">
-              <div><h2 style="margin-bottom:4px;">Sprzedaż miesiąc po miesiącu</h2><div class="muted">Ostatnie 12 miesięcy według daty wystawienia faktury.</div></div>
-              <div class="flex small"><span><b style="color:#4f6feb;">●</b> Sztuki</span><span><b style="color:#10a37f;">●</b> Zamówienia brutto PLN</span><span><b style="color:#f59e0b;">●</b> Faktury</span></div>
+              <div><h2 style="margin-bottom:4px;">Sprzedaż miesiąc po miesiącu</h2><div class="muted">Ostatnie 12 miesięcy: zamówienia według daty złożenia, faktury według daty wystawienia.</div></div>
+              <div class="flex small"><span><b style="color:#4f6feb;">●</b> Sztuki</span><span><b style="color:#10a37f;">●</b> Zamówienia</span><span><b style="color:#f59e0b;">●</b> Faktury</span></div>
             </div>
             <div style="margin-top:16px;overflow-x:auto;"><svg id="salesTrendChart" viewBox="0 0 1040 350" role="img" aria-label="Miesięczne statystyki sprzedaży" style="display:block;min-width:760px;width:100%;height:auto;"></svg></div>
             <details style="margin-top:8px;">
               <summary class="muted" style="cursor:pointer;">Pokaż dokładne dane</summary>
               <table style="margin-top:10px;">
-                <thead><tr><th>Miesiąc</th><th>Liczba sztuk</th><th>Wartość zamówień brutto</th><th>Liczba faktur</th></tr></thead>
-                <tbody>{% for row in sales_chart %}<tr><td>{{ row.label }}</td><td>{{ row.units }}</td><td>{{ "%.2f"|format(row.value) }} PLN</td><td>{{ row.invoices }}</td></tr>{% endfor %}</tbody>
+                <thead><tr><th>Miesiąc</th><th>Liczba sztuk</th><th>Liczba zamówień</th><th>Liczba faktur</th></tr></thead>
+                <tbody>{% for row in sales_chart %}<tr><td>{{ row.label }}</td><td>{{ row.units }}</td><td>{{ row.orders }}</td><td>{{ row.invoices }}</td></tr>{% endfor %}</tbody>
               </table>
             </details>
           </div>
@@ -379,10 +372,10 @@ def register_cash_flow(app, deps):
             const width = W-left-right, height = H-top-bottom;
             const make = (tag, attrs, value) => { const node=document.createElementNS(NS,tag); Object.entries(attrs||{}).forEach(([k,v])=>node.setAttribute(k,v)); if(value!==undefined)node.textContent=value; svg.appendChild(node); return node; };
             for(let i=0;i<=4;i++){const y=top+height*i/4;make('line',{x1:left,y1:y,x2:W-right,y2:y,stroke:'#e3e9f4','stroke-width':'1'});make('text',{x:8,y:y+4,fill:'#71809f','font-size':'12'},`${100-i*25}%`);}
-            const series=[{key:'units',color:'#4f6feb',label:'szt.'},{key:'value',color:'#10a37f',label:'PLN'},{key:'invoices',color:'#f59e0b',label:'faktur'}];
+            const series=[{key:'units',color:'#4f6feb',label:'szt.'},{key:'orders',color:'#10a37f',label:'zamówień'},{key:'invoices',color:'#f59e0b',label:'faktur'}];
             const x=i=>left+(rows.length===1?width/2:width*i/(rows.length-1));
             rows.forEach((row,i)=>make('text',{x:x(i),y:H-25,fill:'#596987','font-size':'12','text-anchor':'middle'},row.label));
-            series.forEach(s=>{const max=Math.max(1,...rows.map(r=>Number(r[s.key])||0));const points=rows.map((r,i)=>({x:x(i),y:top+height-(Number(r[s.key])||0)/max*height,value:Number(r[s.key])||0,label:r.label}));make('polyline',{points:points.map(p=>`${p.x},${p.y}`).join(' '),fill:'none',stroke:s.color,'stroke-width':'4','stroke-linecap':'round','stroke-linejoin':'round'});points.forEach(p=>{const dot=make('circle',{cx:p.x,cy:p.y,r:'5',fill:'#fff',stroke:s.color,'stroke-width':'3'});const title=document.createElementNS(NS,'title');title.textContent=`${p.label}: ${s.key==='value'?p.value.toFixed(2):p.value} ${s.label}`;dot.appendChild(title);});});
+            series.forEach(s=>{const max=Math.max(1,...rows.map(r=>Number(r[s.key])||0));const points=rows.map((r,i)=>({x:x(i),y:top+height-(Number(r[s.key])||0)/max*height,value:Number(r[s.key])||0,label:r.label}));make('polyline',{points:points.map(p=>`${p.x},${p.y}`).join(' '),fill:'none',stroke:s.color,'stroke-width':'4','stroke-linecap':'round','stroke-linejoin':'round'});points.forEach(p=>{const dot=make('circle',{cx:p.x,cy:p.y,r:'5',fill:'#fff',stroke:s.color,'stroke-width':'3'});const title=document.createElementNS(NS,'title');title.textContent=`${p.label}: ${p.value} ${s.label}`;dot.appendChild(title);});});
           })();
           </script>
 
