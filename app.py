@@ -8094,15 +8094,18 @@ def invoices():
             notice_error = True
 
     groups = []
-    current_key = None
-    current = None
+    groups_by_key = {}
     for inv in rows:
         customer_name = inv.get("buyer_name") or inv.get("order_customer_name") or "Bez klienta"
-        key = customer_name.strip().lower()
-        if key != current_key:
-            current = {"customer_name": customer_name, "invoices": [], "months": [], "total_net": 0.0, "total_gross": 0.0}
+        display_name = re.sub(r",\s*", ", ", re.sub(r"\s+", " ", customer_name)).strip()
+        buyer_tax_no = re.sub(r"\D", "", norm(inv.get("buyer_tax_no")))
+        normalized_name = re.sub(r"[\W_]+", "", display_name.casefold(), flags=re.UNICODE)
+        key = ("nip", buyer_tax_no) if buyer_tax_no else ("name", normalized_name)
+        current = groups_by_key.get(key)
+        if current is None:
+            current = {"customer_name": display_name, "invoices": [], "months": [], "total_net": 0.0, "total_gross": 0.0}
             groups.append(current)
-            current_key = key
+            groups_by_key[key] = current
         inv["order_display"] = order_display_no(
             inv.get("source_order_id"),
             inv.get("source_order_created_at"),
