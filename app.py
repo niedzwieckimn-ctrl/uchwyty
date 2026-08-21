@@ -362,6 +362,17 @@ def init_db():
         updated_at TEXT NOT NULL
     )
     """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS cash_flow_expenses(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        expense_date TEXT NOT NULL,
+        category TEXT NOT NULL,
+        description TEXT,
+        document_no TEXT NOT NULL,
+        amount REAL NOT NULL CHECK(amount > 0),
+        created_at TEXT NOT NULL
+    )
+    """)
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS invoice_allocations(
@@ -426,6 +437,13 @@ def init_db():
     company_cols = {r[1] for r in cur.fetchall()}
     if "bank_swift" not in company_cols:
         cur.execute("ALTER TABLE company_profile ADD COLUMN bank_swift TEXT")
+
+    cur.execute("PRAGMA table_info(china_packages)")
+    china_package_cols = {r[1] for r in cur.fetchall()}
+    if "cost_amount" not in china_package_cols:
+        cur.execute("ALTER TABLE china_packages ADD COLUMN cost_amount REAL NOT NULL DEFAULT 0")
+    if "cost_document_no" not in china_package_cols:
+        cur.execute("ALTER TABLE china_packages ADD COLUMN cost_document_no TEXT")
 
     cur.execute("PRAGMA table_info(invoice_meta)")
     invoice_meta_cols = {r[1] for r in cur.fetchall()}
@@ -510,6 +528,7 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_pricing_eur_sku_norm ON pricing_eur(TRIM(LOWER(sku)))")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_email_events_key ON email_events(event_key)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_email_events_type_created ON email_events(event_type, created_at)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_cash_flow_expenses_date ON cash_flow_expenses(expense_date)")
     cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_idempotency_key ON orders(idempotency_key) WHERE idempotency_key IS NOT NULL")
 
     c.commit()
@@ -928,6 +947,7 @@ SUPABASE_SYNC_TABLES = [
     ("invoice_allocations", "id"),
     ("ksef_documents", "invoice_id"),
     ("cash_flow_settings", "key"),
+    ("cash_flow_expenses", "id"),
 ]
 
 # KolejnoĹ›Ä‡ PULL jest waĹĽna: najpierw rodzice, potem dzieci.
@@ -947,6 +967,7 @@ SUPABASE_PULL_TABLES = [
     ("invoice_allocations", "id"),
     ("ksef_documents", "invoice_id"),
     ("cash_flow_settings", "key"),
+    ("cash_flow_expenses", "id"),
 ]
 
 _supabase_sync_lock = threading.Lock()
@@ -4140,6 +4161,9 @@ register_cash_flow(app, {
     "app_now": app_now,
     "to_float": to_float,
     "maybe_pull_shared_from_supabase": maybe_pull_shared_from_supabase,
+    "supabase_enabled": supabase_enabled,
+    "supabase_upsert_rows": supabase_upsert_rows,
+    "supabase_delete_rows": supabase_delete_rows,
     "BASE_URL": BASE_URL,
     "DB_PATH": DB_PATH,
 })
@@ -9890,6 +9914,14 @@ def china():
             <label class="muted small">Notatka</label>
             <input name="note">
           </div>
+          <div>
+            <label class="muted small">Koszt paczki / P/O (PLN)</label>
+            <input type="number" name="cost_amount" min="0.01" step="0.01" required>
+          </div>
+          <div>
+            <label class="muted small">Numer dokumentu kosztowego</label>
+            <input name="cost_document_no" placeholder="domyślnie numer P/O">
+          </div>
           <div class="flex" style="align-items:flex-end;">
             <button class="btn primary" type="submit">Zapisz</button>
           </div>
@@ -9900,7 +9932,7 @@ def china():
         <h2>Paczki (max 200)</h2>
         <table>
           <thead>
-            <tr><th>Nr</th><th>Status</th><th>Tracking</th><th>Notatka</th><th>Data</th><th>Akcje</th></tr>
+            <tr><th>Nr</th><th>Status</th><th>Tracking</th><th>Koszt</th><th>Dokument</th><th>Notatka</th><th>Data</th><th>Akcje</th></tr>
           </thead>
           <tbody>
             {% for p in packs %}
@@ -9926,6 +9958,8 @@ def china():
                     {% endif %}
                   </form>
                 </td>
+                <td><b>{{ "%.2f"|format(p['cost_amount'] or 0) }} PLN</b></td>
+                <td>{{ p['cost_document_no'] or p['package_no'] }}</td>
                 <td>{{ p['note'] or "-" }}</td>
                 <td class="muted">{{ p['created_at'] }}</td>
                 <td class="flex">
@@ -9937,7 +9971,7 @@ def china():
               </tr>
             {% endfor %}
             {% if not packs %}
-              <tr><td colspan="6" class="muted">Brak paczek.</td></tr>
+              <tr><td colspan="8" class="muted">Brak paczek.</td></tr>
             {% endif %}
           </tbody>
         </table>
@@ -9952,17 +9986,19 @@ def china_create():
     status = norm(request.form.get("status")) or "planned"
     tracking = norm(request.form.get("tracking"))
     note = norm(request.form.get("note"))
+    cost_amount = to_float(request.form.get("cost_amount"), 0)
+    cost_document_no = norm(request.form.get("cost_document_no")) or package_no
 
-    if not package_no:
-        return "Brak numeru paczki", 400
+    if not package_no or cost_amount <= 0:
+        return "Podaj numer P/O oraz koszt większy od zera", 400
 
     c = conn()
     cur = c.cursor()
     try:
         cur.execute("""
-          INSERT INTO china_packages(package_no, status, tracking, note, created_at)
-          VALUES(?,?,?,?,?)
-        """, (package_no, status, tracking, note, now_iso()))
+          INSERT INTO china_packages(package_no, status, tracking, note, cost_amount, cost_document_no, created_at)
+          VALUES(?,?,?,?,?,?,?)
+        """, (package_no, status, tracking, note, cost_amount, cost_document_no, now_iso()))
         c.commit()
     except sqlite3.IntegrityError:
         pass
@@ -10032,6 +10068,32 @@ def china_tracking(package_id):
         return redirect(url_for("china_package", package_id=package_id))
     return redirect(url_for("china"))
 
+@app.post("/china/<int:package_id>/cost")
+def china_cost(package_id):
+    cost_amount = to_float(request.form.get("cost_amount"), 0)
+    cost_document_no = norm(request.form.get("cost_document_no"))
+    if cost_amount <= 0 or not cost_document_no:
+        return redirect(url_for("china_package", package_id=package_id, cost_error=1))
+
+    c = conn()
+    cur = c.cursor()
+    cur.execute("SELECT * FROM china_packages WHERE id=?", (package_id,))
+    pack = cur.fetchone()
+    if not pack:
+        c.close()
+        abort(404)
+    cur.execute(
+        "UPDATE china_packages SET cost_amount=?, cost_document_no=? WHERE id=?",
+        (cost_amount, cost_document_no, package_id),
+    )
+    c.commit()
+    cur.execute("SELECT * FROM china_packages WHERE id=?", (package_id,))
+    cloud_row = dict(cur.fetchone())
+    c.close()
+    if supabase_enabled():
+        supabase_upsert_rows("china_packages", [cloud_row], "id")
+    return redirect(url_for("china_package", package_id=package_id, cost_saved=1))
+
 @app.get("/china/<int:package_id>")
 def china_package(package_id):
     # WyĹ‚Ä…czony pull z Supabase tylko dla moduĹ‚u Chiny.
@@ -10072,6 +10134,19 @@ def china_package(package_id):
           {% if pack['tracking'] %}
             <a class="btn" target="_blank" href="https://t.17track.net/en#nums={{ pack['tracking']|urlencode }}">OtwĂłrz 17TRACK</a>
           {% endif %}
+        </form>
+        <form method="post" action="{{ url_for('china_cost', package_id=pack['id']) }}" class="flex" style="margin-top:10px;align-items:flex-end;">
+          <div>
+            <label class="muted small">Koszt paczki / P/O (PLN)</label>
+            <input type="number" name="cost_amount" min="0.01" step="0.01" value="{{ pack['cost_amount'] or '' }}" required style="width:220px;">
+          </div>
+          <div>
+            <label class="muted small">Numer dokumentu kosztowego</label>
+            <input name="cost_document_no" value="{{ pack['cost_document_no'] or pack['package_no'] }}" required style="width:280px;">
+          </div>
+          <button class="btn primary" type="submit">Zapisz koszt</button>
+          {% if request.args.get('cost_saved') %}<span class="badge">Koszt zapisany</span>{% endif %}
+          {% if request.args.get('cost_error') %}<span class="muted" style="color:#b00020;">Podaj kwotę większą od zera i numer dokumentu.</span>{% endif %}
         </form>
       </div>
 

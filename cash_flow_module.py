@@ -44,6 +44,9 @@ def recent_months(today, count=12):
             "units": 0,
             "orders": 0,
             "invoices": 0,
+            "revenue": 0.0,
+            "expenses": 0.0,
+            "profit": 0.0,
         })
     return result
 
@@ -58,6 +61,18 @@ def ensure_cash_flow_tables(conn, now_iso):
         updated_at TEXT NOT NULL
     )
     """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS cash_flow_expenses(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        expense_date TEXT NOT NULL,
+        category TEXT NOT NULL,
+        description TEXT,
+        document_no TEXT NOT NULL,
+        amount REAL NOT NULL CHECK(amount > 0),
+        created_at TEXT NOT NULL
+    )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_cash_flow_expenses_date ON cash_flow_expenses(expense_date)")
     ts = now_iso()
     for key, value in CASH_FLOW_SETTING_KEYS.items():
         cur.execute("""
@@ -74,6 +89,9 @@ def register_cash_flow(app, deps):
     app_now = deps["app_now"]
     to_float = deps["to_float"]
     maybe_pull_shared_from_supabase = deps["maybe_pull_shared_from_supabase"]
+    supabase_enabled = deps.get("supabase_enabled", lambda: False)
+    supabase_upsert_rows = deps.get("supabase_upsert_rows")
+    supabase_delete_rows = deps.get("supabase_delete_rows")
     base_url = deps["BASE_URL"]
     db_path = deps["DB_PATH"]
 
@@ -97,6 +115,7 @@ def register_cash_flow(app, deps):
         c = conn()
         cur = c.cursor()
         ts = now_iso()
+        cloud_rows = []
         for key in CASH_FLOW_SETTING_KEYS:
             val = str(to_float(form.get(key), 0.0))
             cur.execute("""
@@ -106,8 +125,48 @@ def register_cash_flow(app, deps):
                 value=excluded.value,
                 updated_at=excluded.updated_at
             """, (key, val, ts))
+            cloud_rows.append({"key": key, "value": val, "updated_at": ts})
         c.commit()
         c.close()
+        # Te wartości są małe i krytyczne dla płynności. Wysyłamy je od razu,
+        # aby kolejne odświeżenie nie przywróciło starszej wersji z chmury.
+        if supabase_upsert_rows and supabase_enabled():
+            supabase_upsert_rows("cash_flow_settings", cloud_rows, "key")
+
+    @app.post("/cash-flow/expenses/add")
+    def cash_flow_expense_add():
+        expense_date = (request.form.get("expense_date") or "").strip()
+        category = (request.form.get("category") or "").strip()
+        description = (request.form.get("description") or "").strip()
+        document_no = (request.form.get("document_no") or "").strip()
+        amount = to_float(request.form.get("amount"), 0.0)
+        if not parse_date_safe(expense_date) or not category or not document_no or amount <= 0:
+            return redirect(url_for("cash_flow", expense_error="Uzupełnij datę, kategorię, numer dokumentu i kwotę większą od zera."))
+        c = conn()
+        cur = c.cursor()
+        cur.execute("""
+          INSERT INTO cash_flow_expenses(expense_date, category, description, document_no, amount, created_at)
+          VALUES(?,?,?,?,?,?)
+        """, (expense_date, category, description, document_no, amount, now_iso()))
+        expense_id = int(cur.lastrowid)
+        c.commit()
+        cur.execute("SELECT * FROM cash_flow_expenses WHERE id=?", (expense_id,))
+        cloud_row = dict(cur.fetchone())
+        c.close()
+        if supabase_upsert_rows and supabase_enabled():
+            supabase_upsert_rows("cash_flow_expenses", [cloud_row], "id")
+        return redirect(url_for("cash_flow", expense_saved=1))
+
+    @app.post("/cash-flow/expenses/<int:expense_id>/delete")
+    def cash_flow_expense_delete(expense_id):
+        c = conn()
+        cur = c.cursor()
+        cur.execute("DELETE FROM cash_flow_expenses WHERE id=?", (expense_id,))
+        c.commit()
+        c.close()
+        if supabase_delete_rows and supabase_enabled():
+            supabase_delete_rows("cash_flow_expenses", {"id": expense_id})
+        return redirect(url_for("cash_flow", expense_deleted=1))
 
     @app.route("/cash-flow", methods=["GET", "POST"])
     def cash_flow():
@@ -167,6 +226,7 @@ def register_cash_flow(app, deps):
                 chart_row = sales_chart_by_month.get(issue_d.strftime("%Y-%m"))
                 if chart_row is not None:
                     chart_row["invoices"] += 1
+                    chart_row["revenue"] += net
                     invoice_units = 0
                     try:
                         invoice_items = json.loads(inv["invoice_items_json"] or "[]")
@@ -244,6 +304,44 @@ def register_cash_flow(app, deps):
             chart_row = sales_chart_by_month.get(order_month["month_key"])
             if chart_row is not None:
                 chart_row["orders"] = int(order_month["orders_count"] or 0)
+
+        cur.execute("SELECT * FROM cash_flow_expenses ORDER BY expense_date DESC, id DESC")
+        manual_expenses = [dict(row) for row in cur.fetchall()]
+        expense_rows = []
+        for row in manual_expenses:
+            expense_rows.append({**row, "source": "Wydatek ręczny", "can_delete": True})
+            chart_row = sales_chart_by_month.get(str(row["expense_date"])[:7])
+            if chart_row is not None:
+                chart_row["expenses"] += to_float(row["amount"], 0)
+
+        cur.execute("""
+          SELECT id, package_no, cost_amount, cost_document_no, created_at
+          FROM china_packages
+          WHERE COALESCE(cost_amount,0) > 0
+          ORDER BY created_at DESC, id DESC
+        """)
+        for row in cur.fetchall():
+            expense = {
+                "id": int(row["id"]),
+                "expense_date": str(row["created_at"] or "")[:10],
+                "category": "Zakup Chiny P/O",
+                "description": "Koszt paczki " + str(row["package_no"] or ""),
+                "document_no": row["cost_document_no"] or row["package_no"],
+                "amount": to_float(row["cost_amount"], 0),
+                "source": "Chiny P/O",
+                "can_delete": False,
+            }
+            expense_rows.append(expense)
+            chart_row = sales_chart_by_month.get(str(row["created_at"] or "")[:7])
+            if chart_row is not None:
+                chart_row["expenses"] += expense["amount"]
+
+        expense_rows.sort(key=lambda row: (str(row["expense_date"]), int(row["id"])), reverse=True)
+        for chart_row in sales_chart:
+            chart_row["expenses"] += monthly_zus
+            chart_row["revenue"] = round(chart_row["revenue"], 2)
+            chart_row["expenses"] = round(chart_row["expenses"], 2)
+            chart_row["profit"] = round(chart_row["revenue"] - chart_row["expenses"], 2)
 
         cur.execute("""
           SELECT COALESCE(SUM(s.qty),0) AS units,
@@ -347,6 +445,29 @@ def register_cash_flow(app, deps):
             </form>
           </div>
 
+          <div class="card">
+            <div class="flex" style="justify-content:space-between;align-items:flex-start;">
+              <div><h2 style="margin-bottom:4px;">Rejestr wydatków</h2><div class="muted">Koszty P/O są dodawane automatycznie. Pozostałe wydatki wpisz tutaj wraz z numerem dokumentu.</div></div>
+              {% if request.args.get('expense_saved') %}<span class="badge">Wydatek zapisany</span>{% endif %}
+            </div>
+            {% if request.args.get('expense_error') %}<div class="notice" style="margin-top:10px;color:#b00020;">{{ request.args.get('expense_error') }}</div>{% endif %}
+            <form method="post" action="{{ url_for('cash_flow_expense_add') }}" class="grid3" style="margin-top:14px;">
+              <div><label class="muted small">Data wydatku</label><input type="date" name="expense_date" value="{{ today_iso }}" required></div>
+              <div><label class="muted small">Kategoria</label><select name="category" required><option value="">-- wybierz --</option><option>Katalogi</option><option>Odprawa celna</option><option>Transport</option><option>Marketing</option><option>Materiały</option><option>Usługi</option><option>ZUS / podatki</option><option>Inne</option></select></div>
+              <div><label class="muted small">Numer dokumentu</label><input name="document_no" placeholder="np. FV/123/2026" required></div>
+              <div><label class="muted small">Opis</label><input name="description" placeholder="Czego dotyczył wydatek"></div>
+              <div><label class="muted small">Kwota PLN</label><input type="number" name="amount" min="0.01" step="0.01" required></div>
+              <div class="flex" style="align-items:flex-end;"><button class="btn primary" type="submit">Dodaj wydatek</button></div>
+            </form>
+            <table style="margin-top:16px;">
+              <thead><tr><th>Data</th><th>Kategoria</th><th>Dokument</th><th>Opis</th><th>Źródło</th><th>Kwota</th><th>Akcje</th></tr></thead>
+              <tbody>
+                {% for r in expense_rows[:50] %}<tr><td>{{ r.expense_date }}</td><td>{{ r.category }}</td><td><b>{{ r.document_no }}</b></td><td>{{ r.description or '-' }}</td><td><span class="badge">{{ r.source }}</span></td><td><b>{{ "%.2f"|format(r.amount) }} PLN</b></td><td>{% if r.can_delete %}<form method="post" action="{{ url_for('cash_flow_expense_delete', expense_id=r.id) }}" onsubmit="return confirm('Usunąć ten wydatek?')"><button class="btn danger" type="submit">Usuń</button></form>{% else %}<span class="muted">edytuj w P/O</span>{% endif %}</td></tr>{% endfor %}
+                {% if not expense_rows %}<tr><td colspan="7" class="muted">Brak zapisanych wydatków.</td></tr>{% endif %}
+              </tbody>
+            </table>
+          </div>
+
           <div class="grid3">
             <div class="card"><h2>Stan konta</h2><div style="font-size:26px;font-weight:800;">{{ "%.2f"|format(k.account_balance) }} PLN</div></div>
             <div class="card"><h2>Do wpływu</h2><div style="font-size:26px;font-weight:800;">{{ "%.2f"|format(k.unpaid_total) }} PLN</div><div class="muted">z niezapłaconych faktur</div></div>
@@ -389,6 +510,33 @@ def register_cash_flow(app, deps):
             const x=i=>left+(rows.length===1?width/2:width*i/(rows.length-1));
             rows.forEach((row,i)=>make('text',{x:x(i),y:H-25,fill:'#596987','font-size':'12','text-anchor':'middle'},row.label));
             series.forEach(s=>{const max=Math.max(1,...rows.map(r=>Number(r[s.key])||0));const points=rows.map((r,i)=>({x:x(i),y:top+height-(Number(r[s.key])||0)/max*height,value:Number(r[s.key])||0,label:r.label}));make('polyline',{points:points.map(p=>`${p.x},${p.y}`).join(' '),fill:'none',stroke:s.color,'stroke-width':'4','stroke-linecap':'round','stroke-linejoin':'round'});points.forEach(p=>{const dot=make('circle',{cx:p.x,cy:p.y,r:'5',fill:'#fff',stroke:s.color,'stroke-width':'3'});const title=document.createElementNS(NS,'title');title.textContent=`${p.label}: ${p.value} ${s.label}`;dot.appendChild(title);});});
+          })();
+          </script>
+
+          <div class="card">
+            <div class="flex" style="justify-content:space-between;align-items:flex-start;">
+              <div><h2 style="margin-bottom:4px;">Wynik finansowy miesiąc po miesiącu</h2><div class="muted">Przychód netto z faktur minus wydatki ręczne, koszty P/O oraz miesięczny koszt ZUS/stały.</div></div>
+              <div class="flex small"><span><b style="color:#4f6feb;">●</b> Przychód</span><span><b style="color:#ef4444;">●</b> Wydatki</span><span><b style="color:#10a37f;">●</b> Zysk</span></div>
+            </div>
+            <div style="margin-top:16px;overflow-x:auto;"><svg id="profitTrendChart" viewBox="0 0 1040 350" role="img" aria-label="Miesięczny przychód, wydatki i zysk" style="display:block;min-width:760px;width:100%;height:auto;"></svg></div>
+            <details style="margin-top:8px;"><summary class="muted" style="cursor:pointer;">Pokaż dokładne kwoty</summary><table style="margin-top:10px;"><thead><tr><th>Miesiąc</th><th>Przychód netto</th><th>Wydatki</th><th>Zysk</th></tr></thead><tbody>{% for row in sales_chart %}<tr><td>{{ row.label }}</td><td>{{ "%.2f"|format(row.revenue) }} PLN</td><td>{{ "%.2f"|format(row.expenses) }} PLN</td><td style="color:{% if row.profit < 0 %}#b00020{% else %}#067a2d{% endif %};font-weight:800;">{{ "%.2f"|format(row.profit) }} PLN</td></tr>{% endfor %}</tbody></table></details>
+          </div>
+          <script>
+          (() => {
+            const rows = {{ sales_chart_json|safe }};
+            const svg = document.getElementById('profitTrendChart');
+            if (!svg || !rows.length) return;
+            const NS='http://www.w3.org/2000/svg', W=1040, H=350, left=76, right=28, top=28, bottom=58;
+            const width=W-left-right, height=H-top-bottom;
+            const values=rows.flatMap(r=>[Number(r.revenue)||0,Number(r.expenses)||0,Number(r.profit)||0]);
+            let min=Math.min(0,...values), max=Math.max(0,...values); if(max===min)max=min+1;
+            const make=(tag,attrs,value)=>{const n=document.createElementNS(NS,tag);Object.entries(attrs||{}).forEach(([k,v])=>n.setAttribute(k,v));if(value!==undefined)n.textContent=value;svg.appendChild(n);return n;};
+            const y=value=>top+(max-value)/(max-min)*height;
+            for(let i=0;i<=4;i++){const value=max-(max-min)*i/4,yPos=y(value);make('line',{x1:left,y1:yPos,x2:W-right,y2:yPos,stroke:'#e3e9f4','stroke-width':'1'});make('text',{x:4,y:yPos+4,fill:'#71809f','font-size':'11'},`${Math.round(value)} zł`);}
+            if(min<0&&max>0)make('line',{x1:left,y1:y(0),x2:W-right,y2:y(0),stroke:'#94a3b8','stroke-width':'2'});
+            const x=i=>left+(rows.length===1?width/2:width*i/(rows.length-1));
+            rows.forEach((r,i)=>make('text',{x:x(i),y:H-25,fill:'#596987','font-size':'12','text-anchor':'middle'},r.label));
+            [{key:'revenue',color:'#4f6feb',label:'przychód'},{key:'expenses',color:'#ef4444',label:'wydatki'},{key:'profit',color:'#10a37f',label:'zysk'}].forEach(s=>{const pts=rows.map((r,i)=>({x:x(i),y:y(Number(r[s.key])||0),value:Number(r[s.key])||0,label:r.label}));make('polyline',{points:pts.map(p=>`${p.x},${p.y}`).join(' '),fill:'none',stroke:s.color,'stroke-width':'4','stroke-linecap':'round','stroke-linejoin':'round'});pts.forEach(p=>{const dot=make('circle',{cx:p.x,cy:p.y,r:'5',fill:'#fff',stroke:s.color,'stroke-width':'3'});const title=document.createElementNS(NS,'title');title.textContent=`${p.label}: ${s.label} ${p.value.toFixed(2)} PLN`;dot.appendChild(title);});});
           })();
           </script>
 
@@ -478,5 +626,6 @@ def register_cash_flow(app, deps):
                                       settings=settings, k=kpis, inflow_rows=inflow_rows,
                                       overdue_clients=overdue_clients, paid_clients=paid_clients,
                                       reorder_rows=reorder_rows, reorder_horizon_days=reorder_horizon_days,
+                                      expense_rows=expense_rows, today_iso=today.isoformat(),
                                       sales_chart=sales_chart,
                                       sales_chart_json=json.dumps(sales_chart, ensure_ascii=False))
