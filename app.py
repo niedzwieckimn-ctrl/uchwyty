@@ -190,6 +190,7 @@ def init_db():
         model TEXT,
         ean TEXT,
         name TEXT,
+        archived INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL
     )
     """)
@@ -432,6 +433,8 @@ def init_db():
     product_cols = {r[1] for r in cur.fetchall()}
     if "model" not in product_cols:
         cur.execute("ALTER TABLE products ADD COLUMN model TEXT")
+    if "archived" not in product_cols:
+        cur.execute("ALTER TABLE products ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
 
     cur.execute("PRAGMA table_info(company_profile)")
     company_cols = {r[1] for r in cur.fetchall()}
@@ -3430,7 +3433,7 @@ def home():
     maybe_pull_shared_from_supabase()
     c = conn()
     cur = c.cursor()
-    cur.execute("SELECT COUNT(*) AS n FROM products")
+    cur.execute("SELECT COUNT(*) AS n FROM products WHERE COALESCE(archived,0)=0")
     n_products = cur.fetchone()["n"]
     cur.execute("SELECT COUNT(*) AS n FROM orders WHERE status IN ('new','packed','confirmed','in_delivery')")
     n_orders_current = cur.fetchone()["n"]
@@ -3463,6 +3466,7 @@ def home():
         TRIM(LOWER(pr.model)) = TRIM(LOWER(p.model))
         OR TRIM(LOWER(pr.model)) = TRIM(LOWER(p.sku))
       )
+      WHERE COALESCE(p.archived,0)=0
     """)
     inventory_value_net = float(cur.fetchone()["v"] or 0)
     cur.execute("SELECT COUNT(*) AS n FROM orders WHERE date(created_at)=date('now','localtime')")
@@ -3916,7 +3920,7 @@ def client_searches_v2():
             if email_key and company_name and email_key not in order_name_by_email and not _order_name_is_fallback(company_name, email_key):
                 order_name_by_email[email_key] = company_name
 
-        cur.execute("SELECT sku, name FROM products WHERE TRIM(COALESCE(name,''))<>''")
+        cur.execute("SELECT sku, name FROM products WHERE COALESCE(archived,0)=0 AND TRIM(COALESCE(name,''))<>''")
         for rr in cur.fetchall():
             sku = norm(rr["sku"])
             product_name = norm(rr["name"])
@@ -4575,7 +4579,8 @@ def pricing_import():
                   UPDATE products
                   SET model=COALESCE(NULLIF(?, ''), model),
                       ean=COALESCE(NULLIF(?, ''), ean),
-                      name=COALESCE(NULLIF(?, ''), name)
+                      name=COALESCE(NULLIF(?, ''), name),
+                      archived=0
                   WHERE sku=?
                 """, (model, ean, name, sku))
                 pid = int(existing["id"])
@@ -4994,7 +4999,8 @@ def products():
           SELECT p.*, COALESCE(s.qty,0) AS stock
           FROM products p
           LEFT JOIN stock s ON s.product_id=p.id
-          WHERE p.sku LIKE ? OR p.model LIKE ? OR p.ean LIKE ? OR p.name LIKE ?
+          WHERE COALESCE(p.archived,0)=0
+            AND (p.sku LIKE ? OR p.model LIKE ? OR p.ean LIKE ? OR p.name LIKE ?)
           ORDER BY p.sku
           LIMIT 1000
         """, (like, like, like, like))
@@ -5003,6 +5009,7 @@ def products():
           SELECT p.*, COALESCE(s.qty,0) AS stock
           FROM products p
           LEFT JOIN stock s ON s.product_id=p.id
+          WHERE COALESCE(p.archived,0)=0
           ORDER BY p.sku
           LIMIT 1000
         """)
@@ -5092,6 +5099,69 @@ def product_delete(product_id):
     if not product:
         c.close()
         return redirect(url_for("products", product_error="Nie znaleziono produktu."))
+
+    # Usuwanie z katalogu jest archiwizacją produktu. Historyczne dokumenty
+    # nadal wskazują ten sam stabilny identyfikator, ale produkt nie jest już
+    # dostępny w magazynie, panelu klienta ani formularzach nowych dokumentów.
+    active_references = []
+    cur.execute("""
+      SELECT COUNT(*) AS n
+      FROM order_items oi
+      JOIN orders o ON o.id=oi.order_id
+      WHERE oi.product_id=?
+        AND LOWER(COALESCE(o.status,'')) IN
+            ('new','pending','unconfirmed','confirmed','packed','in_delivery','shipped')
+        AND COALESCE(o.warehouse_issued,0)=0
+    """, (product_id,))
+    if int(cur.fetchone()["n"] or 0) > 0:
+        active_references.append("aktywnych zamówieniach")
+    cur.execute("""
+      SELECT COUNT(*) AS n
+      FROM china_items ci
+      JOIN china_packages cp ON cp.id=ci.package_id
+      WHERE ci.product_id=?
+        AND LOWER(COALESCE(cp.status,'')) IN ('planned','ordered','shipped')
+    """, (product_id,))
+    if int(cur.fetchone()["n"] or 0) > 0:
+        active_references.append("aktywnych dostawach P/O")
+    if int(product["stock"] or 0) != 0:
+        active_references.append("niezerowym stanie magazynowym")
+
+    sku = product["sku"]
+    if active_references:
+        c.close()
+        return redirect(url_for(
+            "products",
+            q=sku,
+            product_error="Nie można usunąć produktu, ponieważ jest używany w " + ", ".join(active_references) + ".",
+        ))
+
+    try:
+        if supabase_enabled():
+            # Kolejność ma znaczenie: najpierw ukrycie produktu, następnie dane
+            # aktywnego katalogu. Stare order_items i invoice_allocations zostają.
+            supabase_update_rows("products", {"archived": True}, {"id": product_id})
+            supabase_delete_rows("stock", {"product_id": product_id})
+            try:
+                supabase_delete_rows("pricing_eur", {"sku": sku})
+            except Exception:
+                app.logger.warning("Nie udało się usunąć ceny EUR dla SKU %s", sku, exc_info=True)
+
+        cur.execute("UPDATE products SET archived=1 WHERE id=?", (product_id,))
+        cur.execute("DELETE FROM stock WHERE product_id=?", (product_id,))
+        cur.execute("DELETE FROM pricing_eur WHERE sku=?", (sku,))
+        c.commit()
+    except Exception:
+        c.rollback()
+        c.close()
+        app.logger.exception("Nie udało się zarchiwizować produktu %s", product_id)
+        return redirect(url_for(
+            "products",
+            q=sku,
+            product_error="Nie udało się usunąć produktu z aktywnego magazynu. Najpierw uruchom migrację Supabase.",
+        ))
+    c.close()
+    return redirect(url_for("products", product_deleted=sku))
 
     references = []
     for table, label in (
@@ -5195,7 +5265,7 @@ def products_import():
         cur.execute("SELECT id FROM products WHERE sku=?", (sku,))
         exists = cur.fetchone()
         if exists:
-            cur.execute("UPDATE products SET model=?, ean=?, name=? WHERE sku=?", (model, ean, name, sku))
+            cur.execute("UPDATE products SET model=?, ean=?, name=?, archived=0 WHERE sku=?", (model, ean, name, sku))
             updated += 1
             pid = exists["id"]
         else:
@@ -5209,7 +5279,17 @@ def products_import():
         cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (pid,))
 
     c.commit()
+    changed_ids = [int(r["id"]) for r in cur.execute(
+        "SELECT id FROM products WHERE COALESCE(archived,0)=0"
+    ).fetchall()]
     c.close()
+
+    if supabase_enabled() and changed_ids:
+        try:
+            sync_local_rows_to_supabase("products", "id", changed_ids)
+            sync_local_rows_to_supabase("stock", "product_id", changed_ids)
+        except Exception:
+            app.logger.warning("Nie udało się zsynchronizować importu produktów", exc_info=True)
 
     return redirect(url_for("products", q=""))
 
@@ -5343,7 +5423,7 @@ def api_stock_delta():
 
     c = conn()
     cur = c.cursor()
-    cur.execute("SELECT id FROM products WHERE sku=?", (sku,))
+    cur.execute("SELECT id FROM products WHERE sku=? AND COALESCE(archived,0)=0", (sku,))
     p = cur.fetchone()
     if not p:
         c.close()
@@ -5365,7 +5445,7 @@ def api_product(product_id):
       SELECT p.*, COALESCE(s.qty,0) AS stock
       FROM products p
       LEFT JOIN stock s ON s.product_id=p.id
-      WHERE p.id=?
+      WHERE p.id=? AND COALESCE(p.archived,0)=0
     """, (product_id,))
     r = cur.fetchone()
     c.close()
@@ -5583,7 +5663,7 @@ def order_new():
     maybe_pull_shared_from_supabase()
     c = conn()
     cur = c.cursor()
-    cur.execute("SELECT id, sku, model, name FROM products ORDER BY sku LIMIT 5000")
+    cur.execute("SELECT id, sku, model, name FROM products WHERE COALESCE(archived,0)=0 ORDER BY sku LIMIT 5000")
     products_rows = cur.fetchall()
     cur.execute("SELECT id, name, address, phone, email, nip FROM customers ORDER BY name")
     customers_rows = cur.fetchall()
@@ -5901,7 +5981,7 @@ def order_view(order_id):
                 if al:
                     it.update(al)
 
-    cur.execute("SELECT id, sku, model, name FROM products ORDER BY sku LIMIT 5000")
+    cur.execute("SELECT id, sku, model, name FROM products WHERE COALESCE(archived,0)=0 ORDER BY sku LIMIT 5000")
     products_rows = cur.fetchall()
     c.close()
 
@@ -6102,7 +6182,7 @@ def order_item_add(order_id):
         c.close()
         return "ZamĂłwienie wydane z magazynu jest tylko do podglÄ…du", 400
 
-    cur.execute("SELECT sku FROM products WHERE id=?", (product_id,))
+    cur.execute("SELECT sku FROM products WHERE id=? AND COALESCE(archived,0)=0", (product_id,))
     p = cur.fetchone()
     if not p:
         c.close()
@@ -7499,7 +7579,7 @@ def api_client_orders_create():
             if isinstance(qty, bool) or not isinstance(qty, int) or qty <= 0:
                 label = norm(item.get("sku")) or str(product_id)
                 return jsonify(ok=False, error=f"Nieprawidłowa ilość dla produktu {label}"), 400
-            cur.execute("SELECT id, sku, name FROM products WHERE id=? LIMIT 1", (product_id,))
+            cur.execute("SELECT id, sku, name FROM products WHERE id=? AND COALESCE(archived,0)=0 LIMIT 1", (product_id,))
             product = cur.fetchone()
             if not product:
                 return jsonify(ok=False, error=f"Nie istnieje produkt ID {product_id}"), 400
@@ -10228,7 +10308,7 @@ def china_package(package_id):
         c.close()
         abort(404)
 
-    cur.execute("SELECT id, sku, model, name FROM products ORDER BY sku LIMIT 5000")
+    cur.execute("SELECT id, sku, model, name FROM products WHERE COALESCE(archived,0)=0 ORDER BY sku LIMIT 5000")
     products_rows = cur.fetchall()
 
     cur.execute("""
@@ -10366,7 +10446,7 @@ def china_item_add(package_id):
 
     c = conn()
     cur = c.cursor()
-    cur.execute("SELECT sku FROM products WHERE id=?", (product_id,))
+    cur.execute("SELECT sku FROM products WHERE id=? AND COALESCE(archived,0)=0", (product_id,))
     p = cur.fetchone()
     if not p:
         c.close()
