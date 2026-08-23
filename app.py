@@ -6603,6 +6603,24 @@ def order_invoice(order_id):
             data["payment_to"] = (issue_day + timedelta(days=7)).strftime("%Y-%m-%d")
 
         invoice_items = prepare_invoice_items(items, request.form)
+        if norm(request.form.get("submit_action")) == "packing":
+            if not invoice_items:
+                msg = "Lista pakowania musi zawierac co najmniej jedna pozycje."
+            else:
+                packing_order_no = canonical_order_no(o["id"], o["created_at"], o["order_no"])
+                packing_meta = {
+                    "invoice_no": packing_order_no,
+                    "document_label_key": "order",
+                    "buyer_name": data.get("buyer_name") or o["customer_name"] or "Klient",
+                    "buyer_email": data.get("buyer_email") or o["customer_email"] or "",
+                }
+                packing_path = generate_invoice_packing_list_pdf(o, invoice_items, packing_meta)
+                return send_file(
+                    packing_path,
+                    mimetype="application/pdf",
+                    as_attachment=True,
+                    download_name=f"{safe_filename(packing_order_no)}_lista_pakowania.pdf",
+                )
         existing_invoice_id = invoice_no_exists(data["invoice_no"])
         if existing_invoice_id:
             msg = f"Faktura o takim numerze już istnieje! Numer: {data['invoice_no']}. Wybierz inny numer faktury."
@@ -6734,7 +6752,8 @@ def order_invoice(order_id):
           </div>
 
           <div class="flex" style="align-items:flex-end;">
-            <button class="btn primary" type="submit">Zapisz fakturÄ™ PDF</button>
+            <button class="btn" type="submit" name="submit_action" value="packing" formtarget="_blank">Pakuj</button>
+            <button class="btn primary" type="submit" name="submit_action" value="invoice">Zapisz fakturÄ™ PDF</button>
           </div>
         </form>
       </div>
