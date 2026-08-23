@@ -7611,34 +7611,92 @@ def _send_order_shipped_email(order: dict, tracking_no: str, carrier: str, packi
         language = "pl"
     order_no = canonical_order_no(order.get("id"), order.get("created_at"), order.get("order_no"))
     messages = {
-        "pl": ("Zamówienie zostało wysłane", "Twoje zamówienie zostało wysłane.", "Numer śledzenia", "Śledź przesyłkę"),
-        "de": ("Ihre Bestellung wurde versandt", "Ihre Bestellung wurde versandt.", "Sendungsnummer", "Sendung verfolgen"),
-        "en": ("Your order has been shipped", "Your order has been shipped.", "Tracking number", "Track shipment"),
-        "es": ("Tu pedido ha sido enviado", "Tu pedido ha sido enviado.", "Número de seguimiento", "Seguir el envío"),
-        "it": ("Il tuo ordine è stato spedito", "Il tuo ordine è stato spedito.", "Numero di tracciamento", "Traccia la spedizione"),
+        "pl": {
+            "subject": "Twoje zamówienie {order_no} jest już w drodze",
+            "title": "Zamówienie zostało wysłane",
+            "greeting": "Dzień dobry,",
+            "intro": "Z przyjemnością informujemy, że Twoje zamówienie zostało przekazane kurierowi.",
+            "order": "Numer zamówienia", "carrier": "Przewoźnik", "tracking": "Numer przesyłki",
+            "button": "Śledź swoją przesyłkę",
+            "attachment": "W załączniku znajduje się lista pakowania zawierająca szczegóły wysłanych produktów.",
+            "thanks": "Dziękujemy za zamówienie i życzymy udanego dnia!", "team": "Zespół Niedźwieccy",
+        },
+        "de": {
+            "subject": "Ihre Bestellung {order_no} ist unterwegs",
+            "title": "Ihre Bestellung wurde versandt",
+            "greeting": "Guten Tag,",
+            "intro": "Wir freuen uns, Ihnen mitzuteilen, dass Ihre Bestellung an den Paketdienst übergeben wurde.",
+            "order": "Bestellnummer", "carrier": "Paketdienst", "tracking": "Sendungsnummer",
+            "button": "Sendung verfolgen",
+            "attachment": "Im Anhang finden Sie die Packliste mit den Details zu den versandten Produkten.",
+            "thanks": "Vielen Dank für Ihre Bestellung. Wir wünschen Ihnen einen schönen Tag!", "team": "Ihr Niedźwieccy-Team",
+        },
+        "en": {
+            "subject": "Your order {order_no} is on its way",
+            "title": "Your order has been shipped",
+            "greeting": "Hello,",
+            "intro": "We are pleased to let you know that your order has been handed over to the courier.",
+            "order": "Order number", "carrier": "Courier", "tracking": "Tracking number",
+            "button": "Track your shipment",
+            "attachment": "The attached packing list contains the details of the shipped products.",
+            "thanks": "Thank you for your order and have a great day!", "team": "The Niedźwieccy Team",
+        },
+        "es": {
+            "subject": "Tu pedido {order_no} ya está en camino",
+            "title": "Tu pedido ha sido enviado",
+            "greeting": "Buenos días,",
+            "intro": "Nos complace informarte de que tu pedido ha sido entregado al transportista.",
+            "order": "Número de pedido", "carrier": "Transportista", "tracking": "Número de seguimiento",
+            "button": "Seguir el envío",
+            "attachment": "En el archivo adjunto encontrarás la lista de embalaje con los detalles de los productos enviados.",
+            "thanks": "¡Gracias por tu pedido y que tengas un buen día!", "team": "Equipo Niedźwieccy",
+        },
+        "it": {
+            "subject": "Il tuo ordine {order_no} è in viaggio",
+            "title": "Il tuo ordine è stato spedito",
+            "greeting": "Buongiorno,",
+            "intro": "Siamo lieti di informarti che il tuo ordine è stato affidato al corriere.",
+            "order": "Numero ordine", "carrier": "Corriere", "tracking": "Numero di tracciamento",
+            "button": "Traccia la spedizione",
+            "attachment": "In allegato trovi la lista di imballaggio con i dettagli dei prodotti spediti.",
+            "thanks": "Grazie per il tuo ordine e buona giornata!", "team": "Il team Niedźwieccy",
+        },
     }
-    subject_text, intro, tracking_label, link_label = messages.get(language, messages["pl"])
-    attachment_notes = {
-        "pl": "Lista pakowania znajduje się w załączniku.",
-        "de": "Die Packliste finden Sie im Anhang.",
-        "en": "The packing list is attached.",
-        "es": "La lista de embalaje está adjunta.",
-        "it": "La lista di imballaggio è allegata.",
-    }
-    attachment_note = attachment_notes.get(language, attachment_notes["pl"])
+    copy = messages.get(language, messages["pl"])
     tracking_url = carrier_tracking_url(carrier, tracking_no)
-    safe_order = str(order_no).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    safe_tracking = str(tracking_no).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    carrier_names = {"inpost": "InPost", "dpd": "DPD", "fedex": "FedEx", "dhl": "DHL", "ups": "UPS"}
+    carrier_name = carrier_names.get(norm(carrier).lower(), norm(carrier) or "—")
+    safe_order = html.escape(str(order_no), quote=True)
+    safe_tracking = html.escape(str(tracking_no), quote=True)
+    safe_carrier = html.escape(carrier_name, quote=True)
+    safe_tracking_url = html.escape(tracking_url, quote=True)
+    subject_text = copy["subject"].format(order_no=order_no)
     html_body = (
-        "<div style='font-family:Arial,sans-serif;color:#10203d'>"
-        f"<h2>{subject_text}</h2><p>{intro}</p><p><b>{safe_order}</b></p>"
-        f"<p>{tracking_label}: <b>{safe_tracking}</b></p>"
-        f"<p><a href='{tracking_url}'>{link_label}</a></p><p>{attachment_note}</p></div>"
+        "<div style='margin:0;padding:28px 14px;background:#f3f6fb;font-family:Arial,sans-serif;color:#10203d'>"
+        "<div style='max-width:620px;margin:0 auto;background:#ffffff;border:1px solid #e2e8f2;border-radius:18px;overflow:hidden'>"
+        "<div style='padding:30px 34px 20px'>"
+        f"<h1 style='margin:0 0 24px;font-size:26px;line-height:1.25'>{html.escape(copy['title'])}</h1>"
+        f"<p style='margin:0 0 14px'>{html.escape(copy['greeting'])}</p>"
+        f"<p style='margin:0 0 24px;line-height:1.6'>{html.escape(copy['intro'])}</p>"
+        "<div style='padding:20px;background:#f7f9fd;border:1px solid #e3e9f3;border-radius:14px;line-height:1.8'>"
+        f"<div><span style='color:#62708c'>{html.escape(copy['order'])}:</span> <b>{safe_order}</b></div>"
+        f"<div><span style='color:#62708c'>{html.escape(copy['carrier'])}:</span> <b>{safe_carrier}</b></div>"
+        f"<div><span style='color:#62708c'>{html.escape(copy['tracking'])}:</span> <b>{safe_tracking}</b></div>"
+        "</div>"
+        f"<p style='margin:24px 0'><a href='{safe_tracking_url}' style='display:inline-block;padding:13px 22px;background:#4f70eb;color:#ffffff;text-decoration:none;font-weight:bold;border-radius:10px'>{html.escape(copy['button'])}</a></p>"
+        f"<p style='margin:0 0 24px;line-height:1.6;color:#52617c'>{html.escape(copy['attachment'])}</p>"
+        f"<p style='margin:0;line-height:1.6'>{html.escape(copy['thanks'])}<br><br><b>{html.escape(copy['team'])}</b></p>"
+        "</div></div></div>"
     )
-    text_body = f"{intro}\n{order_no}\n{tracking_label}: {tracking_no}\n{tracking_url}\n{attachment_note}"
+    text_body = (
+        f"{copy['greeting']}\n\n{copy['intro']}\n\n"
+        f"{copy['order']}: {order_no}\n{copy['carrier']}: {carrier_name}\n"
+        f"{copy['tracking']}: {tracking_no}\n{tracking_url}\n\n"
+        f"{copy['attachment']}\n\n{copy['thanks']}\n{copy['team']}"
+    )
     return send_email(
         recipient,
-        f"{subject_text} – {order_no}",
+        subject_text,
         html_body,
         text_body,
         attachments=[packing_attachment],
