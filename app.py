@@ -3134,7 +3134,7 @@ def invoice_edit_items(invoice_id: int, invoice_row: dict):
     ids = sorted(order_ids)
     ph = ",".join(["?"] * len(ids))
     cur.execute(f"""
-      SELECT oi.*, p.model, p.name,
+      SELECT oi.*, p.model, p.name, COALESCE(s.qty,0) AS stock_qty,
              oo.order_no AS source_order_no,
              oo.created_at AS source_order_created_at,
              oo.note AS source_order_note,
@@ -3143,6 +3143,7 @@ def invoice_edit_items(invoice_id: int, invoice_row: dict):
       FROM order_items oi
       JOIN orders oo ON oo.id=oi.order_id
       JOIN products p ON p.id=oi.product_id
+      LEFT JOIN stock s ON s.product_id=oi.product_id
       LEFT JOIN pricing pr ON (TRIM(LOWER(pr.model)) = TRIM(LOWER(p.model)) OR TRIM(LOWER(pr.model)) = TRIM(LOWER(p.sku)))
       WHERE oi.order_id IN ({ph})
       ORDER BY oo.created_at DESC, oo.id DESC, oi.id
@@ -3492,6 +3493,39 @@ def home():
         AND date(issued.issued_at)=date('now','localtime')
     """)
     n_issued_today = int(cur.fetchone()["n"] or 0)
+    # Zamowienia, ktore mozna wydac z obecnego stanu. Stan jest rezerwowany
+    # od najstarszego zamowienia, aby ta sama sztuka nie byla liczona dwa razy.
+    status_ph = ",".join(["?"] * len(CURRENT_ORDER_STATUSES))
+    cur.execute(f"""
+      SELECT o.id, o.order_no, o.created_at, o.note, oi.product_id,
+             SUM(oi.qty) AS required_qty
+      FROM orders o
+      JOIN order_items oi ON oi.order_id=o.id
+      WHERE LOWER(COALESCE(o.status,'')) IN ({status_ph})
+        AND COALESCE(o.warehouse_issued,0)=0
+      GROUP BY o.id, oi.product_id
+      ORDER BY o.created_at, o.id, oi.product_id
+    """, tuple(sorted(CURRENT_ORDER_STATUSES)))
+    issue_rows = [dict(r) for r in cur.fetchall()]
+    cur.execute("SELECT product_id, MAX(0, COALESCE(qty,0)) AS qty FROM stock")
+    issue_stock_pool = {int(r["product_id"]): int(r["qty"] or 0) for r in cur.fetchall()}
+    issue_orders = {}
+    for row in issue_rows:
+        order_id = int(row["id"])
+        issue_orders.setdefault(order_id, {"order": row, "needs": []})["needs"].append(
+            (int(row["product_id"]), int(row["required_qty"] or 0))
+        )
+    issuable_orders = []
+    for candidate in issue_orders.values():
+        if candidate["needs"] and all(issue_stock_pool.get(pid, 0) >= qty for pid, qty in candidate["needs"]):
+            issuable_orders.append(candidate["order"])
+            for pid, qty in candidate["needs"]:
+                issue_stock_pool[pid] = issue_stock_pool.get(pid, 0) - qty
+    n_issuable_today = len(issuable_orders)
+    issuable_order_labels = [
+        order_display_no(r["id"], r.get("created_at"), r.get("order_no"), r.get("note") or "")
+        for r in issuable_orders[:3]
+    ]
     reorder_horizon_days = 60
     try:
         cur.execute("SELECT value FROM cash_flow_settings WHERE key='reorder_horizon_days'")
@@ -3536,6 +3570,7 @@ def home():
       <style>
         .dashboard-head{display:flex;align-items:center;gap:14px;margin-bottom:18px}.dashboard-head h1{margin:0}.search-shell{margin-left:28px;flex:1;max-width:580px;position:relative}.search-shell input{padding-left:42px;background:#fff}.search-shell:before{content:"⌕";position:absolute;left:15px;top:9px;color:#8793aa;font-size:19px;z-index:2}.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;margin-bottom:16px}.metric{display:grid;grid-template-columns:55px 1fr;gap:14px;align-items:center;background:#fff;border:1px solid #e7eaf2;border-radius:22px;padding:18px;box-shadow:var(--shadow)}.metric .icon{display:grid;place-items:center;width:55px;height:55px;border-radius:17px;background:var(--soft,#edf3ff);color:var(--tone,#5577ee);font-size:23px}.metric span{color:#718096;font-size:12px;font-weight:650}.metric b{display:block;margin-top:2px;font-size:25px;letter-spacing:-.6px}.metric small{display:block;margin-top:4px;color:#2da176;font-size:10px}.dash-grid{display:grid;grid-template-columns:minmax(0,2.15fr) minmax(300px,.9fr);gap:16px;align-items:start}.panel-title{display:flex;align-items:center;gap:9px;margin-bottom:13px}.panel-title h2{margin:0}.panel-title .btn{margin-left:auto;padding:7px 11px;font-size:11px}.orders-card{padding-bottom:8px}.orders-card table{min-width:780px}.orders-card td{font-size:12px}.customer-name{font-weight:700}.order-no{color:#4166d3;font-weight:750;text-decoration:none}.side-stack{display:grid;gap:16px}.stock-list{display:grid;gap:2px}.stock-item{display:grid;grid-template-columns:42px 1fr auto;align-items:center;gap:10px;padding:10px 2px;border-bottom:1px solid #edf0f5}.stock-icon{display:grid;place-items:center;width:39px;height:39px;border-radius:12px;background:#f1f4f9;color:#68758d}.stock-name{font-size:12px;font-weight:700}.stock-sku{font-size:9px;color:#8b96a9}.stock-qty{font-size:12px;font-weight:800}.stock-qty:after{content:"";display:inline-block;width:7px;height:7px;margin-left:8px;border-radius:50%;background:#ee5262}.donut-wrap{display:grid;grid-template-columns:145px 1fr;align-items:center;gap:14px}.donut{width:140px;height:140px;border-radius:50%;display:grid;place-items:center;background:conic-gradient(#5577ee 0 calc(var(--p1)*1%),#65a7ec calc(var(--p1)*1%) calc((var(--p1) + var(--p2))*1%),#31b98b calc((var(--p1) + var(--p2))*1%) calc((var(--p1) + var(--p2) + var(--p3))*1%),#e05263 calc((var(--p1) + var(--p2) + var(--p3))*1%) 100%)}.donut:before{content:"";width:86px;height:86px;background:#fff;border-radius:50%;position:absolute}.donut-label{position:relative;text-align:center;font-size:11px;color:#77849b}.donut-label b{display:block;color:#17233c;font-size:25px}.legend{display:grid;gap:9px}.legend-row{display:grid;grid-template-columns:9px 1fr auto;gap:7px;align-items:center;font-size:10px}.legend-dot{width:8px;height:8px;border-radius:50%}.quick-card{grid-column:1}.quick-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:10px}.quick-grid .btn{min-height:80px;flex-direction:column;background:#f8faff;border-color:#e8ecf6;font-size:11px}.quick-grid .btn b{font-size:20px}.quick-grid .btn:nth-child(1){background:#edf3ff;color:#4166d3}.quick-grid .btn:nth-child(2){background:#eaf9f4;color:#16835f}.quick-grid .btn:nth-child(3){background:#eef3ff;color:#4b6bd3}.quick-grid .btn:nth-child(4){background:#fff5e5;color:#c57a10}.quick-grid .btn:nth-child(5){background:#f3edff;color:#7650ce}@media(max-width:1200px){.metrics{grid-template-columns:1fr 1fr}.dash-grid{grid-template-columns:1fr}.quick-card{grid-column:auto}}@media(max-width:760px){.dashboard-head{flex-wrap:wrap}.search-shell{order:3;margin-left:0;flex-basis:100%}.metrics{grid-template-columns:1fr}.quick-grid{grid-template-columns:1fr 1fr}.donut-wrap{grid-template-columns:1fr}.donut{margin:auto}}
       </style>
+      <style>@media(min-width:1201px){.metrics{grid-template-columns:repeat(5,minmax(0,1fr));gap:14px}.metric{padding:16px;grid-template-columns:50px 1fr;gap:12px}.metric .icon{width:50px;height:50px}.metric small{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}</style>
 
       <div class="dashboard-head">
         <div><h1>Pulpit</h1><div class="muted">Przewagę buduje się codziennie — jedną dobrą decyzją naraz.</div></div>
@@ -3546,6 +3581,7 @@ def home():
       <div class="metrics">
         <div class="metric"><div class="icon">▣</div><div><span>Nowe zamówienia</span><b>{{ n_orders_today }}</b><small>{{ n_orders_current }} aktualnie w toku</small></div></div>
         <div class="metric" style="--soft:#eaf9f4;--tone:#1aa176"><div class="icon">◇</div><div><span>Wydane dzisiaj</span><b>{{ n_issued_today }}</b><small>{{ n_stock_qty }} szt. na stanie</small></div></div>
+        <a class="metric" href="{{ url_for('orders', tab='new') }}" style="--soft:#eaf9f4;--tone:#16835f;text-decoration:none;color:inherit"><div class="icon">✓</div><div><span>Możesz wydać dziś</span><b>{{ n_issuable_today }}</b><small title="{{ issuable_order_labels|join(', ') }}">{{ issuable_order_labels|join(', ') if issuable_order_labels else 'Brak kompletnych zamówień' }}</small></div></a>
         <div class="metric" style="--soft:#fff6e6;--tone:#db8a13"><div class="icon">△</div><div><span>Trzeba uzupełnić</span><b>{{ replenishment_count }}</b><small>Według rankingu zakupowego</small></div></div>
         <div class="metric" style="--soft:#edf3ff;--tone:#5577ee"><div class="icon">▤</div><div><span>Wartość magazynu</span><b>{{ "{:,.0f}".format(inventory_value_net).replace(',', ' ') }} zł</b><small>Netto z towarem w drodze</small></div></div>
       </div>
@@ -3578,7 +3614,8 @@ def home():
                                   n_products=n_products, n_orders_current=n_orders_current, n_china_active=n_china_active,
                                   n_stock_qty=n_stock_qty, n_in_delivery_qty=n_in_delivery_qty,
                                   inventory_value_net=inventory_value_net, n_orders_today=n_orders_today,
-                                  n_issued_today=n_issued_today, replenishment_rows=replenishment_rows,
+                                  n_issued_today=n_issued_today, n_issuable_today=n_issuable_today,
+                                  issuable_order_labels=issuable_order_labels, replenishment_rows=replenishment_rows,
                                   replenishment_count=replenishment_count,
                                   recent_orders=recent_orders, status_new=status_new, status_work=status_work,
                                   status_done=status_done, status_cancelled=status_cancelled, status_total=status_total,
@@ -6356,6 +6393,17 @@ def order_invoice(order_id):
         it["invoiced_qty"] = done_qty
         it["remaining_qty"] = max(0, ordered_qty - done_qty)
 
+    # Automatyczna propozycja: nie wiecej niz pozostalo do zafakturowania i
+    # nie wiecej niz fizycznie jest na magazynie. Wspolna pula zabezpiecza
+    # pozycje tego samego produktu przed podwojnym wykorzystaniem stanu.
+    invoice_stock_pool = {}
+    for it in items:
+        pid = int(it.get("product_id") or 0)
+        invoice_stock_pool.setdefault(pid, max(0, int(it.get("stock_qty") or 0)))
+        suggested_qty = min(int(it.get("remaining_qty") or 0), invoice_stock_pool.get(pid, 0))
+        it["suggested_invoice_qty"] = max(0, suggested_qty)
+        invoice_stock_pool[pid] = max(0, invoice_stock_pool.get(pid, 0) - suggested_qty)
+
     cur.execute("SELECT * FROM company_profile WHERE id=1")
     company = cur.fetchone()
 
@@ -6550,7 +6598,7 @@ def order_invoice(order_id):
               Wpisz ilość tylko przy pozycjach, które idą na fakturę. Zamówienia klienta zostają jako osobne listy/notatki.
             </div>
             <table>
-              <thead><tr><th>Zamówienie</th><th>Notatka klienta</th><th>SKU</th><th>Model / Nazwa</th><th>Zamówiono</th><th>Zafakturowano</th><th>Pozostało</th><th>Ilość na fakturze</th><th>Netto/szt</th><th>Brutto/szt</th></tr></thead>
+              <thead><tr><th>Zamówienie</th><th>Notatka klienta</th><th>SKU</th><th>Model / Nazwa</th><th>Zamówiono</th><th>Zafakturowano</th><th>Pozostało</th><th>Na magazynie</th><th>Ilość na fakturze</th><th>Netto/szt</th><th>Brutto/szt</th></tr></thead>
               <tbody>
                 {% for it in items %}
                 <tr>
@@ -6561,8 +6609,9 @@ def order_invoice(order_id):
                   <td>{{ it['ordered_qty'] }}</td>
                   <td>{{ it['invoiced_qty'] }}</td>
                   <td><b>{{ it['remaining_qty'] }}</b></td>
+                  <td><b>{{ it['stock_qty'] }}</b> szt.</td>
                   <td>
-                    <input type="number" min="0" name="invoice_qty_{{ it['id'] }}" value="0" max="{{ it['remaining_qty'] }}" style="width:110px;" {% if it['remaining_qty'] <= 0 %}disabled{% endif %}>
+                    <input type="number" min="0" name="invoice_qty_{{ it['id'] }}" value="{{ it['suggested_invoice_qty'] }}" max="{{ it['remaining_qty'] }}" style="width:110px;" {% if it['remaining_qty'] <= 0 %}disabled{% endif %}>
                   </td>
                   <td>{{ "%.2f"|format(it['net_price']) }}</td>
                   <td>{{ "%.2f"|format(it['gross_price']) }}</td>
