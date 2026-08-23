@@ -3585,7 +3585,7 @@ def home():
       <div class="metrics">
         <div class="metric"><div class="icon">▣</div><div><span>Nowe zamówienia</span><b>{{ n_orders_today }}</b><small>{{ n_orders_current }} aktualnie w toku</small></div></div>
         <div class="metric" style="--soft:#eaf9f4;--tone:#1aa176"><div class="icon">◇</div><div><span>Wydane dzisiaj</span><b>{{ n_issued_today }}</b><small>{{ n_stock_qty }} szt. na stanie</small></div></div>
-        <a class="metric" href="{{ url_for('orders', tab='new') }}" style="--soft:#eaf9f4;--tone:#16835f;text-decoration:none;color:inherit"><div class="icon">✓</div><div><span>Możesz wydać dziś</span><b>{{ n_issuable_today }}</b><small title="{{ issuable_order_labels|join(', ') }}">{{ issuable_order_labels|join(', ') if issuable_order_labels else 'Brak kompletnych zamówień' }}</small></div></a>
+        <a class="metric" href="{{ url_for('orders', tab='new', ready_today=1) }}" style="--soft:#eaf9f4;--tone:#16835f;text-decoration:none;color:inherit"><div class="icon">✓</div><div><span>Możesz wydać dziś</span><b>{{ n_issuable_today }}</b><small title="{{ issuable_order_labels|join(', ') }}">{{ issuable_order_labels|join(', ') if issuable_order_labels else 'Brak kompletnych zamówień' }}</small></div></a>
         <div class="metric" style="--soft:#fff6e6;--tone:#db8a13"><div class="icon">△</div><div><span>Trzeba uzupełnić</span><b>{{ replenishment_count }}</b><small>Według rankingu zakupowego</small></div></div>
         <div class="metric" style="--soft:#edf3ff;--tone:#5577ee"><div class="icon">▤</div><div><span>Wartość magazynu</span><b>{{ "{:,.0f}".format(inventory_value_net).replace(',', ' ') }} zł</b><small>Netto z towarem w drodze</small></div></div>
       </div>
@@ -5467,6 +5467,7 @@ def orders():
         pass
     q = norm(request.args.get("q"))
     tab = norm(request.args.get("tab")) or "new"
+    ready_today = norm(request.args.get("ready_today")) == "1"
     if tab not in {"new", "issued", "realized", "all"}:
         tab = "new"
 
@@ -5590,6 +5591,36 @@ def orders():
                 r["has_shortage"] = has_shortage.get(r["id"], 0)
             else:
                 r["has_shortage"] = 0
+
+    if ready_today:
+        # Dokladnie ten sam warunek co na kafelku pulpitu: cale zamowienie
+        # musi miescic sie w fizycznym stanie. Towar w drodze nie wystarcza.
+        status_ph = ",".join(["?"] * len(CURRENT_ORDER_STATUSES))
+        cur.execute(f"""
+          SELECT o.id, o.created_at, oi.product_id, SUM(oi.qty) AS required_qty
+          FROM orders o
+          JOIN order_items oi ON oi.order_id=o.id
+          WHERE LOWER(COALESCE(o.status,'')) IN ({status_ph})
+            AND COALESCE(o.warehouse_issued,0)=0
+          GROUP BY o.id, oi.product_id
+          ORDER BY o.created_at, o.id, oi.product_id
+        """, tuple(sorted(CURRENT_ORDER_STATUSES)))
+        ready_demand = [dict(r) for r in cur.fetchall()]
+        cur.execute("SELECT product_id, MAX(0, COALESCE(qty,0)) AS qty FROM stock")
+        ready_stock = {int(r["product_id"]): int(r["qty"] or 0) for r in cur.fetchall()}
+        ready_orders = {}
+        for demand in ready_demand:
+            oid = int(demand["id"])
+            ready_orders.setdefault(oid, []).append(
+                (int(demand["product_id"]), int(demand["required_qty"] or 0))
+            )
+        ready_ids = set()
+        for oid, needs in ready_orders.items():
+            if needs and all(ready_stock.get(pid, 0) >= qty for pid, qty in needs):
+                ready_ids.add(oid)
+                for pid, qty in needs:
+                    ready_stock[pid] = ready_stock.get(pid, 0) - qty
+        rows = [r for r in rows if int(r["id"]) in ready_ids]
 
     c.close()
 
@@ -6441,7 +6472,7 @@ def order_invoice(order_id):
     order_ph = ",".join(["?"] * len(related_order_ids))
 
     cur.execute(f"""
-      SELECT oi.*, p.model, p.name,
+      SELECT oi.*, p.model, p.name, COALESCE(s.qty, 0) AS stock_qty,
              oo.order_no AS source_order_no,
              oo.created_at AS source_order_created_at,
              oo.note AS source_order_note,
@@ -6452,6 +6483,7 @@ def order_invoice(order_id):
       FROM order_items oi
       JOIN orders oo ON oo.id=oi.order_id
       JOIN products p ON p.id=oi.product_id
+      LEFT JOIN stock s ON s.product_id=oi.product_id
       LEFT JOIN pricing pr ON (TRIM(LOWER(pr.model)) = TRIM(LOWER(p.model)) OR TRIM(LOWER(pr.model)) = TRIM(LOWER(p.sku)))
       WHERE oi.order_id IN ({order_ph})
       ORDER BY oo.created_at DESC, oo.id DESC, oi.id
