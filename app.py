@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 import io
+import html
 import csv
 import base64
 import re
@@ -233,6 +234,7 @@ def init_db():
         currency TEXT NOT NULL DEFAULT 'PLN',
         price_list TEXT NOT NULL DEFAULT 'pln',
         tracking_no TEXT,
+        carrier TEXT,
         packed_at TEXT,
         shipped_at TEXT,
         FOREIGN KEY(customer_id) REFERENCES customers(id)
@@ -510,6 +512,8 @@ def init_db():
         cur.execute("ALTER TABLE orders ADD COLUMN price_list TEXT NOT NULL DEFAULT 'pln'")
     if "tracking_no" not in order_cols:
         cur.execute("ALTER TABLE orders ADD COLUMN tracking_no TEXT")
+    if "carrier" not in order_cols:
+        cur.execute("ALTER TABLE orders ADD COLUMN carrier TEXT")
     if "packed_at" not in order_cols:
         cur.execute("ALTER TABLE orders ADD COLUMN packed_at TEXT")
     if "shipped_at" not in order_cols:
@@ -898,6 +902,19 @@ def order_status_css(status: str) -> str:
         "issued": "st-issued",
     }
     return mapping.get(v, "")
+
+def carrier_tracking_url(carrier: str, tracking_no: str) -> str:
+    carrier_key = norm(carrier).lower()
+    number = re.sub(r"\s+", "", norm(tracking_no))
+    encoded = urllib.parse.quote(number)
+    bases = {
+        "inpost": "https://inpost.pl/sledzenie-przesylek?number=",
+        "dpd": "https://tracktrace.dpd.com.pl/parcelDetails?p1=",
+        "fedex": "https://www.fedex.com/fedextrack/?trknbr=",
+        "dhl": "https://www.dhl.com/pl-pl/home/tracking.html?tracking-id=",
+        "ups": "https://www.ups.com/track?tracknum=",
+    }
+    return bases.get(carrier_key, "https://t.17track.net/en#nums=") + encoded
 
 def guess_col(headers, candidates):
     h = [x.strip().lower() for x in headers]
@@ -3433,6 +3450,7 @@ app.jinja_env.globals["canonical_order_no"] = canonical_order_no
 app.jinja_env.globals["order_display_no"] = order_display_no
 app.jinja_env.globals["order_status_label"] = order_status_label if "order_status_label" in globals() else None
 app.jinja_env.globals["order_status_css"] = order_status_css if "order_status_css" in globals() else None
+app.jinja_env.globals["carrier_tracking_url"] = carrier_tracking_url
 
 
 # =========================
@@ -6070,9 +6088,15 @@ def order_view(order_id):
         <div class="muted" style="margin-top:6px;">{{ o['created_at'] }}</div>
         <form method="post" action="{{ url_for('order_mark_shipped', order_id=o['id']) }}" class="flex" style="margin-top:14px;padding:14px;border:1px solid #dbe4f2;border-radius:16px;background:#f8fbff;">
           <div><b>Wysyłka do klienta</b><div class="muted">Wpisz numer przesyłki i oznacz zamówienie jako wysłane.</div></div>
+          <select name="carrier" required style="min-width:150px;">
+            <option value="">-- Kurier --</option>
+            {% for carrier_key, carrier_name in [('inpost','InPost'),('dpd','DPD'),('fedex','FedEx'),('dhl','DHL'),('ups','UPS')] %}
+              <option value="{{ carrier_key }}" {% if (o['carrier'] or '')|lower == carrier_key %}selected{% endif %}>{{ carrier_name }}</option>
+            {% endfor %}
+          </select>
           <input name="tracking_no" value="{{ o['tracking_no'] or '' }}" placeholder="Numer śledzenia" required style="min-width:260px;">
           <button class="btn primary" type="submit">Wysłane</button>
-          {% if o['tracking_no'] %}<a class="btn" target="_blank" href="https://t.17track.net/en#nums={{ o['tracking_no']|urlencode }}">Śledź</a>{% endif %}
+          {% if o['tracking_no'] %}<a class="btn" target="_blank" href="{{ carrier_tracking_url(o['carrier'], o['tracking_no']) }}">Śledź</a>{% endif %}
         </form>
         {% if request.args.get('shipment_sent') == '1' %}<div class="hint" style="margin-top:10px;">Status i numer przesyłki zapisane. Klient otrzymał e-mail.</div>{% endif %}
         {% if request.args.get('shipment_email_error') %}<div class="hint" style="margin-top:10px;">Status zapisany, ale e-mail nie został wysłany: {{ request.args.get('shipment_email_error') }}</div>{% endif %}
@@ -6371,8 +6395,12 @@ def order_delete(order_id):
 @app.post("/orders/<int:order_id>/shipped")
 def order_mark_shipped(order_id):
     tracking_no = re.sub(r"\s+", "", norm(request.form.get("tracking_no")))
+    carrier = norm(request.form.get("carrier")).lower()
     if not tracking_no or len(tracking_no) > 120:
         return "Podaj poprawny numer przesyłki", 400
+
+    if carrier not in {"inpost", "dpd", "fedex", "dhl", "ups"}:
+        return "Wybierz poprawnego kuriera", 400
 
     maybe_pull_shared_from_supabase(force=True)
     c = conn()
@@ -6383,9 +6411,17 @@ def order_mark_shipped(order_id):
         if not row:
             abort(404)
         order = dict(row)
+        try:
+            packing_attachment = _order_packing_list_email_attachment(order)
+        except Exception as exc:
+            return redirect(url_for(
+                "order_view",
+                order_id=order_id,
+                shipment_email_error=("Nie udało się przygotować listy pakowania: " + str(exc))[:240],
+            ))
         cur.execute(
-            "UPDATE orders SET status='shipped', tracking_no=?, shipped_at=? WHERE id=?",
-            (tracking_no, now_iso(), order_id),
+            "UPDATE orders SET status='shipped', tracking_no=?, carrier=?, shipped_at=? WHERE id=?",
+            (tracking_no, carrier, now_iso(), order_id),
         )
         c.commit()
         cur.execute("SELECT * FROM orders WHERE id=?", (order_id,))
@@ -6400,10 +6436,10 @@ def order_mark_shipped(order_id):
             app.logger.warning("Nie udało się zsynchronizować wysyłki zamówienia %s: %s", order_id, exc)
 
     try:
-        result = _send_order_shipped_email(order, tracking_no)
+        result = _send_order_shipped_email(order, tracking_no, carrier, packing_attachment)
     except Exception as exc:
         result = {"ok": False, "error": str(exc)}
-    event_key = f"order_shipped:{order_id}:{hashlib.sha256(tracking_no.encode('utf-8')).hexdigest()[:16]}"
+    event_key = f"order_shipped:{order_id}:{carrier}:{hashlib.sha256(tracking_no.encode('utf-8')).hexdigest()[:16]}"
     _record_email_event(event_key, "order_shipped", order_id, order.get("customer_email"), result)
     if result.get("ok"):
         return redirect(url_for("order_view", order_id=order_id, shipment_sent="1"))
@@ -6679,7 +6715,6 @@ def order_invoice(order_id):
                     int(item.get("source_order_id") or item.get("order_id") or order_id)
                     for item in invoice_items
                 ]
-                mark_orders_packed(packed_order_ids)
                 packing_order_no = canonical_order_no(o["id"], o["created_at"], o["order_no"])
                 packing_meta = {
                     "invoice_no": packing_order_no,
@@ -6688,6 +6723,7 @@ def order_invoice(order_id):
                     "buyer_email": data.get("buyer_email") or o["customer_email"] or "",
                 }
                 packing_path = generate_invoice_packing_list_pdf(o, invoice_items, packing_meta)
+                mark_orders_packed(packed_order_ids)
                 return send_file(
                     packing_path,
                     mimetype="application/pdf",
@@ -7437,10 +7473,133 @@ def mark_orders_packed(order_ids) -> list[int]:
             sync_local_rows_to_supabase("orders", "id", changed_ids)
         except Exception as exc:
             app.logger.warning("Nie udało się zsynchronizować statusu pakowania: %s", exc)
+    if changed_ids:
+        c = conn()
+        try:
+            placeholders = ",".join(["?"] * len(changed_ids))
+            cur = c.cursor()
+            cur.execute(f"SELECT * FROM orders WHERE id IN ({placeholders})", tuple(changed_ids))
+            packed_orders = [dict(row) for row in cur.fetchall()]
+        finally:
+            c.close()
+        for packed_order in packed_orders:
+            packed_id = to_int(packed_order.get("id"), 0)
+            event_key = f"order_packed:{packed_id}"
+            if _email_event_already_ok(event_key):
+                continue
+            try:
+                result = _send_order_packed_email(packed_order)
+            except Exception as exc:
+                result = {"ok": False, "error": str(exc)}
+            _record_email_event(
+                event_key,
+                "order_packed",
+                packed_id,
+                packed_order.get("customer_email"),
+                result,
+            )
+            if not result.get("ok"):
+                app.logger.warning(
+                    "Nie udalo sie wyslac informacji o pakowaniu zamowienia %s: %s",
+                    packed_id,
+                    norm(result.get("error")) or "nieznany blad",
+                )
     return changed_ids
 
 
-def _send_order_shipped_email(order: dict, tracking_no: str) -> dict:
+def _send_order_packed_email(order: dict) -> dict:
+    if not send_email:
+        return {"ok": False, "error": "Modul wysylki e-mail nie jest dostepny"}
+    recipient = _email_key(order.get("customer_email"))
+    if not recipient:
+        return {"ok": False, "error": "Zamowienie nie ma adresu e-mail klienta"}
+    try:
+        language = normalize_client_language(_client_profile_for_email(recipient).get("language"))
+    except Exception:
+        language = "pl"
+    order_no = canonical_order_no(order.get("id"), order.get("created_at"), order.get("order_no"))
+    messages = {
+        "pl": ("Rozpoczęliśmy pakowanie zamówienia", "Twoje zamówienie jest w trakcie pakowania i będzie oczekiwać na odbiór przez kuriera."),
+        "de": ("Wir verpacken Ihre Bestellung", "Ihre Bestellung wird derzeit verpackt und wartet anschließend auf die Abholung durch den Kurier."),
+        "en": ("We are packing your order", "Your order is being packed and will then wait for courier collection."),
+        "es": ("Estamos preparando tu pedido", "Tu pedido se está preparando y después quedará a la espera de la recogida por el transportista."),
+        "it": ("Stiamo preparando il tuo ordine", "Il tuo ordine è in fase di preparazione e sarà poi in attesa del ritiro da parte del corriere."),
+    }
+    subject_text, intro = messages.get(language, messages["pl"])
+    attachment_note = {
+        "pl": "Lista pakowania znajduje się w załączniku.",
+        "de": "Die Packliste finden Sie im Anhang.",
+        "en": "The packing list is attached.",
+        "es": "La lista de embalaje está adjunta.",
+        "it": "La lista di imballaggio è allegata.",
+    }.get(language, "Lista pakowania znajduje się w załączniku.")
+    safe_order = html.escape(str(order_no), quote=True)
+    html_body = (
+        "<div style='font-family:Arial,sans-serif;color:#10203d'>"
+        f"<h2>{subject_text}</h2><p><b>{safe_order}</b></p><p>{intro}</p>"
+        f"<p>{attachment_note}</p></div>"
+    )
+    text_body = f"{subject_text}\n{order_no}\n{intro}\n{attachment_note}"
+    packing_attachment = _order_packing_list_email_attachment(order)
+    return send_email(
+        recipient,
+        f"{subject_text} – {order_no}",
+        html_body,
+        text_body,
+        attachments=[packing_attachment],
+    )
+
+
+def _order_packing_list_email_attachment(order: dict) -> dict:
+    """Return the packed PDF, or safely recreate it from the saved order."""
+    order_id = to_int(order.get("id"), 0)
+    order_no = canonical_order_no(order_id, order.get("created_at"), order.get("order_no"))
+    customer_dir = invoice_dir_for_customer(order.get("customer_name") or "Klient")
+    expected_path = packing_list_pdf_path_for_invoice(
+        os.path.join(customer_dir, f"{safe_filename(order_no)}.pdf"),
+        order_no,
+    )
+    if not os.path.exists(expected_path):
+        c = conn()
+        try:
+            cur = c.cursor()
+            cur.execute("""
+              SELECT oi.id, oi.product_id, oi.qty,
+                     COALESCE(NULLIF(oi.sku,''), p.sku, '') AS sku,
+                     COALESCE(p.model, '') AS model,
+                     COALESCE(p.name, '') AS name
+              FROM order_items oi
+              LEFT JOIN products p ON p.id=oi.product_id
+              WHERE oi.order_id=? AND COALESCE(oi.qty,0)>0
+              ORDER BY oi.id
+            """, (order_id,))
+            items = [dict(row) for row in cur.fetchall()]
+        finally:
+            c.close()
+        if not items:
+            raise ValueError("zamówienie nie ma pozycji do listy pakowania")
+        note = norm(order.get("note"))
+        for item in items:
+            item["source_order_no"] = order_no
+            item["source_order_note"] = note
+        meta = {
+            "invoice_no": order_no,
+            "document_label_key": "order",
+            "buyer_name": norm(order.get("customer_name")),
+            "buyer_email": norm(order.get("customer_email")),
+        }
+        expected_path = generate_invoice_packing_list_pdf(order, items, meta)
+    with open(expected_path, "rb") as pdf_file:
+        content = pdf_file.read()
+    if not content:
+        raise ValueError("wygenerowana lista pakowania jest pusta")
+    return {
+        "filename": f"{safe_filename(order_no)}_lista_pakowania.pdf",
+        "content": content,
+    }
+
+
+def _send_order_shipped_email(order: dict, tracking_no: str, carrier: str, packing_attachment: dict) -> dict:
     if not send_email:
         return {"ok": False, "error": "Moduł wysyłki e-mail nie jest dostępny"}
     recipient = _email_key(order.get("customer_email"))
@@ -7459,17 +7618,31 @@ def _send_order_shipped_email(order: dict, tracking_no: str) -> dict:
         "it": ("Il tuo ordine è stato spedito", "Il tuo ordine è stato spedito.", "Numero di tracciamento", "Traccia la spedizione"),
     }
     subject_text, intro, tracking_label, link_label = messages.get(language, messages["pl"])
-    tracking_url = "https://t.17track.net/en#nums=" + urllib.parse.quote(tracking_no)
+    attachment_notes = {
+        "pl": "Lista pakowania znajduje się w załączniku.",
+        "de": "Die Packliste finden Sie im Anhang.",
+        "en": "The packing list is attached.",
+        "es": "La lista de embalaje está adjunta.",
+        "it": "La lista di imballaggio è allegata.",
+    }
+    attachment_note = attachment_notes.get(language, attachment_notes["pl"])
+    tracking_url = carrier_tracking_url(carrier, tracking_no)
     safe_order = str(order_no).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     safe_tracking = str(tracking_no).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     html_body = (
         "<div style='font-family:Arial,sans-serif;color:#10203d'>"
         f"<h2>{subject_text}</h2><p>{intro}</p><p><b>{safe_order}</b></p>"
         f"<p>{tracking_label}: <b>{safe_tracking}</b></p>"
-        f"<p><a href='{tracking_url}'>{link_label}</a></p></div>"
+        f"<p><a href='{tracking_url}'>{link_label}</a></p><p>{attachment_note}</p></div>"
     )
-    text_body = f"{intro}\n{order_no}\n{tracking_label}: {tracking_no}\n{tracking_url}"
-    return send_email(recipient, f"{subject_text} – {order_no}", html_body, text_body)
+    text_body = f"{intro}\n{order_no}\n{tracking_label}: {tracking_no}\n{tracking_url}\n{attachment_note}"
+    return send_email(
+        recipient,
+        f"{subject_text} – {order_no}",
+        html_body,
+        text_body,
+        attachments=[packing_attachment],
+    )
 
 
 def _send_saved_order_confirmation(order_id: int, force: bool = False) -> dict:
@@ -8281,6 +8454,7 @@ def _api_order_lookup_impl():
             "order_no": order.get("order_no"),
             "status": order.get("status"),
             "tracking_no": order.get("tracking_no") or "",
+            "carrier": order.get("carrier") or "",
             "packed_at": order.get("packed_at") or "",
             "shipped_at": order.get("shipped_at") or "",
             "created_at": order.get("created_at"),
@@ -9263,7 +9437,6 @@ def order_packing_list_download_admin(order_id):
     if not items:
         return "Brak pozycji dostępnych obecnie na magazynie do spakowania", 400
 
-    mark_orders_packed([order_id])
     order_no = canonical_order_no(order_row["id"], order_row["created_at"], order_row["order_no"])
     note = norm(order_row["note"])
     for item in items:
@@ -9276,6 +9449,7 @@ def order_packing_list_download_admin(order_id):
         "buyer_email": norm(order_row["customer_email"]),
     }
     pack_path = generate_invoice_packing_list_pdf(order_row, items, meta)
+    mark_orders_packed([order_id])
     return send_file(
         pack_path,
         mimetype="application/pdf",
@@ -9302,14 +9476,13 @@ def invoice_packing_list_download_admin(invoice_id):
     if not items:
         return "Brak pozycji faktury", 400
 
+    ok_pdf, invoice_abs_path = invoice_pdf_exists(inv.get("pdf_path", ""), inv.get("invoice_no", ""))
+    pack_path = packing_list_pdf_path_for_invoice(invoice_abs_path if ok_pdf else "", inv.get("invoice_no") or f"FV_{invoice_id}")
+    pack_path = generate_invoice_packing_list_pdf(o, items, invoice_meta_payload(inv), invoice_abs_path if ok_pdf else "")
     mark_orders_packed([
         int(item.get("source_order_id") or item.get("order_id") or inv.get("order_id") or 0)
         for item in items
     ])
-
-    ok_pdf, invoice_abs_path = invoice_pdf_exists(inv.get("pdf_path", ""), inv.get("invoice_no", ""))
-    pack_path = packing_list_pdf_path_for_invoice(invoice_abs_path if ok_pdf else "", inv.get("invoice_no") or f"FV_{invoice_id}")
-    pack_path = generate_invoice_packing_list_pdf(o, items, invoice_meta_payload(inv), invoice_abs_path if ok_pdf else "")
     if supabase_enabled():
         try:
             packing_ref = supabase_storage_upload_file(
