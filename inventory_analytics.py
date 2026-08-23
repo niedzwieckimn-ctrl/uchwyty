@@ -122,6 +122,7 @@ def build_replenishment_analysis(conn_factory, today: date | None = None, horizo
       SELECT p.id, p.sku, p.model, p.name, p.ean, COALESCE(s.qty,0) AS stock_qty
       FROM products p
       LEFT JOIN stock s ON s.product_id=p.id
+      WHERE COALESCE(p.archived,0)=0
       ORDER BY p.sku
     """)
     products = [dict(row) for row in cur.fetchall()]
