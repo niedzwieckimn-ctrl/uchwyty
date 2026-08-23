@@ -291,14 +291,15 @@ def register_cash_flow(app, deps):
                 "reminder": int(inv["payment_reminder"] or 0) == 1,
             })
 
-        # Liczba zamowien pochodzi z daty ich zlozenia. Liczba sprzedanych
-        # sztuk jest wyzej liczona wylacznie z pozycji wystawionych faktur.
+        # Liczba zamowien oznacza wszystkie zamowienia zapisane w danym
+        # miesiacu wedlug daty zlozenia. Status (takze anulowanie) nie zmienia
+        # historycznego faktu, ze zamowienie zostalo wtedy zlozone.
         cur.execute("""
-          SELECT substr(o.created_at,1,7) AS month_key,
+          SELECT substr(trim(o.created_at),1,7) AS month_key,
                  COUNT(DISTINCT o.id) AS orders_count
           FROM orders o
-          WHERE lower(COALESCE(o.status,'')) <> 'cancelled'
-          GROUP BY substr(o.created_at,1,7)
+          WHERE trim(COALESCE(o.created_at,'')) <> ''
+          GROUP BY substr(trim(o.created_at),1,7)
         """)
         for order_month in cur.fetchall():
             chart_row = sales_chart_by_month.get(order_month["month_key"])
@@ -484,7 +485,7 @@ def register_cash_flow(app, deps):
 
           <div class="card">
             <div class="flex" style="justify-content:space-between;align-items:flex-start;">
-              <div><h2 style="margin-bottom:4px;">Sprzedaż miesiąc po miesiącu</h2><div class="muted">Sztuki i faktury według daty wystawienia faktury; zamówienia według daty złożenia.</div></div>
+              <div><h2 style="margin-bottom:4px;">Sprzedaż miesiąc po miesiącu</h2><div class="muted">Sztuki i faktury według daty wystawienia faktury; wszystkie zapisane zamówienia według daty złożenia, niezależnie od ich późniejszego statusu.</div></div>
               <div class="flex small"><span><b style="color:#4f6feb;">●</b> Sztuki</span><span><b style="color:#10a37f;">●</b> Zamówienia</span><span><b style="color:#f59e0b;">●</b> Faktury</span></div>
             </div>
             <div style="margin-top:16px;overflow-x:auto;"><svg id="salesTrendChart" viewBox="0 0 1040 350" role="img" aria-label="Miesięczne statystyki sprzedaży" style="display:block;min-width:760px;width:100%;height:auto;"></svg></div>

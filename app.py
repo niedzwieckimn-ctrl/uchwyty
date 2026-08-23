@@ -4980,6 +4980,8 @@ def products():
           <h1 style="margin:0;">Produkty</h1>
           <div class="right"></div>
         </div>
+        {% if request.args.get('product_deleted') %}<div class="notice" style="margin-top:10px;color:#067a2d;">Usunięto produkt {{ request.args.get('product_deleted') }}.</div>{% endif %}
+        {% if request.args.get('product_error') %}<div class="notice" style="margin-top:10px;color:#b00020;">{{ request.args.get('product_error') }}</div>{% endif %}
         <form method="get" class="grid3" style="margin-top:10px;">
           <input name="q" value="{{ q }}" placeholder="Szukaj: SKU / model / EAN / nazwa">
           <button class="btn primary" type="submit">Szukaj</button>
@@ -5011,6 +5013,7 @@ def products():
               <th>EAN</th>
               <th>Nazwa</th>
               <th>Stan</th>
+              <th>Akcje</th>
             </tr>
           </thead>
           <tbody>
@@ -5021,6 +5024,11 @@ def products():
               <td>{{ r["ean"] or "" }}</td>
               <td>{{ r["name"] or "" }}</td>
               <td><span class="badge">{{ r["stock"] }}</span></td>
+              <td>
+                <form method="post" action="{{ url_for('product_delete', product_id=r['id']) }}" onsubmit="return confirm('Usunąć wybrany produkt? Tej operacji nie można cofnąć.');">
+                  <button class="btn danger" type="submit">Usuń</button>
+                </form>
+              </td>
             </tr>
             {% endfor %}
             {% if not rows %}
@@ -5032,6 +5040,72 @@ def products():
     {% endblock %}
     """
     return render_template_string(tpl, title="Produkty", base_url=BASE_URL, db_path=DB_PATH, rows=rows, q=q)
+
+@app.post("/products/<int:product_id>/delete")
+def product_delete(product_id):
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+      SELECT p.id, p.sku, COALESCE(s.qty,0) AS stock
+      FROM products p
+      LEFT JOIN stock s ON s.product_id=p.id
+      WHERE p.id=?
+    """, (product_id,))
+    product = cur.fetchone()
+    if not product:
+        c.close()
+        return redirect(url_for("products", product_error="Nie znaleziono produktu."))
+
+    references = []
+    for table, label in (
+        ("order_items", "zamówieniach"),
+        ("china_items", "dostawach P/O"),
+        ("invoice_allocations", "fakturach"),
+    ):
+        cur.execute(f"SELECT COUNT(*) AS n FROM {table} WHERE product_id=?", (product_id,))
+        if int(cur.fetchone()["n"] or 0) > 0:
+            references.append(label)
+    if int(product["stock"] or 0) != 0:
+        references.append("stanie magazynowym")
+
+    sku = product["sku"]
+    if references:
+        c.close()
+        return redirect(url_for(
+            "products",
+            q=sku,
+            product_error="Nie można usunąć produktu, ponieważ jest używany w " + ", ".join(references) + ".",
+        ))
+
+    try:
+        if supabase_enabled():
+            supabase_delete_rows("stock", {"product_id": product_id})
+            try:
+                supabase_delete_rows("products", {"id": product_id})
+            except Exception:
+                cur.execute("SELECT * FROM stock WHERE product_id=?", (product_id,))
+                stock_row = cur.fetchone()
+                if stock_row:
+                    supabase_upsert_rows("stock", [dict(stock_row)], "product_id")
+                raise
+            try:
+                supabase_delete_rows("pricing_eur", {"sku": sku})
+            except Exception:
+                # Brak osobnej ceny EUR nie może cofnąć poprawnego usunięcia
+                # produktu. Osierocona cena nie jest widoczna bez produktu.
+                app.logger.warning("Nie udało się usunąć ceny EUR dla SKU %s", sku, exc_info=True)
+
+        cur.execute("DELETE FROM pricing_eur WHERE sku=?", (sku,))
+        cur.execute("DELETE FROM stock WHERE product_id=?", (product_id,))
+        cur.execute("DELETE FROM products WHERE id=?", (product_id,))
+        c.commit()
+    except Exception:
+        c.rollback()
+        c.close()
+        app.logger.exception("Nie udało się bezpiecznie usunąć produktu %s", product_id)
+        return redirect(url_for("products", q=sku, product_error="Nie udało się usunąć produktu. Sprawdź synchronizację magazynu."))
+    c.close()
+    return redirect(url_for("products", product_deleted=sku))
 
 @app.post("/products/import")
 def products_import():
