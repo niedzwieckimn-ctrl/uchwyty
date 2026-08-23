@@ -12,6 +12,7 @@ Sekrety trzymamy wyłącznie po stronie Rendera:
 from __future__ import annotations
 
 import html
+import base64
 import json
 import os
 import urllib.error
@@ -83,7 +84,7 @@ def _decode_resend_error(exc: urllib.error.HTTPError) -> tuple[str, dict]:
         return raw[:1200], {"raw": raw[:1200]}
 
 
-def send_email(to, subject: str, html_body: str, text_body: str = "") -> dict:
+def send_email(to, subject: str, html_body: str, text_body: str = "", attachments=None) -> dict:
     cfg = email_config_summary()
     recipients = _uniq_emails(to if isinstance(to, (list, tuple, set)) else [to])
     if not recipients:
@@ -101,6 +102,21 @@ def send_email(to, subject: str, html_body: str, text_body: str = "") -> dict:
     }
     if text_body:
         payload["text"] = text_body
+    encoded_attachments = []
+    for attachment in attachments or []:
+        if not isinstance(attachment, dict):
+            continue
+        filename = str(attachment.get("filename") or "").strip()
+        content = attachment.get("content")
+        if not filename or content in (None, b"", ""):
+            continue
+        if isinstance(content, (bytes, bytearray)):
+            content = base64.b64encode(bytes(content)).decode("ascii")
+        elif not isinstance(content, str):
+            continue
+        encoded_attachments.append({"filename": filename, "content": content})
+    if encoded_attachments:
+        payload["attachments"] = encoded_attachments
 
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
