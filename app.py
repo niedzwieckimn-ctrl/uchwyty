@@ -3623,7 +3623,7 @@ def home():
         <div class="card orders-card">
           <div class="panel-title"><span>▣</span><h2>Ostatnie zamówienia</h2><a class="btn" href="{{ url_for('orders') }}">Zobacz wszystkie</a></div>
           <table><thead><tr><th>Nr zamówienia</th><th>Klient</th><th>Data</th><th>Wartość</th><th>Status</th><th></th></tr></thead><tbody>
-          {% for o in recent_orders %}<tr><td><a class="order-no" href="{{ url_for('order_view',order_id=o.id) }}">{{ canonical_order_no(o.id,o.created_at,o.order_no) }}</a></td><td class="customer-name">{{ o.customer_name or '-' }}</td><td>{{ o.created_at[:16] }}</td><td>{{ "%.2f"|format(o.total_net) }} {{ o.currency or 'PLN' }}</td><td><span class="badge {{ order_status_css(o.status) }}">{{ order_status_label(o.status) }}</span></td><td><a class="btn" href="{{ url_for('order_view',order_id=o.id) }}">•••</a></td></tr>{% endfor %}
+          {% for o in recent_orders %}<tr><td><a class="order-no" href="{{ url_for('order_view',order_id=o.id) }}">{{ canonical_order_no(o.id,o.created_at,o.order_no) }}</a></td><td class="customer-name">{{ o.customer_name or '-' }}</td><td>{{ o.created_at[:16] }}</td><td>{{ "%.2f"|format(o.total_net) }} {{ o.currency or 'PLN' }}</td><td><span class="badge {{ order_status_css(o.status) }}">{{ order_status_label(o.status) }}</span></td><td>{% if (o.status or '')|lower in ['new','pending','unconfirmed'] %}<form method="post" action="{{ url_for('order_status_update', order_id=o.id) }}"><input type="hidden" name="status" value="confirmed"><input type="hidden" name="return_to" value="dashboard"><button class="btn primary" type="submit">Potwierdź</button></form>{% endif %}</td></tr>{% endfor %}
           {% if not recent_orders %}<tr><td colspan="6" class="muted">Brak zamówień do wyświetlenia.</td></tr>{% endif %}
           </tbody></table>
         </div>
@@ -6066,16 +6066,6 @@ def order_view(order_id):
             <form method="post" action="{{ url_for('order_confirmation_resend', order_id=o['id']) }}">
               <button class="btn" type="submit">Wyślij ponownie potwierdzenie</button>
             </form>
-            <form method="post" action="{{ url_for('order_status_update', order_id=o['id']) }}" class="flex">
-                <select name="status" style="width:190px;">
-                  <option value="new" {% if o['status'] in ['new','pending','unconfirmed'] %}selected{% endif %}>Niepotwierdzone</option>
-                  <option value="confirmed" {% if o['status']=='confirmed' %}selected{% endif %}>Potwierdzone</option>
-                  <option value="packed" {% if o['status']=='packed' %}selected{% endif %}>W trakcie pakowania / czeka na kuriera</option>
-                  <option value="in_delivery" {% if o['status']=='in_delivery' %}selected{% endif %}>W dostawie</option>
-                  <option value="issued" {% if o['status']=='issued' %}selected{% endif %}>Zrealizowane</option>
-                </select>
-                <button class="btn" type="submit">ZmieĹ„ status</button>
-              </form>
               <a class="btn primary" href="{{ url_for('order_label', order_id=o['id']) }}">Etykieta 30x50</a>
               {% if locked %}
                 <span class="badge">Wydane z magazynu</span>
@@ -6517,6 +6507,8 @@ def order_status_update(order_id):
             except Exception:
                 pass
 
+    if norm(request.form.get("return_to")).lower() == "dashboard":
+        return redirect(url_for("home"))
     return redirect(url_for("order_view", order_id=order_id))
 
 
