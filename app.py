@@ -232,6 +232,9 @@ def init_db():
         warehouse_issued INTEGER NOT NULL DEFAULT 0,
         currency TEXT NOT NULL DEFAULT 'PLN',
         price_list TEXT NOT NULL DEFAULT 'pln',
+        tracking_no TEXT,
+        packed_at TEXT,
+        shipped_at TEXT,
         FOREIGN KEY(customer_id) REFERENCES customers(id)
     )
     """)
@@ -505,6 +508,12 @@ def init_db():
         cur.execute("ALTER TABLE orders ADD COLUMN currency TEXT NOT NULL DEFAULT 'PLN'")
     if "price_list" not in order_cols:
         cur.execute("ALTER TABLE orders ADD COLUMN price_list TEXT NOT NULL DEFAULT 'pln'")
+    if "tracking_no" not in order_cols:
+        cur.execute("ALTER TABLE orders ADD COLUMN tracking_no TEXT")
+    if "packed_at" not in order_cols:
+        cur.execute("ALTER TABLE orders ADD COLUMN packed_at TEXT")
+    if "shipped_at" not in order_cols:
+        cur.execute("ALTER TABLE orders ADD COLUMN shipped_at TEXT")
 
     cur.execute("PRAGMA table_info(order_items)")
     order_item_cols = {r[1] for r in cur.fetchall()}
@@ -869,8 +878,9 @@ def order_status_label(status: str) -> str:
         "pending": "Niepotwierdzone",
         "unconfirmed": "Niepotwierdzone",
         "confirmed": "Potwierdzone",
-        "packed": "W dostawie",
+        "packed": "W trakcie pakowania / czeka na kuriera",
         "in_delivery": "W dostawie",
+        "shipped": "Wysłane",
         "issued": "Zrealizowane",
     }
     return mapping.get(v, status or "-")
@@ -884,6 +894,7 @@ def order_status_css(status: str) -> str:
         "confirmed": "st-confirmed",
         "packed": "st-delivery",
         "in_delivery": "st-delivery",
+        "shipped": "st-confirmed",
         "issued": "st-issued",
     }
     return mapping.get(v, "")
@@ -6041,7 +6052,8 @@ def order_view(order_id):
                 <select name="status" style="width:190px;">
                   <option value="new" {% if o['status'] in ['new','pending','unconfirmed'] %}selected{% endif %}>Niepotwierdzone</option>
                   <option value="confirmed" {% if o['status']=='confirmed' %}selected{% endif %}>Potwierdzone</option>
-                  <option value="in_delivery" {% if o['status'] in ['packed','in_delivery'] %}selected{% endif %}>W dostawie</option>
+                  <option value="packed" {% if o['status']=='packed' %}selected{% endif %}>W trakcie pakowania / czeka na kuriera</option>
+                  <option value="in_delivery" {% if o['status']=='in_delivery' %}selected{% endif %}>W dostawie</option>
                   <option value="issued" {% if o['status']=='issued' %}selected{% endif %}>Zrealizowane</option>
                 </select>
                 <button class="btn" type="submit">ZmieĹ„ status</button>
@@ -6056,6 +6068,14 @@ def order_view(order_id):
           </div>
         </div>
         <div class="muted" style="margin-top:6px;">{{ o['created_at'] }}</div>
+        <form method="post" action="{{ url_for('order_mark_shipped', order_id=o['id']) }}" class="flex" style="margin-top:14px;padding:14px;border:1px solid #dbe4f2;border-radius:16px;background:#f8fbff;">
+          <div><b>Wysyłka do klienta</b><div class="muted">Wpisz numer przesyłki i oznacz zamówienie jako wysłane.</div></div>
+          <input name="tracking_no" value="{{ o['tracking_no'] or '' }}" placeholder="Numer śledzenia" required style="min-width:260px;">
+          <button class="btn primary" type="submit">Wysłane</button>
+          {% if o['tracking_no'] %}<a class="btn" target="_blank" href="https://t.17track.net/en#nums={{ o['tracking_no']|urlencode }}">Śledź</a>{% endif %}
+        </form>
+        {% if request.args.get('shipment_sent') == '1' %}<div class="hint" style="margin-top:10px;">Status i numer przesyłki zapisane. Klient otrzymał e-mail.</div>{% endif %}
+        {% if request.args.get('shipment_email_error') %}<div class="hint" style="margin-top:10px;">Status zapisany, ale e-mail nie został wysłany: {{ request.args.get('shipment_email_error') }}</div>{% endif %}
         {% if request.args.get('confirmation_sent') == '1' %}
           <div class="hint" style="margin-top:10px;">Potwierdzenie zamówienia zostało wysłane ponownie.</div>
         {% elif request.args.get('confirmation_error') %}
@@ -6348,10 +6368,58 @@ def order_delete(order_id):
 
     return redirect(url_for("orders"))
 
+@app.post("/orders/<int:order_id>/shipped")
+def order_mark_shipped(order_id):
+    tracking_no = re.sub(r"\s+", "", norm(request.form.get("tracking_no")))
+    if not tracking_no or len(tracking_no) > 120:
+        return "Podaj poprawny numer przesyłki", 400
+
+    maybe_pull_shared_from_supabase(force=True)
+    c = conn()
+    try:
+        cur = c.cursor()
+        cur.execute("SELECT * FROM orders WHERE id=?", (order_id,))
+        row = cur.fetchone()
+        if not row:
+            abort(404)
+        order = dict(row)
+        cur.execute(
+            "UPDATE orders SET status='shipped', tracking_no=?, shipped_at=? WHERE id=?",
+            (tracking_no, now_iso(), order_id),
+        )
+        c.commit()
+        cur.execute("SELECT * FROM orders WHERE id=?", (order_id,))
+        order = dict(cur.fetchone())
+    finally:
+        c.close()
+
+    if supabase_enabled():
+        try:
+            sync_local_rows_to_supabase("orders", "id", [order_id])
+        except Exception as exc:
+            app.logger.warning("Nie udało się zsynchronizować wysyłki zamówienia %s: %s", order_id, exc)
+
+    try:
+        result = _send_order_shipped_email(order, tracking_no)
+    except Exception as exc:
+        result = {"ok": False, "error": str(exc)}
+    event_key = f"order_shipped:{order_id}:{hashlib.sha256(tracking_no.encode('utf-8')).hexdigest()[:16]}"
+    _record_email_event(event_key, "order_shipped", order_id, order.get("customer_email"), result)
+    if result.get("ok"):
+        return redirect(url_for("order_view", order_id=order_id, shipment_sent="1"))
+    return redirect(url_for(
+        "order_view",
+        order_id=order_id,
+        shipment_email_error=norm(result.get("error"))[:240] or "nieznany błąd",
+    ))
+
+
 @app.post("/orders/<int:order_id>/status")
 def order_status_update(order_id):
     new_status = norm(request.form.get("status")).lower()
-    allowed = {"new", "confirmed", "in_delivery", "issued"}
+    # Status "shipped" można nadać wyłącznie osobnym formularzem,
+    # który wymaga numeru przesyłki i wysyła powiadomienie do klienta.
+    allowed = {"new", "confirmed", "packed", "in_delivery", "issued"}
     if new_status not in allowed:
         return "NieprawidĹ‚owy status", 400
 
@@ -6607,6 +6675,11 @@ def order_invoice(order_id):
             if not invoice_items:
                 msg = "Lista pakowania musi zawierac co najmniej jedna pozycje."
             else:
+                packed_order_ids = [
+                    int(item.get("source_order_id") or item.get("order_id") or order_id)
+                    for item in invoice_items
+                ]
+                mark_orders_packed(packed_order_ids)
                 packing_order_no = canonical_order_no(o["id"], o["created_at"], o["order_no"])
                 packing_meta = {
                     "invoice_no": packing_order_no,
@@ -7336,6 +7409,67 @@ def _record_email_event(event_key, event_type, ref_id, recipient, result):
         pass
     finally:
         c.close()
+
+
+def mark_orders_packed(order_ids) -> list[int]:
+    """Mark selected orders as being packed without issuing stock again."""
+    clean_ids = sorted({to_int(value, 0) for value in (order_ids or []) if to_int(value, 0) > 0})
+    if not clean_ids:
+        return []
+    c = conn()
+    try:
+        placeholders = ",".join(["?"] * len(clean_ids))
+        cur = c.cursor()
+        cur.execute(
+            f"""UPDATE orders
+                SET status='packed', packed_at=COALESCE(packed_at, ?)
+                WHERE id IN ({placeholders})
+                  AND LOWER(COALESCE(status,'')) NOT IN ('issued','completed','cancelled','shipped')""",
+            (now_iso(), *clean_ids),
+        )
+        c.commit()
+        cur.execute(f"SELECT id FROM orders WHERE id IN ({placeholders}) AND status='packed'", tuple(clean_ids))
+        changed_ids = [int(row["id"]) for row in cur.fetchall()]
+    finally:
+        c.close()
+    if changed_ids and supabase_enabled():
+        try:
+            sync_local_rows_to_supabase("orders", "id", changed_ids)
+        except Exception as exc:
+            app.logger.warning("Nie udało się zsynchronizować statusu pakowania: %s", exc)
+    return changed_ids
+
+
+def _send_order_shipped_email(order: dict, tracking_no: str) -> dict:
+    if not send_email:
+        return {"ok": False, "error": "Moduł wysyłki e-mail nie jest dostępny"}
+    recipient = _email_key(order.get("customer_email"))
+    if not recipient:
+        return {"ok": False, "error": "Zamówienie nie ma adresu e-mail klienta"}
+    try:
+        language = normalize_client_language(_client_profile_for_email(recipient).get("language"))
+    except Exception:
+        language = "pl"
+    order_no = canonical_order_no(order.get("id"), order.get("created_at"), order.get("order_no"))
+    messages = {
+        "pl": ("Zamówienie zostało wysłane", "Twoje zamówienie zostało wysłane.", "Numer śledzenia", "Śledź przesyłkę"),
+        "de": ("Ihre Bestellung wurde versandt", "Ihre Bestellung wurde versandt.", "Sendungsnummer", "Sendung verfolgen"),
+        "en": ("Your order has been shipped", "Your order has been shipped.", "Tracking number", "Track shipment"),
+        "es": ("Tu pedido ha sido enviado", "Tu pedido ha sido enviado.", "Número de seguimiento", "Seguir el envío"),
+        "it": ("Il tuo ordine è stato spedito", "Il tuo ordine è stato spedito.", "Numero di tracciamento", "Traccia la spedizione"),
+    }
+    subject_text, intro, tracking_label, link_label = messages.get(language, messages["pl"])
+    tracking_url = "https://t.17track.net/en#nums=" + urllib.parse.quote(tracking_no)
+    safe_order = str(order_no).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    safe_tracking = str(tracking_no).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    html_body = (
+        "<div style='font-family:Arial,sans-serif;color:#10203d'>"
+        f"<h2>{subject_text}</h2><p>{intro}</p><p><b>{safe_order}</b></p>"
+        f"<p>{tracking_label}: <b>{safe_tracking}</b></p>"
+        f"<p><a href='{tracking_url}'>{link_label}</a></p></div>"
+    )
+    text_body = f"{intro}\n{order_no}\n{tracking_label}: {tracking_no}\n{tracking_url}"
+    return send_email(recipient, f"{subject_text} – {order_no}", html_body, text_body)
 
 
 def _send_saved_order_confirmation(order_id: int, force: bool = False) -> dict:
@@ -8146,6 +8280,9 @@ def _api_order_lookup_impl():
             "id": order.get("id"),
             "order_no": order.get("order_no"),
             "status": order.get("status"),
+            "tracking_no": order.get("tracking_no") or "",
+            "packed_at": order.get("packed_at") or "",
+            "shipped_at": order.get("shipped_at") or "",
             "created_at": order.get("created_at"),
             "customer_name": order.get("customer_name"),
             "customer_address": order.get("customer_address"),
@@ -9126,6 +9263,7 @@ def order_packing_list_download_admin(order_id):
     if not items:
         return "Brak pozycji dostępnych obecnie na magazynie do spakowania", 400
 
+    mark_orders_packed([order_id])
     order_no = canonical_order_no(order_row["id"], order_row["created_at"], order_row["order_no"])
     note = norm(order_row["note"])
     for item in items:
@@ -9163,6 +9301,11 @@ def invoice_packing_list_download_admin(invoice_id):
     items = invoice_items_from_saved_json(invoice_id)
     if not items:
         return "Brak pozycji faktury", 400
+
+    mark_orders_packed([
+        int(item.get("source_order_id") or item.get("order_id") or inv.get("order_id") or 0)
+        for item in items
+    ])
 
     ok_pdf, invoice_abs_path = invoice_pdf_exists(inv.get("pdf_path", ""), inv.get("invoice_no", ""))
     pack_path = packing_list_pdf_path_for_invoice(invoice_abs_path if ok_pdf else "", inv.get("invoice_no") or f"FV_{invoice_id}")
