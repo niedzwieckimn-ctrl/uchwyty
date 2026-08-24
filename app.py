@@ -882,7 +882,7 @@ def order_status_label(status: str) -> str:
         "pending": "Niepotwierdzone",
         "unconfirmed": "Niepotwierdzone",
         "confirmed": "Potwierdzone",
-        "packed": "W trakcie pakowania / czeka na kuriera",
+        "packed": "W trakcie pakowania",
         "in_delivery": "W dostawie",
         "shipped": "Wysłane",
         "issued": "Zrealizowane",
