@@ -821,7 +821,10 @@ def payment_type_pl(x: str) -> str:
 
 VAT_23 = Decimal("0.23")
 MONEY_Q = Decimal("0.01")
-CURRENT_ORDER_STATUSES = {"new", "pending", "unconfirmed", "confirmed", "packed", "in_delivery", "shipped"}
+CURRENT_ORDER_STATUSES = {
+    "new", "pending", "unconfirmed", "confirmed", "packed", "packed_partial",
+    "in_delivery", "shipped", "partially_shipped",
+}
 
 
 def money_dec(value) -> Decimal:
@@ -883,8 +886,10 @@ def order_status_label(status: str) -> str:
         "unconfirmed": "Niepotwierdzone",
         "confirmed": "Potwierdzone",
         "packed": "W trakcie pakowania / czeka na kuriera",
+        "packed_partial": "Pakowanie częściowej wysyłki",
         "in_delivery": "W dostawie",
         "shipped": "Wysłane",
+        "partially_shipped": "Wysłane częściowo",
         "issued": "Zrealizowane",
     }
     return mapping.get(v, status or "-")
@@ -897,8 +902,10 @@ def order_status_css(status: str) -> str:
         "unconfirmed": "st-unconfirmed",
         "confirmed": "st-confirmed",
         "packed": "st-delivery",
+        "packed_partial": "st-delivery",
         "in_delivery": "st-delivery",
         "shipped": "st-confirmed",
+        "partially_shipped": "st-delivery",
         "issued": "st-issued",
     }
     return mapping.get(v, "")
@@ -1960,9 +1967,9 @@ def order_pdf_status(status, language: str) -> str:
     key = norm(status).lower()
     if key in {"new", "pending", "unconfirmed"}:
         label_key = "status_unconfirmed"
-    elif key in {"confirmed", "packed"}:
+    elif key in {"confirmed", "packed", "packed_partial"}:
         label_key = "status_confirmed"
-    elif key in {"in_delivery", "shipped"}:
+    elif key in {"in_delivery", "shipped", "partially_shipped"}:
         label_key = "status_in_delivery"
     elif key in {"issued", "completed"}:
         label_key = "status_completed"
@@ -3091,7 +3098,7 @@ def finalize_legacy_shipped_orders_with_full_invoice():
     """Naprawia starszy stan: faktura kompletna, ale status nadal 'shipped'."""
     c = conn()
     cur = c.cursor()
-    cur.execute("SELECT id FROM orders WHERE LOWER(COALESCE(status,''))='shipped'")
+    cur.execute("SELECT id FROM orders WHERE LOWER(COALESCE(status,'')) IN ('shipped','partially_shipped')")
     shipped_order_ids = [int(row["id"]) for row in cur.fetchall()]
     c.close()
     if shipped_order_ids:
@@ -3509,7 +3516,7 @@ def home():
     cur = c.cursor()
     cur.execute("SELECT COUNT(*) AS n FROM products WHERE COALESCE(archived,0)=0")
     n_products = cur.fetchone()["n"]
-    cur.execute("SELECT COUNT(*) AS n FROM orders WHERE status IN ('new','packed','confirmed','in_delivery')")
+    cur.execute("SELECT COUNT(*) AS n FROM orders WHERE status IN ('new','packed','packed_partial','confirmed','in_delivery','shipped','partially_shipped')")
     n_orders_current = cur.fetchone()["n"]
     cur.execute("SELECT COUNT(*) AS n FROM china_packages WHERE status IN ('planned','ordered','shipped')")
     n_china_active = cur.fetchone()["n"]
@@ -3626,7 +3633,7 @@ def home():
     cur.execute("SELECT status,COUNT(*) AS n FROM orders GROUP BY status")
     status_counts = {norm(r["status"]).lower(): int(r["n"] or 0) for r in cur.fetchall()}
     status_new = sum(status_counts.get(x,0) for x in ("new","pending","unconfirmed"))
-    status_work = sum(status_counts.get(x,0) for x in ("confirmed","packed","in_delivery","shipped"))
+    status_work = sum(status_counts.get(x,0) for x in ("confirmed","packed","packed_partial","in_delivery","shipped","partially_shipped"))
     status_done = status_counts.get("issued",0)
     status_cancelled = status_counts.get("cancelled",0)
     status_total = status_new + status_work + status_done + status_cancelled
@@ -5597,9 +5604,10 @@ def orders():
     cur.execute(sql, tuple(params))
     rows = [dict(r) for r in cur.fetchall()]
 
-    visible_open_ids = sorted([r["id"] for r in rows if int(r.get("warehouse_issued") or 0) == 0 and r["status"] in ("new", "packed", "confirmed", "in_delivery")])
+    visible_open_ids = sorted([r["id"] for r in rows if int(r.get("warehouse_issued") or 0) == 0 and norm(r["status"]).lower() in CURRENT_ORDER_STATUSES])
     if visible_open_ids:
-        cur.execute("SELECT id FROM orders WHERE COALESCE(warehouse_issued,0)=0 AND status IN ('new','packed','confirmed','in_delivery') AND id<=? ORDER BY id", (visible_open_ids[-1],))
+        status_ph = ",".join(["?"] * len(CURRENT_ORDER_STATUSES))
+        cur.execute(f"SELECT id FROM orders WHERE COALESCE(warehouse_issued,0)=0 AND LOWER(COALESCE(status,'')) IN ({status_ph}) AND id<=? ORDER BY id", (*sorted(CURRENT_ORDER_STATUSES), visible_open_ids[-1]))
         open_order_ids = [int(r["id"]) for r in cur.fetchall()]
 
         ph = ",".join(["?"] * len(open_order_ids))
@@ -6022,8 +6030,9 @@ def order_view(order_id):
         it["delivery_used"] = 0
         it["line_shortage"] = 0
 
-    if o["status"] in ("new", "packed", "confirmed", "in_delivery"):
-        cur.execute("SELECT id FROM orders WHERE status IN ('new','packed','confirmed','in_delivery') AND id<=? ORDER BY id", (order_id,))
+    if norm(o["status"]).lower() in CURRENT_ORDER_STATUSES:
+        status_ph = ",".join(["?"] * len(CURRENT_ORDER_STATUSES))
+        cur.execute(f"SELECT id FROM orders WHERE LOWER(COALESCE(status,'')) IN ({status_ph}) AND id<=? ORDER BY id", (*sorted(CURRENT_ORDER_STATUSES), order_id))
         scoped_order_ids = [int(r["id"]) for r in cur.fetchall()]
         if scoped_order_ids:
             sph = ",".join(["?"] * len(scoped_order_ids))
@@ -6476,6 +6485,7 @@ def order_mark_shipped(order_id):
             f"""UPDATE orders
                 SET status=CASE
                       WHEN LOWER(COALESCE(status,'')) IN ('issued','completed') THEN status
+                      WHEN LOWER(COALESCE(status,''))='packed_partial' THEN 'partially_shipped'
                       ELSE 'shipped'
                     END,
                     tracking_no=?, carrier=?, shipped_at=?
@@ -6788,7 +6798,7 @@ def order_invoice(order_id):
                     "buyer_email": data.get("buyer_email") or o["customer_email"] or "",
                 }
                 packing_path = generate_invoice_packing_list_pdf(o, invoice_items, packing_meta)
-                mark_orders_packed(packed_order_ids, packing_path=packing_path)
+                mark_orders_packed(packed_order_ids, packing_path=packing_path, packing_items=invoice_items)
                 return send_file(
                     packing_path,
                     mimetype="application/pdf",
@@ -7512,24 +7522,66 @@ def _record_email_event(event_key, event_type, ref_id, recipient, result):
         c.close()
 
 
-def mark_orders_packed(order_ids, packing_path: str = "") -> list[int]:
-    """Mark selected orders as being packed without issuing stock again."""
+def _partial_packing_order_ids(order_ids, packing_items) -> set[int]:
+    """Return orders whose current packing list does not cover every ordered item."""
     clean_ids = sorted({to_int(value, 0) for value in (order_ids or []) if to_int(value, 0) > 0})
-    if not clean_ids:
-        return []
+    if not clean_ids or not packing_items:
+        return set()
+    selected_by_item = {}
+    for item in packing_items:
+        item_id = to_int(item.get("order_item_id") or item.get("id"), 0)
+        if item_id <= 0:
+            continue
+        selected_by_item[item_id] = selected_by_item.get(item_id, 0) + max(0, to_int(item.get("qty"), 0))
     c = conn()
     try:
         placeholders = ",".join(["?"] * len(clean_ids))
         cur = c.cursor()
         cur.execute(
-            f"""UPDATE orders
-                SET status='packed', packed_at=?
-                WHERE id IN ({placeholders})
-                  AND LOWER(COALESCE(status,'')) NOT IN ('issued','completed','cancelled','shipped')""",
-            (now_iso(), *clean_ids),
+            f"SELECT id, order_id, qty FROM order_items WHERE order_id IN ({placeholders})",
+            tuple(clean_ids),
         )
+        rows = [dict(row) for row in cur.fetchall()]
+    finally:
+        c.close()
+    rows_by_order = {}
+    for row in rows:
+        rows_by_order.setdefault(to_int(row.get("order_id"), 0), []).append(row)
+    partial_ids = set()
+    for order_id in clean_ids:
+        order_rows = rows_by_order.get(order_id, [])
+        if not order_rows or any(
+            selected_by_item.get(to_int(row.get("id"), 0), 0) < max(0, to_int(row.get("qty"), 0))
+            for row in order_rows
+        ):
+            partial_ids.add(order_id)
+    return partial_ids
+
+
+def mark_orders_packed(order_ids, packing_path: str = "", packing_items=None) -> list[int]:
+    """Mark selected orders as being packed without issuing stock again."""
+    clean_ids = sorted({to_int(value, 0) for value in (order_ids or []) if to_int(value, 0) > 0})
+    if not clean_ids:
+        return []
+    partial_ids = _partial_packing_order_ids(clean_ids, packing_items)
+    c = conn()
+    try:
+        placeholders = ",".join(["?"] * len(clean_ids))
+        cur = c.cursor()
+        packed_at = now_iso()
+        for packed_order_id in clean_ids:
+            next_status = "packed_partial" if packed_order_id in partial_ids else "packed"
+            cur.execute(
+                """UPDATE orders SET status=?, packed_at=?
+                   WHERE id=? AND LOWER(COALESCE(status,''))
+                   NOT IN ('issued','completed','cancelled','shipped')""",
+                (next_status, packed_at, packed_order_id),
+            )
         c.commit()
-        cur.execute(f"SELECT id FROM orders WHERE id IN ({placeholders}) AND status='packed'", tuple(clean_ids))
+        cur.execute(
+            f"SELECT id FROM orders WHERE id IN ({placeholders}) AND status IN ('packed','packed_partial')",
+            tuple(clean_ids),
+        )
         changed_ids = [int(row["id"]) for row in cur.fetchall()]
     finally:
         c.close()
@@ -7783,6 +7835,16 @@ def _send_orders_shipped_email(orders: list[dict], tracking_no: str, carrier: st
         },
     }
     copy = messages.get(language, messages["pl"])
+    if any(norm(item.get("status")).lower() == "partially_shipped" for item in orders):
+        partial_copy = {
+            "pl": ("Częściowa wysyłka zamówień {numbers}", "Zamówienia zostały wysłane częściowo", "Przekazaliśmy kurierowi część produktów z poniższych zamówień. Pozostałe pozycje wyślemy osobno."),
+            "de": ("Teillieferung der Bestellungen {numbers}", "Ihre Bestellungen wurden teilweise versandt", "Ein Teil der Produkte aus den folgenden Bestellungen wurde an den Paketdienst übergeben. Die übrigen Positionen werden separat versandt."),
+            "en": ("Partial shipment of orders {numbers}", "Your orders have been partially shipped", "Some products from the following orders have been handed over to the courier. The remaining items will be shipped separately."),
+            "es": ("Envío parcial de los pedidos {numbers}", "Tus pedidos se han enviado parcialmente", "Hemos entregado al transportista una parte de los productos de los siguientes pedidos. Los artículos restantes se enviarán por separado."),
+            "it": ("Spedizione parziale degli ordini {numbers}", "I tuoi ordini sono stati spediti parzialmente", "Abbiamo affidato al corriere una parte dei prodotti dei seguenti ordini. Gli articoli rimanenti saranno spediti separatamente."),
+        }.get(language)
+        if partial_copy:
+            copy = dict(copy, subject=partial_copy[0], title=partial_copy[1], intro=partial_copy[2])
     numbers_text = ", ".join(order_numbers)
     tracking_url = carrier_tracking_url(carrier, tracking_no)
     carrier_names = {"inpost": "InPost", "dpd": "DPD", "fedex": "FedEx", "dhl": "DHL", "ups": "UPS"}
@@ -7890,6 +7952,16 @@ def _send_order_shipped_email(order: dict, tracking_no: str, carrier: str, packi
         },
     }
     copy = messages.get(language, messages["pl"])
+    if norm(order.get("status")).lower() == "partially_shipped":
+        partial_copy = {
+            "pl": ("Częściowa wysyłka zamówienia {order_no}", "Zamówienie zostało wysłane częściowo", "Przekazaliśmy kurierowi część produktów z Twojego zamówienia. Pozostałe pozycje wyślemy osobno."),
+            "de": ("Teillieferung der Bestellung {order_no}", "Ihre Bestellung wurde teilweise versandt", "Ein Teil der Produkte aus Ihrer Bestellung wurde an den Paketdienst übergeben. Die übrigen Positionen werden separat versandt."),
+            "en": ("Partial shipment of order {order_no}", "Your order has been partially shipped", "Some products from your order have been handed over to the courier. The remaining items will be shipped separately."),
+            "es": ("Envío parcial del pedido {order_no}", "Tu pedido se ha enviado parcialmente", "Hemos entregado al transportista una parte de los productos de tu pedido. Los artículos restantes se enviarán por separado."),
+            "it": ("Spedizione parziale dell'ordine {order_no}", "Il tuo ordine è stato spedito parzialmente", "Abbiamo affidato al corriere una parte dei prodotti del tuo ordine. Gli articoli rimanenti saranno spediti separatamente."),
+        }.get(language)
+        if partial_copy:
+            copy = dict(copy, subject=partial_copy[0], title=partial_copy[1], intro=partial_copy[2])
     tracking_url = carrier_tracking_url(carrier, tracking_no)
     carrier_names = {"inpost": "InPost", "dpd": "DPD", "fedex": "FedEx", "dhl": "DHL", "ups": "UPS"}
     carrier_name = carrier_names.get(norm(carrier).lower(), norm(carrier) or "—")
@@ -8640,8 +8712,9 @@ def _api_order_lookup_impl():
         it["line_shortage"] = 0
 
     order_id = int(order["id"])
-    if order.get("status") in ("new", "packed", "confirmed", "in_delivery"):
-        cur.execute("SELECT id FROM orders WHERE status IN ('new','packed','confirmed','in_delivery') AND id<=? ORDER BY id", (order_id,))
+    if norm(order.get("status")).lower() in CURRENT_ORDER_STATUSES:
+        status_ph = ",".join(["?"] * len(CURRENT_ORDER_STATUSES))
+        cur.execute(f"SELECT id FROM orders WHERE LOWER(COALESCE(status,'')) IN ({status_ph}) AND id<=? ORDER BY id", (*sorted(CURRENT_ORDER_STATUSES), order_id))
         scoped_order_ids = [int(r["id"]) for r in cur.fetchall()]
         if scoped_order_ids:
             sph = ",".join(["?"] * len(scoped_order_ids))
@@ -9734,7 +9807,7 @@ def order_packing_list_download_admin(order_id):
         "buyer_email": norm(order_row["customer_email"]),
     }
     pack_path = generate_invoice_packing_list_pdf(order_row, items, meta)
-    mark_orders_packed([order_id], packing_path=pack_path)
+    mark_orders_packed([order_id], packing_path=pack_path, packing_items=items)
     return send_file(
         pack_path,
         mimetype="application/pdf",
@@ -9767,7 +9840,7 @@ def invoice_packing_list_download_admin(invoice_id):
     mark_orders_packed([
         int(item.get("source_order_id") or item.get("order_id") or inv.get("order_id") or 0)
         for item in items
-    ], packing_path=pack_path)
+    ], packing_path=pack_path, packing_items=items)
     if supabase_enabled():
         try:
             packing_ref = supabase_storage_upload_file(
