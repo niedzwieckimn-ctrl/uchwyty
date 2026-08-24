@@ -3314,6 +3314,16 @@ def security_gate():
             return jsonify(ok=False, error="Zbyt wiele żądań"), 429
         user = _authenticated_client_user()
         if not user:
+            # Stare e-maile wskazuja endpoint PDF bez naglowka Authorization.
+            # Przekierowujemy do panelu; dokument nadal wymaga tokenu po loginie.
+            old_invoice_link = re.fullmatch(r"/api/invoices/(\d+)/download", path)
+            if request.method == "GET" and old_invoice_link:
+                invoice_id = int(old_invoice_link.group(1))
+                panel_url = (
+                    f"{CLIENT_PANEL_URL}/?"
+                    + urllib.parse.urlencode({"section": "invoices", "invoice": invoice_id})
+                )
+                return redirect(panel_url, code=302)
             return jsonify(ok=False, error="Brak autoryzacji"), 401
         g.client_user = user
         return None
