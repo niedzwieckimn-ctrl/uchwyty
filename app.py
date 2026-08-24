@@ -3087,6 +3087,17 @@ def finalize_fully_invoiced_orders(order_ids: list[int]):
     return completed_order_ids, list(set(changed_product_ids))
 
 
+def finalize_legacy_shipped_orders_with_full_invoice():
+    """Naprawia starszy stan: faktura kompletna, ale status nadal 'shipped'."""
+    c = conn()
+    cur = c.cursor()
+    cur.execute("SELECT id FROM orders WHERE LOWER(COALESCE(status,''))='shipped'")
+    shipped_order_ids = [int(row["id"]) for row in cur.fetchall()]
+    c.close()
+    if shipped_order_ids:
+        finalize_fully_invoiced_orders(shipped_order_ids)
+
+
 def reconcile_orders_after_invoice_change(order_ids: list[int]):
     touched = sorted({int(x) for x in order_ids if x})
     if not touched:
@@ -3491,6 +3502,9 @@ app.jinja_env.globals["carrier_tracking_url"] = carrier_tracking_url
 @app.get("/")
 def home():
     maybe_pull_shared_from_supabase()
+    # Zachowujemy kolejność: Wysłane -> faktura -> Zrealizowane.
+    # Przy okazji naprawiamy rekordy utworzone przez starszą wersję kodu.
+    finalize_legacy_shipped_orders_with_full_invoice()
     c = conn()
     cur = c.cursor()
     cur.execute("SELECT COUNT(*) AS n FROM products WHERE COALESCE(archived,0)=0")
@@ -6459,7 +6473,13 @@ def order_mark_shipped(order_id):
         placeholders = ",".join(["?"] * len(package_order_ids))
         shipped_at = now_iso()
         cur.execute(
-            f"UPDATE orders SET status='shipped', tracking_no=?, carrier=?, shipped_at=? WHERE id IN ({placeholders})",
+            f"""UPDATE orders
+                SET status=CASE
+                      WHEN LOWER(COALESCE(status,'')) IN ('issued','completed') THEN status
+                      ELSE 'shipped'
+                    END,
+                    tracking_no=?, carrier=?, shipped_at=?
+                WHERE id IN ({placeholders})""",
             (tracking_no, carrier, shipped_at, *package_order_ids),
         )
         c.commit()
