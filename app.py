@@ -882,7 +882,7 @@ def order_status_label(status: str) -> str:
         "pending": "Niepotwierdzone",
         "unconfirmed": "Niepotwierdzone",
         "confirmed": "Potwierdzone",
-        "packed": "W trakcie pakowania",
+        "packed": "W trakcie pakowania / czeka na kuriera",
         "in_delivery": "W dostawie",
         "shipped": "Wysłane",
         "issued": "Zrealizowane",
@@ -6715,7 +6715,7 @@ def order_invoice(order_id):
                     "buyer_email": data.get("buyer_email") or o["customer_email"] or "",
                 }
                 packing_path = generate_invoice_packing_list_pdf(o, invoice_items, packing_meta)
-                mark_orders_packed(packed_order_ids)
+                mark_orders_packed(packed_order_ids, packing_path=packing_path)
                 return send_file(
                     packing_path,
                     mimetype="application/pdf",
@@ -7439,7 +7439,7 @@ def _record_email_event(event_key, event_type, ref_id, recipient, result):
         c.close()
 
 
-def mark_orders_packed(order_ids) -> list[int]:
+def mark_orders_packed(order_ids, packing_path: str = "") -> list[int]:
     """Mark selected orders as being packed without issuing stock again."""
     clean_ids = sorted({to_int(value, 0) for value in (order_ids or []) if to_int(value, 0) > 0})
     if not clean_ids:
@@ -7474,34 +7474,47 @@ def mark_orders_packed(order_ids) -> list[int]:
             packed_orders = [dict(row) for row in cur.fetchall()]
         finally:
             c.close()
-        for packed_order in packed_orders:
-            packed_id = to_int(packed_order.get("id"), 0)
-            event_key = f"order_packed:{packed_id}"
-            if _email_event_already_ok(event_key):
-                continue
+        pending_orders = [
+            order for order in packed_orders
+            if not _email_event_already_ok(f"order_packed:{to_int(order.get('id'), 0)}")
+        ]
+        orders_by_recipient = {}
+        for packed_order in pending_orders:
+            recipient = _email_key(packed_order.get("customer_email"))
+            orders_by_recipient.setdefault(recipient, []).append(packed_order)
+        for recipient, recipient_orders in orders_by_recipient.items():
             try:
-                result = _send_order_packed_email(packed_order)
+                result = _send_orders_packed_email(
+                    recipient_orders,
+                    packing_path=packing_path,
+                )
             except Exception as exc:
                 result = {"ok": False, "error": str(exc)}
-            _record_email_event(
-                event_key,
-                "order_packed",
-                packed_id,
-                packed_order.get("customer_email"),
-                result,
-            )
+            for packed_order in recipient_orders:
+                packed_id = to_int(packed_order.get("id"), 0)
+                _record_email_event(
+                    f"order_packed:{packed_id}",
+                    "order_packed",
+                    packed_id,
+                    recipient,
+                    result,
+                )
             if not result.get("ok"):
                 app.logger.warning(
-                    "Nie udalo sie wyslac informacji o pakowaniu zamowienia %s: %s",
-                    packed_id,
+                    "Nie udalo sie wyslac zbiorczej informacji o pakowaniu zamowien %s: %s",
+                    ",".join(str(to_int(order.get("id"), 0)) for order in recipient_orders),
                     norm(result.get("error")) or "nieznany blad",
                 )
     return changed_ids
 
 
-def _send_order_packed_email(order: dict) -> dict:
+def _send_orders_packed_email(orders: list[dict], packing_path: str = "") -> dict:
     if not send_email:
         return {"ok": False, "error": "Modul wysylki e-mail nie jest dostepny"}
+    orders = [dict(order) for order in (orders or []) if order]
+    if not orders:
+        return {"ok": False, "error": "Brak zamowien do wyslania"}
+    order = orders[0]
     recipient = _email_key(order.get("customer_email"))
     if not recipient:
         return {"ok": False, "error": "Zamowienie nie ma adresu e-mail klienta"}
@@ -7509,13 +7522,17 @@ def _send_order_packed_email(order: dict) -> dict:
         language = normalize_client_language(_client_profile_for_email(recipient).get("language"))
     except Exception:
         language = "pl"
-    order_no = canonical_order_no(order.get("id"), order.get("created_at"), order.get("order_no"))
+    order_numbers = [
+        canonical_order_no(item.get("id"), item.get("created_at"), item.get("order_no"))
+        for item in orders
+    ]
+    multiple = len(order_numbers) > 1
     messages = {
-        "pl": ("Rozpoczęliśmy pakowanie zamówienia", "Twoje zamówienie jest w trakcie pakowania i będzie oczekiwać na odbiór przez kuriera."),
-        "de": ("Wir verpacken Ihre Bestellung", "Ihre Bestellung wird derzeit verpackt und wartet anschließend auf die Abholung durch den Kurier."),
-        "en": ("We are packing your order", "Your order is being packed and will then wait for courier collection."),
-        "es": ("Estamos preparando tu pedido", "Tu pedido se está preparando y después quedará a la espera de la recogida por el transportista."),
-        "it": ("Stiamo preparando il tuo ordine", "Il tuo ordine è in fase di preparazione e sarà poi in attesa del ritiro da parte del corriere."),
+        "pl": (("Rozpoczęliśmy pakowanie zamówień" if multiple else "Rozpoczęliśmy pakowanie zamówienia"), ("Twoje zamówienia są pakowane razem i będą oczekiwać na odbiór przez kuriera." if multiple else "Twoje zamówienie jest w trakcie pakowania i będzie oczekiwać na odbiór przez kuriera.")),
+        "de": (("Wir verpacken Ihre Bestellungen" if multiple else "Wir verpacken Ihre Bestellung"), ("Ihre Bestellungen werden gemeinsam verpackt und warten anschließend auf die Abholung durch den Kurier." if multiple else "Ihre Bestellung wird derzeit verpackt und wartet anschließend auf die Abholung durch den Kurier.")),
+        "en": (("We are packing your orders" if multiple else "We are packing your order"), ("Your orders are being packed together and will then wait for courier collection." if multiple else "Your order is being packed and will then wait for courier collection.")),
+        "es": (("Estamos preparando tus pedidos" if multiple else "Estamos preparando tu pedido"), ("Tus pedidos se están preparando juntos y después quedarán a la espera de la recogida por el transportista." if multiple else "Tu pedido se está preparando y después quedará a la espera de la recogida por el transportista.")),
+        "it": (("Stiamo preparando i tuoi ordini" if multiple else "Stiamo preparando il tuo ordine"), ("I tuoi ordini vengono preparati insieme e saranno poi in attesa del ritiro da parte del corriere." if multiple else "Il tuo ordine è in fase di preparazione e sarà poi in attesa del ritiro da parte del corriere.")),
     }
     subject_text, intro = messages.get(language, messages["pl"])
     attachment_note = {
@@ -7525,21 +7542,40 @@ def _send_order_packed_email(order: dict) -> dict:
         "es": "La lista de embalaje está adjunta.",
         "it": "La lista di imballaggio è allegata.",
     }.get(language, "Lista pakowania znajduje się w załączniku.")
-    safe_order = html.escape(str(order_no), quote=True)
+    safe_orders = "".join(
+        f"<li style='margin:4px 0'><b>{html.escape(str(order_no), quote=True)}</b></li>"
+        for order_no in order_numbers
+    )
     html_body = (
         "<div style='font-family:Arial,sans-serif;color:#10203d'>"
-        f"<h2>{subject_text}</h2><p><b>{safe_order}</b></p><p>{intro}</p>"
+        f"<h2>{subject_text}</h2><p>{intro}</p><ul style='padding-left:20px'>{safe_orders}</ul>"
         f"<p>{attachment_note}</p></div>"
     )
-    text_body = f"{subject_text}\n{order_no}\n{intro}\n{attachment_note}"
-    packing_attachment = _order_packing_list_email_attachment(order)
+    text_body = f"{subject_text}\n{intro}\n" + "\n".join(order_numbers) + f"\n{attachment_note}"
+    if packing_path and os.path.exists(packing_path):
+        with open(packing_path, "rb") as pdf_file:
+            packing_content = pdf_file.read()
+        if not packing_content:
+            return {"ok": False, "error": "Wygenerowana lista pakowania jest pusta"}
+        packing_attachment = {
+            "filename": f"{safe_filename(order_numbers[0])}_lista_pakowania.pdf",
+            "content": packing_content,
+        }
+    else:
+        packing_attachment = _order_packing_list_email_attachment(order)
+    subject_orders = ", ".join(order_numbers)
     return send_email(
         recipient,
-        f"{subject_text} – {order_no}",
+        f"{subject_text} – {subject_orders}",
         html_body,
         text_body,
         attachments=[packing_attachment],
     )
+
+
+def _send_order_packed_email(order: dict) -> dict:
+    """Compatibility wrapper for callers that still pack one order."""
+    return _send_orders_packed_email([order])
 
 
 def _order_packing_list_email_attachment(order: dict) -> dict:
@@ -9499,7 +9535,7 @@ def order_packing_list_download_admin(order_id):
         "buyer_email": norm(order_row["customer_email"]),
     }
     pack_path = generate_invoice_packing_list_pdf(order_row, items, meta)
-    mark_orders_packed([order_id])
+    mark_orders_packed([order_id], packing_path=pack_path)
     return send_file(
         pack_path,
         mimetype="application/pdf",
@@ -9532,7 +9568,7 @@ def invoice_packing_list_download_admin(invoice_id):
     mark_orders_packed([
         int(item.get("source_order_id") or item.get("order_id") or inv.get("order_id") or 0)
         for item in items
-    ])
+    ], packing_path=pack_path)
     if supabase_enabled():
         try:
             packing_ref = supabase_storage_upload_file(
