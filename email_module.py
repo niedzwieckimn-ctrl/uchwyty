@@ -271,7 +271,7 @@ def send_invoice_available(invoice: dict, pdf_url: str = "", admin_email: str = 
     recipients = _uniq_emails([buyer_email, admin_email or email_config_summary().get("admin_email")])
     link_html = (
         f"<p><a href='{_esc(pdf_url)}' style='display:inline-block;background:#111;color:#fff;"
-        "padding:10px 14px;border-radius:10px;text-decoration:none'>Pobierz PDF</a></p>"
+        "padding:10px 14px;border-radius:10px;text-decoration:none'>Otwórz fakturę w panelu</a></p>"
         if pdf_url
         else ""
     )
