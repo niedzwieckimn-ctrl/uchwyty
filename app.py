@@ -949,6 +949,10 @@ CLIENT_ALLOWED_ORIGINS = {
     for value in os.environ.get("CLIENT_ALLOWED_ORIGINS", "").split(",")
     if value.strip()
 }
+CLIENT_PANEL_URL = (
+    os.environ.get("CLIENT_PANEL_URL")
+    or "https://panel-klienta-niedzwieccy.netlify.app"
+).strip().rstrip("/")
 ADMIN_ACTION_TOKEN = os.environ.get("ADMIN_ACTION_TOKEN", "").strip()
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin").strip()
 ADMIN_PASSWORD_HASH = os.environ.get("ADMIN_PASSWORD_HASH", "").strip()
@@ -10174,12 +10178,12 @@ def _invoice_email_context(invoice_id: int):
         abort(404)
 
     invoice = dict(row)
-    email = _email_key(invoice.get("buyer_email") or invoice.get("customer_email"))
-    if email:
-        pdf_url = build_public_url(f"/api/invoices/{invoice_id}/download?email={urllib.parse.quote_plus(email)}")
-    else:
-        pdf_url = build_public_url(f"/api/invoices/{invoice_id}/download")
-    return invoice, pdf_url
+    # Wiadomość otwiera panel. Sam PDF pozostaje chroniony tokenem klienta.
+    panel_url = (
+        f"{CLIENT_PANEL_URL}/?"
+        + urllib.parse.urlencode({"section": "invoices", "invoice": invoice_id})
+    )
+    return invoice, panel_url
 
 
 def _send_invoice_to_client(invoice_id: int) -> tuple[int, bool, str]:
