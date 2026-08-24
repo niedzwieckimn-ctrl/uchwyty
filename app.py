@@ -2664,6 +2664,15 @@ def generate_invoice_packing_list_pdf(order_row, items, meta, invoice_pdf_path: 
             return order_no[:-(len(note) + 1)].strip()
         return order_no
 
+    packing_order_numbers = []
+    for item in items:
+        source_no = strip_note_from_order_no(
+            item.get("source_order_no"),
+            item.get("source_order_note"),
+        )
+        if source_no and source_no not in packing_order_numbers:
+            packing_order_numbers.append(source_no)
+
     language = normalize_client_language(meta.get("language") or order_value("language"))
     if not (meta.get("language") or order_value("language")):
         customer_email = norm(order_value("customer_email") or meta.get("buyer_email"))
@@ -2688,7 +2697,12 @@ def generate_invoice_packing_list_pdf(order_row, items, meta, invoice_pdf_path: 
         cpdf.setFillColorRGB(*muted)
         cpdf.setFont(pdf_font_bold, 9)
         document_label_key = norm(meta.get("document_label_key")) or "invoice"
-        subtitle = f"{tr(document_label_key)}: {norm(meta.get('invoice_no') or '-')}"
+        subtitle_value = norm(meta.get("invoice_no") or "-")
+        if document_label_key == "order" and packing_order_numbers:
+            subtitle_value = ", ".join(packing_order_numbers)
+        subtitle = f"{tr(document_label_key)}: {subtitle_value}"
+        subtitle_size = fit_font_size(subtitle, 105 * mm, pdf_font_bold, 9, minimum_size=5.5)
+        cpdf.setFont(pdf_font_bold, subtitle_size)
         if continuation:
             subtitle += f"  |  {tr('continued')}"
         cpdf.drawRightString(195 * mm, h - 23 * mm, subtitle)
@@ -2711,7 +2725,7 @@ def generate_invoice_packing_list_pdf(order_row, items, meta, invoice_pdf_path: 
 
     y = draw_header()
     customer_name = norm(meta.get("buyer_name") or order_value("customer_name") or "-")
-    main_order_no = norm(order_value("order_no") or order_value("number") or "-")
+    main_order_no = ", ".join(packing_order_numbers) or norm(order_value("order_no") or order_value("number") or "-")
     # Data w naglowku pochodzi z zamowienia. Osobna data wydruku jest
     # umieszczana na dole przy polu osoby pakujacej.
     order_created_at = norm(order_value("created_at") or "")
@@ -2725,7 +2739,10 @@ def generate_invoice_packing_list_pdf(order_row, items, meta, invoice_pdf_path: 
     y -= 6 * mm
     cpdf.setFillColorRGB(*navy)
     cpdf.setFont(pdf_font_bold, 10.5)
-    cpdf.drawString(15 * mm, y, fit_text(main_order_no, 50 * mm, pdf_font_bold, 10.5))
+    main_order_font_size = fit_font_size(main_order_no, 50 * mm, pdf_font_bold, 10.5, minimum_size=5.5)
+    cpdf.setFont(pdf_font_bold, main_order_font_size)
+    cpdf.drawString(15 * mm, y, main_order_no)
+    cpdf.setFont(pdf_font_bold, 10.5)
     cpdf.drawString(72 * mm, y, order_date)
     cpdf.drawString(122 * mm, y, fit_text(customer_name, 73 * mm, pdf_font, 10))
     y = draw_table_header(y - 11 * mm)
@@ -6401,6 +6418,22 @@ def order_mark_shipped(order_id):
         if not row:
             abort(404)
         order = dict(row)
+        package_orders = [order]
+        packed_at = norm(order.get("packed_at"))
+        recipient_key = _email_key(order.get("customer_email"))
+        if packed_at and recipient_key:
+            cur.execute(
+                """SELECT * FROM orders
+                   WHERE packed_at=?
+                     AND LOWER(TRIM(COALESCE(customer_email,'')))=?
+                     AND LOWER(COALESCE(status,'')) NOT IN ('cancelled','issued','completed')
+                   ORDER BY id""",
+                (packed_at, recipient_key),
+            )
+            grouped_rows = [dict(item) for item in cur.fetchall()]
+            if grouped_rows:
+                package_orders = grouped_rows
+        package_order_ids = [to_int(item.get("id"), 0) for item in package_orders]
         try:
             packing_attachment = _order_packing_list_email_attachment(order)
         except Exception as exc:
@@ -6409,28 +6442,34 @@ def order_mark_shipped(order_id):
                 order_id=order_id,
                 shipment_email_error=("Nie udało się przygotować listy pakowania: " + str(exc))[:240],
             ))
+        placeholders = ",".join(["?"] * len(package_order_ids))
+        shipped_at = now_iso()
         cur.execute(
-            "UPDATE orders SET status='shipped', tracking_no=?, carrier=?, shipped_at=? WHERE id=?",
-            (tracking_no, carrier, now_iso(), order_id),
+            f"UPDATE orders SET status='shipped', tracking_no=?, carrier=?, shipped_at=? WHERE id IN ({placeholders})",
+            (tracking_no, carrier, shipped_at, *package_order_ids),
         )
         c.commit()
-        cur.execute("SELECT * FROM orders WHERE id=?", (order_id,))
-        order = dict(cur.fetchone())
+        cur.execute(f"SELECT * FROM orders WHERE id IN ({placeholders}) ORDER BY id", tuple(package_order_ids))
+        package_orders = [dict(item) for item in cur.fetchall()]
+        order = next((item for item in package_orders if to_int(item.get("id"), 0) == order_id), package_orders[0])
     finally:
         c.close()
 
     if supabase_enabled():
         try:
-            sync_local_rows_to_supabase("orders", "id", [order_id])
+            sync_local_rows_to_supabase("orders", "id", package_order_ids)
         except Exception as exc:
             app.logger.warning("Nie udało się zsynchronizować wysyłki zamówienia %s: %s", order_id, exc)
 
     try:
-        result = _send_order_shipped_email(order, tracking_no, carrier, packing_attachment)
+        result = _send_orders_shipped_email(package_orders, tracking_no, carrier, packing_attachment)
     except Exception as exc:
         result = {"ok": False, "error": str(exc)}
-    event_key = f"order_shipped:{order_id}:{carrier}:{hashlib.sha256(tracking_no.encode('utf-8')).hexdigest()[:16]}"
-    _record_email_event(event_key, "order_shipped", order_id, order.get("customer_email"), result)
+    tracking_hash = hashlib.sha256(tracking_no.encode("utf-8")).hexdigest()[:16]
+    for package_order in package_orders:
+        package_order_id = to_int(package_order.get("id"), 0)
+        event_key = f"order_shipped:{package_order_id}:{carrier}:{tracking_hash}"
+        _record_email_event(event_key, "order_shipped", package_order_id, package_order.get("customer_email"), result)
     if result.get("ok"):
         return redirect(url_for("order_view", order_id=order_id, shipment_sent="1"))
     return redirect(url_for(
@@ -7450,7 +7489,7 @@ def mark_orders_packed(order_ids, packing_path: str = "") -> list[int]:
         cur = c.cursor()
         cur.execute(
             f"""UPDATE orders
-                SET status='packed', packed_at=COALESCE(packed_at, ?)
+                SET status='packed', packed_at=?
                 WHERE id IN ({placeholders})
                   AND LOWER(COALESCE(status,'')) NOT IN ('issued','completed','cancelled','shipped')""",
             (now_iso(), *clean_ids),
@@ -7625,6 +7664,132 @@ def _order_packing_list_email_attachment(order: dict) -> dict:
         "filename": f"{safe_filename(order_no)}_lista_pakowania.pdf",
         "content": content,
     }
+
+
+def _send_orders_shipped_email(orders: list[dict], tracking_no: str, carrier: str, packing_attachment: dict) -> dict:
+    """Send one shipment message for every order included in one packing batch."""
+    orders = [dict(order) for order in (orders or []) if order]
+    if not orders:
+        return {"ok": False, "error": "Brak zamówień w przesyłce"}
+    order = orders[0]
+    order_numbers = []
+    for packed_order in orders:
+        order_no = canonical_order_no(
+            packed_order.get("id"),
+            packed_order.get("created_at"),
+            packed_order.get("order_no"),
+        )
+        if order_no and order_no not in order_numbers:
+            order_numbers.append(order_no)
+    if not order_numbers:
+        return {"ok": False, "error": "Brak numerów zamówień w przesyłce"}
+    if len(order_numbers) == 1:
+        return _send_order_shipped_email(order, tracking_no, carrier, packing_attachment)
+
+    if not send_email:
+        return {"ok": False, "error": "Moduł wysyłki e-mail nie jest dostępny"}
+    recipient = _email_key(order.get("customer_email"))
+    if not recipient:
+        return {"ok": False, "error": "Zamówienia nie mają adresu e-mail klienta"}
+    try:
+        language = normalize_client_language(_client_profile_for_email(recipient).get("language"))
+    except Exception:
+        language = "pl"
+
+    messages = {
+        "pl": {
+            "subject": "Twoje zamówienia {numbers} są już w drodze",
+            "title": "Zamówienia zostały wysłane",
+            "greeting": "Dzień dobry,",
+            "intro": "Z przyjemnością informujemy, że poniższe zamówienia zostały spakowane razem i przekazane kurierowi w jednej przesyłce.",
+            "orders": "Numery zamówień", "carrier": "Przewoźnik", "tracking": "Numer przesyłki",
+            "button": "Śledź swoją przesyłkę",
+            "attachment": "W załączniku znajduje się wspólna lista pakowania ze szczegółami wysłanych produktów.",
+            "thanks": "Dziękujemy za zamówienia i życzymy udanego dnia!", "team": "Zespół Niedźwieccy",
+        },
+        "de": {
+            "subject": "Ihre Bestellungen {numbers} sind unterwegs",
+            "title": "Ihre Bestellungen wurden versandt",
+            "greeting": "Guten Tag,",
+            "intro": "Wir freuen uns, Ihnen mitzuteilen, dass die folgenden Bestellungen gemeinsam verpackt und in einer Sendung an den Paketdienst übergeben wurden.",
+            "orders": "Bestellnummern", "carrier": "Paketdienst", "tracking": "Sendungsnummer",
+            "button": "Sendung verfolgen",
+            "attachment": "Im Anhang finden Sie die gemeinsame Packliste mit den Details der versandten Produkte.",
+            "thanks": "Vielen Dank für Ihre Bestellungen. Wir wünschen Ihnen einen schönen Tag!", "team": "Ihr Niedźwieccy-Team",
+        },
+        "en": {
+            "subject": "Your orders {numbers} are on their way",
+            "title": "Your orders have been shipped",
+            "greeting": "Hello,",
+            "intro": "We are pleased to let you know that the following orders were packed together and handed over to the courier in one shipment.",
+            "orders": "Order numbers", "carrier": "Courier", "tracking": "Tracking number",
+            "button": "Track your shipment",
+            "attachment": "The attached combined packing list contains the details of the shipped products.",
+            "thanks": "Thank you for your orders and have a great day!", "team": "The Niedźwieccy Team",
+        },
+        "es": {
+            "subject": "Tus pedidos {numbers} ya están en camino",
+            "title": "Tus pedidos han sido enviados",
+            "greeting": "Buenos días,",
+            "intro": "Nos complace informarte de que los siguientes pedidos se embalaron juntos y se entregaron al transportista en un solo envío.",
+            "orders": "Números de pedido", "carrier": "Transportista", "tracking": "Número de seguimiento",
+            "button": "Seguir el envío",
+            "attachment": "En el archivo adjunto encontrarás la lista de embalaje conjunta con los detalles de los productos enviados.",
+            "thanks": "¡Gracias por tus pedidos y que tengas un buen día!", "team": "Equipo Niedźwieccy",
+        },
+        "it": {
+            "subject": "I tuoi ordini {numbers} sono in viaggio",
+            "title": "I tuoi ordini sono stati spediti",
+            "greeting": "Buongiorno,",
+            "intro": "Siamo lieti di informarti che i seguenti ordini sono stati imballati insieme e affidati al corriere in un'unica spedizione.",
+            "orders": "Numeri ordine", "carrier": "Corriere", "tracking": "Numero di tracciamento",
+            "button": "Traccia la spedizione",
+            "attachment": "In allegato trovi la lista di imballaggio cumulativa con i dettagli dei prodotti spediti.",
+            "thanks": "Grazie per i tuoi ordini e buona giornata!", "team": "Il team Niedźwieccy",
+        },
+    }
+    copy = messages.get(language, messages["pl"])
+    numbers_text = ", ".join(order_numbers)
+    tracking_url = carrier_tracking_url(carrier, tracking_no)
+    carrier_names = {"inpost": "InPost", "dpd": "DPD", "fedex": "FedEx", "dhl": "DHL", "ups": "UPS"}
+    carrier_name = carrier_names.get(norm(carrier).lower(), norm(carrier) or "—")
+    order_list_html = "".join(
+        f"<li style='margin:3px 0'><b>{html.escape(str(number), quote=True)}</b></li>"
+        for number in order_numbers
+    )
+    safe_tracking = html.escape(str(tracking_no), quote=True)
+    safe_carrier = html.escape(carrier_name, quote=True)
+    safe_tracking_url = html.escape(tracking_url, quote=True)
+    html_body = (
+        "<div style='margin:0;padding:28px 14px;background:#f3f6fb;font-family:Arial,sans-serif;color:#10203d'>"
+        "<div style='max-width:620px;margin:0 auto;background:#fff;border:1px solid #e2e8f2;border-radius:18px;overflow:hidden'>"
+        "<div style='padding:30px 34px 20px'>"
+        f"<h1 style='margin:0 0 24px;font-size:26px;line-height:1.25'>{html.escape(copy['title'])}</h1>"
+        f"<p style='margin:0 0 14px'>{html.escape(copy['greeting'])}</p>"
+        f"<p style='margin:0 0 24px;line-height:1.6'>{html.escape(copy['intro'])}</p>"
+        "<div style='padding:20px;background:#f7f9fd;border:1px solid #e3e9f3;border-radius:14px;line-height:1.8'>"
+        f"<div style='color:#62708c'>{html.escape(copy['orders'])}:</div><ul style='margin:3px 0 10px;padding-left:22px'>{order_list_html}</ul>"
+        f"<div><span style='color:#62708c'>{html.escape(copy['carrier'])}:</span> <b>{safe_carrier}</b></div>"
+        f"<div><span style='color:#62708c'>{html.escape(copy['tracking'])}:</span> <b>{safe_tracking}</b></div>"
+        "</div>"
+        f"<p style='margin:24px 0'><a href='{safe_tracking_url}' style='display:inline-block;padding:13px 22px;background:#4f70eb;color:#fff;text-decoration:none;font-weight:bold;border-radius:10px'>{html.escape(copy['button'])}</a></p>"
+        f"<p style='margin:0 0 24px;line-height:1.6;color:#52617c'>{html.escape(copy['attachment'])}</p>"
+        f"<p style='margin:0;line-height:1.6'>{html.escape(copy['thanks'])}<br><br><b>{html.escape(copy['team'])}</b></p>"
+        "</div></div></div>"
+    )
+    text_orders = "\n".join(f"- {number}" for number in order_numbers)
+    text_body = (
+        f"{copy['greeting']}\n\n{copy['intro']}\n\n{copy['orders']}:\n{text_orders}\n\n"
+        f"{copy['carrier']}: {carrier_name}\n{copy['tracking']}: {tracking_no}\n{tracking_url}\n\n"
+        f"{copy['attachment']}\n\n{copy['thanks']}\n{copy['team']}"
+    )
+    return send_email(
+        recipient,
+        copy["subject"].format(numbers=numbers_text),
+        html_body,
+        text_body,
+        attachments=[packing_attachment],
+    )
 
 
 def _send_order_shipped_email(order: dict, tracking_no: str, carrier: str, packing_attachment: dict) -> dict:
