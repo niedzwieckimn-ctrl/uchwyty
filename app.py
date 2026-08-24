@@ -1514,6 +1514,11 @@ def maybe_pull_shared_from_supabase(force: bool = False):
         # (np. ponowna wysyłka potwierdzenia po restarcie Rendera).
         if force or request.method == "GET":
             pull_shared_tables_from_supabase(force=force)
+            # Starsze wersje zapisywały każdą rozpoczętą wysyłkę jako
+            # ``shipped``. Po pobraniu danych napraw status na podstawie
+            # faktycznie zrealizowanych pozycji, aby panel klienta nie
+            # sugerował wysłania całego zamówienia.
+            reconcile_legacy_shipped_order_statuses()
     except Exception:
         pass
 
@@ -3094,15 +3099,65 @@ def finalize_fully_invoiced_orders(order_ids: list[int]):
     return completed_order_ids, list(set(changed_product_ids))
 
 
-def finalize_legacy_shipped_orders_with_full_invoice():
-    """Naprawia starszy stan: faktura kompletna, ale status nadal 'shipped'."""
+def reconcile_legacy_shipped_order_statuses():
+    """Uzupełnia precyzyjny status starszych wysyłek bez zmiany dokumentów.
+
+    Dawny kod zapisywał ``shipped`` również wtedy, gdy faktura/wysyłka
+    obejmowała tylko część pozycji. Źródłem prawdy o zrealizowanych ilościach
+    są istniejące ``invoice_allocations``. Rekord bez żadnej alokacji zostaje
+    nietknięty, bo nie da się bezpiecznie ustalić, czy był wysłany częściowo.
+    """
     c = conn()
     cur = c.cursor()
-    cur.execute("SELECT id FROM orders WHERE LOWER(COALESCE(status,'')) IN ('shipped','partially_shipped')")
-    shipped_order_ids = [int(row["id"]) for row in cur.fetchall()]
+    cur.execute("SELECT id, status FROM orders WHERE LOWER(COALESCE(status,'')) IN ('shipped','partially_shipped')")
+    shipped_rows = [dict(row) for row in cur.fetchall()]
+    changed_to_partial = []
+
+    for order_row in shipped_rows:
+        order_id = int(order_row["id"])
+        if norm(order_row.get("status")).lower() != "shipped":
+            continue
+
+        cur.execute("""
+          SELECT
+            COALESCE(SUM(oi.qty), 0) AS ordered_qty,
+            COALESCE(SUM(MIN(oi.qty, COALESCE(done.invoiced_qty, 0))), 0) AS completed_qty
+          FROM order_items oi
+          LEFT JOIN (
+            SELECT order_item_id, SUM(qty) AS invoiced_qty
+            FROM invoice_allocations
+            GROUP BY order_item_id
+          ) done ON done.order_item_id=oi.id
+          WHERE oi.order_id=?
+        """, (order_id,))
+        progress = cur.fetchone()
+        ordered_qty = int(progress["ordered_qty"] or 0) if progress else 0
+        completed_qty = int(progress["completed_qty"] or 0) if progress else 0
+
+        if ordered_qty > 0 and 0 < completed_qty < ordered_qty:
+            cur.execute("UPDATE orders SET status='partially_shipped' WHERE id=?", (order_id,))
+            changed_to_partial.append(order_id)
+
+    c.commit()
     c.close()
+
+    if changed_to_partial and supabase_enabled():
+        for order_id in changed_to_partial:
+            try:
+                supabase_update_rows("orders", {"status": "partially_shipped"}, {"id": order_id})
+            except Exception:
+                app.logger.exception("Nie udało się zsynchronizować częściowej wysyłki zamówienia %s", order_id)
+
+    shipped_order_ids = [int(row["id"]) for row in shipped_rows]
     if shipped_order_ids:
         finalize_fully_invoiced_orders(shipped_order_ids)
+
+    return changed_to_partial
+
+
+def finalize_legacy_shipped_orders_with_full_invoice():
+    """Zachowuje zgodność ze starszym wywołaniem naprawy statusów."""
+    return reconcile_legacy_shipped_order_statuses()
 
 
 def reconcile_orders_after_invoice_change(order_ids: list[int]):
