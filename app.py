@@ -1831,6 +1831,7 @@ ORDER_PDF_TRANSLATIONS = {
         "email": "E-mail", "phone": "Telefon", "notes": "Uwagi klienta",
         "sku": "SKU", "product": "Model / nazwa", "quantity": "Ilość",
         "unit_net": "Cena jedn. netto", "line_net": "Wartość netto",
+        "unit_gross": "Cena jedn. brutto", "line_gross": "Wartość brutto",
         "net_total": "Razem netto", "vat": "VAT", "gross_total": "Razem brutto",
         "currency": "PLN", "page": "Strona",
         "status_unconfirmed": "Niepotwierdzone", "status_confirmed": "Potwierdzone",
@@ -1843,6 +1844,7 @@ ORDER_PDF_TRANSLATIONS = {
         "email": "E-Mail", "phone": "Telefon", "notes": "Kundenhinweise",
         "sku": "SKU", "product": "Modell / Bezeichnung", "quantity": "Menge",
         "unit_net": "Nettostückpreis", "line_net": "Nettowert",
+        "unit_gross": "Bruttostückpreis", "line_gross": "Bruttowert",
         "net_total": "Nettobetrag", "vat": "MwSt.", "gross_total": "Gesamtbetrag",
         "currency": "PLN", "page": "Seite",
         "status_unconfirmed": "Unbestätigt", "status_confirmed": "Bestätigt",
@@ -1855,6 +1857,7 @@ ORDER_PDF_TRANSLATIONS = {
         "email": "Email", "phone": "Phone", "notes": "Customer notes",
         "sku": "SKU", "product": "Model / product", "quantity": "Quantity",
         "unit_net": "Net unit price", "line_net": "Net value",
+        "unit_gross": "Gross unit price", "line_gross": "Gross value",
         "net_total": "Net total", "vat": "VAT", "gross_total": "Gross total",
         "currency": "PLN", "page": "Page",
         "status_unconfirmed": "Unconfirmed", "status_confirmed": "Confirmed",
@@ -1867,6 +1870,7 @@ ORDER_PDF_TRANSLATIONS = {
         "email": "Correo electrónico", "phone": "Teléfono", "notes": "Notas del cliente",
         "sku": "SKU", "product": "Modelo / producto", "quantity": "Cantidad",
         "unit_net": "Precio unitario neto", "line_net": "Importe neto",
+        "unit_gross": "Precio unitario bruto", "line_gross": "Importe bruto",
         "net_total": "Total neto", "vat": "IVA", "gross_total": "Total bruto",
         "currency": "PLN", "page": "Página",
         "status_unconfirmed": "Sin confirmar", "status_confirmed": "Confirmado",
@@ -1879,6 +1883,7 @@ ORDER_PDF_TRANSLATIONS = {
         "email": "E-mail", "phone": "Telefono", "notes": "Note del cliente",
         "sku": "SKU", "product": "Modello / prodotto", "quantity": "Quantità",
         "unit_net": "Prezzo unitario netto", "line_net": "Valore netto",
+        "unit_gross": "Prezzo unitario lordo", "line_gross": "Valore lordo",
         "net_total": "Totale netto", "vat": "IVA", "gross_total": "Totale lordo",
         "currency": "PLN", "page": "Pagina",
         "status_unconfirmed": "Non confermato", "status_confirmed": "Confermato",
@@ -2114,8 +2119,10 @@ def generate_client_order_pdf(
         pdf.drawString(left + 2 * mm, y - 4 * mm, order_pdf_text(language, "sku"))
         pdf.drawString(left + 43 * mm, y - 4 * mm, order_pdf_text(language, "product"))
         pdf.drawRightString(left + 122 * mm, y - 4 * mm, order_pdf_text(language, "quantity"))
-        pdf.drawRightString(left + 152 * mm, y - 4 * mm, order_pdf_text(language, "unit_net"))
-        pdf.drawRightString(right - 2 * mm, y - 4 * mm, order_pdf_text(language, "line_net"))
+        unit_price_key = "unit_gross" if retail_prices else "unit_net"
+        line_value_key = "line_gross" if retail_prices else "line_net"
+        pdf.drawRightString(left + 152 * mm, y - 4 * mm, order_pdf_text(language, unit_price_key))
+        pdf.drawRightString(right - 2 * mm, y - 4 * mm, order_pdf_text(language, line_value_key))
         return y - 10 * mm
 
     y = new_page(first=True)
@@ -2176,8 +2183,10 @@ def generate_client_order_pdf(
         pdf.setFont(bold_font, 8.2)
         pdf.drawString(left + 43 * mm, y, fit(product_label, bold_font, 8.2, 45 * mm))
         pdf.drawRightString(left + 122 * mm, y, str(qty))
-        pdf.drawRightString(left + 152 * mm, y, f"{localized_pdf_money(unit_net, language)} {currency}")
-        pdf.drawRightString(right - 2 * mm, y, f"{localized_pdf_money(line_net, language)} {currency}")
+        displayed_unit_price = unit_gross if retail_prices else unit_net
+        displayed_line_value = line_gross if retail_prices else line_net
+        pdf.drawRightString(left + 152 * mm, y, f"{localized_pdf_money(displayed_unit_price, language)} {currency}")
+        pdf.drawRightString(right - 2 * mm, y, f"{localized_pdf_money(displayed_line_value, language)} {currency}")
         pdf.setStrokeColorRGB(*rule_gray)
         pdf.setLineWidth(0.7)
         pdf.line(left, y - 2.5 * mm, right, y - 2.5 * mm)
@@ -2190,9 +2199,12 @@ def generate_client_order_pdf(
         y = new_page()
     y -= 3 * mm
     pdf.setFillColorRGB(*ink)
-    for key, value, is_bold in (
-        ("net_total", total_net, False), ("vat", vat_value, False), ("gross_total", total_gross, True)
-    ):
+    totals_to_draw = (
+        (("gross_total", total_gross, True),)
+        if retail_prices
+        else (("net_total", total_net, False), ("vat", vat_value, False), ("gross_total", total_gross, True))
+    )
+    for key, value, is_bold in totals_to_draw:
         pdf.setFont(bold_font if is_bold else regular_font, 10 if is_bold else 9)
         pdf.drawRightString(right, y, f"{order_pdf_text(language, key)}: {localized_pdf_money(value, language)} {currency}")
         y -= 5.5 * mm
