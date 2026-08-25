@@ -40,7 +40,7 @@ from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from ksef_module import build_ksef_draft_xml, validate_fa3_xml, validate_ksef_invoice, xml_filename
-from cash_flow_module import register_cash_flow
+from cash_flow_module import register_cash_flow, cash_flow_overdue_invoices
 from inventory_analytics import build_replenishment_analysis, recommended_replenishments
 from proforma_module import generate_proforma_pdf
 try:
@@ -564,6 +564,19 @@ def app_now():
 
 def now_iso():
     return app_now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def overdue_invoice_rows(db_conn, *, current_time=None):
+    """Widok zaleglosci oparty na wspolnej logice modulu Cash flow."""
+    result = cash_flow_overdue_invoices(
+        db_conn, current_time=current_time or app_now()
+    )
+    for invoice in result:
+        invoice["order_display"] = order_display_no(
+            invoice.get("source_order_id"), invoice.get("source_order_created_at"),
+            invoice.get("source_order_no"), invoice.get("source_order_note")
+        ) if invoice.get("source_order_id") else "-"
+    return result
 
 SHORT_ORDER_NO_RE = re.compile(r"^ZAM-(\d{6})(\d+)$", re.I)
 
@@ -3693,6 +3706,9 @@ def home():
     status_cancelled = status_counts.get("cancelled",0)
     status_total = status_new + status_work + status_done + status_cancelled
     status_divisor = max(1, status_total)
+    overdue_invoices = overdue_invoice_rows(c)
+    overdue_count = len(overdue_invoices)
+    overdue_total = sum(float(inv.get("total_gross") or 0) for inv in overdue_invoices)
     c.close()
 
     replenishment_analysis = build_replenishment_analysis(
@@ -3710,7 +3726,7 @@ def home():
       <style>
         .dashboard-head{display:flex;align-items:center;gap:14px;margin-bottom:18px}.dashboard-head h1{margin:0}.search-shell{margin-left:28px;flex:1;max-width:580px;position:relative}.search-shell input{padding-left:42px;background:#fff}.search-shell:before{content:"⌕";position:absolute;left:15px;top:9px;color:#8793aa;font-size:19px;z-index:2}.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;margin-bottom:16px}.metric{display:grid;grid-template-columns:55px 1fr;gap:14px;align-items:center;background:#fff;border:1px solid #e7eaf2;border-radius:22px;padding:18px;box-shadow:var(--shadow)}.metric .icon{display:grid;place-items:center;width:55px;height:55px;border-radius:17px;background:var(--soft,#edf3ff);color:var(--tone,#5577ee);font-size:23px}.metric span{color:#718096;font-size:12px;font-weight:650}.metric b{display:block;margin-top:2px;font-size:25px;letter-spacing:-.6px}.metric small{display:block;margin-top:4px;color:#2da176;font-size:10px}.dash-grid{display:grid;grid-template-columns:minmax(0,2.15fr) minmax(300px,.9fr);gap:16px;align-items:start}.panel-title{display:flex;align-items:center;gap:9px;margin-bottom:13px}.panel-title h2{margin:0}.panel-title .btn{margin-left:auto;padding:7px 11px;font-size:11px}.orders-card{padding-bottom:8px}.orders-card table{min-width:780px}.orders-card td{font-size:12px}.customer-name{font-weight:700}.order-no{color:#4166d3;font-weight:750;text-decoration:none}.side-stack{display:grid;gap:16px}.stock-list{display:grid;gap:2px}.stock-item{display:grid;grid-template-columns:42px 1fr auto;align-items:center;gap:10px;padding:10px 2px;border-bottom:1px solid #edf0f5}.stock-icon{display:grid;place-items:center;width:39px;height:39px;border-radius:12px;background:#f1f4f9;color:#68758d}.stock-name{font-size:12px;font-weight:700}.stock-sku{font-size:9px;color:#8b96a9}.stock-qty{font-size:12px;font-weight:800}.stock-qty:after{content:"";display:inline-block;width:7px;height:7px;margin-left:8px;border-radius:50%;background:#ee5262}.donut-wrap{display:grid;grid-template-columns:145px 1fr;align-items:center;gap:14px}.donut{width:140px;height:140px;border-radius:50%;display:grid;place-items:center;background:conic-gradient(#5577ee 0 calc(var(--p1)*1%),#65a7ec calc(var(--p1)*1%) calc((var(--p1) + var(--p2))*1%),#31b98b calc((var(--p1) + var(--p2))*1%) calc((var(--p1) + var(--p2) + var(--p3))*1%),#e05263 calc((var(--p1) + var(--p2) + var(--p3))*1%) 100%)}.donut:before{content:"";width:86px;height:86px;background:#fff;border-radius:50%;position:absolute}.donut-label{position:relative;text-align:center;font-size:11px;color:#77849b}.donut-label b{display:block;color:#17233c;font-size:25px}.legend{display:grid;gap:9px}.legend-row{display:grid;grid-template-columns:9px 1fr auto;gap:7px;align-items:center;font-size:10px}.legend-dot{width:8px;height:8px;border-radius:50%}.quick-card{grid-column:1}.quick-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:10px}.quick-grid .btn{min-height:80px;flex-direction:column;background:#f8faff;border-color:#e8ecf6;font-size:11px}.quick-grid .btn b{font-size:20px}.quick-grid .btn:nth-child(1){background:#edf3ff;color:#4166d3}.quick-grid .btn:nth-child(2){background:#eaf9f4;color:#16835f}.quick-grid .btn:nth-child(3){background:#eef3ff;color:#4b6bd3}.quick-grid .btn:nth-child(4){background:#fff5e5;color:#c57a10}.quick-grid .btn:nth-child(5){background:#f3edff;color:#7650ce}@media(max-width:1200px){.metrics{grid-template-columns:1fr 1fr}.dash-grid{grid-template-columns:1fr}.quick-card{grid-column:auto}}@media(max-width:760px){.dashboard-head{flex-wrap:wrap}.search-shell{order:3;margin-left:0;flex-basis:100%}.metrics{grid-template-columns:1fr}.quick-grid{grid-template-columns:1fr 1fr}.donut-wrap{grid-template-columns:1fr}.donut{margin:auto}}
       </style>
-      <style>@media(min-width:1201px){.metrics{grid-template-columns:repeat(5,minmax(0,1fr));gap:14px}.metric{padding:16px;grid-template-columns:50px 1fr;gap:12px}.metric .icon{width:50px;height:50px}.metric small{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}</style>
+      <style>@media(min-width:1201px){.metrics{grid-template-columns:repeat(6,minmax(0,1fr));gap:12px}.metric{padding:14px;grid-template-columns:46px 1fr;gap:10px}.metric .icon{width:46px;height:46px}.metric small{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}</style>
 
       <div class="dashboard-head">
         <div><h1>Pulpit</h1><div class="muted">Przewagę buduje się codziennie — jedną dobrą decyzją naraz.</div></div>
@@ -3722,6 +3738,7 @@ def home():
         <div class="metric"><div class="icon">▣</div><div><span>Nowe zamówienia</span><b>{{ n_orders_today }}</b><small>{{ n_orders_current }} aktualnie w toku</small></div></div>
         <div class="metric" style="--soft:#eaf9f4;--tone:#1aa176"><div class="icon">◇</div><div><span>Wydane dzisiaj</span><b>{{ n_issued_today }}</b><small>{{ n_stock_qty }} szt. na stanie</small></div></div>
         <a class="metric" href="{{ url_for('orders', tab='new', ready_today=1) }}" style="--soft:#eaf9f4;--tone:#16835f;text-decoration:none;color:inherit"><div class="icon">✓</div><div><span>Możesz wydać dziś</span><b>{{ n_issuable_today }}</b><small title="{{ issuable_order_labels|join(', ') }}">{{ issuable_order_labels|join(', ') if issuable_order_labels else 'Brak kompletnych zamówień' }}</small></div></a>
+        <a class="metric" href="{{ url_for('overdue_payments') }}" style="--soft:#fff0f1;--tone:#d9485b;text-decoration:none;color:inherit"><div class="icon">!</div><div><span>Zaległości</span><b>{{ overdue_count }}</b><small>{% if overdue_count %}Sprawdź płatności · {{ "{:,.0f}".format(overdue_total).replace(',', ' ') }} zł{% else %}Brak zaległych faktur{% endif %}</small></div></a>
         <div class="metric" style="--soft:#fff6e6;--tone:#db8a13"><div class="icon">△</div><div><span>Trzeba uzupełnić</span><b>{{ replenishment_count }}</b><small>Według rankingu zakupowego</small></div></div>
         <div class="metric" style="--soft:#edf3ff;--tone:#5577ee"><div class="icon">▤</div><div><span>Wartość magazynu</span><b>{{ "{:,.0f}".format(inventory_value_net).replace(',', ' ') }} zł</b><small>Netto z towarem w drodze</small></div></div>
       </div>
@@ -3755,6 +3772,7 @@ def home():
                                   n_stock_qty=n_stock_qty, n_in_delivery_qty=n_in_delivery_qty,
                                   inventory_value_net=inventory_value_net, n_orders_today=n_orders_today,
                                   n_issued_today=n_issued_today, n_issuable_today=n_issuable_today,
+                                  overdue_count=overdue_count, overdue_total=overdue_total,
                                   issuable_order_labels=issuable_order_labels, replenishment_rows=replenishment_rows,
                                   replenishment_count=replenishment_count,
                                   recent_orders=recent_orders, status_new=status_new, status_work=status_work,
@@ -9298,6 +9316,39 @@ def invoices():
         tpl, title="Faktury", base_url=BASE_URL, db_path=DB_PATH,
         groups=groups, q=q, notice=notice, notice_error=notice_error
     )
+
+
+@app.get("/payments/overdue")
+def overdue_payments():
+    maybe_pull_shared_from_supabase()
+    c = conn()
+    rows = overdue_invoice_rows(c)
+    c.close()
+    total_gross = sum(float(inv.get("total_gross") or 0) for inv in rows)
+    tpl = r"""
+    {% extends "base.html" %}
+    {% block content %}
+      <div class="card">
+        <div class="flex" style="align-items:center">
+          <div><h1 style="margin:0">Zaległości</h1><div class="muted">Faktury nieopłacone widoczne od godz. 8:00 następnego dnia po terminie płatności.</div></div>
+          <a class="btn right" href="{{ url_for('home') }}">← Pulpit</a>
+        </div>
+        <div class="flex" style="margin-top:16px"><span class="badge danger">Zaległych faktur: {{ rows|length }}</span><span class="badge">Łącznie brutto: {{ "%.2f"|format(total_gross) }} PLN</span></div>
+      </div>
+      <div class="card">
+        <h2>Sprawdź płatności</h2>
+        <table><thead><tr><th>Faktura</th><th>Klient</th><th>Zamówienie</th><th>Termin</th><th>Po terminie</th><th>Brutto</th><th>Akcje</th></tr></thead><tbody>
+        {% for inv in rows %}<tr>
+          <td><b>{{ inv.invoice_no }}</b></td><td>{{ inv.buyer_name or inv.order_customer_name or '-' }}</td><td>{{ inv.order_display }}</td><td>{{ inv.payment_to }}</td>
+          <td><span class="badge danger">{{ inv.overdue_days }} dni</span></td><td><b>{{ "%.2f"|format(inv.total_gross or 0) }} PLN</b></td>
+          <td><div class="flex"><a class="btn" href="{{ url_for('invoice_download_admin', invoice_id=inv.id) }}" target="_blank">Faktura PDF</a>{% if inv.source_order_id %}<a class="btn" href="{{ url_for('order_view', order_id=inv.source_order_id) }}">Zamówienie</a>{% endif %}<form method="post" action="{{ url_for('invoice_payment_reminder_admin', invoice_id=inv.id) }}"><input type="hidden" name="next" value="{{ request.full_path }}"><button class="btn" type="submit">Przypomnij o płatności</button></form><form method="post" action="{{ url_for('invoice_paid_admin', invoice_id=inv.id) }}"><input type="hidden" name="next" value="{{ request.full_path }}"><button class="btn ok" type="submit">Faktura opłacona</button></form></div></td>
+        </tr>{% endfor %}
+        {% if not rows %}<tr><td colspan="7" class="muted">Brak zaległych faktur. Wszystkie płatności są aktualne.</td></tr>{% endif %}
+        </tbody></table>
+      </div>
+    {% endblock %}
+    """
+    return render_template_string(tpl, title="Zaległości", base_url=BASE_URL, db_path=DB_PATH, rows=rows, total_gross=total_gross)
 
 
 def load_invoice_with_meta(invoice_id: int):
