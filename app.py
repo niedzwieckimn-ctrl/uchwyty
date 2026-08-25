@@ -1998,7 +1998,12 @@ def order_pdf_status(status, language: str) -> str:
     return order_pdf_text(language, label_key)
 
 
-def generate_client_order_pdf(order_row: dict, items: list[dict], language: str) -> tuple[io.BytesIO, str]:
+def generate_client_order_pdf(
+    order_row: dict,
+    items: list[dict],
+    language: str,
+    retail_prices: bool = False,
+) -> tuple[io.BytesIO, str]:
     """Create one localized order PDF without persisting a second document copy."""
     language = normalize_client_language(language)
     currency = normalize_order_currency(order_row.get("currency"))
@@ -2151,6 +2156,13 @@ def generate_client_order_pdf(order_row: dict, items: list[dict], language: str)
         qty = to_int(item.get("qty"), 0)
         unit_net = money_dec(item.get("net_price"))
         unit_gross = money_dec(item.get("gross_price"))
+        if retail_prices:
+            # Cennik detaliczny jest zawsze wyliczany od ceny netto B2B.
+            # Brutto liczymy od wartości źródłowej, a kwoty zaokrąglamy dopiero
+            # na wyjściu — dokładnie tak samo jak ceny detaliczne w panelu.
+            retail_net = unit_net * Decimal("1.45")
+            unit_net = retail_net.quantize(MONEY_Q, rounding=ROUND_HALF_UP)
+            unit_gross = (retail_net * Decimal("1.23")).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
         line_net = (unit_net * qty).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
         line_gross = (unit_gross * qty).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
         total_net += line_net
@@ -2199,7 +2211,8 @@ def generate_client_order_pdf(order_row: dict, items: list[dict], language: str)
     footer()
     pdf.save()
     buffer.seek(0)
-    filename = f"ORDER_{safe_filename(order_number)}_{language}.pdf"
+    pdf_variant = "_RETAIL" if retail_prices else ""
+    filename = f"ORDER_{safe_filename(order_number)}{pdf_variant}_{language}.pdf"
     return buffer, filename
 
 
@@ -8915,7 +8928,7 @@ def api_client_order_pdf(order_id: int):
         return jsonify(ok=False, error="Nie udało się przygotować PDF zamówienia"), 500
 
 
-def _api_client_order_pdf_impl(order_id: int):
+def _api_client_order_pdf_impl(order_id: int, retail_prices: bool = False):
     maybe_pull_shared_from_supabase(force=True)
     email = _email_key(g.client_user.get("email"))
 
@@ -8938,7 +8951,9 @@ def _api_client_order_pdf_impl(order_id: int):
         language = _client_profile_for_email(email).get("language", "pl")
     except Exception:
         language = "pl"
-    pdf_buffer, filename = generate_client_order_pdf(order, items, language)
+    pdf_buffer, filename = generate_client_order_pdf(
+        order, items, language, retail_prices=retail_prices
+    )
     response = send_file(
         pdf_buffer,
         mimetype="application/pdf",
@@ -8948,6 +8963,15 @@ def _api_client_order_pdf_impl(order_id: int):
     )
     response.headers["Cache-Control"] = "no-store"
     return response
+
+
+@app.get("/api/client/orders/<int:order_id>/pdf-retail")
+def api_client_order_pdf_retail(order_id: int):
+    try:
+        return _api_client_order_pdf_impl(order_id, retail_prices=True)
+    except Exception as exc:
+        app.logger.exception("Błąd PDF detal zamówienia klienta order_id=%s: %s", order_id, exc)
+        return jsonify(ok=False, error="Nie udało się przygotować PDF detal zamówienia"), 500
 
 
 @app.get("/orders/<int:order_id>/proforma")
