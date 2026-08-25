@@ -30,6 +30,43 @@ def parse_date_safe(value):
     return None
 
 
+def cash_flow_overdue_invoices(db_conn, *, current_time=None, visible_hour=8):
+    """Wspolne zrodlo zaleglych faktur dla Cash flow i pulpitu.
+
+    Faktura staje sie zalegla o ``visible_hour`` w dniu nastepujacym po
+    terminie platnosci. Faktury oznaczone jako oplacone sa pomijane.
+    """
+    now = current_time or datetime.now()
+    cur = db_conn.cursor()
+    cur.execute("""
+      SELECT i.*, COALESCE(m.paid,0) AS paid,
+             COALESCE(m.payment_reminder,0) AS payment_reminder,
+             o.id AS source_order_id, o.order_no AS source_order_no,
+             o.created_at AS source_order_created_at, o.note AS source_order_note,
+             o.customer_name AS order_customer_name
+      FROM invoices i
+      LEFT JOIN invoice_meta m ON m.invoice_id=i.id
+      LEFT JOIN orders o ON o.id=i.order_id
+      WHERE COALESCE(m.paid,0)=0 AND TRIM(COALESCE(i.payment_to,''))<>''
+      ORDER BY i.payment_to, i.id
+    """)
+    result = []
+    for row in cur.fetchall():
+        invoice = dict(row)
+        due_date = parse_date_safe(invoice.get("payment_to"))
+        if not due_date:
+            continue
+        visible_from = datetime.combine(
+            due_date + timedelta(days=1), datetime.min.time()
+        ).replace(hour=int(visible_hour))
+        if getattr(now, "tzinfo", None):
+            visible_from = visible_from.replace(tzinfo=now.tzinfo)
+        if now >= visible_from:
+            invoice["overdue_days"] = max(1, (now.date() - due_date).days)
+            result.append(invoice)
+    return result
+
+
 def recent_months(today, count=12):
     month_names = ("sty", "lut", "mar", "kwi", "maj", "cze", "lip", "sie", "wrz", "paź", "lis", "gru")
     result = []
@@ -201,6 +238,10 @@ def register_cash_flow(app, deps):
           ORDER BY COALESCE(i.payment_to, i.issue_date) ASC, i.id DESC
         """)
         invoices_rows = cur.fetchall()
+        overdue_invoice_ids = {
+            int(row["id"])
+            for row in cash_flow_overdue_invoices(c, current_time=app_now())
+        }
 
         unpaid_total = overdue_total = due_7_total = due_30_total = 0.0
         month_vat = month_net = month_profit = 0.0
@@ -273,7 +314,8 @@ def register_cash_flow(app, deps):
                 due_7_total += gross
             if due_d <= today + timedelta(days=30):
                 due_30_total += gross
-            if due_d < today:
+            is_overdue = int(inv["id"]) in overdue_invoice_ids
+            if is_overdue:
                 overdue_total += gross
                 days_late = (today - due_d).days
                 rec = overdue_clients_map.setdefault(buyer, {"buyer": buyer, "gross": 0.0, "count": 0, "days_late": 0})
@@ -287,7 +329,7 @@ def register_cash_flow(app, deps):
                 "due": due_d.isoformat() if due_d else "-",
                 "gross": gross,
                 "days": (due_d - today).days if due_d else 0,
-                "overdue": due_d < today if due_d else False,
+                "overdue": is_overdue,
                 "reminder": int(inv["payment_reminder"] or 0) == 1,
             })
 
