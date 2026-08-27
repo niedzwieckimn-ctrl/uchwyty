@@ -5904,38 +5904,36 @@ def orders():
     {% extends "base.html" %}
     {% block content %}
       <style>
-        .order-stat-card{display:block;text-decoration:none;color:inherit;cursor:pointer;transition:transform .15s ease,box-shadow .15s ease,border-color .15s ease;background:#fff;}
-        .order-stat-card:hover{transform:translateY(-2px);box-shadow:0 12px 28px rgba(24,45,84,.13);border-color:#9db5f5;}
+        .order-stat-card{position:relative;display:flex;align-items:center;gap:16px;min-height:122px;text-decoration:none;color:inherit;cursor:pointer;overflow:hidden;transition:transform .15s ease,box-shadow .15s ease,border-color .15s ease;background:#fff;}
+        .order-stat-card::after{content:'›';position:absolute;right:22px;top:50%;transform:translateY(-50%);font-size:30px;font-weight:400;opacity:.34;}
+        .order-stat-card:hover{transform:translateY(-3px);box-shadow:0 16px 34px rgba(24,45,84,.14);}
         .order-stat-card:focus-visible{outline:3px solid rgba(79,111,235,.28);outline-offset:2px;}
-        .order-stat-card.active{background:#eef3ff;border-color:#4f6feb;box-shadow:0 8px 22px rgba(79,111,235,.16);}
-        .order-stat-card.active .order-stat-label{color:#3156c7;font-weight:800;}
+        .order-stat-icon{display:grid;place-items:center;flex:0 0 50px;width:50px;height:50px;border-radius:15px;font-size:22px;font-weight:900;}
+        .order-stat-copy{min-width:0;padding-right:34px;}.order-stat-label{font-weight:750;}.order-stat-value{font-size:34px;font-weight:850;line-height:1;margin-top:10px;}.order-stat-hint{font-size:12px;margin-top:7px;color:#71809f;}
+        .order-stat-card.completed{border-color:#cdebdc;background:linear-gradient(135deg,#fff 45%,#effaf4)}.order-stat-card.completed .order-stat-icon{background:#dcf7e8;color:#08744d;}
+        .order-stat-card.issued{border-color:#d8e2ff;background:linear-gradient(135deg,#fff 45%,#f0f4ff)}.order-stat-card.issued .order-stat-icon{background:#e1e9ff;color:#3156c7;}
+        .order-stat-card.to-issue{border-color:#f4dfad;background:linear-gradient(135deg,#fff 45%,#fff8e8)}.order-stat-card.to-issue .order-stat-icon{background:#ffefc7;color:#9a6200;}
+        .order-stat-card.active{border-width:2px;box-shadow:0 12px 28px rgba(24,45,84,.14);}.order-stat-card.active::after{opacity:.75;}
+        .orders-toolbar{display:flex;align-items:center;gap:10px;justify-content:flex-end;margin-bottom:12px;}.orders-toolbar .all-orders{margin-right:auto;}
+        @media(max-width:760px){.order-stat-card{min-height:104px}.orders-toolbar{align-items:stretch;flex-direction:column}.orders-toolbar .all-orders{margin-right:0}}
       </style>
       <div class="grid3">
-        <a class="card order-stat-card {% if tab=='realized' %}active{% endif %}" href="{{ url_for('orders', tab='realized') }}" aria-label="Pokaż zrealizowane zamówienia" {% if tab=='realized' %}aria-current="page"{% endif %}>
-          <div class="muted order-stat-label">Zrealizowane łącznie</div>
-          <div style="font-size:30px;font-weight:800;margin-top:8px;">{{ order_stats.completed }}</div>
+        <a class="card order-stat-card completed {% if tab=='realized' %}active{% endif %}" href="{{ url_for('orders', tab='realized') }}" aria-label="Pokaż zrealizowane zamówienia" {% if tab=='realized' %}aria-current="page"{% endif %}>
+          <div class="order-stat-icon">✓</div><div class="order-stat-copy"><div class="order-stat-label">Zrealizowane łącznie</div><div class="order-stat-value">{{ order_stats.completed }}</div><div class="order-stat-hint">Pokaż zakończone</div></div>
         </a>
-        <a class="card order-stat-card {% if tab=='issued' %}active{% endif %}" href="{{ url_for('orders', tab='issued') }}" aria-label="Pokaż wydane zamówienia" {% if tab=='issued' %}aria-current="page"{% endif %}>
-          <div class="muted order-stat-label">Wydane</div>
-          <div style="font-size:30px;font-weight:800;margin-top:8px;">{{ order_stats.issued }}</div>
+        <a class="card order-stat-card issued {% if tab=='issued' %}active{% endif %}" href="{{ url_for('orders', tab='issued') }}" aria-label="Pokaż wydane zamówienia" {% if tab=='issued' %}aria-current="page"{% endif %}>
+          <div class="order-stat-icon">⇢</div><div class="order-stat-copy"><div class="order-stat-label">Wydane</div><div class="order-stat-value">{{ order_stats.issued }}</div><div class="order-stat-hint">Pokaż wydane</div></div>
         </a>
-        <a class="card order-stat-card {% if tab=='new' %}active{% endif %}" href="{{ url_for('orders', tab='new') }}" aria-label="Pokaż zamówienia do wydania" {% if tab=='new' %}aria-current="page"{% endif %}>
-          <div class="muted order-stat-label">Do wydania</div>
-          <div style="font-size:30px;font-weight:800;margin-top:8px;">{{ order_stats.to_issue }}</div>
+        <a class="card order-stat-card to-issue {% if tab=='new' %}active{% endif %}" href="{{ url_for('orders', tab='new') }}" aria-label="Pokaż zamówienia do wydania" {% if tab=='new' %}aria-current="page"{% endif %}>
+          <div class="order-stat-icon">○</div><div class="order-stat-copy"><div class="order-stat-label">Do wydania</div><div class="order-stat-value">{{ order_stats.to_issue }}</div><div class="order-stat-hint">Pokaż oczekujące</div></div>
         </a>
       </div>
       <div class="card">
-        <div class="flex">
-          <h1 style="margin:0;">ZamĂłwienia</h1>
-          <a class="btn primary right" href="{{ url_for('order_new') }}">+ Nowe zamĂłwienie</a>
+        <div class="orders-toolbar">
+          <a class="btn all-orders {% if tab=='all' %}primary{% endif %}" href="{{ url_for('orders', tab='all') }}">Wszystkie zamówienia</a>
+          <a class="btn primary" href="{{ url_for('order_new') }}">+ Nowe zamówienie</a>
         </div>
-        <div class="flex" style="margin-top:10px;">
-          <a class="btn {% if tab=='new' %}primary{% endif %}" href="{{ url_for('orders', tab='new', q=q) }}">Do wydania</a>
-          <a class="btn {% if tab=='issued' %}primary{% endif %}" href="{{ url_for('orders', tab='issued', q=q) }}">Wydane</a>
-          <a class="btn {% if tab=='realized' %}primary{% endif %}" href="{{ url_for('orders', tab='realized', q=q) }}">Zrealizowane</a>
-          <a class="btn {% if tab=='all' %}primary{% endif %}" href="{{ url_for('orders', tab='all', q=q) }}">Wszystkie</a>
-        </div>
-        <form method="get" class="grid3" style="margin-top:10px;">
+        <form method="get" class="grid3">
           <input type="hidden" name="tab" value="{{ tab }}">
           <input name="q" value="{{ q }}" placeholder="Szukaj: numer zamĂłwienia lub klient">
           <button class="btn primary" type="submit">Szukaj</button>
