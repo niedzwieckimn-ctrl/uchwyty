@@ -10219,12 +10219,19 @@ def _all_order_invoices_paid(cur, order_id: int) -> bool:
         return False
     placeholders = ",".join(["?"] * len(invoice_ids))
     cur.execute(f"""
-      SELECT invoice_id, COALESCE(paid, 0) AS paid
-      FROM invoice_meta
-      WHERE invoice_id IN ({placeholders})
+      SELECT i.id AS invoice_id, m.invoice_id AS meta_invoice_id,
+             COALESCE(m.sent_to_client,0) AS sent_to_client,
+             COALESCE(m.paid,0) AS paid
+      FROM invoices i
+      LEFT JOIN invoice_meta m ON m.invoice_id=i.id
+      WHERE i.id IN ({placeholders})
     """, tuple(invoice_ids))
-    paid_by_invoice = {int(row["invoice_id"]): int(row["paid"] or 0) for row in cur.fetchall()}
-    return all(paid_by_invoice.get(invoice_id, 0) == 1 for invoice_id in invoice_ids)
+    rows = [dict(row) for row in cur.fetchall()]
+    # Niewysłany szkic starej faktury nie jest należnością klienta i nie może
+    # blokować zamknięcia zamówienia. Rekordy bez invoice_meta są historycznie
+    # widoczne, więc nadal wymagają jawnego oznaczenia płatności.
+    payable = [row for row in rows if row["meta_invoice_id"] is None or int(row["sent_to_client"] or 0) == 1 or int(row["paid"] or 0) == 1]
+    return bool(payable) and all(int(row["paid"] or 0) == 1 for row in payable)
 
 
 def _order_fully_invoiced_for_payment(cur, order_id: int) -> bool:
@@ -10257,14 +10264,16 @@ def reconcile_paid_order_statuses():
     })
     changed_order_ids = []
     for order_id in order_ids:
-        cur.execute("SELECT status FROM orders WHERE id=?", (order_id,))
+        cur.execute("SELECT status, warehouse_issued FROM orders WHERE id=?", (order_id,))
         order_row = cur.fetchone()
         if not order_row:
             continue
         current_status = norm(order_row["status"]).lower()
         if current_status in {"completed", "cancelled"}:
             continue
-        if _order_fully_invoiced_for_payment(cur, order_id) and _all_order_invoices_paid(cur, order_id):
+        historically_fulfilled = int(order_row["warehouse_issued"] or 0) == 1
+        fully_invoiced = _order_fully_invoiced_for_payment(cur, order_id)
+        if (historically_fulfilled or fully_invoiced) and _all_order_invoices_paid(cur, order_id):
             cur.execute("UPDATE orders SET status='completed' WHERE id=?", (order_id,))
             changed_order_ids.append(order_id)
     c.commit()
