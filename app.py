@@ -1534,6 +1534,10 @@ def maybe_pull_shared_from_supabase(force: bool = False):
             # faktycznie zrealizowanych pozycji, aby panel klienta nie
             # sugerował wysłania całego zamówienia.
             reconcile_legacy_shipped_order_statuses()
+            # Status płatności mógł zostać zapisany przed dodaniem automatycznego
+            # zamykania zamówień. Przeliczenie jest idempotentne i uzupełnia
+            # wyłącznie zaległe statusy na podstawie istniejących faktur.
+            reconcile_paid_order_statuses()
     except Exception:
         pass
 
@@ -10191,6 +10195,62 @@ def _all_order_invoices_paid(cur, order_id: int) -> bool:
     return all(paid_by_invoice.get(invoice_id, 0) == 1 for invoice_id in invoice_ids)
 
 
+def _order_fully_invoiced_for_payment(cur, order_id: int) -> bool:
+    """Obsługuje również pełne faktury sprzed tabeli invoice_allocations.
+
+    Jeżeli zamówienie ma choć jedną alokację, obowiązuje dokładne sprawdzenie
+    ilości pozycji. Brak alokacji jest uznawany za historyczną pełną fakturę
+    tylko wtedy, gdy faktura wskazuje zamówienie bezpośrednio przez order_id.
+    """
+    cur.execute("SELECT 1 FROM invoice_allocations WHERE order_id=? LIMIT 1", (order_id,))
+    if cur.fetchone():
+        return order_fully_invoiced(cur, order_id)
+    cur.execute("SELECT 1 FROM invoices WHERE order_id=? LIMIT 1", (order_id,))
+    return cur.fetchone() is not None
+
+
+def reconcile_paid_order_statuses():
+    """Uzupełnia status completed dla wcześniej opłaconych zamówień."""
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+      SELECT DISTINCT linked.order_id
+      FROM (
+        SELECT order_id, id AS invoice_id
+        FROM invoices
+        WHERE order_id IS NOT NULL
+        UNION
+        SELECT order_id, invoice_id
+        FROM invoice_allocations
+        WHERE order_id IS NOT NULL AND invoice_id IS NOT NULL
+      ) linked
+      JOIN invoice_meta m ON m.invoice_id=linked.invoice_id
+      WHERE COALESCE(m.paid,0)=1
+    """)
+    order_ids = sorted({int(row["order_id"]) for row in cur.fetchall() if row["order_id"]})
+    changed_order_ids = []
+    for order_id in order_ids:
+        cur.execute("SELECT status FROM orders WHERE id=?", (order_id,))
+        order_row = cur.fetchone()
+        if not order_row:
+            continue
+        current_status = norm(order_row["status"]).lower()
+        if current_status in {"completed", "cancelled"}:
+            continue
+        if _order_fully_invoiced_for_payment(cur, order_id) and _all_order_invoices_paid(cur, order_id):
+            cur.execute("UPDATE orders SET status='completed' WHERE id=?", (order_id,))
+            changed_order_ids.append(order_id)
+    c.commit()
+    c.close()
+
+    if changed_order_ids and supabase_enabled():
+        try:
+            sync_local_rows_to_supabase("orders", "id", changed_order_ids)
+        except Exception:
+            app.logger.exception("Nie udało się zsynchronizować statusów opłaconych zamówień")
+    return changed_order_ids
+
+
 def _set_invoice_payment_state(invoice_id: int, *, reminder: int | None = None, paid: int | None = None):
     meta = load_invoice_meta(invoice_id) or {}
     pdf_path = meta.get("pdf_path", "")
@@ -10239,7 +10299,7 @@ def _set_invoice_payment_state(invoice_id: int, *, reminder: int | None = None, 
             continue
 
         current_status = norm(order_row["status"]).lower()
-        fully_invoiced = order_fully_invoiced(cur, order_id)
+        fully_invoiced = _order_fully_invoiced_for_payment(cur, order_id)
 
         # Zakończenie następuje dopiero po pełnym zafakturowaniu zamówienia
         # i opłaceniu wszystkich faktur, które je rozliczają.
