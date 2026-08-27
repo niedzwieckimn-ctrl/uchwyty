@@ -903,7 +903,8 @@ def order_status_label(status: str) -> str:
         "in_delivery": "W dostawie",
         "shipped": "Wysłane",
         "partially_shipped": "Wysłane częściowo",
-        "issued": "Zrealizowane",
+        "issued": "W realizacji",
+        "completed": "Zrealizowane",
     }
     return mapping.get(v, status or "-")
 
@@ -919,7 +920,8 @@ def order_status_css(status: str) -> str:
         "in_delivery": "st-delivery",
         "shipped": "st-confirmed",
         "partially_shipped": "st-delivery",
-        "issued": "st-issued",
+        "issued": "st-delivery",
+        "completed": "st-issued",
     }
     return mapping.get(v, "")
 
@@ -1990,11 +1992,11 @@ def order_pdf_status(status, language: str) -> str:
     key = norm(status).lower()
     if key in {"new", "pending", "unconfirmed"}:
         label_key = "status_unconfirmed"
-    elif key in {"confirmed", "packed", "packed_partial"}:
+    elif key in {"confirmed", "packed", "packed_partial", "issued"}:
         label_key = "status_confirmed"
     elif key in {"in_delivery", "shipped", "partially_shipped"}:
         label_key = "status_in_delivery"
-    elif key in {"issued", "completed"}:
+    elif key == "completed":
         label_key = "status_completed"
     elif key == "cancelled":
         label_key = "status_cancelled"
@@ -3093,7 +3095,7 @@ def finalize_fully_invoiced_orders(order_ids: list[int]):
 
     c = conn()
     cur = c.cursor()
-    completed_order_ids = []
+    changed_order_ids = []
     changed_product_ids = []
 
     for order_id in touched:
@@ -3115,17 +3117,30 @@ def finalize_fully_invoiced_orders(order_ids: list[int]):
                 changed_product_ids.append(pid)
             warehouse_issued = 1
 
-        if norm(order_row["status"]).lower() != "issued" or int(order_row["warehouse_issued"] or 0) != warehouse_issued:
-            cur.execute("UPDATE orders SET status='issued', warehouse_issued=? WHERE id=?", (warehouse_issued, order_id))
-            completed_order_ids.append(order_id)
+        current_status = norm(order_row["status"]).lower()
+        # Wystawienie faktury oznacza realizację, a nie zakończenie zamówienia.
+        # Status wysyłki zachowujemy; „Zrealizowane” ustawia dopiero opłacenie
+        # wszystkich faktur przypisanych do zamówienia.
+        preserved = {"shipped", "partially_shipped", "completed", "issued", "cancelled"}
+        next_status = current_status if current_status in preserved else "packed"
+        if current_status != next_status or int(order_row["warehouse_issued"] or 0) != warehouse_issued:
+            if next_status == "packed":
+                cur.execute("""
+                  UPDATE orders
+                  SET status=?, warehouse_issued=?, packed_at=COALESCE(packed_at, ?)
+                  WHERE id=?
+                """, (next_status, warehouse_issued, now_iso(), order_id))
+            else:
+                cur.execute("UPDATE orders SET status=?, warehouse_issued=? WHERE id=?", (next_status, warehouse_issued, order_id))
+            changed_order_ids.append(order_id)
 
     c.commit()
     c.close()
 
     if supabase_enabled():
-        for order_id in completed_order_ids:
+        if changed_order_ids:
             try:
-                supabase_update_rows("orders", {"status": "issued", "warehouse_issued": 1}, {"id": order_id})
+                sync_local_rows_to_supabase("orders", "id", changed_order_ids)
             except Exception:
                 pass
         if changed_product_ids:
@@ -3134,7 +3149,7 @@ def finalize_fully_invoiced_orders(order_ids: list[int]):
             except Exception:
                 pass
 
-    return completed_order_ids, list(set(changed_product_ids))
+    return changed_order_ids, list(set(changed_product_ids))
 
 
 def reconcile_legacy_shipped_order_statuses():
@@ -3226,7 +3241,16 @@ def reconcile_orders_after_invoice_change(order_ids: list[int]):
                 cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (pid,))
                 cur.execute("UPDATE stock SET qty = qty - ? WHERE product_id=?", (qty, pid))
                 changed_product_ids.append(pid)
-            cur.execute("UPDATE orders SET status='issued', warehouse_issued=1 WHERE id=?", (order_id,))
+            preserved = {"shipped", "partially_shipped", "completed", "issued", "cancelled"}
+            next_status = current_status if current_status in preserved else "packed"
+            if next_status == "packed":
+                cur.execute("""
+                  UPDATE orders
+                  SET status=?, warehouse_issued=1, packed_at=COALESCE(packed_at, ?)
+                  WHERE id=?
+                """, (next_status, now_iso(), order_id))
+            else:
+                cur.execute("UPDATE orders SET status=?, warehouse_issued=1 WHERE id=?", (next_status, order_id))
             changed_order_ids.append(order_id)
 
         elif not fully and warehouse_issued == 1:
@@ -3237,7 +3261,7 @@ def reconcile_orders_after_invoice_change(order_ids: list[int]):
                 cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (pid,))
                 cur.execute("UPDATE stock SET qty = qty + ? WHERE product_id=?", (qty, pid))
                 changed_product_ids.append(pid)
-            next_status = "confirmed" if current_status == "issued" else (current_status or "confirmed")
+            next_status = "confirmed" if current_status in {"issued", "packed", "packed_partial"} else (current_status or "confirmed")
             cur.execute("UPDATE orders SET status=?, warehouse_issued=0 WHERE id=?", (next_status, order_id))
             changed_order_ids.append(order_id)
 
@@ -3726,8 +3750,8 @@ def home():
     cur.execute("SELECT status,COUNT(*) AS n FROM orders GROUP BY status")
     status_counts = {norm(r["status"]).lower(): int(r["n"] or 0) for r in cur.fetchall()}
     status_new = sum(status_counts.get(x,0) for x in ("new","pending","unconfirmed"))
-    status_work = sum(status_counts.get(x,0) for x in ("confirmed","packed","packed_partial","in_delivery","shipped","partially_shipped"))
-    status_done = status_counts.get("issued",0)
+    status_work = sum(status_counts.get(x,0) for x in ("confirmed","packed","packed_partial","in_delivery","shipped","partially_shipped","issued"))
+    status_done = status_counts.get("completed",0)
     status_cancelled = status_counts.get("cancelled",0)
     status_total = status_new + status_work + status_done + status_cancelled
     status_divisor = max(1, status_total)
@@ -5704,11 +5728,11 @@ def orders():
 
     if tab == "new":
         where_parts.append("COALESCE(o.warehouse_issued,0)=0")
-        where_parts.append("LOWER(COALESCE(o.status,'')) NOT IN ('in_delivery','issued')")
+        where_parts.append("LOWER(COALESCE(o.status,'')) NOT IN ('in_delivery','issued','completed')")
     elif tab == "issued":
-        where_parts.append("(LOWER(COALESCE(o.status,''))='in_delivery' OR (COALESCE(o.warehouse_issued,0)=1 AND LOWER(COALESCE(o.status,''))<>'issued'))")
+        where_parts.append("(LOWER(COALESCE(o.status,'')) IN ('in_delivery','issued') OR (COALESCE(o.warehouse_issued,0)=1 AND LOWER(COALESCE(o.status,'')) NOT IN ('completed','cancelled')))")
     elif tab == "realized":
-        where_parts.append("LOWER(COALESCE(o.status,''))='issued'")
+        where_parts.append("LOWER(COALESCE(o.status,''))='completed'")
 
     if q:
         where_parts.append("(order_no LIKE ? OR customer_name LIKE ?)")
@@ -10123,6 +10147,50 @@ def _redirect_after_invoice_action(default_endpoint="invoices"):
     return redirect(target)
 
 
+def _invoice_source_order_ids(cur, invoice_id: int) -> list[int]:
+    """Zwraca wszystkie zamówienia rozliczane daną fakturą."""
+    cur.execute("""
+      SELECT DISTINCT order_id
+      FROM invoice_allocations
+      WHERE invoice_id=? AND order_id IS NOT NULL
+    """, (invoice_id,))
+    order_ids = {int(row["order_id"]) for row in cur.fetchall() if row["order_id"]}
+
+    # Starsze faktury mogły powstać przed tabelą invoice_allocations.
+    cur.execute("SELECT order_id FROM invoices WHERE id=?", (invoice_id,))
+    invoice_row = cur.fetchone()
+    if invoice_row and invoice_row["order_id"]:
+        order_ids.add(int(invoice_row["order_id"]))
+    return sorted(order_ids)
+
+
+def _order_invoice_ids(cur, order_id: int) -> list[int]:
+    """Zwraca faktury rozliczające zamówienie, także rekordy historyczne."""
+    cur.execute("""
+      SELECT DISTINCT invoice_id
+      FROM invoice_allocations
+      WHERE order_id=? AND invoice_id IS NOT NULL
+    """, (order_id,))
+    invoice_ids = {int(row["invoice_id"]) for row in cur.fetchall() if row["invoice_id"]}
+    cur.execute("SELECT id FROM invoices WHERE order_id=?", (order_id,))
+    invoice_ids.update(int(row["id"]) for row in cur.fetchall())
+    return sorted(invoice_ids)
+
+
+def _all_order_invoices_paid(cur, order_id: int) -> bool:
+    invoice_ids = _order_invoice_ids(cur, order_id)
+    if not invoice_ids:
+        return False
+    placeholders = ",".join(["?"] * len(invoice_ids))
+    cur.execute(f"""
+      SELECT invoice_id, COALESCE(paid, 0) AS paid
+      FROM invoice_meta
+      WHERE invoice_id IN ({placeholders})
+    """, tuple(invoice_ids))
+    paid_by_invoice = {int(row["invoice_id"]): int(row["paid"] or 0) for row in cur.fetchall()}
+    return all(paid_by_invoice.get(invoice_id, 0) == 1 for invoice_id in invoice_ids)
+
+
 def _set_invoice_payment_state(invoice_id: int, *, reminder: int | None = None, paid: int | None = None):
     meta = load_invoice_meta(invoice_id) or {}
     pdf_path = meta.get("pdf_path", "")
@@ -10160,11 +10228,48 @@ def _set_invoice_payment_state(invoice_id: int, *, reminder: int | None = None, 
         paid=next_paid,
         paid_at=next_paid_at
     )
+
+    changed_order_ids = []
+    c = conn()
+    cur = c.cursor()
+    for order_id in _invoice_source_order_ids(cur, invoice_id):
+        cur.execute("SELECT status, tracking_no, packed_at FROM orders WHERE id=?", (order_id,))
+        order_row = cur.fetchone()
+        if not order_row:
+            continue
+
+        current_status = norm(order_row["status"]).lower()
+        fully_invoiced = order_fully_invoiced(cur, order_id)
+
+        # Zakończenie następuje dopiero po pełnym zafakturowaniu zamówienia
+        # i opłaceniu wszystkich faktur, które je rozliczają.
+        if next_paid and fully_invoiced and _all_order_invoices_paid(cur, order_id):
+            if current_status not in {"completed", "cancelled"}:
+                cur.execute("UPDATE orders SET status='completed' WHERE id=?", (order_id,))
+                changed_order_ids.append(order_id)
+        elif paid == 0 and current_status in {"completed", "issued"}:
+            if norm(order_row["tracking_no"]):
+                next_status = "shipped" if fully_invoiced else "partially_shipped"
+            elif fully_invoiced:
+                next_status = "packed"
+            else:
+                next_status = "packed_partial" if order_row["packed_at"] else "confirmed"
+            cur.execute("UPDATE orders SET status=? WHERE id=?", (next_status, order_id))
+            changed_order_ids.append(order_id)
+
+    c.commit()
+    c.close()
+
     if supabase_enabled():
         try:
             sync_invoice_meta_to_supabase(invoice_id)
         except Exception:
             pass
+        if changed_order_ids:
+            try:
+                sync_local_rows_to_supabase("orders", "id", changed_order_ids)
+            except Exception:
+                pass
 
 
 @app.post("/invoices/<int:invoice_id>/payment-reminder")
