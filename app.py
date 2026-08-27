@@ -3927,33 +3927,6 @@ def client_searches():
     tpl = r"""
     {% extends "base.html" %}
     {% block content %}
-      <style>
-        .stock-summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;margin-bottom:16px}
-        .stock-summary-card{background:#fff;border:1px solid #e7eaf2;border-radius:22px;padding:18px 20px;box-shadow:var(--shadow)}
-        .stock-summary-card span{display:block;color:#718096;font-size:12px;font-weight:700}
-        .stock-summary-card b{display:block;margin-top:5px;color:#17233c;font-size:28px;letter-spacing:-.6px}
-        .stock-summary-card small{display:block;margin-top:4px;color:#2da176;font-size:11px}
-        @media(max-width:760px){.stock-summary{grid-template-columns:1fr}}
-      </style>
-
-      <div class="stock-summary">
-        <div class="stock-summary-card">
-          <span>Na stanie łącznie</span>
-          <b>{{ stock_total }} szt.</b>
-          <small>Fizycznie w magazynie</small>
-        </div>
-        <div class="stock-summary-card">
-          <span>Na stanie + CHINY</span>
-          <b>{{ stock_with_china_total }} szt.</b>
-          <small>Magazyn oraz towar w drodze</small>
-        </div>
-        <div class="stock-summary-card">
-          <span>W zamówieniach</span>
-          <b>{{ reserved_total }} szt.</b>
-          <small>Rezerwacje aktywnych zamówień</small>
-        </div>
-      </div>
-
       <div class="card">
         <div class="flex">
           <h1 style="margin:0;">Top wyszukiwania</h1>
@@ -5529,6 +5502,33 @@ def stock():
     tpl = r"""
     {% extends "base.html" %}
     {% block content %}
+      <style>
+        .stock-summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;margin-bottom:16px}
+        .stock-summary-card{background:#fff;border:1px solid #e7eaf2;border-radius:22px;padding:18px 20px;box-shadow:var(--shadow)}
+        .stock-summary-card span{display:block;color:#718096;font-size:12px;font-weight:700}
+        .stock-summary-card b{display:block;margin-top:5px;color:#17233c;font-size:28px;letter-spacing:-.6px}
+        .stock-summary-card small{display:block;margin-top:4px;color:#2da176;font-size:11px}
+        @media(max-width:760px){.stock-summary{grid-template-columns:1fr}}
+      </style>
+
+      <div class="stock-summary">
+        <div class="stock-summary-card">
+          <span>Na stanie łącznie</span>
+          <b>{{ stock_total }} szt.</b>
+          <small>Fizycznie w magazynie</small>
+        </div>
+        <div class="stock-summary-card">
+          <span>Na stanie + CHINY</span>
+          <b>{{ stock_with_china_total }} szt.</b>
+          <small>Magazyn oraz towar w drodze</small>
+        </div>
+        <div class="stock-summary-card">
+          <span>W zamówieniach</span>
+          <b>{{ reserved_total }} szt.</b>
+          <small>Rezerwacje aktywnych zamówień</small>
+        </div>
+      </div>
+
       <div class="card">
         <div class="flex">
           <h1 style="margin:0;">Magazyn</h1>
