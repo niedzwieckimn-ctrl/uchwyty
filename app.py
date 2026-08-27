@@ -1538,6 +1538,10 @@ def maybe_pull_shared_from_supabase(force: bool = False):
             # zamykania zamówień. Przeliczenie jest idempotentne i uzupełnia
             # wyłącznie zaległe statusy na podstawie istniejących faktur.
             reconcile_paid_order_statuses()
+            # Historycznych faktur zbiorczych nie da się zawsze jednoznacznie
+            # rozdzielić na zamówienia. Zgodnie z regułą biznesową wszystkie
+            # nieanulowane zamówienia starsze niż 14 dni uznajemy za zakończone.
+            reconcile_legacy_orders_by_age()
     except Exception:
         pass
 
@@ -6292,6 +6296,12 @@ def order_view(order_id):
             <form method="post" action="{{ url_for('order_confirmation_resend', order_id=o['id']) }}">
               <button class="btn" type="submit">Wyślij ponownie potwierdzenie</button>
             </form>
+              {% if (o['status'] or '')|lower not in ['completed','cancelled'] %}
+                <form method="post" action="{{ url_for('order_status_update', order_id=o['id']) }}" onsubmit="return confirm('Oznaczyć to zamówienie jako zrealizowane? Status będzie widoczny również w panelu klienta.')">
+                  <input type="hidden" name="status" value="completed">
+                  <button class="btn ok" type="submit">Zrealizowane</button>
+                </form>
+              {% endif %}
               <a class="btn primary" href="{{ url_for('order_label', order_id=o['id']) }}">Etykieta 30x50</a>
               {% if locked %}
                 <span class="badge">Wydane z magazynu</span>
@@ -6700,7 +6710,7 @@ def order_status_update(order_id):
     new_status = norm(request.form.get("status")).lower()
     # Status "shipped" można nadać wyłącznie osobnym formularzem,
     # który wymaga numeru przesyłki i wysyła powiadomienie do klienta.
-    allowed = {"new", "confirmed", "packed", "in_delivery", "issued"}
+    allowed = {"new", "confirmed", "packed", "in_delivery", "issued", "completed"}
     if new_status not in allowed:
         return "NieprawidĹ‚owy status", 400
 
@@ -10284,6 +10294,37 @@ def reconcile_paid_order_statuses():
             sync_local_rows_to_supabase("orders", "id", changed_order_ids)
         except Exception:
             app.logger.exception("Nie udało się zsynchronizować statusów opłaconych zamówień")
+    return changed_order_ids
+
+
+def reconcile_legacy_orders_by_age(days: int = 14):
+    """Twardo zamyka nieanulowane zamówienia sprzed co najmniej ``days`` dni."""
+    cutoff = (app_now() - timedelta(days=max(1, int(days)))).strftime("%Y-%m-%d")
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+      SELECT id
+      FROM orders
+      WHERE TRIM(COALESCE(created_at,''))<>''
+        AND SUBSTR(TRIM(created_at),1,10) <= ?
+        AND LOWER(COALESCE(status,'')) NOT IN ('completed','cancelled')
+    """, (cutoff,))
+    changed_order_ids = [int(row["id"]) for row in cur.fetchall()]
+    if changed_order_ids:
+        placeholders = ",".join(["?"] * len(changed_order_ids))
+        cur.execute(
+            f"UPDATE orders SET status='completed' WHERE id IN ({placeholders})",
+            tuple(changed_order_ids),
+        )
+    c.commit()
+    c.close()
+
+    if changed_order_ids and supabase_enabled():
+        try:
+            for offset in range(0, len(changed_order_ids), 250):
+                sync_local_rows_to_supabase("orders", "id", changed_order_ids[offset:offset + 250])
+        except Exception:
+            app.logger.exception("Nie udało się zsynchronizować zamówień zamkniętych regułą 14 dni")
     return changed_order_ids
 
 
