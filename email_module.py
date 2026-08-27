@@ -40,6 +40,32 @@ def _esc(value) -> str:
     return html.escape(str(value or ""), quote=True)
 
 
+def _email_shell(title: str, content: str, footer: str = "Zespół Niedźwieccy") -> str:
+    """Wspólny, czytelny układ wszystkich wiadomości transakcyjnych."""
+    return (
+        "<div style='margin:0;padding:28px 14px;background:#f3f6fb;font-family:Arial,sans-serif;color:#10203d'>"
+        "<div style='max-width:620px;margin:0 auto;background:#fff;border:1px solid #e2e8f2;border-radius:18px;overflow:hidden'>"
+        "<div style='padding:30px 34px 28px'>"
+        f"<h1 style='margin:0 0 24px;font-size:26px;line-height:1.25'>{_esc(title)}</h1>"
+        f"{content}"
+        f"<p style='margin:26px 0 0;line-height:1.6;color:#52617c'>Pozdrawiamy,<br><b>{_esc(footer)}</b></p>"
+        "</div></div></div>"
+    )
+
+
+def _email_info_box(content: str, *, danger: bool = False) -> str:
+    background = "#fff5f5" if danger else "#f7f9fd"
+    border = "#fecaca" if danger else "#e3e9f3"
+    return f"<div style='margin:22px 0;padding:20px;background:{background};border:1px solid {border};border-radius:14px;line-height:1.8'>{content}</div>"
+
+
+def _email_button(label: str, url: str, *, danger: bool = False) -> str:
+    if not url:
+        return ""
+    color = "#dc2626" if danger else "#4f70eb"
+    return f"<p style='margin:24px 0'><a href='{_esc(url)}' style='display:inline-block;padding:13px 22px;background:{color};color:#fff;text-decoration:none;font-weight:bold;border-radius:10px'>{_esc(label)}</a></p>"
+
+
 def _uniq_emails(values: Iterable[str] | None) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
@@ -239,20 +265,17 @@ def send_order_confirmation(order: dict, items: list[dict], admin_email: str = "
     recipients = _uniq_emails([customer_email, admin_email or email_config_summary().get("admin_email")])
     subject = copy["subject"].format(order_no=order_no)
     items_table, total = _items_table(items, copy, currency)
-    html_body = f"""
-    <div style="font-family:Arial,sans-serif;color:#111;line-height:1.5;max-width:760px">
-      <h2 style="margin-bottom:8px">{_esc(copy['title'])}</h2>
-      <p>{copy['intro'].format(order_no=_esc(order_no))}</p>
-      <p>
-        <b>{_esc(copy['customer'])}:</b> {_esc(customer_name)}<br>
-        <b>{_esc(copy['email'])}:</b> {_esc(customer_email)}<br>
-        <b>{_esc(copy['note'])}:</b> {_esc(note)}
-      </p>
-      {items_table}
-      <p style="margin-top:18px">{_esc(copy['reply'])}</p>
-      <p style="color:#555;margin-top:18px">{_esc(copy['regards'])},<br>Niedźwieccy</p>
-    </div>
-    """
+    details = _email_info_box(
+        f"<div><span style='color:#62708c'>{_esc(copy['customer'])}:</span> <b>{_esc(customer_name)}</b></div>"
+        f"<div><span style='color:#62708c'>{_esc(copy['email'])}:</span> <b>{_esc(customer_email)}</b></div>"
+        f"<div><span style='color:#62708c'>{_esc(copy['note'])}:</span> {_esc(note)}</div>"
+    )
+    html_body = _email_shell(
+        copy["title"],
+        f"<p style='margin:0 0 20px;line-height:1.6'>{copy['intro'].format(order_no=_esc(order_no))}</p>"
+        f"{details}<div style='overflow-x:auto'>{items_table}</div>"
+        f"<p style='margin:22px 0 0;line-height:1.6'>{_esc(copy['reply'])}</p>",
+    )
     text_body = (
         f"{copy['title']}: {order_no}\n"
         f"{copy['customer']}: {customer_name}\n"
@@ -269,27 +292,19 @@ def send_invoice_available(invoice: dict, pdf_url: str = "", admin_email: str = 
     buyer_name = invoice.get("buyer_name") or invoice.get("customer_name") or "Klient"
     buyer_email = invoice.get("buyer_email") or invoice.get("customer_email") or ""
     recipients = _uniq_emails([buyer_email, admin_email or email_config_summary().get("admin_email")])
-    link_html = (
-        f"<p><a href='{_esc(pdf_url)}' style='display:inline-block;background:#111;color:#fff;"
-        "padding:10px 14px;border-radius:10px;text-decoration:none'>Otwórz fakturę w panelu</a></p>"
-        if pdf_url
-        else ""
-    )
+    link_html = _email_button("Otwórz fakturę w panelu", pdf_url)
     subject = f"Nowa faktura do pobrania: {invoice_no}"
-    html_body = f"""
-    <div style="font-family:Arial,sans-serif;color:#111;line-height:1.5;max-width:760px">
-      <h2 style="margin-bottom:8px">Nowa faktura jest dostępna</h2>
-      <p>Udostępniliśmy fakturę <b>{_esc(invoice_no)}</b>. Możesz ją pobrać w panelu klienta albo przyciskiem poniżej.</p>
-      <p>
-        <b>Klient:</b> {_esc(buyer_name)}<br>
-        <b>Kwota brutto:</b> {_esc(_money(invoice.get('total_gross')))}<br>
-        <b>Termin płatności:</b> {_esc(invoice.get('payment_to') or '-')}
-      </p>
-      {link_html}
-      <p style="color:#555">Po pobraniu faktury komunikat w panelu klienta przestanie się pojawiać.</p>
-      <p style="color:#555;margin-top:18px">Pozdrawiamy,<br>Niedźwieccy</p>
-    </div>
-    """
+    details = _email_info_box(
+        f"<div><span style='color:#62708c'>Numer faktury:</span> <b>{_esc(invoice_no)}</b></div>"
+        f"<div><span style='color:#62708c'>Klient:</span> <b>{_esc(buyer_name)}</b></div>"
+        f"<div><span style='color:#62708c'>Kwota brutto:</span> <b>{_esc(_money(invoice.get('total_gross')))}</b></div>"
+        f"<div><span style='color:#62708c'>Termin płatności:</span> <b>{_esc(invoice.get('payment_to') or '-')}</b></div>"
+    )
+    html_body = _email_shell(
+        "Nowa faktura jest dostępna",
+        f"<p style='margin:0;line-height:1.6'>Udostępniliśmy fakturę <b>{_esc(invoice_no)}</b>. Możesz ją pobrać w panelu klienta.</p>"
+        f"{details}{link_html}<p style='margin:0;line-height:1.6;color:#52617c'>Po pobraniu faktury komunikat w panelu klienta przestanie się pojawiać.</p>",
+    )
     text_body = (
         f"Nowa faktura jest dostępna: {invoice_no}\n"
         f"Kwota brutto: {_money(invoice.get('total_gross'))}\n"
@@ -305,27 +320,21 @@ def send_payment_reminder(invoice: dict, pdf_url: str = "", admin_email: str = "
     buyer_name = invoice.get("buyer_name") or invoice.get("customer_name") or "Klient"
     buyer_email = invoice.get("buyer_email") or invoice.get("customer_email") or ""
     recipients = _uniq_emails([buyer_email, admin_email or email_config_summary().get("admin_email")])
-    link_html = (
-        f"<p><a href='{_esc(pdf_url)}' style='display:inline-block;background:#dc2626;color:#fff;"
-        "padding:10px 14px;border-radius:10px;text-decoration:none'>Pobierz fakturę PDF</a></p>"
-        if pdf_url
-        else ""
-    )
+    link_html = _email_button("Pobierz fakturę PDF", pdf_url, danger=True)
     subject = f"Przypomnienie o płatności: {invoice_no}"
-    html_body = f"""
-    <div style="font-family:Arial,sans-serif;color:#111;line-height:1.5;max-width:760px">
-      <h2 style="margin-bottom:8px">Przypomnienie o płatności</h2>
-      <p>Przypominamy o fakturze <b>{_esc(invoice_no)}</b>, która jest jeszcze oznaczona jako nieopłacona.</p>
-      <p>
-        <b>Klient:</b> {_esc(buyer_name)}<br>
-        <b>Kwota brutto:</b> {_esc(_money(invoice.get('total_gross')))}<br>
-        <b>Termin płatności:</b> {_esc(invoice.get('payment_to') or '-')}
-      </p>
-      {link_html}
-      <p>Prosimy o uregulowanie płatności. Jeśli przelew został już wykonany, możesz zignorować tę wiadomość.<br>Wadomość została wygenerowana automatycznie, prosimy na nią nie odpowiadać.</p>
-      <p style="color:#555;margin-top:18px">Pozdrawiamy,<br>Niedźwieccy</p>
-    </div>
-    """
+    details = _email_info_box(
+        f"<div><span style='color:#991b1b'>Numer faktury:</span> <b>{_esc(invoice_no)}</b></div>"
+        f"<div><span style='color:#991b1b'>Klient:</span> <b>{_esc(buyer_name)}</b></div>"
+        f"<div><span style='color:#991b1b'>Kwota brutto:</span> <b>{_esc(_money(invoice.get('total_gross')))}</b></div>"
+        f"<div><span style='color:#991b1b'>Termin płatności:</span> <b>{_esc(invoice.get('payment_to') or '-')}</b></div>",
+        danger=True,
+    )
+    html_body = _email_shell(
+        "Przypomnienie o płatności",
+        f"<p style='margin:0;line-height:1.6'>Przypominamy o fakturze <b>{_esc(invoice_no)}</b>, która jest oznaczona jako nieopłacona.</p>"
+        f"{details}{link_html}<p style='margin:0;line-height:1.6'>Prosimy o uregulowanie płatności. Jeśli przelew został już wykonany, możesz zignorować tę wiadomość.</p>"
+        "<p style='margin:12px 0 0;color:#71809f;font-size:13px'>Wiadomość została wygenerowana automatycznie.</p>",
+    )
     text_body = (
         f"Przypomnienie o płatności za {invoice_no}\n"
         f"Kwota brutto: {_money(invoice.get('total_gross'))}\n"
