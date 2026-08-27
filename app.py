@@ -5731,12 +5731,30 @@ def orders():
     c = conn()
     cur = c.cursor()
 
+    cur.execute("""
+      SELECT
+        SUM(CASE WHEN LOWER(COALESCE(status,''))='completed' THEN 1 ELSE 0 END) AS completed_count,
+        SUM(CASE WHEN LOWER(COALESCE(status,'')) IN ('in_delivery','issued')
+          OR (COALESCE(warehouse_issued,0)=1 AND LOWER(COALESCE(status,'')) NOT IN ('completed','cancelled'))
+          THEN 1 ELSE 0 END) AS issued_count,
+        SUM(CASE WHEN COALESCE(warehouse_issued,0)=0
+          AND LOWER(COALESCE(status,'')) NOT IN ('in_delivery','issued','completed','cancelled')
+          THEN 1 ELSE 0 END) AS to_issue_count
+      FROM orders
+    """)
+    stats_row = cur.fetchone()
+    order_stats = {
+        "completed": int(stats_row["completed_count"] or 0),
+        "issued": int(stats_row["issued_count"] or 0),
+        "to_issue": int(stats_row["to_issue_count"] or 0),
+    }
+
     where_parts = []
     params = []
 
     if tab == "new":
         where_parts.append("COALESCE(o.warehouse_issued,0)=0")
-        where_parts.append("LOWER(COALESCE(o.status,'')) NOT IN ('in_delivery','issued','completed')")
+        where_parts.append("LOWER(COALESCE(o.status,'')) NOT IN ('in_delivery','issued','completed','cancelled')")
     elif tab == "issued":
         where_parts.append("(LOWER(COALESCE(o.status,'')) IN ('in_delivery','issued') OR (COALESCE(o.warehouse_issued,0)=1 AND LOWER(COALESCE(o.status,'')) NOT IN ('completed','cancelled')))")
     elif tab == "realized":
@@ -5885,6 +5903,27 @@ def orders():
     tpl = r"""
     {% extends "base.html" %}
     {% block content %}
+      <style>
+        .order-stat-card{display:block;text-decoration:none;color:inherit;cursor:pointer;transition:transform .15s ease,box-shadow .15s ease,border-color .15s ease;background:#fff;}
+        .order-stat-card:hover{transform:translateY(-2px);box-shadow:0 12px 28px rgba(24,45,84,.13);border-color:#9db5f5;}
+        .order-stat-card:focus-visible{outline:3px solid rgba(79,111,235,.28);outline-offset:2px;}
+        .order-stat-card.active{background:#eef3ff;border-color:#4f6feb;box-shadow:0 8px 22px rgba(79,111,235,.16);}
+        .order-stat-card.active .order-stat-label{color:#3156c7;font-weight:800;}
+      </style>
+      <div class="grid3">
+        <a class="card order-stat-card {% if tab=='realized' %}active{% endif %}" href="{{ url_for('orders', tab='realized') }}" aria-label="Pokaż zrealizowane zamówienia" {% if tab=='realized' %}aria-current="page"{% endif %}>
+          <div class="muted order-stat-label">Zrealizowane łącznie</div>
+          <div style="font-size:30px;font-weight:800;margin-top:8px;">{{ order_stats.completed }}</div>
+        </a>
+        <a class="card order-stat-card {% if tab=='issued' %}active{% endif %}" href="{{ url_for('orders', tab='issued') }}" aria-label="Pokaż wydane zamówienia" {% if tab=='issued' %}aria-current="page"{% endif %}>
+          <div class="muted order-stat-label">Wydane</div>
+          <div style="font-size:30px;font-weight:800;margin-top:8px;">{{ order_stats.issued }}</div>
+        </a>
+        <a class="card order-stat-card {% if tab=='new' %}active{% endif %}" href="{{ url_for('orders', tab='new') }}" aria-label="Pokaż zamówienia do wydania" {% if tab=='new' %}aria-current="page"{% endif %}>
+          <div class="muted order-stat-label">Do wydania</div>
+          <div style="font-size:30px;font-weight:800;margin-top:8px;">{{ order_stats.to_issue }}</div>
+        </a>
+      </div>
       <div class="card">
         <div class="flex">
           <h1 style="margin:0;">ZamĂłwienia</h1>
@@ -5945,7 +5984,7 @@ def orders():
       </div>
     {% endblock %}
     """
-    return render_template_string(tpl, title="ZamĂłwienia", base_url=BASE_URL, db_path=DB_PATH, rows=rows, q=q, tab=tab, order_status_label=order_status_label, order_status_css=order_status_css, canonical_order_no=canonical_order_no)
+    return render_template_string(tpl, title="ZamĂłwienia", base_url=BASE_URL, db_path=DB_PATH, rows=rows, q=q, tab=tab, order_stats=order_stats, order_status_label=order_status_label, order_status_css=order_status_css, canonical_order_no=canonical_order_no)
 
 @app.get("/orders/new")
 def order_new():
@@ -7849,14 +7888,27 @@ def _send_orders_packed_email(orders: list[dict], packing_path: str = "") -> dic
         "es": "La lista de embalaje está adjunta.",
         "it": "La lista di imballaggio è allegata.",
     }.get(language, "Lista pakowania znajduje się w załączniku.")
+    footer_text = {
+        "pl": "Zespół Niedźwieccy", "de": "Ihr Niedźwieccy-Team",
+        "en": "The Niedźwieccy Team", "es": "Equipo Niedźwieccy",
+        "it": "Il team Niedźwieccy",
+    }.get(language, "Zespół Niedźwieccy")
     safe_orders = "".join(
         f"<li style='margin:4px 0'><b>{html.escape(str(order_no), quote=True)}</b></li>"
         for order_no in order_numbers
     )
     html_body = (
-        "<div style='font-family:Arial,sans-serif;color:#10203d'>"
-        f"<h2>{subject_text}</h2><p>{intro}</p><ul style='padding-left:20px'>{safe_orders}</ul>"
-        f"<p>{attachment_note}</p></div>"
+        "<div style='margin:0;padding:28px 14px;background:#f3f6fb;font-family:Arial,sans-serif;color:#10203d'>"
+        "<div style='max-width:620px;margin:0 auto;background:#fff;border:1px solid #e2e8f2;border-radius:18px;overflow:hidden'>"
+        "<div style='padding:30px 34px 28px'>"
+        f"<h1 style='margin:0 0 24px;font-size:26px;line-height:1.25'>{html.escape(subject_text)}</h1>"
+        f"<p style='margin:0 0 22px;line-height:1.6'>{html.escape(intro)}</p>"
+        "<div style='padding:20px;background:#f7f9fd;border:1px solid #e3e9f3;border-radius:14px;line-height:1.8'>"
+        f"<div style='color:#62708c'>Numery zamówień:</div><ul style='margin:4px 0;padding-left:22px'>{safe_orders}</ul>"
+        "</div>"
+        f"<p style='margin:22px 0 0;line-height:1.6;color:#52617c'>{html.escape(attachment_note)}</p>"
+        f"<p style='margin:26px 0 0;line-height:1.6;color:#52617c'><b>{html.escape(footer_text)}</b></p>"
+        "</div></div></div>"
     )
     text_body = f"{subject_text}\n{intro}\n" + "\n".join(order_numbers) + f"\n{attachment_note}"
     if packing_path and os.path.exists(packing_path):
