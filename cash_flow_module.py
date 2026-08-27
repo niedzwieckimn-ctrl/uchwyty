@@ -548,11 +548,23 @@ def register_cash_flow(app, deps):
             const W = 1040, H = 350, left = 58, right = 28, top = 28, bottom = 58;
             const width = W-left-right, height = H-top-bottom;
             const make = (tag, attrs, value) => { const node=document.createElementNS(NS,tag); Object.entries(attrs||{}).forEach(([k,v])=>node.setAttribute(k,v)); if(value!==undefined)node.textContent=value; svg.appendChild(node); return node; };
+            const smoothPath = points => {
+              if (!points.length) return '';
+              if (points.length === 1) return `M ${points[0].x} ${points[0].y}`;
+              let d = `M ${points[0].x} ${points[0].y}`;
+              for (let i=0; i<points.length-1; i++) {
+                const p0=points[Math.max(0,i-1)], p1=points[i], p2=points[i+1], p3=points[Math.min(points.length-1,i+2)];
+                const c1x=p1.x+(p2.x-p0.x)/6, c1y=p1.y+(p2.y-p0.y)/6;
+                const c2x=p2.x-(p3.x-p1.x)/6, c2y=p2.y-(p3.y-p1.y)/6;
+                d += ` C ${c1x} ${c1y}, ${c2x} ${c2y}, ${p2.x} ${p2.y}`;
+              }
+              return d;
+            };
             for(let i=0;i<=4;i++){const y=top+height*i/4;make('line',{x1:left,y1:y,x2:W-right,y2:y,stroke:'#e3e9f4','stroke-width':'1'});make('text',{x:8,y:y+4,fill:'#71809f','font-size':'12'},`${100-i*25}%`);}
             const series=[{key:'units',color:'#4f6feb',label:'szt.'},{key:'orders',color:'#10a37f',label:'zamówień'},{key:'invoices',color:'#f59e0b',label:'faktur'}];
             const x=i=>left+(rows.length===1?width/2:width*i/(rows.length-1));
             rows.forEach((row,i)=>make('text',{x:x(i),y:H-25,fill:'#596987','font-size':'12','text-anchor':'middle'},row.label));
-            series.forEach(s=>{const max=Math.max(1,...rows.map(r=>Number(r[s.key])||0));const points=rows.map((r,i)=>({x:x(i),y:top+height-(Number(r[s.key])||0)/max*height,value:Number(r[s.key])||0,label:r.label}));make('polyline',{points:points.map(p=>`${p.x},${p.y}`).join(' '),fill:'none',stroke:s.color,'stroke-width':'4','stroke-linecap':'round','stroke-linejoin':'round'});points.forEach(p=>{const dot=make('circle',{cx:p.x,cy:p.y,r:'5',fill:'#fff',stroke:s.color,'stroke-width':'3'});const title=document.createElementNS(NS,'title');title.textContent=`${p.label}: ${p.value} ${s.label}`;dot.appendChild(title);});});
+            series.forEach(s=>{const max=Math.max(1,...rows.map(r=>Number(r[s.key])||0));const points=rows.map((r,i)=>({x:x(i),y:top+height-(Number(r[s.key])||0)/max*height,value:Number(r[s.key])||0,label:r.label}));make('path',{d:smoothPath(points),fill:'none',stroke:s.color,'stroke-width':'4','stroke-linecap':'round','stroke-linejoin':'round'});points.forEach(p=>{const hit=make('circle',{cx:p.x,cy:p.y,r:'10',fill:'transparent','pointer-events':'all'});const title=document.createElementNS(NS,'title');title.textContent=`${p.label}: ${p.value} ${s.label}`;hit.appendChild(title);});});
           })();
           </script>
 
@@ -574,12 +586,13 @@ def register_cash_flow(app, deps):
             const values=rows.flatMap(r=>[Number(r.revenue)||0,Number(r.expenses)||0,Number(r.profit)||0]);
             let min=Math.min(0,...values), max=Math.max(0,...values); if(max===min)max=min+1;
             const make=(tag,attrs,value)=>{const n=document.createElementNS(NS,tag);Object.entries(attrs||{}).forEach(([k,v])=>n.setAttribute(k,v));if(value!==undefined)n.textContent=value;svg.appendChild(n);return n;};
+            const smoothPath=points=>{if(!points.length)return'';if(points.length===1)return`M ${points[0].x} ${points[0].y}`;let d=`M ${points[0].x} ${points[0].y}`;for(let i=0;i<points.length-1;i++){const p0=points[Math.max(0,i-1)],p1=points[i],p2=points[i+1],p3=points[Math.min(points.length-1,i+2)];const c1x=p1.x+(p2.x-p0.x)/6,c1y=p1.y+(p2.y-p0.y)/6,c2x=p2.x-(p3.x-p1.x)/6,c2y=p2.y-(p3.y-p1.y)/6;d+=` C ${c1x} ${c1y}, ${c2x} ${c2y}, ${p2.x} ${p2.y}`;}return d;};
             const y=value=>top+(max-value)/(max-min)*height;
             for(let i=0;i<=4;i++){const value=max-(max-min)*i/4,yPos=y(value);make('line',{x1:left,y1:yPos,x2:W-right,y2:yPos,stroke:'#e3e9f4','stroke-width':'1'});make('text',{x:4,y:yPos+4,fill:'#71809f','font-size':'11'},`${Math.round(value)} zł`);}
             if(min<0&&max>0)make('line',{x1:left,y1:y(0),x2:W-right,y2:y(0),stroke:'#94a3b8','stroke-width':'2'});
             const x=i=>left+(rows.length===1?width/2:width*i/(rows.length-1));
             rows.forEach((r,i)=>make('text',{x:x(i),y:H-25,fill:'#596987','font-size':'12','text-anchor':'middle'},r.label));
-            [{key:'revenue',color:'#4f6feb',label:'przychód'},{key:'expenses',color:'#ef4444',label:'wydatki'},{key:'profit',color:'#10a37f',label:'zysk'}].forEach(s=>{const pts=rows.map((r,i)=>({x:x(i),y:y(Number(r[s.key])||0),value:Number(r[s.key])||0,label:r.label}));make('polyline',{points:pts.map(p=>`${p.x},${p.y}`).join(' '),fill:'none',stroke:s.color,'stroke-width':'4','stroke-linecap':'round','stroke-linejoin':'round'});pts.forEach(p=>{const dot=make('circle',{cx:p.x,cy:p.y,r:'5',fill:'#fff',stroke:s.color,'stroke-width':'3'});const title=document.createElementNS(NS,'title');title.textContent=`${p.label}: ${s.label} ${p.value.toFixed(2)} PLN`;dot.appendChild(title);});});
+            [{key:'revenue',color:'#4f6feb',label:'przychód'},{key:'expenses',color:'#ef4444',label:'wydatki'},{key:'profit',color:'#10a37f',label:'zysk'}].forEach(s=>{const pts=rows.map((r,i)=>({x:x(i),y:y(Number(r[s.key])||0),value:Number(r[s.key])||0,label:r.label}));make('path',{d:smoothPath(pts),fill:'none',stroke:s.color,'stroke-width':'4','stroke-linecap':'round','stroke-linejoin':'round'});pts.forEach(p=>{const hit=make('circle',{cx:p.x,cy:p.y,r:'10',fill:'transparent','pointer-events':'all'});const title=document.createElementNS(NS,'title');title.textContent=`${p.label}: ${s.label} ${p.value.toFixed(2)} PLN`;hit.appendChild(title);});});
           })();
           </script>
 
