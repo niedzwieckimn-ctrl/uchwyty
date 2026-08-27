@@ -9942,7 +9942,7 @@ def invoice_download_admin(invoice_id):
 
 @app.get("/orders/<int:order_id>/packing-list")
 def order_packing_list_download_admin(order_id):
-    """Generuje liste pakowania bez wymogu uprzedniego wystawienia faktury."""
+    """Generuje wspolna liste pakowania dla zamowien tego samego klienta."""
     maybe_pull_shared_from_supabase()
     c = conn()
     cur = c.cursor()
@@ -9951,15 +9951,34 @@ def order_packing_list_download_admin(order_id):
     if not order_row:
         c.close()
         return "Nie znaleziono zamowienia", 404
-    cur.execute("""
-      SELECT oi.id, oi.product_id, oi.qty, p.sku, p.model, p.name,
+    candidate_orders = [dict(order_row)]
+    recipient = _email_key(order_row["customer_email"])
+    if recipient:
+        # Jedno klikniecie „Pakuj” obejmuje pozostale potwierdzone zamowienia
+        # tego samego klienta. Dzieki temu powstaje jeden dokument i jeden
+        # zbiorczy e-mail, zamiast osobnej wiadomosci dla kazdego zamowienia.
+        cur.execute("""
+          SELECT *
+          FROM orders
+          WHERE id<>?
+            AND LOWER(TRIM(COALESCE(customer_email,'')))=?
+            AND LOWER(COALESCE(status,''))='confirmed'
+          ORDER BY created_at, id
+        """, (order_id, recipient))
+        candidate_orders.extend(dict(row) for row in cur.fetchall())
+
+    candidate_by_id = {int(order["id"]): order for order in candidate_orders}
+    candidate_ids = sorted(candidate_by_id)
+    placeholders = ",".join(["?"] * len(candidate_ids))
+    cur.execute(f"""
+      SELECT oi.id, oi.order_id, oi.product_id, oi.qty, p.sku, p.model, p.name,
              COALESCE(s.qty,0) AS stock_qty
       FROM order_items oi
       JOIN products p ON p.id=oi.product_id
       LEFT JOIN stock s ON s.product_id=oi.product_id
-      WHERE oi.order_id=?
-      ORDER BY oi.id
-    """, (order_id,))
+      WHERE oi.order_id IN ({placeholders})
+      ORDER BY oi.order_id, oi.id
+    """, tuple(candidate_ids))
     order_items = [dict(row) for row in cur.fetchall()]
     c.close()
     if not order_items:
@@ -9978,16 +9997,19 @@ def order_packing_list_download_admin(order_id):
         if pack_qty <= 0:
             continue
         item["qty"] = pack_qty
+        source_order = candidate_by_id.get(int(item.get("order_id") or 0), {})
+        item["source_order_id"] = int(item.get("order_id") or 0)
+        item["source_order_no"] = canonical_order_no(
+            source_order.get("id"), source_order.get("created_at"), source_order.get("order_no")
+        )
+        item["source_order_note"] = norm(source_order.get("note"))
         items.append(item)
 
     if not items:
         return "Brak pozycji dostępnych obecnie na magazynie do spakowania", 400
 
+    packed_order_ids = sorted({int(item["source_order_id"]) for item in items})
     order_no = canonical_order_no(order_row["id"], order_row["created_at"], order_row["order_no"])
-    note = norm(order_row["note"])
-    for item in items:
-        item["source_order_no"] = order_no
-        item["source_order_note"] = note
     meta = {
         "invoice_no": order_no,
         "document_label_key": "order",
@@ -9995,12 +10017,13 @@ def order_packing_list_download_admin(order_id):
         "buyer_email": norm(order_row["customer_email"]),
     }
     pack_path = generate_invoice_packing_list_pdf(order_row, items, meta)
-    mark_orders_packed([order_id], packing_path=pack_path, packing_items=items)
+    mark_orders_packed(packed_order_ids, packing_path=pack_path, packing_items=items)
+    filename_suffix = "_zbiorcza" if len(packed_order_ids) > 1 else ""
     return send_file(
         pack_path,
         mimetype="application/pdf",
         as_attachment=True,
-        download_name=f"{safe_filename(order_no)}_lista_pakowania.pdf",
+        download_name=f"{safe_filename(order_no)}{filename_suffix}_lista_pakowania.pdf",
     )
 
 
