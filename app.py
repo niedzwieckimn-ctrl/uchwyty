@@ -10151,6 +10151,27 @@ def _redirect_after_invoice_action(default_endpoint="invoices"):
     return redirect(target)
 
 
+def _invoice_json_order_ids(raw_items_json: str) -> set[int]:
+    """Odczytuje powiązania wielu zamówień ze starszego zapisu faktury."""
+    try:
+        items = json.loads(raw_items_json or "[]")
+    except Exception:
+        return set()
+    if not isinstance(items, list):
+        return set()
+    order_ids = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            order_id = int(item.get("source_order_id") or item.get("order_id") or 0)
+        except (TypeError, ValueError):
+            order_id = 0
+        if order_id > 0:
+            order_ids.add(order_id)
+    return order_ids
+
+
 def _invoice_source_order_ids(cur, invoice_id: int) -> list[int]:
     """Zwraca wszystkie zamówienia rozliczane daną fakturą."""
     cur.execute("""
@@ -10165,6 +10186,13 @@ def _invoice_source_order_ids(cur, invoice_id: int) -> list[int]:
     invoice_row = cur.fetchone()
     if invoice_row and invoice_row["order_id"]:
         order_ids.add(int(invoice_row["order_id"]))
+
+    # Stare faktury zbiorcze przechowywały dodatkowe zamówienia wyłącznie
+    # w JSON-ie pozycji; invoices.order_id wskazywało tylko pierwsze z nich.
+    cur.execute("SELECT invoice_items_json FROM invoice_meta WHERE invoice_id=?", (invoice_id,))
+    meta_row = cur.fetchone()
+    if meta_row:
+        order_ids.update(_invoice_json_order_ids(meta_row["invoice_items_json"]))
     return sorted(order_ids)
 
 
@@ -10178,6 +10206,10 @@ def _order_invoice_ids(cur, order_id: int) -> list[int]:
     invoice_ids = {int(row["invoice_id"]) for row in cur.fetchall() if row["invoice_id"]}
     cur.execute("SELECT id FROM invoices WHERE order_id=?", (order_id,))
     invoice_ids.update(int(row["id"]) for row in cur.fetchall())
+    cur.execute("SELECT invoice_id, invoice_items_json FROM invoice_meta WHERE TRIM(COALESCE(invoice_items_json,''))<>''")
+    for row in cur.fetchall():
+        if order_id in _invoice_json_order_ids(row["invoice_items_json"]):
+            invoice_ids.add(int(row["invoice_id"]))
     return sorted(invoice_ids)
 
 
@@ -10206,28 +10238,23 @@ def _order_fully_invoiced_for_payment(cur, order_id: int) -> bool:
     if cur.fetchone():
         return order_fully_invoiced(cur, order_id)
     cur.execute("SELECT 1 FROM invoices WHERE order_id=? LIMIT 1", (order_id,))
-    return cur.fetchone() is not None
+    if cur.fetchone() is not None:
+        return True
+    cur.execute("SELECT invoice_items_json FROM invoice_meta WHERE TRIM(COALESCE(invoice_items_json,''))<>''")
+    return any(order_id in _invoice_json_order_ids(row["invoice_items_json"]) for row in cur.fetchall())
 
 
 def reconcile_paid_order_statuses():
     """Uzupełnia status completed dla wcześniej opłaconych zamówień."""
     c = conn()
     cur = c.cursor()
-    cur.execute("""
-      SELECT DISTINCT linked.order_id
-      FROM (
-        SELECT order_id, id AS invoice_id
-        FROM invoices
-        WHERE order_id IS NOT NULL
-        UNION
-        SELECT order_id, invoice_id
-        FROM invoice_allocations
-        WHERE order_id IS NOT NULL AND invoice_id IS NOT NULL
-      ) linked
-      JOIN invoice_meta m ON m.invoice_id=linked.invoice_id
-      WHERE COALESCE(m.paid,0)=1
-    """)
-    order_ids = sorted({int(row["order_id"]) for row in cur.fetchall() if row["order_id"]})
+    cur.execute("SELECT invoice_id FROM invoice_meta WHERE COALESCE(paid,0)=1")
+    paid_invoice_ids = [int(row["invoice_id"]) for row in cur.fetchall()]
+    order_ids = sorted({
+        order_id
+        for invoice_id in paid_invoice_ids
+        for order_id in _invoice_source_order_ids(cur, invoice_id)
+    })
     changed_order_ids = []
     for order_id in order_ids:
         cur.execute("SELECT status FROM orders WHERE id=?", (order_id,))
