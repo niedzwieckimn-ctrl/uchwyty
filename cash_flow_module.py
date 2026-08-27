@@ -68,7 +68,10 @@ def cash_flow_overdue_invoices(db_conn, *, current_time=None, visible_hour=8):
 
 
 def recent_months(today, count=12):
-    month_names = ("sty", "lut", "mar", "kwi", "maj", "cze", "lip", "sie", "wrz", "paź", "lis", "gru")
+    month_names = (
+        "styczeń", "luty", "marzec", "kwiecień", "maj", "czerwiec",
+        "lipiec", "sierpień", "wrzesień", "październik", "listopad", "grudzień",
+    )
     result = []
     year, month = today.year, today.month
     for offset in range(count - 1, -1, -1):
@@ -77,7 +80,9 @@ def recent_months(today, count=12):
         item_month = item_month_zero + 1
         result.append({
             "key": f"{item_year:04d}-{item_month:02d}",
-            "label": f"{month_names[item_month - 1]} {str(item_year)[2:]}",
+            # Pełny rok usuwa dwuznaczność etykiety „sie 26”, którą można
+            # błędnie odczytać jako dzień miesiąca zamiast sierpnia 2026.
+            "label": f"{month_names[item_month - 1]} {item_year}",
             "units": 0,
             "orders": 0,
             "invoices": 0,
