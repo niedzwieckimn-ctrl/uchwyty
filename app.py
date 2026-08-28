@@ -7195,7 +7195,7 @@ def order_invoice(order_id):
                     {% if inv['paid_at'] %}<div class="muted small">{{ inv['paid_at'] }}</div>{% endif %}
                   {% else %}
                     <span class="badge danger">Nieopłacona</span>
-                    {% if inv['payment_reminder'] %}<span class="badge">Przypomnienie aktywne</span>{% endif %}
+                    {% if inv['payment_reminder'] %}<span class="badge ok">Przypomnienie wysłane</span>{% endif %}
                   {% endif %}
                 </td>
                 <td>
@@ -9402,7 +9402,7 @@ def invoices():
                             <span class="badge ok">Opłacona</span>
                           {% else %}
                             <span class="badge danger">Nieopłacona</span>
-                            {% if inv.payment_reminder %}<span class="badge">Przypomnienie aktywne</span>{% endif %}
+                            {% if inv.payment_reminder %}<span class="badge ok">Przypomnienie wysłane</span>{% endif %}
                           {% endif %}
                           {% if inv.ksef_status == 'sent' %}
                             <span class="badge ok">W KSeF</span>
@@ -9510,7 +9510,7 @@ def overdue_payments():
         <table><thead><tr><th>Faktura</th><th>Klient</th><th>Zamówienie</th><th>Termin</th><th>Po terminie</th><th>Brutto</th><th>Akcje</th></tr></thead><tbody>
         {% for inv in rows %}<tr>
           <td><b>{{ inv.invoice_no }}</b></td><td>{{ inv.buyer_name or inv.order_customer_name or '-' }}</td><td>{{ inv.order_display }}</td><td>{{ inv.payment_to }}</td>
-          <td><span class="badge danger">{{ inv.overdue_days }} dni</span></td><td><b>{{ "%.2f"|format(inv.total_gross or 0) }} PLN</b></td>
+          <td><span class="badge danger">{{ inv.overdue_days }} dni</span>{% if inv.payment_reminder %} <span class="badge ok">Przypomnienie wysłane</span>{% endif %}</td><td><b>{{ "%.2f"|format(inv.total_gross or 0) }} PLN</b></td>
           <td><div class="flex"><a class="btn" href="{{ url_for('invoice_download_admin', invoice_id=inv.id) }}" target="_blank">Faktura PDF</a>{% if inv.source_order_id %}<a class="btn" href="{{ url_for('order_view', order_id=inv.source_order_id) }}">Zamówienie</a>{% endif %}<form method="post" action="{{ url_for('invoice_payment_reminder_admin', invoice_id=inv.id) }}"><input type="hidden" name="next" value="{{ request.full_path }}"><button class="btn" type="submit">Przypomnij o płatności</button></form><form method="post" action="{{ url_for('invoice_paid_admin', invoice_id=inv.id) }}"><input type="hidden" name="next" value="{{ request.full_path }}"><button class="btn ok" type="submit">Faktura opłacona</button></form></div></td>
         </tr>{% endfor %}
         {% if not rows %}<tr><td colspan="7" class="muted">Brak zaległych faktur. Wszystkie płatności są aktualne.</td></tr>{% endif %}
@@ -10790,6 +10790,54 @@ def _invoice_email_context(invoice_id: int):
         + urllib.parse.urlencode({"section": "invoices", "invoice": invoice_id})
     )
     return invoice, panel_url
+
+
+def send_automatic_payment_reminders(reference_time=None) -> dict:
+    """Wysyła jedno przypomnienie dzień po terminie płatności.
+
+    Harmonogram uruchamia tę funkcję o 12:00 czasu Europe/Warsaw. Znacznik
+    payment_reminder jest zapisywany dopiero po udanej wysyłce, dzięki czemu
+    ponowne uruchomienie jest bezpieczne i nie dubluje wiadomości.
+    """
+    now = reference_time or app_now()
+    due_date = (now.date() - timedelta(days=1)).isoformat()
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""
+      SELECT i.id
+      FROM invoices i
+      LEFT JOIN invoice_meta m ON m.invoice_id=i.id
+      WHERE SUBSTR(TRIM(COALESCE(i.payment_to,'')),1,10)=?
+        AND COALESCE(m.paid,0)=0
+        AND COALESCE(m.payment_reminder,0)=0
+      ORDER BY i.id
+    """, (due_date,))
+    invoice_ids = [int(row["id"]) for row in cur.fetchall()]
+    c.close()
+
+    sent_ids = []
+    failed = []
+    for invoice_id in invoice_ids:
+        try:
+            if not send_payment_reminder:
+                raise RuntimeError("Moduł wysyłki przypomnień nie jest dostępny")
+            invoice_row, pdf_url = _invoice_email_context(invoice_id)
+            result = send_payment_reminder(invoice_row, pdf_url=pdf_url)
+            if not result.get("ok"):
+                raise RuntimeError(norm(result.get("error")) or "Wysyłka nie powiodła się")
+            _set_invoice_payment_state(invoice_id, reminder=1, paid=None)
+            sent_ids.append(invoice_id)
+        except Exception as exc:
+            failed.append({"invoice_id": invoice_id, "error": str(exc)[:300]})
+            app.logger.exception("Automatyczne przypomnienie nie zostało wysłane dla faktury %s", invoice_id)
+    return {
+        "ok": not failed,
+        "due_date": due_date,
+        "eligible": len(invoice_ids),
+        "sent": len(sent_ids),
+        "sent_ids": sent_ids,
+        "failed": failed,
+    }
 
 
 def _send_invoice_to_client(invoice_id: int) -> tuple[int, bool, str]:
