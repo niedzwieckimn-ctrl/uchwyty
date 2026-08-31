@@ -3096,6 +3096,29 @@ def order_fully_invoiced(cur, order_id: int) -> bool:
     return all(int(row["qty"] or 0) > 0 and int(done.get(int(row["id"]), 0)) >= int(row["qty"] or 0) for row in rows)
 
 
+def issue_order_stock(cur, order_id: int) -> list[int]:
+    """Odejmij pełne zamówienie dokładnie raz w bieżącej transakcji."""
+    cur.execute(
+        "UPDATE orders SET warehouse_issued=1 WHERE id=? AND COALESCE(warehouse_issued,0)=0",
+        (order_id,),
+    )
+    if cur.rowcount != 1:
+        return []
+
+    cur.execute("SELECT product_id, qty FROM order_items WHERE order_id=? ORDER BY id", (order_id,))
+    changed_product_ids = []
+    for item in cur.fetchall():
+        product_id = int(item["product_id"])
+        qty = int(item["qty"] or 0)
+        if qty <= 0:
+            continue
+        cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (product_id,))
+        cur.execute("UPDATE stock SET qty=qty-? WHERE product_id=?", (qty, product_id))
+        changed_product_ids.append(product_id)
+
+    return changed_product_ids
+
+
 def finalize_fully_invoiced_orders(order_ids: list[int]):
     touched = sorted({int(x) for x in order_ids if x})
     if not touched:
@@ -3116,13 +3139,7 @@ def finalize_fully_invoiced_orders(order_ids: list[int]):
 
         warehouse_issued = int(order_row["warehouse_issued"] or 0)
         if warehouse_issued == 0:
-            cur.execute("SELECT product_id, qty FROM order_items WHERE order_id=?", (order_id,))
-            for it in cur.fetchall():
-                pid = int(it["product_id"])
-                qty = int(it["qty"] or 0)
-                cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (pid,))
-                cur.execute("UPDATE stock SET qty = qty - ? WHERE product_id=?", (qty, pid))
-                changed_product_ids.append(pid)
+            changed_product_ids.extend(issue_order_stock(cur, order_id))
             warehouse_issued = 1
 
         current_status = norm(order_row["status"]).lower()
@@ -5715,6 +5732,94 @@ def api_product(product_id):
 # ORDERS
 # -------------------------
 
+def missed_stock_issue_candidates(cur):
+    cur.execute("""
+      SELECT o.id, o.order_no, o.created_at, o.shipped_at, o.status,
+             COALESCE(SUM(oi.qty),0) AS item_qty,
+             GROUP_CONCAT(oi.sku || ' × ' || oi.qty, ', ') AS items_label
+      FROM orders o
+      JOIN order_items oi ON oi.order_id=o.id
+      WHERE COALESCE(o.warehouse_issued,0)=0
+        AND TRIM(COALESCE(o.shipped_at,''))<>''
+        AND LOWER(COALESCE(o.status,'')) IN ('shipped','issued','completed')
+      GROUP BY o.id
+      ORDER BY o.shipped_at, o.id
+    """)
+    return [dict(row) for row in cur.fetchall()]
+
+
+@app.get("/orders/stock-issue-audit")
+def stock_issue_audit():
+    maybe_pull_shared_from_supabase(force=True)
+    c = conn()
+    try:
+        rows = missed_stock_issue_candidates(c.cursor())
+    finally:
+        c.close()
+    tpl = r"""
+    {% extends "base.html" %}
+    {% block content %}
+      <div class="card">
+        <div class="flex">
+          <div>
+            <h1 style="margin:0 0 8px;">Audyt wydań magazynowych</h1>
+            <div class="muted">Wysłane pełne zamówienia, które nadal nie mają potwierdzonego zdjęcia stanu.</div>
+          </div>
+          <a class="btn right" href="{{ url_for('orders') }}">← Zamówienia</a>
+        </div>
+      </div>
+      <div class="card">
+        <div class="flex" style="margin-bottom:16px;">
+          <div><b>Znaleziono: {{ rows|length }}</b>{% if rows %}<div class="muted">Zakres: {{ rows[0]['shipped_at'] }} – {{ rows[-1]['shipped_at'] }}</div>{% endif %}</div>
+          {% if rows %}
+          <form class="right" method="post" action="{{ url_for('stock_issue_repair') }}" onsubmit="return confirm('Odjąć ze stanu wszystkie pozycje z {{ rows|length }} wykazanych zamówień?');">
+            <button class="btn danger" type="submit">Napraw wykazane stany</button>
+          </form>
+          {% endif %}
+        </div>
+        {% if request.args.get('repaired') %}<div class="badge" style="margin-bottom:14px;">Naprawiono zamówienia: {{ request.args.get('repaired') }}</div>{% endif %}
+        <table>
+          <thead><tr><th>Zamówienie</th><th>Status</th><th>Wysłano</th><th>Sztuki</th><th>Pozycje</th></tr></thead>
+          <tbody>
+          {% for row in rows %}
+            <tr><td><a href="{{ url_for('order_view', order_id=row['id']) }}"><b>{{ canonical_order_no(row['id'], row['created_at'], row['order_no']) }}</b></a></td><td>{{ order_status_label(row['status']) }}</td><td>{{ row['shipped_at'] }}</td><td><b>{{ row['item_qty'] }}</b></td><td>{{ row['items_label'] }}</td></tr>
+          {% endfor %}
+          {% if not rows %}<tr><td colspan="5" class="muted">Brak wysłanych zamówień wymagających naprawy.</td></tr>{% endif %}
+          </tbody>
+        </table>
+      </div>
+    {% endblock %}
+    """
+    return render_template_string(tpl, title="Audyt wydań", base_url=BASE_URL, db_path=DB_PATH, rows=rows, canonical_order_no=canonical_order_no, order_status_label=order_status_label)
+
+
+@app.post("/orders/stock-issue-audit/repair")
+def stock_issue_repair():
+    maybe_pull_shared_from_supabase(force=True)
+    c = conn()
+    changed_orders = []
+    changed_products = []
+    try:
+        cur = c.cursor()
+        for row in missed_stock_issue_candidates(cur):
+            product_ids = issue_order_stock(cur, int(row["id"]))
+            if product_ids:
+                changed_orders.append(int(row["id"]))
+                changed_products.extend(product_ids)
+        c.commit()
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
+    if supabase_enabled():
+        if changed_orders:
+            sync_local_rows_to_supabase("orders", "id", changed_orders)
+        if changed_products:
+            sync_local_rows_to_supabase("stock", "product_id", sorted(set(changed_products)))
+    return redirect(url_for("stock_issue_audit", repaired=len(changed_orders)))
+
+
 @app.get("/orders")
 def orders():
     maybe_pull_shared_from_supabase()
@@ -5931,6 +6036,7 @@ def orders():
       <div class="card">
         <div class="orders-toolbar">
           <a class="btn all-orders {% if tab=='all' %}primary{% endif %}" href="{{ url_for('orders', tab='all') }}">Wszystkie zamówienia</a>
+          <a class="btn" href="{{ url_for('stock_issue_audit') }}">Audyt wydań</a>
           <a class="btn primary" href="{{ url_for('order_new') }}">+ Nowe zamówienie</a>
         </div>
         <form method="get" class="grid3">
@@ -6700,6 +6806,15 @@ def order_mark_shipped(order_id):
             ))
         placeholders = ",".join(["?"] * len(package_order_ids))
         shipped_at = now_iso()
+        # Wysyłka jest momentem fizycznego wydania. Odejmujemy wszystkie
+        # pełne zamówienia ze wspólnej paczki; warehouse_issued zapewnia,
+        # że późniejsza faktura nie zdejmie ich ponownie.
+        changed_product_ids = []
+        for package_order in package_orders:
+            if norm(package_order.get("status")).lower() != "packed_partial":
+                changed_product_ids.extend(
+                    issue_order_stock(cur, to_int(package_order.get("id"), 0))
+                )
         cur.execute(
             f"""UPDATE orders
                 SET status=CASE
@@ -6721,6 +6836,10 @@ def order_mark_shipped(order_id):
     if supabase_enabled():
         try:
             sync_local_rows_to_supabase("orders", "id", package_order_ids)
+            if changed_product_ids:
+                sync_local_rows_to_supabase(
+                    "stock", "product_id", sorted(set(changed_product_ids))
+                )
         except Exception as exc:
             app.logger.warning("Nie udało się zsynchronizować wysyłki zamówienia %s: %s", order_id, exc)
 
