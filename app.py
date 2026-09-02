@@ -3151,9 +3151,10 @@ def finalize_fully_invoiced_orders(order_ids: list[int]):
         if not order_row:
             continue
 
-        # Faktura jest dokumentem finansowym i nie wykonuje ruchu magazynowego.
-        # Stan zdejmuje wyłącznie fizyczne oznaczenie przesyłki jako „Wysłane”.
         warehouse_issued = int(order_row["warehouse_issued"] or 0)
+        if warehouse_issued == 0:
+            changed_product_ids.extend(issue_order_stock(cur, order_id))
+            warehouse_issued = 1
 
         current_status = norm(order_row["status"]).lower()
         # Wystawienie faktury oznacza realizację, a nie zakończenie zamówienia.
@@ -3272,20 +3273,36 @@ def reconcile_orders_after_invoice_change(order_ids: list[int]):
         current_status = norm(order_row["status"]).lower()
 
         if fully and warehouse_issued == 0:
+            cur.execute("SELECT product_id, qty FROM order_items WHERE order_id=?", (order_id,))
+            for it in cur.fetchall():
+                pid = int(it["product_id"])
+                qty = int(it["qty"] or 0)
+                cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (pid,))
+                cur.execute("UPDATE stock SET qty = qty - ? WHERE product_id=?", (qty, pid))
+                changed_product_ids.append(pid)
             preserved = {"shipped", "partially_shipped", "completed", "issued", "cancelled"}
             next_status = current_status if current_status in preserved else "packed"
             if next_status == "packed":
                 cur.execute("""
                   UPDATE orders
-                  SET status=?, packed_at=COALESCE(packed_at, ?)
+                  SET status=?, warehouse_issued=1, packed_at=COALESCE(packed_at, ?)
                   WHERE id=?
                 """, (next_status, now_iso(), order_id))
             else:
-                cur.execute("UPDATE orders SET status=? WHERE id=?", (next_status, order_id))
+                cur.execute("UPDATE orders SET status=?, warehouse_issued=1 WHERE id=?", (next_status, order_id))
             changed_order_ids.append(order_id)
 
-        # Usunięcie lub edycja faktury również nie może zwracać towaru na stan.
-        # Ruch magazynowy jest niezależny od dokumentów finansowych.
+        elif not fully and warehouse_issued == 1:
+            cur.execute("SELECT product_id, qty FROM order_items WHERE order_id=?", (order_id,))
+            for it in cur.fetchall():
+                pid = int(it["product_id"])
+                qty = int(it["qty"] or 0)
+                cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (pid,))
+                cur.execute("UPDATE stock SET qty = qty + ? WHERE product_id=?", (qty, pid))
+                changed_product_ids.append(pid)
+            next_status = "confirmed" if current_status in {"issued", "packed", "packed_partial"} else (current_status or "confirmed")
+            cur.execute("UPDATE orders SET status=?, warehouse_issued=0 WHERE id=?", (next_status, order_id))
+            changed_order_ids.append(order_id)
 
     c.commit()
     c.close()
