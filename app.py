@@ -7303,30 +7303,16 @@ def order_invoice(order_id):
         it["invoiced_qty"] = done_qty
         it["remaining_qty"] = max(0, ordered_qty - done_qty)
 
-    # Faktura dla zamówienia już spakowanego/wysłanego dokumentuje towar,
-    # który mógł zostać wcześniej zdjęty z magazynu. W takim przypadku stan
-    # nie może ograniczać ilości na fakturze. Dla zamówień jeszcze
-    # nieprzygotowanych zachowujemy podpowiedź opartą o dostępny magazyn.
+    # Automatyczna propozycja: nie wiecej niz pozostalo do zafakturowania i
+    # nie wiecej niz fizycznie jest na magazynie. Wspolna pula zabezpiecza
+    # pozycje tego samego produktu przed podwojnym wykorzystaniem stanu.
     invoice_stock_pool = {}
     for it in items:
         pid = int(it.get("product_id") or 0)
         invoice_stock_pool.setdefault(pid, max(0, int(it.get("stock_qty") or 0)))
-        source_order = related_order_by_id.get(int(it.get("order_id") or 0), {})
-        source_status = norm(source_order.get("status")).lower()
-        already_prepared_or_issued = (
-            int(source_order.get("warehouse_issued") or 0) == 1
-            or source_status in {
-                "packed", "packed_partial", "in_delivery", "shipped",
-                "partially_shipped", "issued", "completed",
-            }
-        )
-        if already_prepared_or_issued:
-            suggested_qty = int(it.get("remaining_qty") or 0)
-        else:
-            suggested_qty = min(int(it.get("remaining_qty") or 0), invoice_stock_pool.get(pid, 0))
+        suggested_qty = min(int(it.get("remaining_qty") or 0), invoice_stock_pool.get(pid, 0))
         it["suggested_invoice_qty"] = max(0, suggested_qty)
-        if not already_prepared_or_issued:
-            invoice_stock_pool[pid] = max(0, invoice_stock_pool.get(pid, 0) - suggested_qty)
+        invoice_stock_pool[pid] = max(0, invoice_stock_pool.get(pid, 0) - suggested_qty)
 
     cur.execute("SELECT * FROM company_profile WHERE id=1")
     company = cur.fetchone()
