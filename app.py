@@ -7065,9 +7065,24 @@ def order_invoice(order_id):
     c.close()
 
     default_issue = app_now().strftime("%Y-%m-%d")
-    buyer_address_source = customer_row["address"] if customer_row and customer_row["address"] else (o["customer_address"] or "")
+    # Profil w Supabase jest najświeższym źródłem danych klienta. Lokalny
+    # rekord albo starsze zamówienie mogą nie zawierać adresu, mimo że klient
+    # uzupełnił go później w swoim profilu.
+    try:
+        client_profile = _client_profile_for_email(o["customer_email"])
+    except Exception as exc:
+        app.logger.warning("Nie udało się pobrać profilu do faktury order_id=%s: %s", order_id, exc)
+        client_profile = {}
+    buyer_address_source = (
+        norm(client_profile.get("address"))
+        or (norm(customer_row["address"]) if customer_row and customer_row["address"] else "")
+        or norm(o["customer_address"])
+    )
     st, pc, city = split_address(buyer_address_source)
-    buyer_tax_no = customer_row["nip"] if customer_row and customer_row["nip"] else ""
+    buyer_tax_no = (
+        norm(client_profile.get("nip"))
+        or (norm(customer_row["nip"]) if customer_row and customer_row["nip"] else "")
+    )
     buyer_address_default = "\n".join([x for x in [st, f"{pc} {city}".strip()] if x]).strip()
 
     msg = ""
@@ -7088,12 +7103,12 @@ def order_invoice(order_id):
             "sell_date": default_issue,
             "payment_type": "przelew",
             "payment_to": (app_now() + timedelta(days=7)).strftime("%Y-%m-%d"),
-            "buyer_name": o["customer_name"] or "",
+            "buyer_name": norm(client_profile.get("name")) or o["customer_name"] or "",
             "buyer_tax_no": buyer_tax_no,
             "buyer_address": buyer_address_default,
             "buyer_country": "PL",
             "buyer_email": o["customer_email"] or "",
-            "buyer_phone": o["customer_phone"] or "",
+            "buyer_phone": norm(client_profile.get("phone")) or o["customer_phone"] or "",
             "discount_percent": "0",
         }
     else:
@@ -7102,6 +7117,8 @@ def order_invoice(order_id):
             "buyer_name", "buyer_tax_no", "buyer_address", "buyer_country",
             "buyer_email", "buyer_phone", "discount_percent"
         ]}
+        if not data.get("buyer_address"):
+            data["buyer_address"] = buyer_address_default
         st, pc, city = split_address(data.get("buyer_address", ""))
         data["buyer_street"] = st
         data["buyer_post_code"] = pc
