@@ -16,7 +16,8 @@ from difflib import SequenceMatcher
 
 
 ACTIVE_ORDER_STATUSES = {
-    "new", "pending", "unconfirmed", "confirmed", "packed", "in_delivery", "shipped"
+    "new", "pending", "unconfirmed", "confirmed", "packed", "packed_partial",
+    "in_delivery", "shipped", "partially_shipped"
 }
 INCOMING_PACKAGE_STATUSES = {"planned", "ordered", "shipped"}
 CANCELLED_ORDER_STATUSES = {"cancelled", "canceled", "deleted", "usuniete", "anulowane"}
@@ -130,9 +131,15 @@ def build_replenishment_analysis(conn_factory, today: date | None = None, horizo
     active_statuses = tuple(sorted(ACTIVE_ORDER_STATUSES))
     active_placeholders = ",".join("?" for _ in active_statuses)
     cur.execute(f"""
-      SELECT oi.product_id, COALESCE(SUM(oi.qty),0) AS reserved_qty
+      SELECT oi.product_id,
+             COALESCE(SUM(MAX(0, oi.qty - COALESCE(a.allocated_qty,0))),0) AS reserved_qty
       FROM order_items oi
       JOIN orders o ON o.id=oi.order_id
+      LEFT JOIN (
+        SELECT order_item_id, SUM(qty) AS allocated_qty
+        FROM invoice_allocations
+        GROUP BY order_item_id
+      ) a ON a.order_item_id=oi.id
       WHERE COALESCE(o.warehouse_issued,0)=0
         AND lower(COALESCE(o.status,'')) IN ({active_placeholders})
       GROUP BY oi.product_id
