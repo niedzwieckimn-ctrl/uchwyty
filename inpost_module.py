@@ -124,3 +124,29 @@ def get_label(shipment_id, label_format="pdf", label_type="A6"):
         f"/shipments/{int(shipment_id)}/label?format={fmt}&type={label_type}",
         accept="application/octet-stream",
     )
+
+
+def create_dispatch_order(shipment_ids, pickup):
+    organization_id = config_summary()["organization_id"]
+    clean_ids = list(dict.fromkeys(str(int(value)) for value in shipment_ids if value))
+    if not clean_ids:
+        raise InPostError("Wybierz co najmniej jedną przesyłkę")
+    street, building = split_street_building(pickup.get("street"))
+    phone = normalize_polish_phone(pickup.get("phone"))
+    if not street or not pickup.get("city") or not pickup.get("post_code") or not phone:
+        raise InPostError("Uzupełnij adres odbioru i telefon kontaktowy")
+    payload = {
+        "shipments": clean_ids,
+        "comment": (pickup.get("comment") or "")[:100],
+        "name": (pickup.get("name") or "Magazyn")[:100],
+        "phone": phone,
+        "email": (pickup.get("email") or "")[:100],
+        "address": {
+            "street": street,
+            "building_number": building,
+            "city": pickup.get("city") or "",
+            "post_code": pickup.get("post_code") or "",
+            "country_code": "PL",
+        },
+    }
+    return _request(f"/organizations/{organization_id}/dispatch_orders", "POST", payload)
