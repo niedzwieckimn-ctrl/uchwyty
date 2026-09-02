@@ -39,6 +39,7 @@ from reportlab.lib.units import mm
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+from pypdf import PdfReader, PdfWriter
 from ksef_module import build_ksef_draft_xml, validate_fa3_xml, validate_ksef_invoice, xml_filename
 from cash_flow_module import register_cash_flow, cash_flow_overdue_invoices
 from inventory_analytics import build_replenishment_analysis, recommended_replenishments
@@ -6443,7 +6444,7 @@ def order_view(order_id):
           <span class="badge {{ order_status_css(o['status']) }}">{{ order_status_label(o['status']) }}</span>
           <div class="right flex">
             <a class="btn" href="{{ url_for('orders') }}">â† Lista</a>
-            <a class="btn primary" href="{{ url_for('order_packing_list_download_admin', order_id=o['id']) }}" target="_blank">Pakuj</a>
+            <a class="btn primary" href="{{ url_for('order_packing_list_download_admin', order_id=o['id']) }}">Pakuj</a>
             {% if (o['currency'] or 'PLN') == 'EUR' %}
               <a class="btn primary" href="{{ url_for('order_proforma', order_id=o['id']) }}" target="_blank">Proforma EUR</a>
               <span class="badge" title="Dokument końcowy wystawiasz ręcznie poza modułem KSeF.">Faktura końcowa — ręcznie</span>
@@ -6809,12 +6810,13 @@ def order_inpost_create(order_id):
         c.close()
 
     cfg = inpost_config_summary()
+    bundle = request.form.get("bundle") == "1" or request.args.get("bundle") == "1"
     error = norm(request.args.get("inpost_error"))
     if request.method == "POST":
         if not cfg["configured"]:
             error = "Brak konfiguracji InPost na Renderze: " + ", ".join(cfg["missing"])
         elif norm(order.get("inpost_shipment_id")):
-            return redirect(url_for("order_inpost_label", order_id=order_id))
+            return redirect(url_for("order_inpost_label", order_id=order_id, bundle="1" if bundle else None))
         elif norm(order.get("status")).lower() not in {"packed", "shipped", "completed", "issued"}:
             error = "Najpierw użyj przycisku Pakuj. Etykietę można utworzyć dla pełnej paczki."
         else:
@@ -6882,7 +6884,7 @@ def order_inpost_create(order_id):
                     c.close()
                 if supabase_enabled():
                     sync_local_rows_to_supabase("orders", "id", package_ids)
-                return redirect(url_for("order_inpost_label", order_id=order_id))
+                return redirect(url_for("order_inpost_label", order_id=order_id, bundle="1" if bundle else None))
             except InPostError as exc:
                 error = str(exc)
 
@@ -6892,8 +6894,9 @@ def order_inpost_create(order_id):
       <div class="card">
         {% if error %}<div class="hint" style="border-color:#fecaca;background:#fff1f2;margin-bottom:15px;">{{ error }}</div>{% endif %}
         {% if not cfg.configured %}<div class="hint">Dodaj na Renderze zmienne <b>INPOST_ORGANIZATION_ID</b> i <b>INPOST_API_TOKEN</b>.</div>{% endif %}
-        {% if o.inpost_shipment_id %}<div class="flex"><span class="badge">Przesyłka już utworzona</span><a class="btn primary" href="{{ url_for('order_inpost_label', order_id=o.id) }}">Pobierz etykietę ponownie</a></div>{% else %}
+        {% if o.inpost_shipment_id %}<div class="flex"><span class="badge">Przesyłka już utworzona</span><a class="btn primary" href="{{ url_for('order_inpost_label', order_id=o.id, bundle='1' if bundle else None) }}">{% if bundle %}Pobierz listę A4 + etykietę A6{% else %}Pobierz etykietę ponownie{% endif %}</a></div>{% else %}
         <form method="post" class="row">
+          {% if bundle %}<input type="hidden" name="bundle" value="1">{% endif %}
           <div><label class="muted small">Serwis</label><select name="service" required><option value="inpost_courier_standard">Kurier Standard</option><option value="inpost_courier_express_1700">Doręczenie 17:00</option><option value="inpost_courier_express_1200">Doręczenie 12:00</option><option value="inpost_courier_express_1000">Doręczenie 10:00</option></select></div>
           <div><label class="muted small">Liczba paczek</label><input type="number" name="quantity" value="1" min="1" max="99" required></div>
           <div><label class="muted small">Długość (cm)</label><input type="number" name="length" value="40" min="0.1" max="350" step="0.1" required></div>
@@ -6911,7 +6914,7 @@ def order_inpost_create(order_id):
     {% endblock %}
     """
     labels = [canonical_order_no(item["id"], item["created_at"], item["order_no"]) for item in package_orders]
-    return render_template_string(tpl, title="Etykieta InPost", base_url=BASE_URL, db_path=DB_PATH, o=order, cfg=cfg, error=error, package_labels=labels)
+    return render_template_string(tpl, title="Etykieta InPost", base_url=BASE_URL, db_path=DB_PATH, o=order, cfg=cfg, error=error, package_labels=labels, bundle=bundle)
 
 
 @app.get("/orders/<int:order_id>/inpost/label")
@@ -6931,7 +6934,25 @@ def order_inpost_label(order_id):
         pdf = inpost_get_label(shipment_id, "pdf", "A6")
     except InPostError as exc:
         return redirect(url_for("order_inpost_create", order_id=order_id, inpost_error=str(exc)[:240]))
-    filename = safe_filename(canonical_order_no(row["id"], row["created_at"], row["order_no"])) + "_InPost_A6.pdf"
+    filename_root = safe_filename(canonical_order_no(row["id"], row["created_at"], row["order_no"]))
+    if request.args.get("bundle") == "1":
+        pack_path = norm(session.get(f"inpost_pack_path_{order_id}"))
+        if pack_path and os.path.isfile(pack_path):
+            try:
+                writer = PdfWriter()
+                writer.append(pack_path)
+                writer.append(io.BytesIO(pdf))
+                combined = io.BytesIO()
+                writer.write(combined)
+                writer.close()
+                combined.seek(0)
+                return send_file(
+                    combined, mimetype="application/pdf", as_attachment=True,
+                    download_name=filename_root + "_pakiet_A4_lista_A6_InPost.pdf", max_age=0,
+                )
+            except Exception as exc:
+                app.logger.exception("Nie udało się połączyć listy A4 z etykietą A6: %s", exc)
+    filename = filename_root + "_InPost_A6.pdf"
     return send_file(io.BytesIO(pdf), mimetype="application/pdf", as_attachment=True, download_name=filename, max_age=0)
 
 
@@ -10424,6 +10445,18 @@ def invoice_download_admin(invoice_id):
 @app.get("/orders/<int:order_id>/packing-list")
 def order_packing_list_download_admin(order_id):
     """Generuje wspolna liste pakowania dla zamowien tego samego klienta."""
+    selected_carrier = norm(request.args.get("carrier")).lower()
+    if selected_carrier not in {"inpost", "other"}:
+        tpl = r"""
+        {% extends "base.html" %}{% block content %}
+          <div class="card"><div class="flex"><div><h1 style="margin:0 0 8px;">Pakuj zamówienie</h1><div class="muted">Wybierz sposób wysyłki. Lista pakowa zostanie przygotowana w formacie A4.</div></div><a class="btn right" href="{{ url_for('order_view', order_id=order_id) }}">← Zamówienie</a></div></div>
+          <div class="grid2">
+            <a class="card" style="text-decoration:none;color:inherit;min-height:170px;" href="{{ url_for('order_packing_list_download_admin', order_id=order_id, carrier='inpost') }}"><h2>InPost</h2><p class="muted">Wybór paczki → etykieta A6 → wspólny PDF z listą pakową A4.</p><span class="btn primary">Wybierz InPost</span></a>
+            <a class="card" style="text-decoration:none;color:inherit;min-height:170px;" href="{{ url_for('order_packing_list_download_admin', order_id=order_id, carrier='other') }}"><h2>Inny przewoźnik</h2><p class="muted">Przygotuj samą listę pakową A4 i wpisz numer przesyłki później.</p><span class="btn">Wybierz innego</span></a>
+          </div>
+        {% endblock %}
+        """
+        return render_template_string(tpl, title="Pakuj", base_url=BASE_URL, db_path=DB_PATH, order_id=order_id)
     maybe_pull_shared_from_supabase()
     c = conn()
     cur = c.cursor()
@@ -10500,6 +10533,9 @@ def order_packing_list_download_admin(order_id):
     pack_path = generate_invoice_packing_list_pdf(order_row, items, meta)
     mark_orders_packed(packed_order_ids, packing_path=pack_path, packing_items=items)
     filename_suffix = "_zbiorcza" if len(packed_order_ids) > 1 else ""
+    if selected_carrier == "inpost":
+        session[f"inpost_pack_path_{order_id}"] = pack_path
+        return redirect(url_for("order_inpost_create", order_id=order_id, bundle="1"))
     return send_file(
         pack_path,
         mimetype="application/pdf",
