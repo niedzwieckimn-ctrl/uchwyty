@@ -6828,19 +6828,36 @@ def order_inpost_create(order_id):
                 "email": order.get("customer_email"),
             }
             try:
+                allowed_services = {
+                    "inpost_courier_standard", "inpost_courier_express_1700",
+                    "inpost_courier_express_1200", "inpost_courier_express_1000",
+                }
+                service = norm(request.form.get("service"))
+                if service not in allowed_services:
+                    raise InPostError("Wybierz poprawny serwis kurierski")
                 parcel = {
-                    "length": max(1, to_int(request.form.get("length"), 400)),
-                    "width": max(1, to_int(request.form.get("width"), 300)),
-                    "height": max(1, to_int(request.form.get("height"), 200)),
+                    "length": max(1, round(to_float(request.form.get("length"), 40) * 10, 1)),
+                    "width": max(1, round(to_float(request.form.get("width"), 30) * 10, 1)),
+                    "height": max(1, round(to_float(request.form.get("height"), 20) * 10, 1)),
                     "weight": max(0.01, to_float(request.form.get("weight"), 5)),
+                    "quantity": max(1, min(99, to_int(request.form.get("quantity"), 1))),
                     "non_standard": request.form.get("non_standard") == "1",
                     "comments": norm(request.form.get("comments")),
+                }
+                additional_services = [
+                    key for key in ("sms", "email", "rod", "saturday")
+                    if request.form.get(key) == "1"
+                ]
+                options = {
+                    "additional_services": additional_services,
+                    "insurance": max(0, to_float(request.form.get("insurance"), 0)),
+                    "cod": max(0, to_float(request.form.get("cod"), 0)),
                 }
                 reference = ", ".join(
                     canonical_order_no(item["id"], item["created_at"], item["order_no"])
                     for item in package_orders
                 )
-                shipment = create_courier_shipment(receiver, parcel, reference)
+                shipment = create_courier_shipment(receiver, parcel, reference, service, options)
                 shipment_id = norm(shipment.get("id"))
                 tracking_number = norm(shipment.get("tracking_number"))
                 if not shipment_id:
@@ -6872,12 +6889,17 @@ def order_inpost_create(order_id):
         {% if not cfg.configured %}<div class="hint">Dodaj na Renderze zmienne <b>INPOST_ORGANIZATION_ID</b> i <b>INPOST_API_TOKEN</b>.</div>{% endif %}
         {% if o.inpost_shipment_id %}<div class="flex"><span class="badge">Przesyłka już utworzona</span><a class="btn primary" href="{{ url_for('order_inpost_label', order_id=o.id) }}">Pobierz etykietę ponownie</a></div>{% else %}
         <form method="post" class="row">
-          <div><label class="muted small">Długość (mm)</label><input type="number" name="length" value="400" min="1" required></div>
-          <div><label class="muted small">Szerokość (mm)</label><input type="number" name="width" value="300" min="1" required></div>
-          <div><label class="muted small">Wysokość (mm)</label><input type="number" name="height" value="200" min="1" required></div>
+          <div><label class="muted small">Serwis</label><select name="service" required><option value="inpost_courier_standard">Kurier Standard</option><option value="inpost_courier_express_1700">Doręczenie 17:00</option><option value="inpost_courier_express_1200">Doręczenie 12:00</option><option value="inpost_courier_express_1000">Doręczenie 10:00</option></select></div>
+          <div><label class="muted small">Liczba paczek</label><input type="number" name="quantity" value="1" min="1" max="99" required></div>
+          <div><label class="muted small">Długość (cm)</label><input type="number" name="length" value="40" min="0.1" max="350" step="0.1" required></div>
+          <div><label class="muted small">Szerokość (cm)</label><input type="number" name="width" value="30" min="0.1" max="240" step="0.1" required></div>
+          <div><label class="muted small">Wysokość (cm)</label><input type="number" name="height" value="20" min="0.1" max="240" step="0.1" required></div>
           <div><label class="muted small">Waga (kg)</label><input type="number" name="weight" value="5" min="0.01" max="50" step="0.01" required></div>
           <div><label class="muted small">Rodzaj</label><select name="non_standard"><option value="0">Standardowa</option><option value="1">Niestandardowa</option></select></div>
+          <div><label class="muted small">Dodatkowa ochrona (PLN)</label><input type="number" name="insurance" value="0" min="0" step="0.01"></div>
+          <div><label class="muted small">Pobranie COD (PLN)</label><input type="number" name="cod" value="0" min="0" step="0.01"><div class="muted small">Ochrona musi być ≥ pobraniu.</div></div>
           <div><label class="muted small">Uwagi dla InPost</label><input name="comments" maxlength="100"></div>
+          <div style="grid-column:1/-1" class="flex"><label><input type="checkbox" name="sms" value="1"> Serwis SMS</label><label><input type="checkbox" name="email" value="1"> Serwis Email</label><label><input type="checkbox" name="rod" value="1"> Zwrot dokumentów</label><label><input type="checkbox" name="saturday" value="1"> Doręczenie w sobotę</label></div>
           <div style="grid-column:1/-1"><button class="btn primary" type="submit" onclick="return confirm('Utworzyć płatną przesyłkę InPost dla tej paczki?')">Utwórz przesyłkę i pobierz PDF A6</button></div>
         </form>{% endif %}
       </div>
