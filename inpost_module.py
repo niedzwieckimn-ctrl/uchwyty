@@ -74,9 +74,18 @@ def normalize_polish_phone(value):
     return digits
 
 
-def create_courier_shipment(receiver, parcel, reference):
+def create_courier_shipment(receiver, parcel, reference, service="inpost_courier_standard", options=None):
     organization_id = config_summary()["organization_id"]
+    options = options or {}
     street, building = split_street_building(receiver.get("street"))
+    parcel_payload = {
+        "dimensions": {
+            "length": str(parcel["length"]), "width": str(parcel["width"]),
+            "height": str(parcel["height"]), "unit": "mm",
+        },
+        "weight": {"amount": str(parcel["weight"]), "unit": "kg"},
+        "is_non_standard": bool(parcel.get("non_standard")),
+    }
     payload = {
         "receiver": {
             "company_name": receiver.get("name") or "Odbiorca",
@@ -90,19 +99,20 @@ def create_courier_shipment(receiver, parcel, reference):
                 "country_code": "PL",
             },
         },
-        "parcels": [{
-            "dimensions": {
-                "length": str(parcel["length"]), "width": str(parcel["width"]),
-                "height": str(parcel["height"]), "unit": "mm",
-            },
-            "weight": {"amount": str(parcel["weight"]), "unit": "kg"},
-            "is_non_standard": bool(parcel.get("non_standard")),
-        }],
-        "service": "inpost_courier_standard",
+        "parcels": [dict(parcel_payload) for _ in range(max(1, min(99, int(parcel.get("quantity", 1)))))],
+        "service": service,
         "reference": reference[:100],
         "comments": (parcel.get("comments") or "")[:100],
-        "additional_services": ["email", "sms"],
+        "additional_services": list(options.get("additional_services") or []),
     }
+    insurance = float(options.get("insurance") or 0)
+    cod = float(options.get("cod") or 0)
+    if insurance > 0:
+        payload["insurance"] = {"amount": round(insurance, 2), "currency": "PLN"}
+    if cod > 0:
+        if insurance < cod:
+            raise InPostError("Ubezpieczenie musi być co najmniej równe kwocie pobrania")
+        payload["cod"] = {"amount": round(cod, 2), "currency": "PLN"}
     return _request(f"/organizations/{organization_id}/shipments", "POST", payload)
 
 
