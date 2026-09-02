@@ -43,6 +43,12 @@ from ksef_module import build_ksef_draft_xml, validate_fa3_xml, validate_ksef_in
 from cash_flow_module import register_cash_flow, cash_flow_overdue_invoices
 from inventory_analytics import build_replenishment_analysis, recommended_replenishments
 from proforma_module import generate_proforma_pdf
+from inpost_module import (
+    InPostError,
+    config_summary as inpost_config_summary,
+    create_courier_shipment,
+    get_label as inpost_get_label,
+)
 try:
     from ksef_api import ksef_config_summary, send_invoice_to_ksef
 except Exception:
@@ -518,6 +524,10 @@ def init_db():
         cur.execute("ALTER TABLE orders ADD COLUMN packed_at TEXT")
     if "shipped_at" not in order_cols:
         cur.execute("ALTER TABLE orders ADD COLUMN shipped_at TEXT")
+    if "inpost_shipment_id" not in order_cols:
+        cur.execute("ALTER TABLE orders ADD COLUMN inpost_shipment_id TEXT")
+    if "inpost_label_format" not in order_cols:
+        cur.execute("ALTER TABLE orders ADD COLUMN inpost_label_format TEXT")
 
     cur.execute("PRAGMA table_info(order_items)")
     order_item_cols = {r[1] for r in cur.fetchall()}
@@ -6457,6 +6467,7 @@ def order_view(order_id):
         <div class="muted" style="margin-top:6px;">{{ o['created_at'] }}</div>
         <form method="post" action="{{ url_for('order_mark_shipped', order_id=o['id']) }}" class="flex" style="margin-top:14px;padding:14px;border:1px solid #dbe4f2;border-radius:16px;background:#f8fbff;">
           <div><b>Wysyłka do klienta</b><div class="muted">Wpisz numer przesyłki i oznacz zamówienie jako wysłane.</div></div>
+          <a class="btn" href="{{ url_for('order_inpost_create', order_id=o['id']) }}">{% if o['inpost_shipment_id'] %}Pobierz etykietę InPost{% else %}Generuj etykietę InPost{% endif %}</a>
           <select name="carrier" required style="min-width:150px;">
             <option value="">-- Kurier --</option>
             {% for carrier_key, carrier_name in [('inpost','InPost'),('dpd','DPD'),('fedex','FedEx'),('dhl','DHL'),('ups','UPS')] %}
@@ -6760,6 +6771,142 @@ def order_delete(order_id):
             pass
 
     return redirect(url_for("orders"))
+
+def _packed_package_orders(cur, order):
+    packed_at = norm(order.get("packed_at"))
+    recipient = _email_key(order.get("customer_email"))
+    if not packed_at or not recipient:
+        return [order]
+    cur.execute(
+        """SELECT * FROM orders
+           WHERE packed_at=? AND LOWER(TRIM(COALESCE(customer_email,'')))=?
+             AND LOWER(COALESCE(status,'')) NOT IN ('cancelled')
+           ORDER BY id""",
+        (packed_at, recipient),
+    )
+    rows = [dict(row) for row in cur.fetchall()]
+    return rows or [order]
+
+
+@app.route("/orders/<int:order_id>/inpost", methods=["GET", "POST"])
+def order_inpost_create(order_id):
+    maybe_pull_shared_from_supabase(force=True)
+    c = conn()
+    try:
+        cur = c.cursor()
+        cur.execute("SELECT * FROM orders WHERE id=?", (order_id,))
+        row = cur.fetchone()
+        if not row:
+            abort(404)
+        order = dict(row)
+        package_orders = _packed_package_orders(cur, order)
+    finally:
+        c.close()
+
+    cfg = inpost_config_summary()
+    error = norm(request.args.get("inpost_error"))
+    if request.method == "POST":
+        if not cfg["configured"]:
+            error = "Brak konfiguracji InPost na Renderze: " + ", ".join(cfg["missing"])
+        elif norm(order.get("inpost_shipment_id")):
+            return redirect(url_for("order_inpost_label", order_id=order_id))
+        elif norm(order.get("status")).lower() not in {"packed", "shipped", "completed", "issued"}:
+            error = "Najpierw użyj przycisku Pakuj. Etykietę można utworzyć dla pełnej paczki."
+        else:
+            address_source = norm(order.get("customer_address"))
+            phone = norm(order.get("customer_phone"))
+            try:
+                profile = _client_profile_for_email(order.get("customer_email"))
+                address_source = norm(profile.get("address")) or address_source
+                phone = norm(profile.get("phone")) or phone
+            except Exception:
+                pass
+            street, post_code, city = split_address(address_source)
+            receiver = {
+                "name": order.get("customer_name"), "street": street,
+                "post_code": post_code, "city": city, "phone": phone,
+                "email": order.get("customer_email"),
+            }
+            try:
+                parcel = {
+                    "length": max(1, to_int(request.form.get("length"), 400)),
+                    "width": max(1, to_int(request.form.get("width"), 300)),
+                    "height": max(1, to_int(request.form.get("height"), 200)),
+                    "weight": max(0.01, to_float(request.form.get("weight"), 5)),
+                    "non_standard": request.form.get("non_standard") == "1",
+                    "comments": norm(request.form.get("comments")),
+                }
+                reference = ", ".join(
+                    canonical_order_no(item["id"], item["created_at"], item["order_no"])
+                    for item in package_orders
+                )
+                shipment = create_courier_shipment(receiver, parcel, reference)
+                shipment_id = norm(shipment.get("id"))
+                tracking_number = norm(shipment.get("tracking_number"))
+                if not shipment_id:
+                    raise InPostError("API nie zwróciło identyfikatora przesyłki")
+                package_ids = [int(item["id"]) for item in package_orders]
+                c = conn()
+                try:
+                    placeholders = ",".join(["?"] * len(package_ids))
+                    c.execute(
+                        f"""UPDATE orders SET inpost_shipment_id=?, inpost_label_format='pdf',
+                            tracking_no=CASE WHEN ?<>'' THEN ? ELSE tracking_no END, carrier='inpost'
+                            WHERE id IN ({placeholders})""",
+                        (shipment_id, tracking_number, tracking_number, *package_ids),
+                    )
+                    c.commit()
+                finally:
+                    c.close()
+                if supabase_enabled():
+                    sync_local_rows_to_supabase("orders", "id", package_ids)
+                return redirect(url_for("order_inpost_label", order_id=order_id))
+            except InPostError as exc:
+                error = str(exc)
+
+    tpl = r"""
+    {% extends "base.html" %}{% block content %}
+      <div class="card"><div class="flex"><div><h1 style="margin:0 0 8px;">Etykieta InPost</h1><div class="muted">Jedna przesyłka dla zamówień: {{ package_labels|join(', ') }}</div></div><a class="btn right" href="{{ url_for('order_view', order_id=o.id) }}">← Zamówienie</a></div></div>
+      <div class="card">
+        {% if error %}<div class="hint" style="border-color:#fecaca;background:#fff1f2;margin-bottom:15px;">{{ error }}</div>{% endif %}
+        {% if not cfg.configured %}<div class="hint">Dodaj na Renderze zmienne <b>INPOST_ORGANIZATION_ID</b> i <b>INPOST_API_TOKEN</b>.</div>{% endif %}
+        {% if o.inpost_shipment_id %}<div class="flex"><span class="badge">Przesyłka już utworzona</span><a class="btn primary" href="{{ url_for('order_inpost_label', order_id=o.id) }}">Pobierz etykietę ponownie</a></div>{% else %}
+        <form method="post" class="row">
+          <div><label class="muted small">Długość (mm)</label><input type="number" name="length" value="400" min="1" required></div>
+          <div><label class="muted small">Szerokość (mm)</label><input type="number" name="width" value="300" min="1" required></div>
+          <div><label class="muted small">Wysokość (mm)</label><input type="number" name="height" value="200" min="1" required></div>
+          <div><label class="muted small">Waga (kg)</label><input type="number" name="weight" value="5" min="0.01" max="50" step="0.01" required></div>
+          <div><label class="muted small">Rodzaj</label><select name="non_standard"><option value="0">Standardowa</option><option value="1">Niestandardowa</option></select></div>
+          <div><label class="muted small">Uwagi dla InPost</label><input name="comments" maxlength="100"></div>
+          <div style="grid-column:1/-1"><button class="btn primary" type="submit" onclick="return confirm('Utworzyć płatną przesyłkę InPost dla tej paczki?')">Utwórz przesyłkę i pobierz PDF A6</button></div>
+        </form>{% endif %}
+      </div>
+    {% endblock %}
+    """
+    labels = [canonical_order_no(item["id"], item["created_at"], item["order_no"]) for item in package_orders]
+    return render_template_string(tpl, title="Etykieta InPost", base_url=BASE_URL, db_path=DB_PATH, o=order, cfg=cfg, error=error, package_labels=labels)
+
+
+@app.get("/orders/<int:order_id>/inpost/label")
+def order_inpost_label(order_id):
+    maybe_pull_shared_from_supabase(force=True)
+    c = conn()
+    try:
+        row = c.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+    finally:
+        c.close()
+    if not row:
+        abort(404)
+    shipment_id = norm(row["inpost_shipment_id"])
+    if not shipment_id:
+        return redirect(url_for("order_inpost_create", order_id=order_id))
+    try:
+        pdf = inpost_get_label(shipment_id, "pdf", "A6")
+    except InPostError as exc:
+        return redirect(url_for("order_inpost_create", order_id=order_id, inpost_error=str(exc)[:240]))
+    filename = safe_filename(canonical_order_no(row["id"], row["created_at"], row["order_no"])) + "_InPost_A6.pdf"
+    return send_file(io.BytesIO(pdf), mimetype="application/pdf", as_attachment=True, download_name=filename, max_age=0)
+
 
 @app.post("/orders/<int:order_id>/shipped")
 def order_mark_shipped(order_id):
