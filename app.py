@@ -1548,6 +1548,10 @@ def maybe_pull_shared_from_supabase(force: bool = False):
             # faktycznie zrealizowanych pozycji, aby panel klienta nie
             # sugerował wysłania całego zamówienia.
             reconcile_legacy_shipped_order_statuses()
+            # Faktura mogła powstać w starszej wersji, która pozostawiła
+            # spakowane zamówienie wyłącznie jako rezerwację. Rozliczamy
+            # takie pełne faktury jednokrotnie przy pierwszym odczycie.
+            reconcile_existing_invoiced_reservations()
             # Status płatności mógł zostać zapisany przed dodaniem automatycznego
             # zamykania zamówień. Przeliczenie jest idempotentne i uzupełnia
             # wyłącznie zaległe statusy na podstawie istniejących faktur.
@@ -3189,6 +3193,27 @@ def finalize_fully_invoiced_orders(order_ids: list[int]):
                 pass
 
     return changed_order_ids, list(set(changed_product_ids))
+
+
+def reconcile_existing_invoiced_reservations():
+    """Rozlicz starsze pełne faktury, które nadal wiszą jako rezerwacje."""
+    c = conn()
+    try:
+        cur = c.cursor()
+        cur.execute("""
+          SELECT id
+          FROM orders
+          WHERE COALESCE(warehouse_issued, 0)=0
+            AND LOWER(COALESCE(status,'')) IN ('packed','packed_partial')
+          ORDER BY id
+        """)
+        candidate_ids = [int(row["id"]) for row in cur.fetchall()]
+    finally:
+        c.close()
+
+    if not candidate_ids:
+        return [], []
+    return finalize_fully_invoiced_orders(candidate_ids)
 
 
 def reconcile_legacy_shipped_order_statuses():
