@@ -3151,10 +3151,9 @@ def finalize_fully_invoiced_orders(order_ids: list[int]):
         if not order_row:
             continue
 
+        # Faktura jest dokumentem finansowym i nie wykonuje ruchu magazynowego.
+        # Stan zdejmuje wyłącznie fizyczne oznaczenie przesyłki jako „Wysłane”.
         warehouse_issued = int(order_row["warehouse_issued"] or 0)
-        if warehouse_issued == 0:
-            changed_product_ids.extend(issue_order_stock(cur, order_id))
-            warehouse_issued = 1
 
         current_status = norm(order_row["status"]).lower()
         # Wystawienie faktury oznacza realizację, a nie zakończenie zamówienia.
@@ -3273,36 +3272,20 @@ def reconcile_orders_after_invoice_change(order_ids: list[int]):
         current_status = norm(order_row["status"]).lower()
 
         if fully and warehouse_issued == 0:
-            cur.execute("SELECT product_id, qty FROM order_items WHERE order_id=?", (order_id,))
-            for it in cur.fetchall():
-                pid = int(it["product_id"])
-                qty = int(it["qty"] or 0)
-                cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (pid,))
-                cur.execute("UPDATE stock SET qty = qty - ? WHERE product_id=?", (qty, pid))
-                changed_product_ids.append(pid)
             preserved = {"shipped", "partially_shipped", "completed", "issued", "cancelled"}
             next_status = current_status if current_status in preserved else "packed"
             if next_status == "packed":
                 cur.execute("""
                   UPDATE orders
-                  SET status=?, warehouse_issued=1, packed_at=COALESCE(packed_at, ?)
+                  SET status=?, packed_at=COALESCE(packed_at, ?)
                   WHERE id=?
                 """, (next_status, now_iso(), order_id))
             else:
-                cur.execute("UPDATE orders SET status=?, warehouse_issued=1 WHERE id=?", (next_status, order_id))
+                cur.execute("UPDATE orders SET status=? WHERE id=?", (next_status, order_id))
             changed_order_ids.append(order_id)
 
-        elif not fully and warehouse_issued == 1:
-            cur.execute("SELECT product_id, qty FROM order_items WHERE order_id=?", (order_id,))
-            for it in cur.fetchall():
-                pid = int(it["product_id"])
-                qty = int(it["qty"] or 0)
-                cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (pid,))
-                cur.execute("UPDATE stock SET qty = qty + ? WHERE product_id=?", (qty, pid))
-                changed_product_ids.append(pid)
-            next_status = "confirmed" if current_status in {"issued", "packed", "packed_partial"} else (current_status or "confirmed")
-            cur.execute("UPDATE orders SET status=?, warehouse_issued=0 WHERE id=?", (next_status, order_id))
-            changed_order_ids.append(order_id)
+        # Usunięcie lub edycja faktury również nie może zwracać towaru na stan.
+        # Ruch magazynowy jest niezależny od dokumentów finansowych.
 
     c.commit()
     c.close()
@@ -6481,10 +6464,11 @@ def order_view(order_id):
             {% endfor %}
           </select>
           <input name="tracking_no" value="{{ o['tracking_no'] or '' }}" placeholder="Numer śledzenia" required style="min-width:260px;">
+          <label style="display:flex;align-items:center;gap:7px;"><input type="checkbox" name="notify_customer" value="1" checked> Wyślij e-mail klientowi</label>
           <button class="btn primary" type="submit">Wysłane</button>
           {% if o['tracking_no'] %}<a class="btn" target="_blank" href="{{ carrier_tracking_url(o['carrier'], o['tracking_no']) }}">Śledź</a>{% endif %}
         </form>
-        {% if request.args.get('shipment_sent') == '1' %}<div class="hint" style="margin-top:10px;">Status i numer przesyłki zapisane. Klient otrzymał e-mail.</div>{% endif %}
+        {% if request.args.get('shipment_sent') == '1' %}<div class="hint" style="margin-top:10px;">Status i numer przesyłki zapisane.{% if request.args.get('notification_skipped') == '1' %} Powiadomienie klienta zostało pominięte.{% else %} Klient otrzymał e-mail.{% endif %}</div>{% endif %}
         {% if request.args.get('shipment_email_error') %}<div class="hint" style="margin-top:10px;">Status zapisany, ale e-mail nie został wysłany: {{ request.args.get('shipment_email_error') }}</div>{% endif %}
         {% if request.args.get('confirmation_sent') == '1' %}
           <div class="hint" style="margin-top:10px;">Potwierdzenie zamówienia zostało wysłane ponownie.</div>
@@ -7043,6 +7027,7 @@ def inpost_dispatch_order():
 def order_mark_shipped(order_id):
     tracking_no = re.sub(r"\s+", "", norm(request.form.get("tracking_no")))
     carrier = norm(request.form.get("carrier")).lower()
+    notify_customer = request.form.get("notify_customer", "1") == "1"
     if not tracking_no or len(tracking_no) > 120:
         return "Podaj poprawny numer przesyłki", 400
 
@@ -7113,13 +7098,31 @@ def order_mark_shipped(order_id):
 
     if supabase_enabled():
         try:
-            sync_local_rows_to_supabase("orders", "id", package_order_ids)
+            # Nie wysyłamy całego rekordu. Jedna brakująca w chmurze kolumna
+            # opcjonalnego modułu mogłaby odrzucić PATCH i po kolejnym pullu
+            # cofnąć status oraz tracking do wartości sprzed wysyłki.
+            for package_order in package_orders:
+                supabase_update_rows(
+                    "orders",
+                    {
+                        "status": package_order.get("status"),
+                        "tracking_no": tracking_no,
+                        "carrier": carrier,
+                        "shipped_at": shipped_at,
+                        "warehouse_issued": int(package_order.get("warehouse_issued") or 0),
+                    },
+                    {"id": int(package_order["id"])},
+                )
             if changed_product_ids:
                 sync_local_rows_to_supabase(
                     "stock", "product_id", sorted(set(changed_product_ids))
                 )
         except Exception as exc:
-            app.logger.warning("Nie udało się zsynchronizować wysyłki zamówienia %s: %s", order_id, exc)
+            app.logger.exception("Nie udało się zsynchronizować wysyłki zamówienia %s: %s", order_id, exc)
+            return redirect(url_for(
+                "order_view", order_id=order_id,
+                shipment_email_error="Nie zapisano statusu wysyłki w chmurze. E-mail nie został ponownie wysłany. Spróbuj ponownie po sprawdzeniu połączenia.",
+            ))
 
     try:
         result = _send_orders_shipped_email(package_orders, tracking_no, carrier, packing_attachment)
@@ -7300,16 +7303,30 @@ def order_invoice(order_id):
         it["invoiced_qty"] = done_qty
         it["remaining_qty"] = max(0, ordered_qty - done_qty)
 
-    # Automatyczna propozycja: nie wiecej niz pozostalo do zafakturowania i
-    # nie wiecej niz fizycznie jest na magazynie. Wspolna pula zabezpiecza
-    # pozycje tego samego produktu przed podwojnym wykorzystaniem stanu.
+    # Faktura dla zamówienia już spakowanego/wysłanego dokumentuje towar,
+    # który mógł zostać wcześniej zdjęty z magazynu. W takim przypadku stan
+    # nie może ograniczać ilości na fakturze. Dla zamówień jeszcze
+    # nieprzygotowanych zachowujemy podpowiedź opartą o dostępny magazyn.
     invoice_stock_pool = {}
     for it in items:
         pid = int(it.get("product_id") or 0)
         invoice_stock_pool.setdefault(pid, max(0, int(it.get("stock_qty") or 0)))
-        suggested_qty = min(int(it.get("remaining_qty") or 0), invoice_stock_pool.get(pid, 0))
+        source_order = related_order_by_id.get(int(it.get("order_id") or 0), {})
+        source_status = norm(source_order.get("status")).lower()
+        already_prepared_or_issued = (
+            int(source_order.get("warehouse_issued") or 0) == 1
+            or source_status in {
+                "packed", "packed_partial", "in_delivery", "shipped",
+                "partially_shipped", "issued", "completed",
+            }
+        )
+        if already_prepared_or_issued:
+            suggested_qty = int(it.get("remaining_qty") or 0)
+        else:
+            suggested_qty = min(int(it.get("remaining_qty") or 0), invoice_stock_pool.get(pid, 0))
         it["suggested_invoice_qty"] = max(0, suggested_qty)
-        invoice_stock_pool[pid] = max(0, invoice_stock_pool.get(pid, 0) - suggested_qty)
+        if not already_prepared_or_issued:
+            invoice_stock_pool[pid] = max(0, invoice_stock_pool.get(pid, 0) - suggested_qty)
 
     cur.execute("SELECT * FROM company_profile WHERE id=1")
     company = cur.fetchone()
@@ -7346,6 +7363,11 @@ def order_invoice(order_id):
     # Profil w Supabase jest najświeższym źródłem danych klienta. Lokalny
     # rekord albo starsze zamówienie mogą nie zawierać adresu, mimo że klient
     # uzupełnił go później w swoim profilu.
+    if not notify_customer:
+        return redirect(url_for(
+            "order_view", order_id=order_id, shipment_sent="1", notification_skipped="1"
+        ))
+
     try:
         client_profile = _client_profile_for_email(o["customer_email"])
     except Exception as exc:
