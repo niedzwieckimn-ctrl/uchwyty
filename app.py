@@ -1548,10 +1548,6 @@ def maybe_pull_shared_from_supabase(force: bool = False):
             # faktycznie zrealizowanych pozycji, aby panel klienta nie
             # sugerował wysłania całego zamówienia.
             reconcile_legacy_shipped_order_statuses()
-            # Faktura mogła powstać w starszej wersji, która pozostawiła
-            # spakowane zamówienie wyłącznie jako rezerwację. Rozliczamy
-            # takie pełne faktury jednokrotnie przy pierwszym odczycie.
-            reconcile_existing_invoiced_reservations()
             # Status płatności mógł zostać zapisany przed dodaniem automatycznego
             # zamykania zamówień. Przeliczenie jest idempotentne i uzupełnia
             # wyłącznie zaległe statusy na podstawie istniejących faktur.
@@ -3193,27 +3189,6 @@ def finalize_fully_invoiced_orders(order_ids: list[int]):
                 pass
 
     return changed_order_ids, list(set(changed_product_ids))
-
-
-def reconcile_existing_invoiced_reservations():
-    """Rozlicz starsze pełne faktury, które nadal wiszą jako rezerwacje."""
-    c = conn()
-    try:
-        cur = c.cursor()
-        cur.execute("""
-          SELECT id
-          FROM orders
-          WHERE COALESCE(warehouse_issued, 0)=0
-            AND LOWER(COALESCE(status,'')) IN ('packed','packed_partial')
-          ORDER BY id
-        """)
-        candidate_ids = [int(row["id"]) for row in cur.fetchall()]
-    finally:
-        c.close()
-
-    if not candidate_ids:
-        return [], []
-    return finalize_fully_invoiced_orders(candidate_ids)
 
 
 def reconcile_legacy_shipped_order_statuses():
@@ -7260,6 +7235,82 @@ def order_status_update(order_id):
 def order_issue(order_id):
     # Stara akcja wyĹ‚Ä…czona. Wydanie dzieje siÄ™ teraz przy zmianie statusu na "W dostawie".
     return redirect(url_for("order_view", order_id=order_id))
+
+
+@app.route("/orders/recover-v25-reservations", methods=["GET", "POST"])
+def recover_v25_reservations():
+    """Ręczne, kontrolowane cofnięcie rozchodów wykonanych przez wersję v25."""
+    maybe_pull_shared_from_supabase(force=request.method == "POST")
+    c = conn()
+    cur = c.cursor()
+    restored = 0
+    changed_order_ids = []
+    changed_product_ids = []
+
+    if request.method == "POST":
+        selected_ids = sorted({to_int(value, 0) for value in request.form.getlist("order_id") if to_int(value, 0) > 0})
+        for selected_id in selected_ids:
+            cur.execute("""
+              SELECT id FROM orders
+              WHERE id=? AND COALESCE(warehouse_issued,0)=1
+                AND LOWER(COALESCE(status,'')) IN ('packed','packed_partial')
+            """, (selected_id,))
+            if not cur.fetchone() or not order_fully_invoiced(cur, selected_id):
+                continue
+            cur.execute("SELECT product_id, qty FROM order_items WHERE order_id=?", (selected_id,))
+            for item in cur.fetchall():
+                product_id = int(item["product_id"])
+                qty = int(item["qty"] or 0)
+                cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (product_id,))
+                cur.execute("UPDATE stock SET qty=qty+? WHERE product_id=?", (qty, product_id))
+                changed_product_ids.append(product_id)
+            cur.execute("UPDATE orders SET warehouse_issued=0 WHERE id=?", (selected_id,))
+            changed_order_ids.append(selected_id)
+            restored += 1
+        c.commit()
+
+        if supabase_enabled():
+            try:
+                if changed_order_ids:
+                    sync_local_rows_to_supabase("orders", "id", changed_order_ids)
+                if changed_product_ids:
+                    sync_local_rows_to_supabase("stock", "product_id", sorted(set(changed_product_ids)))
+            except Exception:
+                app.logger.exception("Nie udało się zsynchronizować cofnięcia v25")
+
+    cur.execute("""
+      SELECT o.id, o.order_no, o.created_at, o.customer_name, o.status,
+             COALESCE(SUM(oi.qty),0) AS total_qty
+      FROM orders o
+      JOIN order_items oi ON oi.order_id=o.id
+      WHERE COALESCE(o.warehouse_issued,0)=1
+        AND LOWER(COALESCE(o.status,'')) IN ('packed','packed_partial')
+      GROUP BY o.id
+      ORDER BY o.id DESC
+    """)
+    candidates = [dict(row) for row in cur.fetchall() if order_fully_invoiced(cur, int(row["id"]))]
+    c.close()
+
+    tpl = """
+    {% extends 'base.html' %}{% block content %}
+    <div class="card"><h1>Przywrócenie rezerwacji po v25</h1>
+      <p class="muted">Zaznacz tylko zamówienia, których rezerwacje zniknęły po wdrożeniu v25.</p>
+      {% if restored %}<div class="hint">Przywrócono rezerwacje: <b>{{ restored }}</b>.</div>{% endif %}
+      <form method="post">
+        <table><thead><tr><th></th><th>Zamówienie</th><th>Klient</th><th>Sztuki</th><th>Status</th></tr></thead><tbody>
+        {% for row in candidates %}<tr>
+          <td><input type="checkbox" name="order_id" value="{{ row.id }}"></td>
+          <td><b>{{ canonical_order_no(row.id, row.created_at, row.order_no) }}</b></td>
+          <td>{{ row.customer_name }}</td><td>{{ row.total_qty }}</td><td>{{ row.status }}</td>
+        </tr>{% endfor %}
+        {% if not candidates %}<tr><td colspan="5">Brak zamówień wymagających cofnięcia.</td></tr>{% endif %}
+        </tbody></table>
+        {% if candidates %}<button class="btn primary" type="submit" style="margin-top:16px" onclick="return confirm('Przywrócić zaznaczone rezerwacje i ilości magazynowe?')">Przywróć zaznaczone</button>{% endif %}
+      </form>
+    </div>{% endblock %}
+    """
+    return render_template_string(tpl, title="Przywrócenie rezerwacji", base_url=BASE_URL, db_path=DB_PATH,
+                                  candidates=candidates, restored=restored, canonical_order_no=canonical_order_no)
 
 
 @app.route("/orders/<int:order_id>/invoice", methods=["GET", "POST"])
