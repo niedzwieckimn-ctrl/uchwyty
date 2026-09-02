@@ -7349,11 +7349,6 @@ def order_invoice(order_id):
     # Profil w Supabase jest najświeższym źródłem danych klienta. Lokalny
     # rekord albo starsze zamówienie mogą nie zawierać adresu, mimo że klient
     # uzupełnił go później w swoim profilu.
-    if not notify_customer:
-        return redirect(url_for(
-            "order_view", order_id=order_id, shipment_sent="1", notification_skipped="1"
-        ))
-
     try:
         client_profile = _client_profile_for_email(o["customer_email"])
     except Exception as exc:
