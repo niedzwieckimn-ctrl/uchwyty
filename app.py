@@ -47,6 +47,7 @@ from inpost_module import (
     InPostError,
     config_summary as inpost_config_summary,
     create_courier_shipment,
+    create_dispatch_order as inpost_create_dispatch_order,
     get_label as inpost_get_label,
 )
 try:
@@ -528,6 +529,8 @@ def init_db():
         cur.execute("ALTER TABLE orders ADD COLUMN inpost_shipment_id TEXT")
     if "inpost_label_format" not in order_cols:
         cur.execute("ALTER TABLE orders ADD COLUMN inpost_label_format TEXT")
+    if "inpost_dispatch_order_id" not in order_cols:
+        cur.execute("ALTER TABLE orders ADD COLUMN inpost_dispatch_order_id TEXT")
 
     cur.execute("PRAGMA table_info(order_items)")
     order_item_cols = {r[1] for r in cur.fetchall()}
@@ -6047,6 +6050,7 @@ def orders():
         <div class="orders-toolbar">
           <a class="btn all-orders {% if tab=='all' %}primary{% endif %}" href="{{ url_for('orders', tab='all') }}">Wszystkie zamówienia</a>
           <a class="btn" href="{{ url_for('stock_issue_audit') }}">Audyt wydań</a>
+          <a class="btn" href="{{ url_for('inpost_dispatch_order') }}">Zamów kuriera InPost</a>
           <a class="btn primary" href="{{ url_for('order_new') }}">+ Nowe zamówienie</a>
         </div>
         <form method="get" class="grid3">
@@ -6468,6 +6472,7 @@ def order_view(order_id):
         <form method="post" action="{{ url_for('order_mark_shipped', order_id=o['id']) }}" class="flex" style="margin-top:14px;padding:14px;border:1px solid #dbe4f2;border-radius:16px;background:#f8fbff;">
           <div><b>Wysyłka do klienta</b><div class="muted">Wpisz numer przesyłki i oznacz zamówienie jako wysłane.</div></div>
           <a class="btn" href="{{ url_for('order_inpost_create', order_id=o['id']) }}">{% if o['inpost_shipment_id'] %}Pobierz etykietę InPost{% else %}Generuj etykietę InPost{% endif %}</a>
+          <a class="btn" href="{{ url_for('inpost_dispatch_order') }}">Zamów kuriera</a>
           <select name="carrier" required style="min-width:150px;">
             <option value="">-- Kurier --</option>
             {% for carrier_key, carrier_name in [('inpost','InPost'),('dpd','DPD'),('fedex','FedEx'),('dhl','DHL'),('ups','UPS')] %}
@@ -6928,6 +6933,89 @@ def order_inpost_label(order_id):
         return redirect(url_for("order_inpost_create", order_id=order_id, inpost_error=str(exc)[:240]))
     filename = safe_filename(canonical_order_no(row["id"], row["created_at"], row["order_no"])) + "_InPost_A6.pdf"
     return send_file(io.BytesIO(pdf), mimetype="application/pdf", as_attachment=True, download_name=filename, max_age=0)
+
+
+@app.route("/inpost/dispatch", methods=["GET", "POST"])
+def inpost_dispatch_order():
+    maybe_pull_shared_from_supabase(force=True)
+    c = conn()
+    try:
+        cur = c.cursor()
+        cur.execute("""SELECT inpost_shipment_id, MIN(id) AS order_id,
+                              GROUP_CONCAT(order_no, ', ') AS order_numbers,
+                              MAX(tracking_no) AS tracking_no, MAX(created_at) AS created_at
+                       FROM orders
+                       WHERE TRIM(COALESCE(inpost_shipment_id,''))<>''
+                         AND TRIM(COALESCE(inpost_dispatch_order_id,''))=''
+                       GROUP BY inpost_shipment_id ORDER BY MAX(id) DESC""")
+        pending = [dict(row) for row in cur.fetchall()]
+        company_row = cur.execute("SELECT * FROM company_profile WHERE id=1").fetchone()
+        company = dict(company_row) if company_row else {}
+    finally:
+        c.close()
+    street, post_code, city = split_address(company.get("address") or "")
+    error = norm(request.args.get("error"))
+    created = norm(request.args.get("created"))
+    if request.method == "POST":
+        selected = list(dict.fromkeys(norm(value) for value in request.form.getlist("shipment_id") if norm(value)))
+        allowed = {norm(row["inpost_shipment_id"]) for row in pending}
+        selected = [value for value in selected if value in allowed]
+        pickup = {
+            "name": norm(request.form.get("name")), "street": norm(request.form.get("street")),
+            "post_code": norm(request.form.get("post_code")), "city": norm(request.form.get("city")),
+            "phone": norm(request.form.get("phone")), "email": norm(request.form.get("email")),
+            "comment": norm(request.form.get("comment")),
+        }
+        try:
+            result = inpost_create_dispatch_order(selected, pickup)
+            dispatch_id = norm(result.get("id"))
+            if not dispatch_id:
+                raise InPostError("API nie zwróciło identyfikatora zlecenia odbioru")
+            c = conn()
+            try:
+                placeholders = ",".join(["?"] * len(selected))
+                c.execute(
+                    f"UPDATE orders SET inpost_dispatch_order_id=? WHERE inpost_shipment_id IN ({placeholders})",
+                    (dispatch_id, *selected),
+                )
+                c.commit()
+                cur = c.cursor()
+                cur.execute(f"SELECT id FROM orders WHERE inpost_shipment_id IN ({placeholders})", tuple(selected))
+                changed_ids = [int(row["id"]) for row in cur.fetchall()]
+            finally:
+                c.close()
+            if supabase_enabled() and changed_ids:
+                sync_local_rows_to_supabase("orders", "id", changed_ids)
+            return redirect(url_for("inpost_dispatch_order", created=dispatch_id))
+        except InPostError as exc:
+            error = str(exc)
+    tpl = r"""
+    {% extends "base.html" %}{% block content %}
+      <div class="card"><div class="flex"><div><h1 style="margin:0 0 8px;">Zamów kuriera InPost</h1><div class="muted">Zlecenie odbioru powstaje dopiero dla zaznaczonych, wcześniej utworzonych przesyłek.</div></div><a class="btn right" href="{{ url_for('orders') }}">← Zamówienia</a></div></div>
+      <div class="card">
+        {% if created %}<div class="hint" style="margin-bottom:14px;">Zamówiono kuriera. ID zlecenia: <b>{{ created }}</b></div>{% endif %}
+        {% if error %}<div class="hint" style="border-color:#fecaca;background:#fff1f2;margin-bottom:14px;">{{ error }}</div>{% endif %}
+        <form method="post">
+          <h2>Przesyłki oczekujące na odbiór</h2>
+          <table><thead><tr><th></th><th>Zamówienia</th><th>Tracking</th><th>ID ShipX</th></tr></thead><tbody>
+          {% for row in pending %}<tr><td><input type="checkbox" name="shipment_id" value="{{ row.inpost_shipment_id }}"></td><td>{{ row.order_numbers }}</td><td>{{ row.tracking_no or '-' }}</td><td>{{ row.inpost_shipment_id }}</td></tr>{% endfor %}
+          {% if not pending %}<tr><td colspan="4" class="muted">Brak przesyłek oczekujących na zamówienie kuriera.</td></tr>{% endif %}
+          </tbody></table>
+          {% if pending %}<div class="row" style="margin-top:18px;">
+            <div><label class="muted small">Nazwa punktu odbioru</label><input name="name" value="{{ company.company_name or 'Magazyn' }}" required></div>
+            <div><label class="muted small">Ulica i numer</label><input name="street" value="{{ street }}" required></div>
+            <div><label class="muted small">Kod pocztowy</label><input name="post_code" value="{{ post_code }}" required></div>
+            <div><label class="muted small">Miasto</label><input name="city" value="{{ city }}" required></div>
+            <div><label class="muted small">Telefon</label><input name="phone" value="{{ company.phone or '' }}" required></div>
+            <div><label class="muted small">Email</label><input name="email" value="{{ company.email or '' }}"></div>
+            <div><label class="muted small">Komentarz</label><input name="comment" maxlength="100"></div>
+            <div style="grid-column:1/-1"><button class="btn primary" type="submit" onclick="return confirm('Zamówić kuriera po zaznaczone przesyłki?')">Zamów kuriera</button></div>
+          </div>{% endif %}
+        </form>
+      </div>
+    {% endblock %}
+    """
+    return render_template_string(tpl, title="Zamów kuriera InPost", base_url=BASE_URL, db_path=DB_PATH, pending=pending, company=company, street=street, post_code=post_code, city=city, error=error, created=created)
 
 
 @app.post("/orders/<int:order_id>/shipped")
