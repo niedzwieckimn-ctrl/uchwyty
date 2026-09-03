@@ -24,7 +24,7 @@ ITEMS = [{
 def foreign_invoice(kind="wdt"):
     return {
         "invoice_no": "FV/TEST/1", "issue_date": "2026-09-03",
-        "sell_date": "2026-09-03", "place": "Kotusów",
+        "sell_date": "2026-09-03", "place": "Kotuszów",
         "buyer_name": "Test Buyer", "buyer_street": "Street 1",
         "buyer_post_code": "10115", "buyer_city": "Berlin",
         "buyer_country": "DE", "buyer_tax_no": "DE123456789",
@@ -51,6 +51,7 @@ def test_wdt_fa3_currency_rate_identity_and_totals():
     xml = ksef_foreign.generate(foreign_invoice(), COMPANY, ITEMS)
     root, ns = xml_values(xml)
     assert root.findtext(".//f:KodWaluty", namespaces=ns) == "EUR"
+    assert root.findtext(".//f:P_1M", namespaces=ns) == "Kotuszów"
     assert root.findtext(".//f:P_12", namespaces=ns) == "0 WDT"
     assert root.findtext(".//f:KodUE", namespaces=ns) == "DE"
     assert root.findtext(".//f:NrVatUE", namespaces=ns) == "123456789"
@@ -174,3 +175,52 @@ def test_export_pdf_is_foreign_and_not_wdt(historical_db):
     assert "Ausfuhrlieferung" in text
     assert "innergemeinschaftliche Lieferung" not in text
     assert "USD" in text
+
+
+def test_invoice_edit_keeps_saved_eur_price_and_zero_vat(historical_db):
+    rows = backend.invoice_edit_items(1, backend.load_invoice_with_meta(1))
+    assert rows[0]["net_price"] == 10
+    assert rows[0]["currency"] == "EUR"
+    form = {f"invoice_qty_{rows[0]['id']}": "2"}
+    prepared = backend.prepare_invoice_edit_items(rows, form, "wdt", "EUR")
+    assert prepared[0]["net_price"] == 10
+    assert prepared[0]["gross_price"] == 10
+    assert prepared[0]["vat_rate"] == 0
+    assert prepared[0]["currency"] == "EUR"
+
+
+def test_eur_order_automatically_becomes_wdt_without_language_rule():
+    order = {"currency": "EUR", "price_list": "eu_eur"}
+    kind, currency, country = backend.automatic_invoice_tax_context(
+        order, "DE368333559", "Deutschland"
+    )
+    assert (kind, currency, country) == ("wdt", "EUR", "DE")
+
+
+def test_domain_routes_keep_names_and_read_pages_are_side_effect_free(historical_db, monkeypatch):
+    monkeypatch.setattr(backend, "maybe_pull_shared_from_supabase", lambda *a, **k: None)
+    backend.app.secret_key = "test-secret-key"
+    rules = {(rule.rule, rule.endpoint) for rule in backend.app.url_map.iter_rules()}
+    assert len(rules) == 89
+    for expected in {
+        ("/", "home"), ("/customers", "customers"), ("/orders", "orders"),
+        ("/stock", "stock"), ("/invoices", "invoices"), ("/ksef", "ksef_dashboard"),
+        ("/inpost/dispatch", "inpost_dispatch_order"), ("/china", "china"),
+    }:
+        assert expected in rules
+
+    c = backend.conn()
+    tables = [row[0] for row in c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+    before = {table: [tuple(row) for row in c.execute(f"SELECT * FROM {table} ORDER BY 1")] for table in tables}
+    c.close()
+    client = backend.app.test_client()
+    with client.session_transaction() as sess:
+        sess["admin_authenticated"] = True
+        sess["csrf_token"] = "test"
+    for path in ("/", "/customers", "/customers/1/edit", "/orders", "/orders/1", "/stock", "/invoices", "/invoices/1/edit", "/ksef", "/china"):
+        response = client.get(path)
+        assert response.status_code == 200, path
+    c = backend.conn()
+    after = {table: [tuple(row) for row in c.execute(f"SELECT * FROM {table} ORDER BY 1")] for table in tables}
+    c.close()
+    assert after == before
