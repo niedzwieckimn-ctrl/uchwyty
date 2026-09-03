@@ -1,5 +1,9 @@
 """Mechanically extracted Flask routes; business logic is unchanged."""
 
+from pathlib import Path
+
+INVOICES_LIST_TEMPLATE = (Path(__file__).resolve().parent.parent / "templates" / "invoices_list.html").read_text(encoding="utf-8")
+
 def register_routes(context):
     globals().update(context)
 
@@ -628,16 +632,6 @@ def register_routes(context):
         cur = c.cursor()
         params = []
         where = ""
-        if q:
-            like = f"%{q.lower()}%"
-            where = """
-              WHERE LOWER(COALESCE(i.invoice_no,'')) LIKE ?
-                 OR LOWER(COALESCE(i.buyer_name,'')) LIKE ?
-                 OR LOWER(COALESCE(o.customer_name,'')) LIKE ?
-                 OR LOWER(COALESCE(o.order_no,'')) LIKE ?
-                 OR LOWER(COALESCE(o.note,'')) LIKE ?
-            """
-            params = [like, like, like, like, like]
 
         cur.execute(f"""
           SELECT
@@ -667,6 +661,63 @@ def register_routes(context):
         """, params)
         rows = [dict(r) for r in cur.fetchall()]
         c.close()
+
+        # Filtry i statystyki tego ekranu są wyliczane wyłącznie w pamięci.
+        # Nie zapisujemy danych ani nie zmieniamy istniejących akcji faktury.
+        view = norm(request.args.get("view")) or "all"
+        if view not in {"all", "customers"}:
+            view = "all"
+        selected_customer = norm(request.args.get("customer"))
+        selected_month = norm(request.args.get("month"))
+        selected_payment = norm(request.args.get("payment"))
+        selected_type = norm(request.args.get("document_type"))
+        selected_currency = norm(request.args.get("currency")).upper()
+        selected_ksef = norm(request.args.get("ksef"))
+        selected_sent = norm(request.args.get("sent"))
+        today = app_now().date().isoformat()
+        current_month = today[:7]
+
+        for inv in rows:
+            inv["customer_display"] = inv.get("buyer_name") or inv.get("order_customer_name") or "Bez klienta"
+            inv["currency"] = normalize_order_currency(inv.get("currency"))
+            inv["document_type"] = resolve_invoice_type(inv)
+            inv["document_type_label"] = {"domestic": "KRAJOWA", "wdt": "WDT", "export": "EKSPORT"}.get(inv["document_type"], "KRAJOWA")
+            due = norm(inv.get("payment_to"))[:10]
+            inv["payment_status"] = "paid" if inv.get("paid") else ("overdue" if due and due < today else "unpaid")
+            inv["payment_status_label"] = {"paid": "Zapłacona", "overdue": "Po terminie", "unpaid": "Nieopłacona"}[inv["payment_status"]]
+            inv["pdf_ok"] = 1 if (invoice_pdf_exists(inv.get("pdf_path", ""), inv.get("invoice_no", ""))[0] or inv.get("invoice_items_json")) else 0
+
+        all_rows = list(rows)
+        summary = {
+            "all": len(all_rows),
+            "unpaid": sum(1 for inv in all_rows if not inv.get("paid")),
+            "overdue": sum(1 for inv in all_rows if inv["payment_status"] == "overdue"),
+            "paid": sum(1 for inv in all_rows if inv.get("paid")),
+            "ksef": sum(1 for inv in all_rows if inv.get("ksef_status") == "sent"),
+            "unsent": sum(1 for inv in all_rows if not inv.get("sent_to_client")),
+        }
+        month_totals = {}
+        for inv in all_rows:
+            if norm(inv.get("issue_date"))[:7] != current_month:
+                continue
+            total = month_totals.setdefault(inv["currency"], {"currency": inv["currency"], "net": 0.0, "gross": 0.0})
+            total["net"] += float(inv.get("total_net") or 0)
+            total["gross"] += float(inv.get("total_gross") or 0)
+
+        customers = sorted({inv["customer_display"] for inv in all_rows}, key=str.casefold)
+        months = sorted({norm(inv.get("issue_date"))[:7] for inv in all_rows if norm(inv.get("issue_date"))[:7]}, reverse=True)
+        currencies = sorted({inv["currency"] for inv in all_rows})
+        query = q.casefold()
+        rows = [inv for inv in all_rows if (
+            (not query or any(query in norm(inv.get(field)).casefold() for field in ("invoice_no", "customer_display", "source_order_no", "source_order_note")))
+            and (not selected_customer or inv["customer_display"] == selected_customer)
+            and (not selected_month or norm(inv.get("issue_date"))[:7] == selected_month)
+            and (not selected_payment or inv["payment_status"] == selected_payment)
+            and (not selected_type or inv["document_type"] == selected_type)
+            and (not selected_currency or inv["currency"] == selected_currency)
+            and (not selected_ksef or (selected_ksef == "none" and inv.get("ksef_status") not in {"sent", "ready", "error"}) or inv.get("ksef_status") == selected_ksef)
+            and (not selected_sent or (selected_sent == "sent" and inv.get("sent_to_client")) or (selected_sent == "unsent" and not inv.get("sent_to_client")))
+        )]
 
         notice = ""
         notice_error = False
@@ -725,6 +776,17 @@ def register_routes(context):
                 )
                 currency_total["total_net"] += float(inv.get("total_net") or 0)
                 currency_total["total_gross"] += float(inv.get("total_gross") or 0)
+
+        return render_template_string(
+            INVOICES_LIST_TEMPLATE, title="Faktury", base_url=BASE_URL, db_path=DB_PATH,
+            rows=rows, groups=groups, q=q, view=view, summary=summary,
+            month_totals=list(month_totals.values()), current_month=current_month,
+            customers=customers, months=months, currencies=currencies,
+            selected_customer=selected_customer, selected_month=selected_month,
+            selected_payment=selected_payment, selected_type=selected_type,
+            selected_currency=selected_currency, selected_ksef=selected_ksef,
+            selected_sent=selected_sent, notice=notice, notice_error=notice_error,
+        )
 
         tpl = r"""
         {% extends "base.html" %}
