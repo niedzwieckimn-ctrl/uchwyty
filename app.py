@@ -6959,7 +6959,7 @@ def order_inpost_create(order_id):
       <div class="card">
         {% if created and o.inpost_shipment_id %}<div class="hint" style="border-color:#a7e8cf;background:#edfbf6;color:#17684e;margin-bottom:15px;"><b>Przesyłka InPost została utworzona.</b>{% if o.tracking_no %} Numer: <b>{{ o.tracking_no }}</b>.{% else %} InPost przygotowuje jeszcze numer przesyłki.{% endif %} PDF pobierzesz przyciskiem poniżej.</div>{% endif %}
         {% if error %}<div class="hint" style="border-color:#fecaca;background:#fff1f2;margin-bottom:15px;">{{ error }}</div>{% endif %}
-        {% if not cfg.configured %}<div class="hint">Dodaj na Renderze zmienne <b>INPOST_ORGANIZATION_ID</b> i <b>INPOST_API_TOKEN</b>.</div>{% endif %}
+        {% if not cfg.configured %}<div class="hint">Dodaj na Renderze zmienną <b>INPOST_API_TOKEN</b>. ID organizacji aplikacja pobierze automatycznie.</div>{% endif %}
         {% if o.inpost_shipment_id %}<div class="flex"><span class="badge">Przesyłka już utworzona</span><a class="btn primary" href="{{ url_for('order_inpost_label', order_id=o.id, bundle='1' if bundle else None) }}">{% if bundle %}Pobierz listę A4 + etykietę A6 (PDF){% else %}Pobierz etykietę A6 (PDF){% endif %}</a><a class="btn" href="{{ url_for('order_view', order_id=o.id) }}">Wróć do zamówienia</a></div>{% else %}
         <form method="post" class="row">
           {% if bundle %}<input type="hidden" name="bundle" value="1">{% endif %}

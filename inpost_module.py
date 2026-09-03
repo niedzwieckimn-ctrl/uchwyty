@@ -9,6 +9,9 @@ class InPostError(RuntimeError):
     pass
 
 
+_DISCOVERED_ORGANIZATION_ID = ""
+
+
 def _looks_like_api_token(value):
     value = (value or "").strip()
     return len(value) >= 40 or value.count(".") >= 2
@@ -23,16 +26,21 @@ def config_summary():
     swapped = _looks_like_api_token(organization_id) and token.isdigit()
     if swapped:
         token, organization_id = organization_id, token
+    elif not token and _looks_like_api_token(organization_id):
+        # Pozwala naprawić konfigurację, w której jedyna dostępna wartość
+        # (token) została wcześniej wpisana do pola organizacji.
+        token, organization_id = organization_id, ""
     invalid = []
     if token and not _looks_like_api_token(token):
         invalid.append("INPOST_API_TOKEN")
-    if organization_id and not organization_id.isdigit():
+    if organization_id and not organization_id.isdigit() and not _looks_like_api_token(organization_id):
         invalid.append("INPOST_ORGANIZATION_ID")
     return {
-        "configured": bool(token and organization_id and not invalid),
+        # ID organizacji jest opcjonalne: gdy go brak, pobieramy je bezpiecznie
+        # z /organizations przy użyciu tokenu.
+        "configured": bool(token and "INPOST_API_TOKEN" not in invalid),
         "missing": [name for name, value in (
             ("INPOST_API_TOKEN", token),
-            ("INPOST_ORGANIZATION_ID", organization_id),
         ) if not value] + invalid,
         "token": token,
         "organization_id": organization_id,
@@ -87,6 +95,28 @@ def _request(path, method="GET", payload=None, accept="application/json"):
         raise InPostError(f"Brak połączenia z InPost: {exc.reason}") from exc
 
 
+def organization_id():
+    global _DISCOVERED_ORGANIZATION_ID
+    cfg = config_summary()
+    if cfg["organization_id"].isdigit():
+        return cfg["organization_id"]
+    if _DISCOVERED_ORGANIZATION_ID:
+        return _DISCOVERED_ORGANIZATION_ID
+    response = _request("/organizations")
+    organizations = list(response.get("items") or []) if isinstance(response, dict) else []
+    courier = [item for item in organizations if "inpost_courier_standard" in (item.get("services") or [])]
+    candidates = courier or organizations
+    if not candidates:
+        raise InPostError("Token InPost nie ma dostępu do organizacji obsługującej przesyłki kurierskie")
+    if len(candidates) > 1:
+        raise InPostError("Token ma dostęp do kilku organizacji. Ustaw INPOST_ORGANIZATION_ID na Renderze.")
+    resolved = str(candidates[0].get("id") or "").strip()
+    if not resolved.isdigit():
+        raise InPostError("InPost nie zwrócił poprawnego ID organizacji")
+    _DISCOVERED_ORGANIZATION_ID = resolved
+    return resolved
+
+
 def split_street_building(value):
     text = (value or "").strip().rstrip(",")
     match = re.match(r"^(.*?)[,\s]+(\d+[A-Za-z0-9/\-]*)$", text)
@@ -103,7 +133,7 @@ def normalize_polish_phone(value):
 
 
 def create_courier_shipment(receiver, parcel, reference, service="inpost_courier_standard", options=None):
-    organization_id = config_summary()["organization_id"]
+    resolved_organization_id = organization_id()
     options = options or {}
     street, building = split_street_building(receiver.get("street"))
     parcel_payload = {
@@ -141,7 +171,7 @@ def create_courier_shipment(receiver, parcel, reference, service="inpost_courier
         if insurance < cod:
             raise InPostError("Ubezpieczenie musi być co najmniej równe kwocie pobrania")
         payload["cod"] = {"amount": round(cod, 2), "currency": "PLN"}
-    return _request(f"/organizations/{organization_id}/shipments", "POST", payload)
+    return _request(f"/organizations/{resolved_organization_id}/shipments", "POST", payload)
 
 
 def get_label(shipment_id, label_format="pdf", label_type="A6"):
@@ -159,7 +189,7 @@ def get_shipment(shipment_id):
 
 
 def create_dispatch_order(shipment_ids, pickup):
-    organization_id = config_summary()["organization_id"]
+    resolved_organization_id = organization_id()
     clean_ids = list(dict.fromkeys(str(int(value)) for value in shipment_ids if value))
     if not clean_ids:
         raise InPostError("Wybierz co najmniej jedną przesyłkę")
@@ -181,4 +211,4 @@ def create_dispatch_order(shipment_ids, pickup):
             "country_code": "PL",
         },
     }
-    return _request(f"/organizations/{organization_id}/dispatch_orders", "POST", payload)
+    return _request(f"/organizations/{resolved_organization_id}/dispatch_orders", "POST", payload)
