@@ -6497,6 +6497,14 @@ def order_view(order_id):
         <div class="flex">
           <h1 style="margin:0;">{{ order_display_no(o['id'], o['created_at'], o['order_no'], o['note']) }}</h1>
           <span class="badge {{ order_status_css(o['status']) }}">{{ order_status_label(o['status']) }}</span>
+          <form method="post" action="{{ url_for('order_status_update', order_id=o['id']) }}" class="flex" style="margin-left:10px;">
+            <select name="status" aria-label="Ręczna korekta statusu">
+              {% for status_key in ['new','confirmed','packed','packed_partial','in_delivery','shipped','partially_shipped','issued','completed','cancelled'] %}
+                <option value="{{ status_key }}" {% if (o['status'] or '')|lower == status_key %}selected{% endif %}>{{ order_status_label(status_key) }}</option>
+              {% endfor %}
+            </select>
+            <button class="btn" type="submit" onclick="return confirm('Zapisać ręczną korektę statusu? Nie zmieni to stanu magazynowego ani nie wyśle e-maila.')">Zmień status</button>
+          </form>
           <div class="right flex">
             <a class="btn" href="{{ url_for('orders') }}">â† Lista</a>
             <a class="btn primary" href="{{ url_for('order_packing_list_download_admin', order_id=o['id']) }}">Pakuj</a>
@@ -6509,12 +6517,6 @@ def order_view(order_id):
             <form method="post" action="{{ url_for('order_confirmation_resend', order_id=o['id']) }}">
               <button class="btn" type="submit">Wyślij ponownie potwierdzenie</button>
             </form>
-              {% if (o['status'] or '')|lower not in ['completed','cancelled'] %}
-                <form method="post" action="{{ url_for('order_status_update', order_id=o['id']) }}" onsubmit="return confirm('Oznaczyć to zamówienie jako zrealizowane? Status będzie widoczny również w panelu klienta.')">
-                  <input type="hidden" name="status" value="completed">
-                  <button class="btn ok" type="submit">Zrealizowane</button>
-                </form>
-              {% endif %}
               <a class="btn primary" href="{{ url_for('order_label', order_id=o['id']) }}">Etykieta 30x50</a>
               {% if locked %}
                 <span class="badge">Wydane z magazynu</span>
@@ -7279,7 +7281,10 @@ def order_status_update(order_id):
     new_status = norm(request.form.get("status")).lower()
     # Status "shipped" można nadać wyłącznie osobnym formularzem,
     # który wymaga numeru przesyłki i wysyła powiadomienie do klienta.
-    allowed = {"new", "confirmed", "packed", "in_delivery", "issued", "completed"}
+    allowed = {
+        "new", "confirmed", "packed", "packed_partial", "in_delivery",
+        "shipped", "partially_shipped", "issued", "completed", "cancelled",
+    }
     if new_status not in allowed:
         return "NieprawidĹ‚owy status", 400
 
@@ -11007,7 +11012,11 @@ def _order_fully_invoiced_for_payment(cur, order_id: int) -> bool:
 
 
 def reconcile_paid_order_statuses():
-    """Uzupełnia status completed dla wcześniej opłaconych zamówień."""
+    """Zamyka tylko w pełni zafakturowane i opłacone zamówienia.
+
+    Samo wcześniejsze wydanie magazynowe nie dowodzi, że wysłano całość.
+    Dotyczy to zwłaszcza zamówień realizowanych kilkoma paczkami.
+    """
     c = conn()
     cur = c.cursor()
     cur.execute("SELECT invoice_id FROM invoice_meta WHERE COALESCE(paid,0)=1")
@@ -11026,9 +11035,8 @@ def reconcile_paid_order_statuses():
         current_status = norm(order_row["status"]).lower()
         if current_status in {"completed", "cancelled"}:
             continue
-        historically_fulfilled = int(order_row["warehouse_issued"] or 0) == 1
         fully_invoiced = _order_fully_invoiced_for_payment(cur, order_id)
-        if (historically_fulfilled or fully_invoiced) and _all_order_invoices_paid(cur, order_id):
+        if fully_invoiced and _all_order_invoices_paid(cur, order_id):
             cur.execute("UPDATE orders SET status='completed' WHERE id=?", (order_id,))
             changed_order_ids.append(order_id)
     c.commit()
@@ -11043,34 +11051,12 @@ def reconcile_paid_order_statuses():
 
 
 def reconcile_legacy_orders_by_age(days: int = 14):
-    """Twardo zamyka nieanulowane zamówienia sprzed co najmniej ``days`` dni."""
-    cutoff = (app_now() - timedelta(days=max(1, int(days)))).strftime("%Y-%m-%d")
-    c = conn()
-    cur = c.cursor()
-    cur.execute("""
-      SELECT id
-      FROM orders
-      WHERE TRIM(COALESCE(created_at,''))<>''
-        AND SUBSTR(TRIM(created_at),1,10) <= ?
-        AND LOWER(COALESCE(status,'')) NOT IN ('completed','cancelled')
-    """, (cutoff,))
-    changed_order_ids = [int(row["id"]) for row in cur.fetchall()]
-    if changed_order_ids:
-        placeholders = ",".join(["?"] * len(changed_order_ids))
-        cur.execute(
-            f"UPDATE orders SET status='completed' WHERE id IN ({placeholders})",
-            tuple(changed_order_ids),
-        )
-    c.commit()
-    c.close()
+    """Wyłączona reguła historyczna.
 
-    if changed_order_ids and supabase_enabled():
-        try:
-            for offset in range(0, len(changed_order_ids), 250):
-                sync_local_rows_to_supabase("orders", "id", changed_order_ids[offset:offset + 250])
-        except Exception:
-            app.logger.exception("Nie udało się zsynchronizować zamówień zamkniętych regułą 14 dni")
-    return changed_order_ids
+    Wiek zamówienia nie świadczy o jego realizacji. W szczególności zamówień
+    wysłanych częściowo nie wolno automatycznie zamykać po 14 dniach.
+    """
+    return []
 
 
 def _set_invoice_payment_state(invoice_id: int, *, reminder: int | None = None, paid: int | None = None):
