@@ -3688,7 +3688,16 @@ def home():
 
     cur.execute("""
       SELECT COALESCE(SUM(
-        (COALESCE(s.qty,0) + COALESCE(d.in_delivery_qty,0)) * COALESCE(pr.net_price,0)
+        (COALESCE(s.qty,0) + COALESCE(d.in_delivery_qty,0)) * COALESCE((
+          SELECT pr.net_price
+          FROM pricing pr
+          WHERE TRIM(LOWER(pr.model)) = TRIM(LOWER(p.sku))
+             OR TRIM(LOWER(pr.model)) = TRIM(LOWER(p.model))
+          ORDER BY
+            CASE WHEN TRIM(LOWER(pr.model)) = TRIM(LOWER(p.sku)) THEN 0 ELSE 1 END,
+            pr.created_at DESC
+          LIMIT 1
+        ),0)
       ), 0) AS v
       FROM products p
       LEFT JOIN stock s ON s.product_id=p.id
@@ -3699,10 +3708,6 @@ def home():
         WHERE cp.status IN ('planned', 'ordered', 'shipped')
         GROUP BY ci.product_id
       ) d ON d.product_id=p.id
-      LEFT JOIN pricing pr ON (
-        TRIM(LOWER(pr.model)) = TRIM(LOWER(p.model))
-        OR TRIM(LOWER(pr.model)) = TRIM(LOWER(p.sku))
-      )
       WHERE COALESCE(p.archived,0)=0
     """)
     inventory_value_net = float(cur.fetchone()["v"] or 0)
@@ -7589,7 +7594,7 @@ def order_invoice(order_id):
           </div>
 
           <div class="flex" style="align-items:flex-end;">
-            <button class="btn" type="submit" name="submit_action" value="packing" formtarget="_blank">Pakuj</button>
+            <a class="btn" href="{{ url_for('order_packing_list_download_admin', order_id=o['id']) }}" target="_blank">Pakuj</a>
             <button class="btn primary" type="submit" name="submit_action" value="invoice">Zapisz fakturÄ™ PDF</button>
           </div>
         </form>
@@ -7635,7 +7640,7 @@ def order_invoice(order_id):
                 <td>
                   <div class="flex">
                     <a class="btn" href="{{ url_for('invoice_download_admin', invoice_id=inv['id']) }}" target="_blank">Pobierz PDF</a>
-                    <a class="btn" href="{{ url_for('invoice_packing_list_download_admin', invoice_id=inv['id']) }}" target="_blank">Pakuj</a>
+                    <a class="btn" href="{{ url_for('order_packing_list_download_admin', order_id=inv['order_id'] or o['id']) }}" target="_blank">Pakuj</a>
                     <form method="post" action="{{ url_for('invoice_regenerate_admin', invoice_id=inv['id']) }}">
                       <button class="btn" type="submit">Regeneruj PDF</button>
                     </form>
@@ -9853,7 +9858,11 @@ def invoices():
                         <td>
                           <div class="flex">
                             <a class="btn" href="{{ url_for('invoice_download_admin', invoice_id=inv.id) }}" target="_blank">Faktura PDF</a>
+                            {% if inv.source_order_id %}
+                            <a class="btn" href="{{ url_for('order_packing_list_download_admin', order_id=inv.source_order_id) }}" target="_blank">Pakuj</a>
+                            {% else %}
                             <a class="btn" href="{{ url_for('invoice_packing_list_download_admin', invoice_id=inv.id) }}" target="_blank">Pakuj</a>
+                            {% endif %}
                             {% if not inv.sent_to_client %}
                               <form method="post" action="{{ url_for('invoice_send_admin', invoice_id=inv.id) }}">
                                 <input type="hidden" name="next" value="{{ request.full_path }}">
@@ -10462,10 +10471,10 @@ def invoice_download_admin(invoice_id):
     return send_file(abs_path, mimetype="application/pdf", as_attachment=True, download_name=os.path.basename(abs_path))
 
 
-@app.get("/orders/<int:order_id>/packing-list")
+@app.route("/orders/<int:order_id>/packing-list", methods=["GET", "POST"])
 def order_packing_list_download_admin(order_id):
     """Generuje wspolna liste pakowania dla zamowien tego samego klienta."""
-    selected_carrier = norm(request.args.get("carrier")).lower()
+    selected_carrier = norm(request.form.get("carrier") or request.args.get("carrier")).lower()
     if selected_carrier not in {"inpost", "other"}:
         tpl = r"""
         {% extends "base.html" %}{% block content %}
@@ -10518,29 +10527,66 @@ def order_packing_list_download_admin(order_id):
     if not order_items:
         return "Brak pozycji zamowienia", 400
 
-    # Lista robocza ma zawierac wyłącznie to, co można teraz fizycznie
-    # spakować z magazynu. Wspólna pula dla product_id zapobiega pokazaniu
-    # tego samego stanu kilka razy, gdy produkt występuje w kilku pozycjach.
+    # Wspólna pula dla product_id zapobiega wybraniu tego samego stanu
+    # kilka razy, gdy produkt występuje w kilku zamówieniach klienta.
     stock_pool = {}
+    selection_rows = []
     items = []
     for item in order_items:
         product_id = int(item.get("product_id") or 0)
         available = stock_pool.setdefault(product_id, max(0, int(item.get("stock_qty") or 0)))
-        pack_qty = min(max(0, int(item.get("qty") or 0)), available)
+        max_pack_qty = min(max(0, int(item.get("qty") or 0)), available)
+        pack_qty = max_pack_qty if request.method == "GET" else min(
+            max_pack_qty,
+            max(0, to_int(request.form.get(f"pack_qty_{item['id']}"), 0)),
+        )
         stock_pool[product_id] = available - pack_qty
-        if pack_qty <= 0:
-            continue
-        item["qty"] = pack_qty
         source_order = candidate_by_id.get(int(item.get("order_id") or 0), {})
         item["source_order_id"] = int(item.get("order_id") or 0)
         item["source_order_no"] = canonical_order_no(
             source_order.get("id"), source_order.get("created_at"), source_order.get("order_no")
         )
         item["source_order_note"] = norm(source_order.get("note"))
-        items.append(item)
+        item["max_pack_qty"] = max_pack_qty
+        item["selected_pack_qty"] = pack_qty
+        selection_rows.append(item)
+        if pack_qty <= 0:
+            continue
+        packed_item = dict(item)
+        packed_item["qty"] = pack_qty
+        items.append(packed_item)
 
+    if request.method == "GET":
+        tpl = r"""
+        {% extends "base.html" %}{% block content %}
+          <div class="card">
+            <div class="flex"><div><h1 style="margin:0 0 8px;">Wybierz zawartość paczki</h1>
+              <div class="muted">{% if carrier == 'inpost' %}InPost: po zatwierdzeniu wybierzesz paczkę i wygenerujesz etykietę A6.{% else %}Inny przewoźnik: zostanie pobrana wyłącznie zbiorcza lista pakowa A4.{% endif %}</div>
+            </div><a class="btn right" href="{{ url_for('order_view', order_id=order_id) }}">← Zamówienie</a></div>
+          </div>
+          <div class="card"><form method="post">
+            <input type="hidden" name="carrier" value="{{ carrier }}">
+            <table><thead><tr><th>Zamówienie</th><th>Notatka</th><th>SKU</th><th>Model / nazwa</th><th>Zamówiono</th><th>Dostępne do paczki</th><th>Pakuj</th></tr></thead><tbody>
+            {% for item in rows %}<tr>
+              <td><b>{{ item.source_order_no }}</b></td><td>{{ item.source_order_note or '-' }}</td>
+              <td><b>{{ item.sku }}</b></td><td>{{ item.model or item.name or '' }}</td>
+              <td>{{ item.qty }}</td><td>{{ item.max_pack_qty }}</td>
+              <td><input type="number" min="0" max="{{ item.max_pack_qty }}" name="pack_qty_{{ item.id }}" value="{{ item.selected_pack_qty }}" style="width:110px;"></td>
+            </tr>{% endfor %}</tbody></table>
+            <button class="btn primary" type="submit" style="margin-top:16px;">
+              {% if carrier == 'inpost' %}Dalej: paczka i etykieta InPost{% else %}Pobierz zbiorczą listę A4{% endif %}
+            </button>
+          </form></div>
+        {% endblock %}
+        """
+        return render_template_string(
+            tpl, title="Zawartość paczki", base_url=BASE_URL, db_path=DB_PATH,
+            rows=selection_rows, carrier=selected_carrier, order_id=order_id,
+        )
+
+    # Dopiero zatwierdzenie formularza zapisuje status pakowania.
     if not items:
-        return "Brak pozycji dostępnych obecnie na magazynie do spakowania", 400
+        return "Wybierz co najmniej jedną sztukę do spakowania", 400
 
     packed_order_ids = sorted({int(item["source_order_id"]) for item in items})
     order_no = canonical_order_no(order_row["id"], order_row["created_at"], order_row["order_no"])
