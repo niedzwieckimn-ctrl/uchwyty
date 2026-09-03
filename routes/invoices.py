@@ -689,7 +689,7 @@ def register_routes(context):
             key = ("nip", buyer_tax_no) if buyer_tax_no else ("name", normalized_name)
             current = groups_by_key.get(key)
             if current is None:
-                current = {"customer_name": display_name, "invoices": [], "months": [], "total_net": 0.0, "total_gross": 0.0}
+                current = {"customer_name": display_name, "invoices": [], "months": [], "currency_totals": {}}
                 groups.append(current)
                 groups_by_key[key] = current
             inv["order_display"] = order_display_no(
@@ -700,8 +700,13 @@ def register_routes(context):
             ) if inv.get("source_order_id") else "-"
             inv["pdf_ok"] = 1 if (invoice_pdf_exists(inv.get("pdf_path", ""), inv.get("invoice_no", ""))[0] or inv.get("invoice_items_json")) else 0
             current["invoices"].append(inv)
-            current["total_net"] += float(inv.get("total_net") or 0)
-            current["total_gross"] += float(inv.get("total_gross") or 0)
+            invoice_currency = normalize_order_currency(inv.get("currency"))
+            inv["currency"] = invoice_currency
+            currency_total = current["currency_totals"].setdefault(
+                invoice_currency, {"currency": invoice_currency, "total_net": 0.0, "total_gross": 0.0}
+            )
+            currency_total["total_net"] += float(inv.get("total_net") or 0)
+            currency_total["total_gross"] += float(inv.get("total_gross") or 0)
 
         for g in groups:
             month_map = {}
@@ -710,12 +715,16 @@ def register_routes(context):
                 month_key = issue_date[:7] if len(issue_date) >= 7 else "bez-daty"
                 month_label = month_key if month_key != "bez-daty" else "Bez daty"
                 if month_key not in month_map:
-                    month_map[month_key] = {"month": month_key, "label": month_label, "invoices": [], "total_net": 0.0, "total_gross": 0.0}
+                    month_map[month_key] = {"month": month_key, "label": month_label, "invoices": [], "currency_totals": {}}
                     g["months"].append(month_map[month_key])
                 month = month_map[month_key]
                 month["invoices"].append(inv)
-                month["total_net"] += float(inv.get("total_net") or 0)
-                month["total_gross"] += float(inv.get("total_gross") or 0)
+                invoice_currency = inv["currency"]
+                currency_total = month["currency_totals"].setdefault(
+                    invoice_currency, {"currency": invoice_currency, "total_net": 0.0, "total_gross": 0.0}
+                )
+                currency_total["total_net"] += float(inv.get("total_net") or 0)
+                currency_total["total_gross"] += float(inv.get("total_gross") or 0)
 
         tpl = r"""
         {% extends "base.html" %}
@@ -743,8 +752,10 @@ def register_routes(context):
                 <summary class="flex" style="cursor:pointer; align-items:center;">
                   <h2 style="margin:0;">{{ g.customer_name }}</h2>
                   <span class="badge">{{ g.invoices|length }} faktur</span>
-                  <span class="badge">Netto: {{ "%.2f"|format(g.total_net) }} PLN</span>
-                  <span class="badge">Brutto: {{ "%.2f"|format(g.total_gross) }} PLN</span>
+                  {% for total in g.currency_totals.values() %}
+                    <span class="badge">Netto: {{ "%.2f"|format(total.total_net) }} {{ total.currency }}</span>
+                    <span class="badge">Brutto: {{ "%.2f"|format(total.total_gross) }} {{ total.currency }}</span>
+                  {% endfor %}
                   <span class="btn right">Pokaż faktury</span>
                 </summary>
 
@@ -753,8 +764,10 @@ def register_routes(context):
                     <summary class="flex" style="cursor:pointer; align-items:center;">
                       <b>{{ m.label }}</b>
                       <span class="badge">{{ m.invoices|length }} faktur</span>
-                      <span class="badge">Netto: {{ "%.2f"|format(m.total_net) }} PLN</span>
-                      <span class="badge">Brutto: {{ "%.2f"|format(m.total_gross) }} PLN</span>
+                      {% for total in m.currency_totals.values() %}
+                        <span class="badge">Netto: {{ "%.2f"|format(total.total_net) }} {{ total.currency }}</span>
+                        <span class="badge">Brutto: {{ "%.2f"|format(total.total_gross) }} {{ total.currency }}</span>
+                      {% endfor %}
                     </summary>
 
                     <table style="margin-top:10px;">
@@ -775,8 +788,8 @@ def register_routes(context):
                             <td><b>{{ inv.invoice_no }}</b></td>
                             <td>{{ inv.issue_date }}</td>
                             <td>{{ inv.order_display }}</td>
-                            <td>{{ "%.2f"|format(inv.total_net) }}</td>
-                            <td>{{ "%.2f"|format(inv.total_gross) }}</td>
+                            <td>{{ "%.2f"|format(inv.total_net) }} {{ inv.currency }}</td>
+                            <td>{{ "%.2f"|format(inv.total_gross) }} {{ inv.currency }}</td>
                             <td>
                               {% if inv.sent_to_client %}
                                 <span class="badge ok">Udostępniona klientowi</span>
