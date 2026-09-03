@@ -7212,15 +7212,8 @@ def order_mark_shipped(order_id):
             ))
         placeholders = ",".join(["?"] * len(package_order_ids))
         shipped_at = now_iso()
-        # Wysyłka jest momentem fizycznego wydania. Odejmujemy wszystkie
-        # pełne zamówienia ze wspólnej paczki; warehouse_issued zapewnia,
-        # że późniejsza faktura nie zdejmie ich ponownie.
-        changed_product_ids = []
-        for package_order in package_orders:
-            if norm(package_order.get("status")).lower() != "packed_partial":
-                changed_product_ids.extend(
-                    issue_order_stock(cur, to_int(package_order.get("id"), 0))
-                )
+        # Status wysyłki nie zmienia magazynu. Stan schodzi dopiero podczas
+        # pełnego zafakturowania zamówienia w finalize_fully_invoiced_orders().
         cur.execute(
             f"""UPDATE orders
                 SET status=CASE
@@ -7255,10 +7248,6 @@ def order_mark_shipped(order_id):
                         "warehouse_issued": int(package_order.get("warehouse_issued") or 0),
                     },
                     {"id": int(package_order["id"])},
-                )
-            if changed_product_ids:
-                sync_local_rows_to_supabase(
-                    "stock", "product_id", sorted(set(changed_product_ids))
                 )
         except Exception as exc:
             app.logger.exception("Nie udało się zsynchronizować wysyłki zamówienia %s: %s", order_id, exc)
@@ -7306,28 +7295,7 @@ def order_status_update(order_id):
     if new_status == "confirmed":
         qr_data_url = make_qr_data_url(canonical_order_no(o["id"], o["created_at"], o["order_no"]))
 
-    changed_product_ids = []
     warehouse_issued = int(o["warehouse_issued"] or 0)
-
-    # Jedyny moment zdjÄ™cia stanu:
-    # przy przejĹ›ciu na "in_delivery" i tylko jeĹ›li jeszcze nie byĹ‚o wydane.
-    if new_status == "in_delivery" and warehouse_issued == 0:
-        cur.execute("""
-          SELECT oi.product_id, oi.qty
-          FROM order_items oi
-          WHERE oi.order_id=?
-          ORDER BY oi.id
-        """, (order_id,))
-        items = cur.fetchall()
-
-        for it in items:
-            pid = int(it["product_id"])
-            qty = int(it["qty"])
-            cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (pid,))
-            cur.execute("UPDATE stock SET qty = qty - ? WHERE product_id=?", (qty, pid))
-            changed_product_ids.append(pid)
-
-        warehouse_issued = 1
 
     cur.execute(
         "UPDATE orders SET status=?, qr_data_url=?, warehouse_issued=? WHERE id=?",
@@ -7346,11 +7314,6 @@ def order_status_update(order_id):
         except Exception:
             pass
 
-        if changed_product_ids:
-            try:
-                sync_local_rows_to_supabase("stock", "product_id", changed_product_ids)
-            except Exception:
-                pass
 
     if norm(request.form.get("return_to")).lower() == "dashboard":
         return redirect(url_for("home"))
@@ -7359,7 +7322,8 @@ def order_status_update(order_id):
 
 @app.get("/orders/<int:order_id>/issue")
 def order_issue(order_id):
-    # Stara akcja wyĹ‚Ä…czona. Wydanie dzieje siÄ™ teraz przy zmianie statusu na "W dostawie".
+    # Stara ręczna akcja jest wyłączona. Stan schodzi podczas pełnego
+    # zafakturowania zamówienia.
     return redirect(url_for("order_view", order_id=order_id))
 
 
@@ -7439,14 +7403,32 @@ def order_invoice(order_id):
         it["invoiced_qty"] = done_qty
         it["remaining_qty"] = max(0, ordered_qty - done_qty)
 
-    # Automatyczna propozycja: nie wiecej niz pozostalo do zafakturowania i
-    # nie wiecej niz fizycznie jest na magazynie. Wspolna pula zabezpiecza
-    # pozycje tego samego produktu przed podwojnym wykorzystaniem stanu.
+    packing_selection = session.get("latest_packing_selection") or {}
+    packing_order_ids = {
+        to_int(value, 0) for value in packing_selection.get("order_ids", [])
+        if to_int(value, 0) > 0
+    } if isinstance(packing_selection, dict) else set()
+    packing_qty_by_item = {}
+    if int(order_id) in packing_order_ids:
+        for pair in packing_selection.get("items", []):
+            if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                item_id = to_int(pair[0], 0)
+                packed_qty = max(0, to_int(pair[1], 0))
+                if item_id > 0 and packed_qty > 0:
+                    packing_qty_by_item[item_id] = packing_qty_by_item.get(item_id, 0) + packed_qty
+    invoice_from_packing = bool(packing_qty_by_item)
+
     invoice_stock_pool = {}
     for it in items:
         pid = int(it.get("product_id") or 0)
         invoice_stock_pool.setdefault(pid, max(0, int(it.get("stock_qty") or 0)))
-        suggested_qty = min(int(it.get("remaining_qty") or 0), invoice_stock_pool.get(pid, 0))
+        if invoice_from_packing:
+            suggested_qty = min(
+                int(it.get("remaining_qty") or 0),
+                packing_qty_by_item.get(int(it.get("id") or 0), 0),
+            )
+        else:
+            suggested_qty = min(int(it.get("remaining_qty") or 0), invoice_stock_pool.get(pid, 0))
         it["suggested_invoice_qty"] = max(0, suggested_qty)
         invoice_stock_pool[pid] = max(0, invoice_stock_pool.get(pid, 0) - suggested_qty)
 
@@ -7560,6 +7542,16 @@ def order_invoice(order_id):
             data["payment_to"] = (issue_day + timedelta(days=7)).strftime("%Y-%m-%d")
 
         invoice_items = prepare_invoice_items(items, request.form)
+        if norm(request.form.get("submit_action")) != "packing" and invoice_from_packing:
+            invalid_packing_qty = next((
+                item for item in invoice_items
+                if int(item.get("qty") or 0) > packing_qty_by_item.get(
+                    int(item.get("order_item_id") or item.get("id") or 0), 0
+                )
+            ), None)
+            if invalid_packing_qty:
+                msg = "Ilość na fakturze nie może być większa niż ilość zapisana na ostatniej liście pakowej."
+                invoice_items = []
         if norm(request.form.get("submit_action")) != "packing" and data["invoice_type"] == "wdt_0":
             vat_eu = re.sub(r"[\s.-]+", "", data.get("buyer_tax_no") or "").upper()
             buyer_country = norm(data.get("buyer_country")).upper()
@@ -7670,6 +7662,8 @@ def order_invoice(order_id):
                     except Exception:
                         pass
             _order_id, email_ok, email_error = _send_invoice_to_client(invoice_id)
+            if invoice_from_packing:
+                session.pop("latest_packing_selection", None)
             redirect_args = {
                 "generated": "1",
                 "invoice_id": invoice_id,
@@ -7726,7 +7720,11 @@ def order_invoice(order_id):
           <div style="grid-column:1/-1;">
             <h2>Pozycje faktury — wybierz ilości z zamówień klienta</h2>
             <div class="hint" style="margin-bottom:10px;">
-              Wpisz ilość tylko przy pozycjach, które idą na fakturę. Zamówienia klienta zostają jako osobne listy/notatki.
+              {% if invoice_from_packing %}
+                Ilości pobrano z ostatniej listy pakowej. Nie można zafakturować więcej niż spakowano.
+              {% else %}
+                To lista utworzona przed zapisywaniem zawartości paczki. Sprawdź ilości ręcznie; kolejne faktury pobiorą je z listy pakowej.
+              {% endif %}
             </div>
             <table>
               <thead><tr><th>Zamówienie</th><th>Notatka klienta</th><th>SKU</th><th>Model / Nazwa</th><th>Zamówiono</th><th>Zafakturowano</th><th>Pozostało</th><th>Na magazynie</th><th>Ilość na fakturze</th><th>Netto/szt {{ d['currency'] }}</th><th>Brutto/szt {{ d['currency'] }}</th></tr></thead>
@@ -7840,7 +7838,7 @@ def order_invoice(order_id):
       </div>
     {% endblock %}
     """
-    return render_template_string(tpl, title="Faktura", base_url=BASE_URL, db_path=DB_PATH, o=o, d=data, company=company, items=items, invoice_rows=invoice_rows, msg=msg, canonical_order_no=canonical_order_no)
+    return render_template_string(tpl, title="Faktura", base_url=BASE_URL, db_path=DB_PATH, o=o, d=data, company=company, items=items, invoice_rows=invoice_rows, msg=msg, canonical_order_no=canonical_order_no, invoice_from_packing=invoice_from_packing)
 
 
 @app.get("/orders/<int:order_id>/print")
@@ -10782,6 +10780,15 @@ def order_packing_list_download_admin(order_id):
         return "Wybierz co najmniej jedną sztukę do spakowania", 400
 
     packed_order_ids = sorted({int(item["source_order_id"]) for item in items})
+    session["latest_packing_selection"] = {
+        "root_order_id": int(order_id),
+        "order_ids": packed_order_ids,
+        "items": [
+            [int(item.get("id") or item.get("order_item_id") or 0), int(item.get("qty") or 0)]
+            for item in items
+            if int(item.get("id") or item.get("order_item_id") or 0) > 0 and int(item.get("qty") or 0) > 0
+        ],
+    }
     order_no = canonical_order_no(order_row["id"], order_row["created_at"], order_row["order_no"])
     meta = {
         "invoice_no": order_no,

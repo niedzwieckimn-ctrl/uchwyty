@@ -28,6 +28,12 @@ def headers():
     return {"Authorization": "Bearer test", "Idempotency-Key": str(uuid.uuid4())}
 
 
+def test_inpost_accepts_full_and_partial_packing_statuses():
+    assert backend.inpost_label_allowed_for_status("packed") is True
+    assert backend.inpost_label_allowed_for_status("packed_partial") is True
+    assert backend.inpost_label_allowed_for_status("confirmed") is False
+
+
 def payload(qty=1, product_id=990001):
     return {"note": "test", "items": [{"product_id": product_id, "sku": "TEST-001", "qty": qty}]}
 

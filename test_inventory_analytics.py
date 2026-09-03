@@ -17,10 +17,11 @@ def make_db(tmp_path):
 
     c = connect()
     c.executescript("""
-      CREATE TABLE products(id INTEGER PRIMARY KEY, sku TEXT, model TEXT, name TEXT, ean TEXT);
+      CREATE TABLE products(id INTEGER PRIMARY KEY, sku TEXT, model TEXT, name TEXT, ean TEXT, archived INTEGER DEFAULT 0);
       CREATE TABLE stock(product_id INTEGER PRIMARY KEY, qty INTEGER);
       CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INTEGER, customer_email TEXT, status TEXT, warehouse_issued INTEGER, created_at TEXT);
       CREATE TABLE order_items(id INTEGER PRIMARY KEY, order_id INTEGER, product_id INTEGER, qty INTEGER);
+      CREATE TABLE invoice_allocations(id INTEGER PRIMARY KEY, invoice_id INTEGER, order_id INTEGER, order_item_id INTEGER, product_id INTEGER, qty INTEGER);
       CREATE TABLE china_packages(id INTEGER PRIMARY KEY, status TEXT);
       CREATE TABLE china_items(id INTEGER PRIMARY KEY, package_id INTEGER, product_id INTEGER, qty INTEGER);
       CREATE TABLE client_search_logs(customer_email TEXT, query TEXT, product_sku TEXT, product_model TEXT, product_name TEXT, results_count INTEGER, created_at TEXT);
@@ -32,7 +33,7 @@ def make_db(tmp_path):
 
 def add_product(connect, product_id=1, sku="CH010", stock=0):
     c = connect()
-    c.execute("INSERT INTO products VALUES(?,?,?,?,?)", (product_id, sku, sku, "Winsor", ""))
+    c.execute("INSERT INTO products(id,sku,model,name,ean) VALUES(?,?,?,?,?)", (product_id, sku, sku, "Winsor", ""))
     c.execute("INSERT INTO stock VALUES(?,?)", (product_id, stock))
     c.commit()
     c.close()
@@ -106,6 +107,34 @@ def test_cancelled_order_does_not_reserve_stock(tmp_path):
     row = build_replenishment_analysis(connect, TODAY, 60)[0]
     assert row["reserved_qty"] == 0
     assert row["available_qty"] == 8
+
+
+def test_partial_shipment_reserves_only_uninvoiced_quantity(tmp_path):
+    connect = make_db(tmp_path)
+    add_product(connect, stock=20)
+    c = connect()
+    c.execute("INSERT INTO orders VALUES(1,1,'a@example.com','partially_shipped',0,'2026-08-08 10:00:00')")
+    c.execute("INSERT INTO order_items VALUES(1,1,1,10)")
+    c.execute("INSERT INTO invoice_allocations VALUES(1,1,1,1,1,6)")
+    c.commit()
+    c.close()
+    row = build_replenishment_analysis(connect, TODAY, 60)[0]
+    assert row["reserved_qty"] == 4
+    assert row["available_qty"] == 16
+
+
+def test_fully_invoiced_packed_order_is_not_reserved(tmp_path):
+    connect = make_db(tmp_path)
+    add_product(connect, stock=20)
+    c = connect()
+    c.execute("INSERT INTO orders VALUES(1,1,'a@example.com','packed',0,'2026-08-08 10:00:00')")
+    c.execute("INSERT INTO order_items VALUES(1,1,1,10)")
+    c.execute("INSERT INTO invoice_allocations VALUES(1,1,1,1,1,10)")
+    c.commit()
+    c.close()
+    row = build_replenishment_analysis(connect, TODAY, 60)[0]
+    assert row["reserved_qty"] == 0
+    assert row["available_qty"] == 20
 
 
 def test_single_search_does_not_trigger_purchase(tmp_path):
