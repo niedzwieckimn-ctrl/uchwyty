@@ -8319,6 +8319,14 @@ def mark_orders_packed(order_ids, packing_path: str = "", packing_items=None) ->
     try:
         placeholders = ",".join(["?"] * len(clean_ids))
         cur = c.cursor()
+        cur.execute(
+            f"SELECT id, LOWER(COALESCE(status,'')) AS status FROM orders WHERE id IN ({placeholders})",
+            tuple(clean_ids),
+        )
+        already_packed_ids = {
+            int(row["id"]) for row in cur.fetchall()
+            if norm(row["status"]).lower() in {"packed", "packed_partial"}
+        }
         packed_at = now_iso()
         for packed_order_id in clean_ids:
             next_status = "packed_partial" if packed_order_id in partial_ids else "packed"
@@ -8352,6 +8360,7 @@ def mark_orders_packed(order_ids, packing_path: str = "", packing_items=None) ->
             c.close()
         pending_orders = [
             order for order in packed_orders
+            if to_int(order.get("id"), 0) not in already_packed_ids
             if not _email_event_already_ok(f"order_packed:{to_int(order.get('id'), 0)}")
         ]
         orders_by_recipient = {}
@@ -10623,7 +10632,7 @@ def order_packing_list_download_admin(order_id):
           FROM orders
           WHERE id<>?
             AND LOWER(TRIM(COALESCE(customer_email,'')))=?
-            AND LOWER(COALESCE(status,''))='confirmed'
+            AND LOWER(COALESCE(status,'')) IN ('confirmed','packed','packed_partial')
           ORDER BY created_at, id
         """, (order_id, recipient))
         candidate_orders.extend(dict(row) for row in cur.fetchall())
