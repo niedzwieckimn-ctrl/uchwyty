@@ -6800,6 +6800,10 @@ def _packed_package_orders(cur, order):
     return rows or [order]
 
 
+def inpost_label_allowed_for_status(status) -> bool:
+    return norm(status).lower() in {"packed", "packed_partial", "shipped", "completed", "issued"}
+
+
 @app.route("/orders/<int:order_id>/inpost", methods=["GET", "POST"])
 def order_inpost_create(order_id):
     maybe_pull_shared_from_supabase(force=True)
@@ -6823,8 +6827,8 @@ def order_inpost_create(order_id):
             error = "Brak konfiguracji InPost na Renderze: " + ", ".join(cfg["missing"])
         elif norm(order.get("inpost_shipment_id")):
             return redirect(url_for("order_inpost_label", order_id=order_id, bundle="1" if bundle else None))
-        elif norm(order.get("status")).lower() not in {"packed", "shipped", "completed", "issued"}:
-            error = "Najpierw użyj przycisku Pakuj. Etykietę można utworzyć dla pełnej paczki."
+        elif not inpost_label_allowed_for_status(order.get("status")):
+            error = "Najpierw wybierz zawartość paczki w kreatorze Pakuj."
         else:
             address_source = norm(order.get("customer_address"))
             phone = norm(order.get("customer_phone"))
@@ -10478,10 +10482,35 @@ def order_packing_list_download_admin(order_id):
     if selected_carrier not in {"inpost", "other"}:
         tpl = r"""
         {% extends "base.html" %}{% block content %}
-          <div class="card"><div class="flex"><div><h1 style="margin:0 0 8px;">Pakuj zamówienie</h1><div class="muted">Wybierz sposób wysyłki. Lista pakowa zostanie przygotowana w formacie A4.</div></div><a class="btn right" href="{{ url_for('order_view', order_id=order_id) }}">← Zamówienie</a></div></div>
-          <div class="grid2">
-            <a class="card" style="text-decoration:none;color:inherit;min-height:170px;" href="{{ url_for('order_packing_list_download_admin', order_id=order_id, carrier='inpost') }}"><h2>InPost</h2><p class="muted">Wybór paczki → etykieta A6 → wspólny PDF z listą pakową A4.</p><span class="btn primary">Wybierz InPost</span></a>
-            <a class="card" style="text-decoration:none;color:inherit;min-height:170px;" href="{{ url_for('order_packing_list_download_admin', order_id=order_id, carrier='other') }}"><h2>Inny przewoźnik</h2><p class="muted">Przygotuj samą listę pakową A4 i wpisz numer przesyłki później.</p><span class="btn">Wybierz innego</span></a>
+          <style>
+            .carrier-options{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}
+            .carrier-option{display:flex;flex-direction:column;min-height:190px;text-decoration:none;color:inherit;overflow:hidden;transition:transform .16s ease,border-color .16s ease,box-shadow .16s ease}
+            .carrier-option:hover{transform:translateY(-2px);border-color:#bdcaf5;box-shadow:0 18px 42px rgba(31,55,105,.13)}
+            .carrier-option-head{display:flex;align-items:center;gap:14px;margin-bottom:14px}
+            .carrier-icon{display:grid;place-items:center;flex:0 0 48px;width:48px;height:48px;border-radius:15px;background:#edf3ff;color:#4166d3;font-size:22px;font-weight:900}
+            .carrier-option.other .carrier-icon{background:#f2f4f8;color:#65728a}
+            .carrier-option h2{margin:0;font-size:20px}
+            .carrier-option p{margin:0;line-height:1.6;max-width:520px}
+            .carrier-action{margin-top:auto;padding-top:24px}.carrier-action .btn{pointer-events:none}
+            @media(max-width:760px){.carrier-options{grid-template-columns:1fr}.carrier-option{min-height:170px}}
+          </style>
+          <div class="card">
+            <div class="flex">
+              <div><h1 style="margin:0 0 8px;">Pakuj zamówienie</h1><div class="muted">Najpierw wybierz sposób wysyłki, a następnie zawartość paczki.</div></div>
+              <a class="btn right" href="{{ url_for('order_view', order_id=order_id) }}">← Zamówienie</a>
+            </div>
+          </div>
+          <div class="carrier-options">
+            <a class="card carrier-option" href="{{ url_for('order_packing_list_download_admin', order_id=order_id, carrier='inpost') }}">
+              <div class="carrier-option-head"><span class="carrier-icon">I</span><h2>InPost</h2></div>
+              <p class="muted">Wybierz zamówienia i ilości, określ rodzaj paczki, a następnie wygeneruj etykietę A6 oraz wspólną listę pakową A4.</p>
+              <div class="carrier-action"><span class="btn primary">Wybierz InPost →</span></div>
+            </a>
+            <a class="card carrier-option other" href="{{ url_for('order_packing_list_download_admin', order_id=order_id, carrier='other') }}">
+              <div class="carrier-option-head"><span class="carrier-icon">↗</span><h2>Inny przewoźnik</h2></div>
+              <p class="muted">Wybierz zamówienia i ilości, a następnie pobierz jedną zbiorczą listę pakową A4 — bez zamawiania kuriera.</p>
+              <div class="carrier-action"><span class="btn">Wybierz innego przewoźnika →</span></div>
+            </a>
           </div>
         {% endblock %}
         """
