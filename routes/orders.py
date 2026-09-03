@@ -83,10 +83,6 @@ def register_routes(context):
     @app.get("/orders")
     def orders():
         maybe_pull_shared_from_supabase()
-        try:
-            link_orders_to_customers_by_email(sync_remote=True)
-        except Exception:
-            pass
         q = norm(request.args.get("q"))
         tab = norm(request.args.get("tab")) or "new"
         ready_today = norm(request.args.get("ready_today")) == "1"
@@ -586,10 +582,6 @@ def register_routes(context):
     @app.get("/orders/<int:order_id>")
     def order_view(order_id):
         maybe_pull_shared_from_supabase()
-        try:
-            link_orders_to_customers_by_email(sync_remote=True)
-        except Exception:
-            pass
         c = conn()
         cur = c.cursor()
         cur.execute("SELECT * FROM orders WHERE id=?", (order_id,))

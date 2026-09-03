@@ -35,9 +35,8 @@ def register_routes(context):
     @app.get("/")
     def home():
         maybe_pull_shared_from_supabase()
-        # Zachowujemy kolejność: Wysłane -> faktura -> Zrealizowane.
-        # Przy okazji naprawiamy rekordy utworzone przez starszą wersję kodu.
-        finalize_legacy_shipped_orders_with_full_invoice()
+        # Historyczna reconciliacja działa po synchronizacji w tle, poza
+        # krytyczną ścieżką renderowania pulpitu.
         c = conn()
         cur = c.cursor()
         cur.execute("SELECT COUNT(*) AS n FROM products WHERE COALESCE(archived,0)=0")
