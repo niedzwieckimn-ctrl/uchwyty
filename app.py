@@ -7783,7 +7783,7 @@ def order_invoice(order_id):
         auto_type, order_currency, auto_country = automatic_invoice_tax_context(dict(o), buyer_tax_no, "")
         data = {
             "invoice_no": next_invoice_no(default_issue),
-            "place": "KotuszĂłw",
+            "place": "Kotuszów",
             "issue_date": default_issue,
             "sell_date": default_issue,
             "payment_type": "przelew",
@@ -10074,7 +10074,7 @@ def order_proforma(order_id: int):
         iban=norm(os.environ.get("PROFORMA_EUR_IBAN") or company.get("bank_account")),
         bic=norm(os.environ.get("PROFORMA_EUR_BIC")),
         bank_name=norm(os.environ.get("PROFORMA_EUR_BANK")),
-        place=norm(os.environ.get("PROFORMA_PLACE") or "Kotusów"),
+        place=norm(os.environ.get("PROFORMA_PLACE") or "Kotuszów"),
     )
     return send_file(pdf_buffer, mimetype="application/pdf", as_attachment=True, download_name=filename, max_age=0)
 
@@ -10473,7 +10473,7 @@ def invoice_meta_payload(invoice_row: dict):
 
     return {
         "invoice_no": invoice_row.get("invoice_no") or "",
-        "place": "KotuszĂłw",
+        "place": "Kotuszów",
         "issue_date": invoice_row.get("issue_date") or app_now().strftime("%Y-%m-%d"),
         "sell_date": invoice_row.get("sell_date") or app_now().strftime("%Y-%m-%d"),
         "payment_type": invoice_row.get("payment_type") or "przelew",

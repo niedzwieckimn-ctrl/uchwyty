@@ -122,7 +122,7 @@ def generate(invoice, company, items):
     fa = SubElement(root, _tag("Fa"))
     _add(fa, "KodWaluty", _text(invoice.get("currency")).upper())
     _add(fa, "P_1", _date(invoice.get("issue_date")))
-    _add(fa, "P_1M", _limit(invoice.get("place") or company.get("city") or "Kotusów", 256))
+    _add(fa, "P_1M", _limit(invoice.get("place") or company.get("city") or "Kotuszów", 256))
     _add(fa, "P_2", _limit(invoice.get("invoice_no"), 256))
     _add(fa, "P_6", _date(invoice.get("sell_date")))
 
@@ -174,4 +174,3 @@ def generate(invoice, company, items):
 
     rough = tostring(root, encoding="utf-8")
     return minidom.parseString(rough).toprettyxml(indent="  ", encoding="utf-8").decode("utf-8")
-

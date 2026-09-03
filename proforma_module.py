@@ -20,7 +20,7 @@ def _money(value):
     return f"{amount:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") + " EUR"
 
 
-def generate_proforma_pdf(order, items, company, language="de", logo_path="", iban="", bic="", bank_name="", place="Kotusów"):
+def generate_proforma_pdf(order, items, company, language="de", logo_path="", iban="", bic="", bank_name="", place="Kotuszów"):
     language = language if language in TEXTS else "en"
     t = TEXTS[language]
     issue = date.today()
