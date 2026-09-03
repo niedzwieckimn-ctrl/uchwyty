@@ -9,16 +9,34 @@ class InPostError(RuntimeError):
     pass
 
 
+def _looks_like_api_token(value):
+    value = (value or "").strip()
+    return len(value) >= 40 or value.count(".") >= 2
+
+
 def config_summary():
     token = os.environ.get("INPOST_API_TOKEN", "").strip()
     organization_id = os.environ.get("INPOST_ORGANIZATION_ID", "").strip()
+    # Częsty błąd konfiguracji na Renderze: token i numeryczny identyfikator
+    # organizacji są wklejone do przeciwnych zmiennych. Rozpoznajemy go bez
+    # ujawniania sekretu i używamy wartości we właściwych rolach.
+    swapped = _looks_like_api_token(organization_id) and token.isdigit()
+    if swapped:
+        token, organization_id = organization_id, token
+    invalid = []
+    if token and not _looks_like_api_token(token):
+        invalid.append("INPOST_API_TOKEN")
+    if organization_id and not organization_id.isdigit():
+        invalid.append("INPOST_ORGANIZATION_ID")
     return {
-        "configured": bool(token and organization_id),
+        "configured": bool(token and organization_id and not invalid),
         "missing": [name for name, value in (
             ("INPOST_API_TOKEN", token),
             ("INPOST_ORGANIZATION_ID", organization_id),
-        ) if not value],
+        ) if not value] + invalid,
+        "token": token,
         "organization_id": organization_id,
+        "swapped": swapped,
         "sandbox": os.environ.get("INPOST_SANDBOX", "0").lower() in {"1", "true", "yes", "on"},
     }
 
@@ -37,7 +55,7 @@ def _request(path, method="GET", payload=None, accept="application/json"):
     if not cfg["configured"]:
         raise InPostError("Brak konfiguracji: " + ", ".join(cfg["missing"]))
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
-    headers = {"Authorization": "Bearer " + os.environ["INPOST_API_TOKEN"].strip(), "Accept": accept}
+    headers = {"Authorization": "Bearer " + cfg["token"], "Accept": accept}
     if body is not None:
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(_base_url() + path, data=body, headers=headers, method=method)
@@ -54,7 +72,17 @@ def _request(path, method="GET", payload=None, accept="application/json"):
             message = details.get("message") or details.get("error") or raw
         except Exception:
             message = raw
-        raise InPostError(f"InPost HTTP {exc.code}: {message}") from exc
+        # Odpowiedź serwera może zawierać pełny URL z omyłkowo wklejonym
+        # tokenem. Nigdy nie pokazujemy sekretów w panelu ani w logach.
+        safe_message = str(message)
+        for secret in {
+            cfg.get("token", ""),
+            os.environ.get("INPOST_API_TOKEN", "").strip(),
+            os.environ.get("INPOST_ORGANIZATION_ID", "").strip(),
+        }:
+            if secret and _looks_like_api_token(secret):
+                safe_message = safe_message.replace(secret, "[ukryto]")
+        raise InPostError(f"InPost HTTP {exc.code}: {safe_message}") from exc
     except urllib.error.URLError as exc:
         raise InPostError(f"Brak połączenia z InPost: {exc.reason}") from exc
 
