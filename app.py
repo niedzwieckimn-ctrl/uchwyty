@@ -40,7 +40,16 @@ from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from pypdf import PdfReader, PdfWriter
-from ksef_module import build_ksef_draft_xml, validate_fa3_xml, validate_ksef_invoice, xml_filename
+from ksef_module import (
+    build_ksef_draft_xml as _legacy_build_ksef_draft_xml,
+    validate_fa3_xml, validate_ksef_invoice as _legacy_validate_ksef_invoice,
+    xml_filename,
+)
+from invoice_types import normalize_invoice_type, resolve_invoice_type
+import invoice_domestic
+import invoice_foreign
+import ksef_domestic
+import ksef_foreign
 from cash_flow_module import register_cash_flow, cash_flow_overdue_invoices
 from inventory_analytics import build_replenishment_analysis, recommended_replenishments
 from proforma_module import generate_proforma_pdf
@@ -339,6 +348,12 @@ def init_db():
         FOREIGN KEY(order_id) REFERENCES orders(id)
     )
     """)
+    # Nowe dokumenty zapisują jawny typ podatkowy. Kolumna jest nullable,
+    # dzięki czemu historycznych faktur nie backfillujemy ani nie zmieniamy.
+    cur.execute("PRAGMA table_info(invoices)")
+    invoice_cols = {r[1] for r in cur.fetchall()}
+    if "invoice_type" not in invoice_cols:
+        cur.execute("ALTER TABLE invoices ADD COLUMN invoice_type TEXT")
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS invoice_meta(
@@ -2015,7 +2030,8 @@ def price_list_currency(value) -> str:
 
 
 def normalize_order_currency(value) -> str:
-    return "EUR" if norm(value).upper() == "EUR" else "PLN"
+    currency = norm(value).upper()
+    return currency if re.fullmatch(r"[A-Z]{3}", currency or "") else "PLN"
 
 
 def order_pdf_text(language: str, key: str) -> str:
@@ -2428,7 +2444,7 @@ def generate_sales_invoice(order_row, items):
     return fpath
 
 
-def generate_order_invoice_pdf(order_row, items, meta):
+def _legacy_generate_order_invoice_pdf(order_row, items, meta):
     customer_dir = invoice_dir_for_customer(meta.get("buyer_name") or (order_row["customer_name"] if order_row and "customer_name" in order_row.keys() else "") or "Klient")
     fname = f"{safe_filename(meta['invoice_no'])}.pdf"
     fpath = os.path.join(customer_dir, fname)
@@ -2455,6 +2471,7 @@ def generate_order_invoice_pdf(order_row, items, meta):
 
     pricing_map = {norm(r["model"]): r for r in pricing_rows}
     product_map = {norm(r["sku"]): r for r in product_rows}
+    document_type = resolve_invoice_type(meta, items)
     document_vat_rate = to_int((items[0].get("vat_rate") if items else meta.get("vat_rate")), 23)
     document_currency = norm((items[0].get("currency") if items else meta.get("currency")) or "PLN").upper()
     invoice_language = customer_language
@@ -2530,19 +2547,19 @@ def generate_order_invoice_pdf(order_row, items, meta):
 
     header_y = h - 20 * mm
     if invoice_language == "de":
-        document_title = "Rechnung – innergemeinschaftliche Lieferung 0 %" if document_vat_rate == 0 else "Rechnung"
+        document_title = ("Rechnung – Ausfuhrlieferung 0 %" if document_type == "export" else "Rechnung – innergemeinschaftliche Lieferung 0 %") if document_vat_rate == 0 else "Rechnung"
         invoice_no_label = "Rechnungsnummer"
     elif invoice_language == "en":
-        document_title = "Invoice – intra-Community supply 0%" if document_vat_rate == 0 else "VAT invoice"
+        document_title = ("Invoice – export of goods 0%" if document_type == "export" else "Invoice – intra-Community supply 0%") if document_vat_rate == 0 else "VAT invoice"
         invoice_no_label = "Invoice number"
     elif invoice_language == "es":
-        document_title = "Factura – entrega intracomunitaria 0 %" if document_vat_rate == 0 else "Factura"
+        document_title = ("Factura – exportación de bienes 0 %" if document_type == "export" else "Factura – entrega intracomunitaria 0 %") if document_vat_rate == 0 else "Factura"
         invoice_no_label = "Número de factura"
     elif invoice_language == "it":
-        document_title = "Fattura – cessione intracomunitaria 0%" if document_vat_rate == 0 else "Fattura"
+        document_title = ("Fattura – esportazione di beni 0%" if document_type == "export" else "Fattura – cessione intracomunitaria 0%") if document_vat_rate == 0 else "Fattura"
         invoice_no_label = "Numero fattura"
     else:
-        document_title = "Faktura WDT 0%" if document_vat_rate == 0 else "Faktura VAT"
+        document_title = ("Faktura eksportowa 0%" if document_type == "export" else "Faktura WDT 0%") if document_vat_rate == 0 else "Faktura VAT"
         invoice_no_label = "Numer faktury"
 
     # Numer faktury musi być w pełni widoczny. Wcześniej tytuł i numer były
@@ -2584,8 +2601,13 @@ def generate_order_invoice_pdf(order_row, items, meta):
     cpdf.drawString(150 * mm, y, f"{pdf_copy['sell']}: {pdf_txt(meta['sell_date'])}")
 
     y -= 7 * mm
-    cpdf.drawString(15 * mm, y, f"{pdf_copy['payment']}: {pdf_txt(payment_label)}")
-    cpdf.drawString(85 * mm, y, f"{pdf_copy['due']}: {pdf_txt(meta.get('payment_to') or '-')}")
+    is_paid = int(meta.get("paid") or 0) == 1
+    paid_labels = {"pl":"Opłacona", "de":"Bezahlt", "en":"Paid", "es":"Pagada", "it":"Pagata"}
+    if is_paid:
+        cpdf.drawString(15 * mm, y, paid_labels.get(invoice_language, "Paid"))
+    else:
+        cpdf.drawString(15 * mm, y, f"{pdf_copy['payment']}: {pdf_txt(payment_label)}")
+        cpdf.drawString(85 * mm, y, f"{pdf_copy['due']}: {pdf_txt(meta.get('payment_to') or '-')}")
 
     y -= 10 * mm
     cpdf.setFont(pdf_font_bold, 10)
@@ -2625,7 +2647,7 @@ def generate_order_invoice_pdf(order_row, items, meta):
         seller_lines.append(f"{pdf_copy['phone']}: {seller_phone}")
     if seller_email:
         seller_lines.append(f"{pdf_copy['email']}: {seller_email}")
-    if seller_bank:
+    if seller_bank and not is_paid:
         seller_lines.append(f"{pdf_copy['account']}: {seller_bank}")
 
     buyer_lines = [buyer_name, buyer_tax_line, buyer_street, f"{buyer_post} {buyer_city}".strip(), buyer_country]
@@ -2771,10 +2793,26 @@ def generate_order_invoice_pdf(order_row, items, meta):
         y -= 9 * mm
         cpdf.setFont(pdf_font, 8.5)
         legal_width = 180 * mm
-        for legal_line in wrap_pdf_text(pdf_copy["wdt"], pdf_font, 8.5, legal_width):
+        export_copy = {
+            "pl":"Eksport towarów — stawka VAT 0%.",
+            "de":"Ausfuhrlieferung — Umsatzsteuersatz 0 %.",
+            "en":"Export of goods — VAT rate 0%.",
+            "es":"Exportación de bienes — IVA 0 %.",
+            "it":"Esportazione di beni — IVA 0%.",
+        }
+        export_basis = {
+            "pl":"Podstawa: art. 41 ust. 4–11 ustawy o VAT; stawka 0% wymaga dokumentów potwierdzających wywóz.",
+            "de":"Rechtsgrundlage: Art. 41 Abs. 4–11 des polnischen Umsatzsteuergesetzes; der Ausfuhrnachweis ist erforderlich.",
+            "en":"Legal basis: Article 41(4–11) of the Polish VAT Act; proof of export is required.",
+            "es":"Base legal: art. 41, apdos. 4–11, de la Ley polaca del IVA; se exige prueba de exportación.",
+            "it":"Base giuridica: art. 41, commi 4–11, della legge polacca sull’IVA; è richiesta la prova dell’esportazione.",
+        }
+        legal_title = export_copy.get(invoice_language, export_copy["en"]) if document_type == "export" else pdf_copy["wdt"]
+        legal_basis = export_basis.get(invoice_language, export_basis["en"]) if document_type == "export" else pdf_copy["wdt_basis"]
+        for legal_line in wrap_pdf_text(legal_title, pdf_font, 8.5, legal_width):
             cpdf.drawString(15 * mm, y, legal_line)
             y -= 4.5 * mm
-        for legal_line in wrap_pdf_text(pdf_copy["wdt_basis"], pdf_font, 8.5, legal_width):
+        for legal_line in wrap_pdf_text(legal_basis, pdf_font, 8.5, legal_width):
             cpdf.drawString(15 * mm, y, legal_line)
             y -= 4.5 * mm
 
@@ -2795,6 +2833,22 @@ def generate_order_invoice_pdf(order_row, items, meta):
 
     cpdf.save()
     return fpath, round(total_net,2), round(total_gross,2)
+
+
+def generate_order_invoice_pdf(order_row, items, meta):
+    """Pure PDF dispatcher; it performs no stock/status/allocation writes."""
+    invoice_type = resolve_invoice_type(meta, items)
+    payload = dict(meta)
+    payload["invoice_type"] = invoice_type
+    if invoice_type == "domestic":
+        return invoice_domestic.generate(
+            order_row, items, payload, renderer=_legacy_generate_order_invoice_pdf
+        )
+    if invoice_type in {"wdt", "export"}:
+        return invoice_foreign.generate(
+            order_row, items, payload, renderer=_legacy_generate_order_invoice_pdf
+        )
+    raise ValueError("Nieobsługiwany typ faktury")
 
 
 def packing_list_pdf_path_for_invoice(invoice_pdf_path: str, invoice_no: str) -> str:
@@ -7688,7 +7742,7 @@ def order_invoice(order_id):
             "buyer_email": o["customer_email"] or "",
             "buyer_phone": norm(client_profile.get("phone")) or o["customer_phone"] or "",
             "discount_percent": "0",
-            "invoice_type": "wdt_0" if order_currency == "EUR" else "domestic_23",
+            "invoice_type": "wdt" if order_currency != "PLN" else "domestic",
             "currency": order_currency,
         }
     else:
@@ -7698,8 +7752,10 @@ def order_invoice(order_id):
             "buyer_email", "buyer_phone", "discount_percent", "invoice_type", "currency"
         ]}
         order_currency = normalize_order_currency(o["currency"])
-        data["currency"] = order_currency
-        data["invoice_type"] = "wdt_0" if order_currency == "EUR" else "domestic_23"
+        data["currency"] = normalize_order_currency(data.get("currency") or order_currency)
+        data["invoice_type"] = normalize_invoice_type(data.get("invoice_type"))
+        if not data["invoice_type"]:
+            msg = "Wybierz typ podatkowy faktury: krajowa, WDT albo eksport."
         if not data.get("buyer_address"):
             data["buyer_address"] = buyer_address_default
         st, pc, city = split_address(data.get("buyer_address", ""))
@@ -7730,7 +7786,7 @@ def order_invoice(order_id):
             if invalid_packing_qty:
                 msg = "Ilość na fakturze nie może być większa niż ilość zapisana na ostatniej liście pakowej."
                 invoice_items = []
-        if norm(request.form.get("submit_action")) != "packing" and data["invoice_type"] == "wdt_0":
+        if norm(request.form.get("submit_action")) != "packing" and data["invoice_type"] == "wdt":
             vat_eu = re.sub(r"[\s.-]+", "", data.get("buyer_tax_no") or "").upper()
             buyer_country = norm(data.get("buyer_country")).upper()
             eu_vat_prefixes = {
@@ -7752,15 +7808,32 @@ def order_invoice(order_id):
                 data["vat_rate"] = 0
                 for invoice_item in invoice_items:
                     invoice_item["vat_rate"] = 0
-                    invoice_item["currency"] = "EUR"
+                    invoice_item["currency"] = data["currency"]
                     invoice_item["gross_price"] = invoice_item.get("net_price")
                     invoice_item["line_value_vat"] = 0.0
                     invoice_item["line_value_gross"] = invoice_item.get("line_value_net")
-        elif norm(request.form.get("submit_action")) != "packing":
+        elif norm(request.form.get("submit_action")) != "packing" and data["invoice_type"] == "export":
+            buyer_country = norm(data.get("buyer_country")).upper()
+            eu_codes = {"AT","BE","BG","HR","CY","CZ","DK","EE","FI","FR","DE","EL","GR","HU","IE","IT","LV","LT","LU","MT","NL","PT","RO","SK","SI","ES","SE","PL"}
+            if not buyer_country or buyer_country in eu_codes:
+                msg = "Eksport wymaga kraju nabywcy spoza Unii Europejskiej."
+                invoice_items = []
+            elif not norm(data.get("buyer_tax_no")):
+                msg = "Dla eksportu podaj zagraniczny Tax ID nabywcy."
+                invoice_items = []
+            else:
+                data["vat_rate"] = 0
+                for invoice_item in invoice_items:
+                    invoice_item["vat_rate"] = 0
+                    invoice_item["currency"] = data["currency"]
+                    invoice_item["gross_price"] = invoice_item.get("net_price")
+                    invoice_item["line_value_vat"] = 0.0
+                    invoice_item["line_value_gross"] = invoice_item.get("line_value_net")
+        elif norm(request.form.get("submit_action")) != "packing" and data["invoice_type"] == "domestic":
             data["vat_rate"] = 23
             for invoice_item in invoice_items:
                 invoice_item["vat_rate"] = 23
-                invoice_item["currency"] = "PLN"
+                invoice_item["currency"] = data["currency"]
         if norm(request.form.get("submit_action")) == "packing":
             if not invoice_items:
                 msg = "Lista pakowania musi zawierac co najmniej jedna pozycje."
@@ -7797,12 +7870,12 @@ def order_invoice(order_id):
             cur.execute("""
               INSERT INTO invoices(order_id, invoice_no, issue_date, sell_date, payment_type, payment_to,
                                    buyer_name, buyer_tax_no, buyer_street, buyer_post_code, buyer_city, buyer_country,
-                                   buyer_email, buyer_phone, total_net, total_gross, created_at)
-              VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                                   buyer_email, buyer_phone, total_net, total_gross, created_at, invoice_type)
+              VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 order_id, data["invoice_no"], data["issue_date"], data["sell_date"], data["payment_type"], data["payment_to"],
                 data["buyer_name"], data["buyer_tax_no"], data["buyer_street"], data["buyer_post_code"], data["buyer_city"], data["buyer_country"],
-                data["buyer_email"], data["buyer_phone"], total_net, total_gross, now_iso()
+                data["buyer_email"], data["buyer_phone"], total_net, total_gross, now_iso(), data["invoice_type"]
             ))
             invoice_id = cur.lastrowid
             if not invoice_id:
@@ -7870,9 +7943,13 @@ def order_invoice(order_id):
 
       <div class="card">
         <form method="post" class="row">
-          <input type="hidden" name="invoice_type" value="{{ d['invoice_type'] }}">
-          <input type="hidden" name="currency" value="{{ d['currency'] }}">
-          {% if d['invoice_type'] == 'wdt_0' %}
+          <div><label class="muted small">Typ podatkowy</label><select name="invoice_type" required>
+            <option value="domestic" {% if d['invoice_type'] == 'domestic' %}selected{% endif %}>Krajowa 23%</option>
+            <option value="wdt" {% if d['invoice_type'] == 'wdt' %}selected{% endif %}>WDT 0%</option>
+            <option value="export" {% if d['invoice_type'] == 'export' %}selected{% endif %}>Eksport 0%</option>
+          </select></div>
+          <div><label class="muted small">Waluta</label><input name="currency" value="{{ d['currency'] }}" maxlength="3" required></div>
+          {% if d['invoice_type'] == 'wdt' %}
             <div class="hint" style="grid-column:1/-1;">
               <b>Faktura WDT 0% w EUR.</b> Przed wystawieniem sprawdź aktywny numer VAT UE nabywcy w VIES.
               Stawkę 0% stosuj tylko dla dostawy do innego kraju UE i zachowaj dokumenty potwierdzające wywóz oraz dostarczenie towaru.
@@ -7893,7 +7970,7 @@ def order_invoice(order_id):
           <div><label class="muted small">Rabat %</label><input name="discount_percent" value="{{ d['discount_percent'] or "0" }}"></div>
 
           <div><label class="muted small">Nabywca</label><input name="buyer_name" value="{{ d['buyer_name'] }}" required></div>
-          <div><label class="muted small">{{ 'VAT UE nabywcy' if d['invoice_type'] == 'wdt_0' else 'NIP nabywcy' }}</label><input name="buyer_tax_no" value="{{ d['buyer_tax_no'] }}" placeholder="{{ 'np. DE123456789' if d['invoice_type'] == 'wdt_0' else '' }}"></div>
+          <div><label class="muted small">{{ 'VAT UE nabywcy' if d['invoice_type'] == 'wdt' else ('Tax ID nabywcy' if d['invoice_type'] == 'export' else 'NIP nabywcy') }}</label><input name="buyer_tax_no" value="{{ d['buyer_tax_no'] }}" placeholder="{{ 'np. DE123456789' if d['invoice_type'] == 'wdt' else '' }}"></div>
           <div><label class="muted small">Adres nabywcy</label><textarea name="buyer_address" placeholder="Ulica&#10;Kod pocztowy Miasto">{{ d['buyer_address'] }}</textarea></div>
           <div><label class="muted small">Kraj</label><input name="buyer_country" value="{{ d['buyer_country'] }}"></div>
           <div><label class="muted small">Email</label><input name="buyer_email" value="{{ d['buyer_email'] }}"></div>
@@ -7934,7 +8011,7 @@ def order_invoice(order_id):
 
           <div class="flex" style="align-items:flex-end;">
             <a class="btn" href="{{ url_for('order_packing_list_download_admin', order_id=o['id']) }}" target="_blank">Pakuj</a>
-            <button class="btn primary" type="submit" name="submit_action" value="invoice">{{ 'Zapisz fakturę WDT 0% PDF' if d['invoice_type'] == 'wdt_0' else 'Zapisz fakturę PDF' }}</button>
+            <button class="btn primary" type="submit" name="submit_action" value="invoice">Zapisz fakturę PDF</button>
           </div>
         </form>
       </div>
@@ -10317,8 +10394,11 @@ def load_invoice_with_meta(invoice_id: int):
     cur = c.cursor()
     cur.execute("""
       SELECT i.*, COALESCE(m.pdf_path,'') AS pdf_path, COALESCE(m.sent_to_client,0) AS sent_to_client,
-             COALESCE(m.invoice_items_json,'') AS invoice_items_json
+             COALESCE(m.paid,0) AS paid, COALESCE(m.paid_at,'') AS paid_at,
+             COALESCE(m.invoice_items_json,'') AS invoice_items_json,
+             COALESCE(o.currency,'PLN') AS order_currency
       FROM invoices i
+      LEFT JOIN orders o ON o.id=i.order_id
       LEFT JOIN invoice_meta m ON m.invoice_id = i.id
       WHERE i.id=?
       LIMIT 1
@@ -10346,6 +10426,10 @@ def invoice_meta_payload(invoice_row: dict):
         "sell_date": invoice_row.get("sell_date") or app_now().strftime("%Y-%m-%d"),
         "payment_type": invoice_row.get("payment_type") or "przelew",
         "payment_to": invoice_row.get("payment_to") or "",
+        "invoice_type": invoice_row.get("invoice_type") or "",
+        "currency": invoice_row.get("order_currency") or invoice_row.get("currency") or "PLN",
+        "paid": int(invoice_row.get("paid") or 0),
+        "paid_at": invoice_row.get("paid_at") or "",
         "buyer_name": invoice_row.get("buyer_name") or "",
         "buyer_tax_no": invoice_row.get("buyer_tax_no") or "",
         "buyer_address": buyer_address,
@@ -10474,12 +10558,6 @@ def regenerate_invoice_pdf_after_ksef_send(invoice_id: int, ksef_number: str) ->
     packing_pdf_path = generate_invoice_packing_list_pdf(order_row, items, meta_payload, pdf_path)
     stored_pdf_path = upload_invoice_pdfs_to_supabase(invoice_id, inv.get("invoice_no") or f"FV_{invoice_id}", pdf_path, packing_pdf_path)
 
-    c = conn()
-    cur = c.cursor()
-    cur.execute("UPDATE invoices SET total_net=?, total_gross=? WHERE id=?", (total_net, total_gross, invoice_id))
-    c.commit()
-    c.close()
-
     current_meta = load_invoice_meta(invoice_id) or {}
     upsert_invoice_meta(
         invoice_id,
@@ -10505,12 +10583,40 @@ def regenerate_invoice_pdf_after_ksef_send(invoice_id: int, ksef_number: str) ->
     return True
 
 
+def validate_ksef_invoice(invoice, company, items):
+    """Select the validator by tax type without persisting any change."""
+    invoice_type = resolve_invoice_type(invoice, items)
+    payload = dict(invoice)
+    payload["invoice_type"] = invoice_type
+    if invoice_type == "domestic":
+        return ksef_domestic.validate(
+            payload, company, items, validator=_legacy_validate_ksef_invoice
+        )
+    return ksef_foreign.validate(payload, company, items)
+
+
+def build_ksef_draft_xml(invoice, company, items):
+    """Pure FA(3) dispatcher for domestic, WDT and export documents."""
+    invoice_type = resolve_invoice_type(invoice, items)
+    payload = dict(invoice)
+    payload["invoice_type"] = invoice_type
+    if invoice_type == "domestic":
+        return ksef_domestic.generate(
+            payload, company, items, generator=_legacy_build_ksef_draft_xml
+        )
+    if invoice_type in {"wdt", "export"}:
+        return ksef_foreign.generate(payload, company, items)
+    raise ValueError("Nieobsługiwany typ faktury")
+
+
 def build_invoice_ksef_payload(invoice_id: int):
     inv = load_invoice_with_meta(invoice_id)
     if not inv:
         return None, {}, [], ["Nie znaleziono faktury."]
     company = load_company_profile()
     items = invoice_items_from_saved_json(invoice_id)
+    inv["currency"] = inv.get("order_currency") or (items[0].get("currency") if items else "PLN")
+    inv["invoice_type"] = resolve_invoice_type(inv, items)
     problems = validate_ksef_invoice(inv, company, items)
     return inv, company, items, problems
 
@@ -10660,10 +10766,6 @@ def invoice_ksef_mark_sent(invoice_id):
         upsert_ksef_doc(invoice_id, "error", last_error="Wpisz numer KSeF, żeby oznaczyć fakturę jako wysłaną.")
         return redirect(next_url)
     upsert_ksef_doc(invoice_id, "sent", ksef_number=ksef_number, last_error="")
-    try:
-        regenerate_invoice_pdf_after_ksef_send(invoice_id, ksef_number)
-    except Exception as exc:
-        upsert_ksef_doc(invoice_id, "sent", ksef_number=ksef_number, last_error=f"Oznaczono jako wysłaną, ale nie udało się odświeżyć PDF: {exc}")
     return redirect(next_url)
 
 
@@ -10699,10 +10801,6 @@ def invoice_ksef_send(invoice_id):
     if result.get("ok"):
         ksef_number = result.get("ksef_number") or (f"ref: {result.get('invoice_reference_number')}" if result.get("invoice_reference_number") else "")
         upsert_ksef_doc(invoice_id, "sent", xml_path=path, ksef_number=ksef_number)
-        try:
-            regenerate_invoice_pdf_after_ksef_send(invoice_id, ksef_number)
-        except Exception as exc:
-            upsert_ksef_doc(invoice_id, "sent", xml_path=path, ksef_number=ksef_number, last_error=f"Wysłano do KSeF, ale nie udało się odświeżyć PDF: {exc}")
     else:
         upsert_ksef_doc(invoice_id, "error", xml_path=path, last_error=result.get("message") or "Nie udało się wysłać faktury do KSeF.")
     return redirect(next_url)
@@ -10763,12 +10861,6 @@ def invoice_download_admin(invoice_id):
         abs_path, total_net, total_gross = generate_order_invoice_pdf(o, items, meta)
         packing_pdf_path = generate_invoice_packing_list_pdf(o, items, meta, abs_path)
         stored_pdf_path = upload_invoice_pdfs_to_supabase(invoice_id, row.get("invoice_no") or f"FV_{invoice_id}", abs_path, packing_pdf_path)
-
-        c = conn()
-        cur = c.cursor()
-        cur.execute("UPDATE invoices SET total_net=?, total_gross=? WHERE id=?", (total_net, total_gross, invoice_id))
-        c.commit()
-        c.close()
 
         current_meta = load_invoice_meta(invoice_id) or {}
         upsert_invoice_meta(
@@ -11055,12 +11147,6 @@ def invoice_regenerate_admin(invoice_id):
     pdf_path, total_net, total_gross = generate_order_invoice_pdf(o, items, meta)
     packing_pdf_path = generate_invoice_packing_list_pdf(o, items, meta, pdf_path)
     stored_pdf_path = upload_invoice_pdfs_to_supabase(invoice_id, inv["invoice_no"], pdf_path, packing_pdf_path)
-
-    c = conn()
-    cur = c.cursor()
-    cur.execute("UPDATE invoices SET total_net=?, total_gross=? WHERE id=?", (total_net, total_gross, invoice_id))
-    c.commit()
-    c.close()
 
     current_meta = load_invoice_meta(invoice_id) or {}
     upsert_invoice_meta(

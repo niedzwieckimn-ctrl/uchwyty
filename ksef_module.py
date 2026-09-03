@@ -356,20 +356,23 @@ def build_ksef_draft_xml(invoice: dict, company: dict, items: list[dict]) -> str
         _add(row, "P_11", _money(line_net))
         _add(row, "P_12", "23")
 
-    payment = SubElement(fa, _tag("Platnosc"))
-    due = _payment_due_date(invoice)
-    if due:
-        due_node = SubElement(payment, _tag("TerminPlatnosci"))
-        _add(due_node, "Termin", due)
-    payment_code = _payment_code(_invoice_payment_type(invoice))
-    _add(payment, "FormaPlatnosci", payment_code)
-    bank_account = _pln_bank_account(company.get("bank_account"))
-    if payment_code == "6" and bank_account:
-        bank_node = SubElement(payment, _tag("RachunekBankowy"))
-        _add(bank_node, "NrRB", bank_account)
-        bank_swift = _swift(company.get("bank_swift"))
-        if bank_swift:
-            _add(bank_node, "SWIFT", bank_swift)
+    # Opłacony dokument nie prezentuje terminu ani rachunku jako aktywnego
+    # zobowiązania. Sam generator tylko odczytuje stan i nigdy go nie zmienia.
+    if not int(invoice.get("paid") or 0):
+        payment = SubElement(fa, _tag("Platnosc"))
+        due = _payment_due_date(invoice)
+        if due:
+            due_node = SubElement(payment, _tag("TerminPlatnosci"))
+            _add(due_node, "Termin", due)
+        payment_code = _payment_code(_invoice_payment_type(invoice))
+        _add(payment, "FormaPlatnosci", payment_code)
+        bank_account = _pln_bank_account(company.get("bank_account"))
+        if payment_code == "6" and bank_account:
+            bank_node = SubElement(payment, _tag("RachunekBankowy"))
+            _add(bank_node, "NrRB", bank_account)
+            bank_swift = _swift(company.get("bank_swift"))
+            if bank_swift:
+                _add(bank_node, "SWIFT", bank_swift)
 
     rough = tostring(root, encoding="utf-8")
     return minidom.parseString(rough).toprettyxml(indent="  ", encoding="utf-8").decode("utf-8")

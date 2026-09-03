@@ -21,6 +21,14 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(backend, "maybe_pull_shared_from_supabase", lambda **kwargs: None)
     monkeypatch.setattr(backend, "_authenticated_client_user", lambda: {"id": "user-1", "email": "test@example.com", "name": "Test"})
     monkeypatch.setattr(backend, "_order_by_idempotency_key", lambda key: None)
+    monkeypatch.setattr(backend, "_client_profile_for_email", lambda email: {
+        "id": 77, "name": "Test", "email": email, "language": "pl",
+        "price_list": "pln", "currency": "PLN",
+    })
+    monkeypatch.setattr(backend, "_client_stock_catalog_rows", lambda profile: [{
+        "product_id": 990001, "price_available": True, "net_price": 10,
+        "gross_price": 12.3, "retail_price": 12.3, "currency": "PLN",
+    }])
     return backend.app.test_client()
 
 
@@ -136,7 +144,7 @@ def test_client_profile_uses_verified_email(client, monkeypatch):
     lookup.assert_called_once_with("test@example.com")
 
 
-def test_profile_language_patch_is_normalized(client, monkeypatch):
+def test_profile_language_patch_is_admin_only(client, monkeypatch):
     monkeypatch.setattr(backend, "_client_profile_for_email", lambda email: {
         "id": 77, "name": "Test", "email": email, "language": "pl"
     })
@@ -147,9 +155,8 @@ def test_profile_language_patch_is_normalized(client, monkeypatch):
         json={"language": "xx"},
         headers={"Authorization": "Bearer test"},
     )
-    assert response.status_code == 200
-    assert response.get_json()["customer"]["language"] == "pl"
-    update.assert_called_once_with("customers", {"language": "pl"}, {"id": 77})
+    assert response.status_code == 403
+    update.assert_not_called()
 
 
 def test_order_pdf_is_owned_and_uses_profile_language(client, monkeypatch):
