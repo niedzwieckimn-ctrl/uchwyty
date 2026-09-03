@@ -354,6 +354,8 @@ def init_db():
     invoice_cols = {r[1] for r in cur.fetchall()}
     if "invoice_type" not in invoice_cols:
         cur.execute("ALTER TABLE invoices ADD COLUMN invoice_type TEXT")
+    if "currency" not in invoice_cols:
+        cur.execute("ALTER TABLE invoices ADD COLUMN currency TEXT")
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS invoice_meta(
@@ -2034,6 +2036,25 @@ def normalize_order_currency(value) -> str:
     return currency if re.fullmatch(r"[A-Z]{3}", currency or "") else "PLN"
 
 
+EU_VAT_PREFIXES = {"AT","BE","BG","HR","CY","CZ","DK","EE","FI","FR","DE","EL","HU","IE","IT","LV","LT","LU","MT","NL","PT","RO","SK","SI","ES","SE"}
+
+
+def automatic_invoice_tax_context(order, buyer_tax_no="", buyer_country=""):
+    """Derive new invoice settings from the persisted order, never language."""
+    order = order or {}
+    currency = normalize_order_currency(order.get("currency") or price_list_currency(order.get("price_list")))
+    price_list = normalize_client_price_list(order.get("price_list"))
+    tax_id = re.sub(r"[\s.\-]+", "", norm(buyer_tax_no).upper())
+    country = norm(buyer_country).upper()
+    aliases = {"DEUTSCHLAND":"DE", "GERMANY":"DE", "NIEMCY":"DE", "POLSKA":"PL", "POLAND":"PL"}
+    country = aliases.get(country, country)
+    prefix = tax_id[:2] if len(tax_id) >= 2 else ""
+    if prefix in EU_VAT_PREFIXES:
+        country = prefix
+    invoice_type = "wdt" if price_list == "eu_eur" or currency == "EUR" else "domestic"
+    return invoice_type, currency, country
+
+
 def order_pdf_text(language: str, key: str) -> str:
     language = normalize_client_language(language)
     return ORDER_PDF_TRANSLATIONS.get(language, {}).get(key) or ORDER_PDF_TRANSLATIONS["pl"].get(key, "")
@@ -3579,6 +3600,17 @@ def reconcile_orders_after_invoice_change(order_ids: list[int]):
 def invoice_edit_items(invoice_id: int, invoice_row: dict):
     c = conn()
     cur = c.cursor()
+    cur.execute("SELECT invoice_items_json FROM invoice_meta WHERE invoice_id=?", (invoice_id,))
+    saved_meta = cur.fetchone()
+    saved_by_item = {}
+    if saved_meta and norm(saved_meta["invoice_items_json"]):
+        try:
+            for saved in json.loads(saved_meta["invoice_items_json"]):
+                saved_id = to_int(saved.get("order_item_id") or saved.get("id"), 0)
+                if saved_id:
+                    saved_by_item[saved_id] = saved
+        except Exception:
+            saved_by_item = {}
     cur.execute("SELECT order_id, order_item_id, qty FROM invoice_allocations WHERE invoice_id=?", (invoice_id,))
     current_alloc_rows = [dict(r) for r in cur.fetchall()]
     current_qty_by_item = {int(r["order_item_id"]): int(r["qty"] or 0) for r in current_alloc_rows}
@@ -3618,8 +3650,9 @@ def invoice_edit_items(invoice_id: int, invoice_row: dict):
              oo.order_no AS source_order_no,
              oo.created_at AS source_order_created_at,
              oo.note AS source_order_note,
-             COALESCE(pr.net_price, 0) AS net_price,
-             COALESCE(pr.gross_price, 0) AS gross_price
+             COALESCE(oi.unit_net_price, pr.net_price, 0) AS net_price,
+             COALESCE(oi.unit_gross_price, oi.unit_net_price, pr.gross_price, pr.net_price, 0) AS gross_price,
+             COALESCE(oi.currency, oo.currency, 'PLN') AS currency
       FROM order_items oi
       JOIN orders oo ON oo.id=oi.order_id
       JOIN products p ON p.id=oi.product_id
@@ -3641,6 +3674,23 @@ def invoice_edit_items(invoice_id: int, invoice_row: dict):
         invoiced_other = max(0, invoiced_total - current_qty)
         max_qty = max(0, ordered_qty - invoiced_other)
         row = dict(it)
+        # Dla pozycji już znajdującej się na fakturze zapisany JSON jest
+        # źródłem prawdy o cenie. Nie wolno zastępować EUR bieżącym cennikiem PLN.
+        saved = saved_by_item.get(item_id) or {}
+        order_has_foreign_snapshot = (
+            normalize_invoice_type(invoice_row.get("invoice_type")) in {"wdt", "export"}
+            and normalize_order_currency(it.get("currency")) != "PLN"
+            and money_float(it.get("net_price")) > 0
+        )
+        if saved and not order_has_foreign_snapshot:
+            if saved.get("net_price") not in (None, ""):
+                row["net_price"] = money_float(saved.get("net_price"))
+            if saved.get("gross_price") not in (None, ""):
+                row["gross_price"] = money_float(saved.get("gross_price"))
+            if norm(saved.get("currency")):
+                row["currency"] = normalize_order_currency(saved.get("currency"))
+            if saved.get("vat_rate") not in (None, ""):
+                row["vat_rate"] = to_int(saved.get("vat_rate"), 23)
         row["order_item_id"] = item_id
         row["source_order_id"] = int(it.get("order_id") or 0)
         row["source_order_no"] = order_display_no(
@@ -3659,7 +3709,7 @@ def invoice_edit_items(invoice_id: int, invoice_row: dict):
     return out
 
 
-def prepare_invoice_edit_items(edit_items: list[dict], form):
+def prepare_invoice_edit_items(edit_items: list[dict], form, invoice_type="domestic", currency="PLN"):
     prepared = []
     for it in edit_items:
         max_qty = int(it.get("remaining_qty") or 0)
@@ -3675,10 +3725,12 @@ def prepare_invoice_edit_items(edit_items: list[dict], form):
         row["qty"] = qty
         line_net = money_dec(row.get("net_price")) * Decimal(qty)
         line_net = line_net.quantize(MONEY_Q, rounding=ROUND_HALF_UP)
-        line_vat = vat23_from_net(line_net)
+        foreign_zero = normalize_invoice_type(invoice_type) in {"wdt", "export"}
+        line_vat = Decimal("0.00") if foreign_zero else vat23_from_net(line_net)
         line_gross = (line_net + line_vat).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
-        row["gross_price"] = money_float(gross_from_net_23(row.get("net_price")))
-        row["vat_rate"] = 23
+        row["gross_price"] = money_float(row.get("net_price")) if foreign_zero else money_float(gross_from_net_23(row.get("net_price")))
+        row["vat_rate"] = 0 if foreign_zero else 23
+        row["currency"] = normalize_order_currency(currency)
         row["line_value_net"] = money_float(line_net)
         row["line_value_vat"] = money_float(line_vat)
         row["line_value_gross"] = money_float(line_gross)
@@ -7728,6 +7780,7 @@ def order_invoice(order_id):
 
     if request.method == "GET":
         order_currency = normalize_order_currency(o["currency"])
+        auto_type, order_currency, auto_country = automatic_invoice_tax_context(dict(o), buyer_tax_no, "")
         data = {
             "invoice_no": next_invoice_no(default_issue),
             "place": "KotuszĂłw",
@@ -7738,11 +7791,11 @@ def order_invoice(order_id):
             "buyer_name": norm(client_profile.get("name")) or o["customer_name"] or "",
             "buyer_tax_no": buyer_tax_no,
             "buyer_address": buyer_address_default,
-            "buyer_country": "" if order_currency == "EUR" else "PL",
+            "buyer_country": auto_country or ("" if order_currency == "EUR" else "PL"),
             "buyer_email": o["customer_email"] or "",
             "buyer_phone": norm(client_profile.get("phone")) or o["customer_phone"] or "",
             "discount_percent": "0",
-            "invoice_type": "wdt" if order_currency != "PLN" else "domestic",
+            "invoice_type": auto_type,
             "currency": order_currency,
         }
     else:
@@ -7752,10 +7805,12 @@ def order_invoice(order_id):
             "buyer_email", "buyer_phone", "discount_percent", "invoice_type", "currency"
         ]}
         order_currency = normalize_order_currency(o["currency"])
-        data["currency"] = normalize_order_currency(data.get("currency") or order_currency)
-        data["invoice_type"] = normalize_invoice_type(data.get("invoice_type"))
-        if not data["invoice_type"]:
-            msg = "Wybierz typ podatkowy faktury: krajowa, WDT albo eksport."
+        auto_type, auto_currency, auto_country = automatic_invoice_tax_context(dict(o), data.get("buyer_tax_no"), data.get("buyer_country"))
+        # Zwykły flow jest całkowicie automatyczny: zamówienie z cennika UE
+        # zawsze daje WDT/EUR, a kraj pochodzi z prefiksu VAT UE.
+        data["currency"] = auto_currency
+        data["invoice_type"] = auto_type
+        data["buyer_country"] = auto_country
         if not data.get("buyer_address"):
             data["buyer_address"] = buyer_address_default
         st, pc, city = split_address(data.get("buyer_address", ""))
@@ -7870,12 +7925,12 @@ def order_invoice(order_id):
             cur.execute("""
               INSERT INTO invoices(order_id, invoice_no, issue_date, sell_date, payment_type, payment_to,
                                    buyer_name, buyer_tax_no, buyer_street, buyer_post_code, buyer_city, buyer_country,
-                                   buyer_email, buyer_phone, total_net, total_gross, created_at, invoice_type)
-              VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                                   buyer_email, buyer_phone, total_net, total_gross, created_at, invoice_type, currency)
+              VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 order_id, data["invoice_no"], data["issue_date"], data["sell_date"], data["payment_type"], data["payment_to"],
                 data["buyer_name"], data["buyer_tax_no"], data["buyer_street"], data["buyer_post_code"], data["buyer_city"], data["buyer_country"],
-                data["buyer_email"], data["buyer_phone"], total_net, total_gross, now_iso(), data["invoice_type"]
+                data["buyer_email"], data["buyer_phone"], total_net, total_gross, now_iso(), data["invoice_type"], data["currency"]
             ))
             invoice_id = cur.lastrowid
             if not invoice_id:
@@ -7943,12 +7998,9 @@ def order_invoice(order_id):
 
       <div class="card">
         <form method="post" class="row">
-          <div><label class="muted small">Typ podatkowy</label><select name="invoice_type" required>
-            <option value="domestic" {% if d['invoice_type'] == 'domestic' %}selected{% endif %}>Krajowa 23%</option>
-            <option value="wdt" {% if d['invoice_type'] == 'wdt' %}selected{% endif %}>WDT 0%</option>
-            <option value="export" {% if d['invoice_type'] == 'export' %}selected{% endif %}>Eksport 0%</option>
-          </select></div>
-          <div><label class="muted small">Waluta</label><input name="currency" value="{{ d['currency'] }}" maxlength="3" required></div>
+          <input type="hidden" name="invoice_type" value="{{ d['invoice_type'] }}">
+          <input type="hidden" name="currency" value="{{ d['currency'] }}">
+          <div><label class="muted small">Rozliczenie</label><div class="hint"><b>{{ 'WDT 0%' if d['invoice_type']=='wdt' else ('Eksport 0%' if d['invoice_type']=='export' else 'Krajowa 23%') }}</b> · {{ d['currency'] }} — ustawione automatycznie z zamówienia</div></div>
           {% if d['invoice_type'] == 'wdt' %}
             <div class="hint" style="grid-column:1/-1;">
               <b>Faktura WDT 0% w EUR.</b> Przed wystawieniem sprawdź aktywny numer VAT UE nabywcy w VIES.
@@ -10427,7 +10479,7 @@ def invoice_meta_payload(invoice_row: dict):
         "payment_type": invoice_row.get("payment_type") or "przelew",
         "payment_to": invoice_row.get("payment_to") or "",
         "invoice_type": invoice_row.get("invoice_type") or "",
-        "currency": invoice_row.get("order_currency") or invoice_row.get("currency") or "PLN",
+        "currency": invoice_row.get("currency") or invoice_row.get("order_currency") or "PLN",
         "paid": int(invoice_row.get("paid") or 0),
         "paid_at": invoice_row.get("paid_at") or "",
         "buyer_name": invoice_row.get("buyer_name") or "",
@@ -10615,7 +10667,7 @@ def build_invoice_ksef_payload(invoice_id: int):
         return None, {}, [], ["Nie znaleziono faktury."]
     company = load_company_profile()
     items = invoice_items_from_saved_json(invoice_id)
-    inv["currency"] = inv.get("order_currency") or (items[0].get("currency") if items else "PLN")
+    inv["currency"] = inv.get("currency") or (items[0].get("currency") if items else None) or inv.get("order_currency") or "PLN"
     inv["invoice_type"] = resolve_invoice_type(inv, items)
     problems = validate_ksef_invoice(inv, company, items)
     return inv, company, items, problems
@@ -11144,6 +11196,19 @@ def invoice_regenerate_admin(invoice_id):
         return "Brak pozycji faktury", 400
 
     meta = invoice_meta_payload(inv)
+    auto_type, auto_currency, auto_country = automatic_invoice_tax_context(
+        dict(o), inv.get("buyer_tax_no"), inv.get("buyer_country")
+    )
+    meta.update(invoice_type=auto_type, currency=auto_currency, buyer_country=auto_country or inv.get("buyer_country"))
+    # Starsze błędne PDF-y WDT mogły mieć w JSON ceny z lokalnego cennika PLN.
+    # Regeneracja odbudowuje je z cen zapisanych w zamówieniu klienta (EUR),
+    # zachowując dokładnie te same alokacje i ilości.
+    if auto_type == "wdt" and auto_currency == "EUR" and any(normalize_order_currency(x.get("currency")) != "EUR" for x in items):
+        edit_rows = invoice_edit_items(invoice_id, dict(inv, invoice_type=auto_type))
+        qty_form = {f"invoice_qty_{row['id']}": str(row.get("current_invoice_qty") or 0) for row in edit_rows}
+        corrected = prepare_invoice_edit_items(edit_rows, qty_form, auto_type, auto_currency)
+        if corrected:
+            items = corrected
     pdf_path, total_net, total_gross = generate_order_invoice_pdf(o, items, meta)
     packing_pdf_path = generate_invoice_packing_list_pdf(o, items, meta, pdf_path)
     stored_pdf_path = upload_invoice_pdfs_to_supabase(invoice_id, inv["invoice_no"], pdf_path, packing_pdf_path)
@@ -11961,6 +12026,12 @@ def invoice_edit_admin(invoice_id):
     order_row = cur.fetchone()
     c.close()
 
+    auto_type, auto_currency, auto_country = automatic_invoice_tax_context(
+        dict(order_row) if order_row else {}, inv.get("buyer_tax_no"), inv.get("buyer_country")
+    )
+    inv["invoice_type"] = auto_type
+    inv["currency"] = auto_currency
+    inv["buyer_country"] = auto_country or inv.get("buyer_country")
     edit_items = invoice_edit_items(invoice_id, dict(inv))
 
     msg = ""
@@ -11968,12 +12039,54 @@ def invoice_edit_admin(invoice_id):
         data = {k: norm(request.form.get(k)) for k in [
             "invoice_no", "issue_date", "sell_date", "payment_type", "payment_to",
             "buyer_name", "buyer_tax_no", "buyer_address", "buyer_country",
-            "buyer_email", "buyer_phone"
+            "buyer_email", "buyer_phone", "invoice_type", "currency"
         ]}
-        invoice_items = prepare_invoice_edit_items(edit_items, request.form)
+        data["invoice_type"], data["currency"], automatic_country = automatic_invoice_tax_context(
+            dict(order_row) if order_row else {}, data.get("buyer_tax_no"), data.get("buyer_country")
+        )
+        country_aliases = {
+            "DEUTSCHLAND":"DE", "GERMANY":"DE", "NIEMCY":"DE",
+            "POLSKA":"PL", "POLAND":"PL", "UNITED STATES":"US", "USA":"US",
+            "UNITED KINGDOM":"GB", "GROSSBRITANNIEN":"GB", "WIELKA BRYTANIA":"GB",
+        }
+        data["buyer_country"] = automatic_country or country_aliases.get(data["buyer_country"].upper(), data["buyer_country"].upper())
+        refresh_foreign_prices = (
+            data["invoice_type"] == "wdt" and data["currency"] == "EUR"
+            and any(
+                normalize_order_currency(item.get("currency")) != "EUR" or money_float(item.get("net_price")) <= 0
+                for item in edit_items if int(item.get("current_invoice_qty") or 0) > 0
+            )
+        )
+        if refresh_foreign_prices and data["invoice_type"] == "wdt" and data["currency"] == "EUR":
+            try:
+                eur_rows = supabase_request(
+                    "/rest/v1/pricing_eur", method="GET",
+                    params={"select": "sku,price_eur,uvp_eur", "limit": 5000}, timeout=30,
+                ) or []
+                eur_by_sku = {norm(row.get("sku")).lower(): row for row in eur_rows}
+                missing_eur = []
+                for edit_item in edit_items:
+                    eur_price = eur_by_sku.get(norm(edit_item.get("sku")).lower()) or {}
+                    price = money_float(eur_price.get("price_eur"))
+                    if price <= 0 and int(edit_item.get("current_invoice_qty") or 0) > 0:
+                        missing_eur.append(norm(edit_item.get("sku")))
+                        continue
+                    if price > 0:
+                        edit_item["net_price"] = price
+                        edit_item["gross_price"] = price
+                        edit_item["currency"] = "EUR"
+                if missing_eur:
+                    msg = "Brak ceny EUR dla SKU: " + ", ".join(missing_eur[:10])
+            except Exception as exc:
+                msg = "Nie udało się pobrać cennika EUR: " + str(exc)
+        invoice_items = prepare_invoice_edit_items(edit_items, request.form, data["invoice_type"], data["currency"])
         existing_invoice_id = invoice_no_exists(data["invoice_no"], invoice_id)
-        if not data["invoice_no"]:
+        if msg:
+            pass
+        elif not data["invoice_no"]:
             msg = "Numer faktury jest wymagany."
+        elif not data["invoice_type"]:
+            msg = "Wybierz typ podatkowy faktury."
         elif existing_invoice_id:
             msg = f"Faktura o takim numerze już istnieje! Numer: {data['invoice_no']}. Wybierz inny numer faktury."
         elif not invoice_items:
@@ -11987,12 +12100,12 @@ def invoice_edit_admin(invoice_id):
               UPDATE invoices
               SET invoice_no=?, issue_date=?, sell_date=?, payment_type=?, payment_to=?,
                   buyer_name=?, buyer_tax_no=?, buyer_street=?, buyer_post_code=?, buyer_city=?,
-                  buyer_country=?, buyer_email=?, buyer_phone=?
+                  buyer_country=?, buyer_email=?, buyer_phone=?, invoice_type=?, currency=?
               WHERE id=?
             """, (
                 data["invoice_no"], data["issue_date"], data["sell_date"], data["payment_type"], data["payment_to"],
                 data["buyer_name"], data["buyer_tax_no"], st, pc, city,
-                data["buyer_country"], data["buyer_email"], data["buyer_phone"], invoice_id
+                data["buyer_country"], data["buyer_email"], data["buyer_phone"], data["invoice_type"], data["currency"], invoice_id
             ))
             c.commit()
             c.close()
@@ -12086,6 +12199,9 @@ def invoice_edit_admin(invoice_id):
       <div class="card">
         <form method="post" class="row">
           <div><label class="muted small">Numer faktury</label><input name="invoice_no" value="{{ inv.invoice_no }}" required></div>
+          <input type="hidden" name="invoice_type" value="{{ inv.invoice_type }}">
+          <input type="hidden" name="currency" value="{{ inv.currency }}">
+          <div><label class="muted small">Rozliczenie</label><div class="hint"><b>{{ 'WDT 0%' if inv.invoice_type=='wdt' else ('Eksport 0%' if inv.invoice_type=='export' else 'Krajowa 23%') }}</b> · {{ inv.currency }} — z zamówienia i cennika klienta</div></div>
           <div><label class="muted small">Data wystawienia</label><input name="issue_date" type="date" value="{{ inv.issue_date }}"></div>
           <div><label class="muted small">Data sprzedaży</label><input name="sell_date" type="date" value="{{ inv.sell_date }}"></div>
           <div><label class="muted small">Forma płatności</label>
@@ -12097,7 +12213,7 @@ def invoice_edit_admin(invoice_id):
           </div>
           <div><label class="muted small">Termin płatności</label><input name="payment_to" type="date" value="{{ inv.payment_to }}"></div>
           <div><label class="muted small">Nabywca</label><input name="buyer_name" value="{{ inv.buyer_name }}"></div>
-          <div><label class="muted small">NIP nabywcy</label><input name="buyer_tax_no" value="{{ inv.buyer_tax_no }}"></div>
+          <div><label class="muted small">NIP / VAT UE / Tax ID nabywcy</label><input name="buyer_tax_no" value="{{ inv.buyer_tax_no }}"></div>
           <div><label class="muted small">Adres nabywcy</label><textarea name="buyer_address" placeholder="Ulica&#10;Kod pocztowy Miasto">{{ buyer_address }}</textarea></div>
           <div><label class="muted small">Kraj</label><input name="buyer_country" value="{{ inv.buyer_country or 'PL' }}"></div>
           <div><label class="muted small">Email</label><input name="buyer_email" value="{{ inv.buyer_email }}"></div>
@@ -12118,8 +12234,8 @@ def invoice_edit_admin(invoice_id):
                   <th>Na innych fakturach</th>
                   <th>Maks. na tej fakturze</th>
                   <th>Ilość na fakturze</th>
-                  <th>Netto/szt</th>
-                  <th>Brutto/szt</th>
+                  <th>Netto/szt ({{ inv.currency }})</th>
+                  <th>Brutto/szt ({{ inv.currency }})</th>
                 </tr>
               </thead>
               <tbody>
