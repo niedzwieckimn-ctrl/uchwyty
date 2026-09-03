@@ -1,1 +1,1 @@
-
+"""Domain route registration."""
