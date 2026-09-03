@@ -6077,7 +6077,6 @@ def orders():
         <div class="orders-toolbar">
           <a class="btn all-orders {% if tab=='all' %}primary{% endif %}" href="{{ url_for('orders', tab='all') }}">Wszystkie zamówienia</a>
           <a class="btn" href="{{ url_for('stock_issue_audit') }}">Audyt wydań</a>
-          <a class="btn" href="{{ url_for('inpost_dispatch_order') }}">Zamów kuriera InPost</a>
           <a class="btn primary" href="{{ url_for('order_new') }}">+ Nowe zamówienie</a>
         </div>
         <form method="get" class="grid3">
@@ -6503,7 +6502,6 @@ def order_view(order_id):
           {% else %}
             <a class="btn" href="{{ url_for('order_inpost_create', order_id=o['id']) }}">Generuj etykietę InPost</a>
           {% endif %}
-          <a class="btn" href="{{ url_for('inpost_dispatch_order') }}">Zamów kuriera</a>
           <select name="carrier" required style="min-width:150px;">
             <option value="">-- Kurier --</option>
             {% for carrier_key, carrier_name in [('inpost','InPost'),('dpd','DPD'),('fedex','FedEx'),('dhl','DHL'),('ups','UPS')] %}
@@ -6957,7 +6955,7 @@ def order_inpost_create(order_id):
     {% extends "base.html" %}{% block content %}
       <div class="card"><div class="flex"><div><h1 style="margin:0 0 8px;">Etykieta InPost</h1><div class="muted">Jedna przesyłka dla zamówień: {{ package_labels|join(', ') }}</div></div><a class="btn right" href="{{ url_for('order_view', order_id=o.id) }}">← Zamówienie</a></div></div>
       <div class="card">
-        {% if created and o.inpost_shipment_id %}<div class="hint" style="border-color:#a7e8cf;background:#edfbf6;color:#17684e;margin-bottom:15px;"><b>Przesyłka InPost została utworzona.</b>{% if o.tracking_no %} Numer: <b>{{ o.tracking_no }}</b>.{% else %} InPost przygotowuje jeszcze numer przesyłki.{% endif %} PDF pobierzesz przyciskiem poniżej.</div>{% endif %}
+        {% if created and o.inpost_shipment_id %}<div class="hint" style="border-color:#a7e8cf;background:#edfbf6;color:#17684e;margin-bottom:15px;"><b>Przesyłka InPost została utworzona z odbiorem przez kuriera.</b>{% if o.tracking_no %} Numer: <b>{{ o.tracking_no }}</b>.{% else %} InPost przygotowuje jeszcze numer przesyłki.{% endif %} PDF pobierzesz przyciskiem poniżej.</div>{% endif %}
         {% if error %}<div class="hint" style="border-color:#fecaca;background:#fff1f2;margin-bottom:15px;">{{ error }}</div>{% endif %}
         {% if not cfg.configured %}<div class="hint">Dodaj na Renderze zmienną <b>INPOST_API_TOKEN</b>. ID organizacji aplikacja pobierze automatycznie.</div>{% endif %}
         {% if o.inpost_shipment_id %}<div class="flex"><span class="badge">Przesyłka już utworzona</span><a class="btn primary" href="{{ url_for('order_inpost_label', order_id=o.id, bundle='1' if bundle else None) }}">{% if bundle %}Pobierz listę A4 + etykietę A6 (PDF){% else %}Pobierz etykietę A6 (PDF){% endif %}</a><a class="btn" href="{{ url_for('order_view', order_id=o.id) }}">Wróć do zamówienia</a></div>{% else %}

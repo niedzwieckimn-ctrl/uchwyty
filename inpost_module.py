@@ -78,6 +78,11 @@ def _request(path, method="GET", payload=None, accept="application/json"):
         try:
             details = json.loads(raw)
             message = details.get("message") or details.get("error") or raw
+            validation_details = details.get("details")
+            if validation_details:
+                if isinstance(validation_details, (dict, list)):
+                    validation_details = json.dumps(validation_details, ensure_ascii=False)
+                message = f"{message} Szczegóły: {validation_details}"
         except Exception:
             message = raw
         # Odpowiedź serwera może zawierać pełny URL z omyłkowo wklejonym
@@ -159,6 +164,10 @@ def create_courier_shipment(receiver, parcel, reference, service="inpost_courier
         },
         "parcels": [dict(parcel_payload) for _ in range(max(1, min(99, int(parcel.get("quantity", 1)))))],
         "service": service,
+        # Dla przesyłek kurierskich sposób nadania musi być częścią samej
+        # przesyłki. Na umowie kurierskiej InPost oznacza to odbiór przez
+        # kuriera, bez dokładania przez użytkownika drugiego ręcznego kroku.
+        "custom_attributes": {"sending_method": "dispatch_order"},
         "reference": reference[:100],
         "comments": (parcel.get("comments") or "")[:100],
         "additional_services": list(options.get("additional_services") or []),
