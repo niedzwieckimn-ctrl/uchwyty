@@ -50,6 +50,7 @@ from inpost_module import (
     create_courier_shipment,
     create_dispatch_order as inpost_create_dispatch_order,
     get_label as inpost_get_label,
+    get_shipment as inpost_get_shipment,
 )
 try:
     from ksef_api import ksef_config_summary, send_invoice_to_ksef
@@ -6497,7 +6498,11 @@ def order_view(order_id):
         <div class="muted" style="margin-top:6px;">{{ o['created_at'] }}</div>
         <form method="post" action="{{ url_for('order_mark_shipped', order_id=o['id']) }}" class="flex" style="margin-top:14px;padding:14px;border:1px solid #dbe4f2;border-radius:16px;background:#f8fbff;">
           <div><b>Wysyłka do klienta</b><div class="muted">Wpisz numer przesyłki i oznacz zamówienie jako wysłane.</div></div>
-          <a class="btn" href="{{ url_for('order_inpost_create', order_id=o['id']) }}">{% if o['inpost_shipment_id'] %}Pobierz etykietę InPost{% else %}Generuj etykietę InPost{% endif %}</a>
+          {% if o['inpost_shipment_id'] %}
+            <a class="btn primary" href="{{ url_for('order_inpost_label', order_id=o['id'], bundle='1') }}">Pobierz PDF A4 + A6</a>
+          {% else %}
+            <a class="btn" href="{{ url_for('order_inpost_create', order_id=o['id']) }}">Generuj etykietę InPost</a>
+          {% endif %}
           <a class="btn" href="{{ url_for('inpost_dispatch_order') }}">Zamów kuriera</a>
           <select name="carrier" required style="min-width:150px;">
             <option value="">-- Kurier --</option>
@@ -6826,7 +6831,12 @@ def inpost_label_allowed_for_status(status) -> bool:
 
 @app.route("/orders/<int:order_id>/inpost", methods=["GET", "POST"])
 def order_inpost_create(order_id):
-    maybe_pull_shared_from_supabase(force=True)
+    # Po utworzeniu przesyłki nie pobieramy natychmiast starszej kopii rekordu
+    # z Supabase. Dzięki temu zapisany identyfikator i przycisk PDF są widoczne
+    # od razu również wtedy, gdy synchronizacja zdalna potrzebuje chwili.
+    just_created = request.args.get("created") == "1"
+    if not just_created:
+        maybe_pull_shared_from_supabase(force=True)
     c = conn()
     try:
         cur = c.cursor()
@@ -6899,6 +6909,22 @@ def order_inpost_create(order_id):
                 tracking_number = norm(shipment.get("tracking_number"))
                 if not shipment_id:
                     raise InPostError("API nie zwróciło identyfikatora przesyłki")
+                # ShipX przygotowuje ofertę i potwierdza przesyłkę
+                # asynchronicznie. Pierwsza odpowiedź często nie ma jeszcze
+                # numeru śledzenia, dlatego przez kilka sekund odpytujemy
+                # utworzony zasób zamiast zostawiać puste pole w zamówieniu.
+                if not tracking_number:
+                    for attempt in range(6):
+                        if attempt:
+                            time.sleep(1)
+                        try:
+                            current_shipment = inpost_get_shipment(shipment_id)
+                        except InPostError:
+                            continue
+                        tracking_number = norm(current_shipment.get("tracking_number"))
+                        if tracking_number:
+                            shipment = current_shipment
+                            break
                 package_ids = [int(item["id"]) for item in package_orders]
                 c = conn()
                 try:
@@ -6913,8 +6939,17 @@ def order_inpost_create(order_id):
                 finally:
                     c.close()
                 if supabase_enabled():
-                    sync_local_rows_to_supabase("orders", "id", package_ids)
-                return redirect(url_for("order_inpost_label", order_id=order_id, bundle="1" if bundle else None))
+                    try:
+                        sync_local_rows_to_supabase("orders", "id", package_ids)
+                    except Exception as exc:
+                        # Przesyłka w InPost już istnieje. Błąd synchronizacji
+                        # nie może ukryć identyfikatora ani prowokować ponownego
+                        # utworzenia płatnej przesyłki.
+                        app.logger.exception("Przesyłka InPost %s utworzona, ale synchronizacja zamówień nie powiodła się: %s", shipment_id, exc)
+                return redirect(url_for(
+                    "order_inpost_create", order_id=order_id, created="1",
+                    bundle="1" if bundle else None,
+                ))
             except InPostError as exc:
                 error = str(exc)
 
@@ -6922,9 +6957,10 @@ def order_inpost_create(order_id):
     {% extends "base.html" %}{% block content %}
       <div class="card"><div class="flex"><div><h1 style="margin:0 0 8px;">Etykieta InPost</h1><div class="muted">Jedna przesyłka dla zamówień: {{ package_labels|join(', ') }}</div></div><a class="btn right" href="{{ url_for('order_view', order_id=o.id) }}">← Zamówienie</a></div></div>
       <div class="card">
+        {% if created and o.inpost_shipment_id %}<div class="hint" style="border-color:#a7e8cf;background:#edfbf6;color:#17684e;margin-bottom:15px;"><b>Przesyłka InPost została utworzona.</b>{% if o.tracking_no %} Numer: <b>{{ o.tracking_no }}</b>.{% else %} InPost przygotowuje jeszcze numer przesyłki.{% endif %} PDF pobierzesz przyciskiem poniżej.</div>{% endif %}
         {% if error %}<div class="hint" style="border-color:#fecaca;background:#fff1f2;margin-bottom:15px;">{{ error }}</div>{% endif %}
         {% if not cfg.configured %}<div class="hint">Dodaj na Renderze zmienne <b>INPOST_ORGANIZATION_ID</b> i <b>INPOST_API_TOKEN</b>.</div>{% endif %}
-        {% if o.inpost_shipment_id %}<div class="flex"><span class="badge">Przesyłka już utworzona</span><a class="btn primary" href="{{ url_for('order_inpost_label', order_id=o.id, bundle='1' if bundle else None) }}">{% if bundle %}Pobierz listę A4 + etykietę A6{% else %}Pobierz etykietę ponownie{% endif %}</a></div>{% else %}
+        {% if o.inpost_shipment_id %}<div class="flex"><span class="badge">Przesyłka już utworzona</span><a class="btn primary" href="{{ url_for('order_inpost_label', order_id=o.id, bundle='1' if bundle else None) }}">{% if bundle %}Pobierz listę A4 + etykietę A6 (PDF){% else %}Pobierz etykietę A6 (PDF){% endif %}</a><a class="btn" href="{{ url_for('order_view', order_id=o.id) }}">Wróć do zamówienia</a></div>{% else %}
         <form method="post" class="row">
           {% if bundle %}<input type="hidden" name="bundle" value="1">{% endif %}
           <div><label class="muted small">Serwis</label><select name="service" required><option value="inpost_courier_standard">Kurier Standard</option><option value="inpost_courier_express_1700">Doręczenie 17:00</option><option value="inpost_courier_express_1200">Doręczenie 12:00</option><option value="inpost_courier_express_1000">Doręczenie 10:00</option></select></div>
@@ -6944,7 +6980,7 @@ def order_inpost_create(order_id):
     {% endblock %}
     """
     labels = [canonical_order_no(item["id"], item["created_at"], item["order_no"]) for item in package_orders]
-    return render_template_string(tpl, title="Etykieta InPost", base_url=BASE_URL, db_path=DB_PATH, o=order, cfg=cfg, error=error, package_labels=labels, bundle=bundle)
+    return render_template_string(tpl, title="Etykieta InPost", base_url=BASE_URL, db_path=DB_PATH, o=order, cfg=cfg, error=error, package_labels=labels, bundle=bundle, created=just_created)
 
 
 @app.get("/orders/<int:order_id>/inpost/label")
@@ -6960,10 +6996,43 @@ def order_inpost_label(order_id):
     shipment_id = norm(row["inpost_shipment_id"])
     if not shipment_id:
         return redirect(url_for("order_inpost_create", order_id=order_id))
-    try:
-        pdf = inpost_get_label(shipment_id, "pdf", "A6")
-    except InPostError as exc:
-        return redirect(url_for("order_inpost_create", order_id=order_id, inpost_error=str(exc)[:240]))
+    # Przy okazji pobrania uzupełnij numer, jeśli pierwsza odpowiedź ShipX
+    # podczas tworzenia przesyłki jeszcze go nie zawierała.
+    if not norm(row["tracking_no"]):
+        try:
+            current_shipment = inpost_get_shipment(shipment_id)
+            refreshed_tracking = norm(current_shipment.get("tracking_number"))
+            if refreshed_tracking:
+                c = conn()
+                try:
+                    c.execute("UPDATE orders SET tracking_no=?, carrier='inpost' WHERE inpost_shipment_id=?", (refreshed_tracking, shipment_id))
+                    c.commit()
+                    changed_ids = [int(item["id"]) for item in c.execute("SELECT id FROM orders WHERE inpost_shipment_id=?", (shipment_id,)).fetchall()]
+                finally:
+                    c.close()
+                if supabase_enabled() and changed_ids:
+                    try:
+                        sync_local_rows_to_supabase("orders", "id", changed_ids)
+                    except Exception as exc:
+                        app.logger.warning("Nie udało się zsynchronizować numeru InPost: %s", exc)
+        except InPostError:
+            pass
+    label_error = None
+    pdf = None
+    for attempt in range(3):
+        try:
+            pdf = inpost_get_label(shipment_id, "pdf", "A6")
+            break
+        except InPostError as exc:
+            label_error = exc
+            if attempt < 2:
+                time.sleep(1)
+    if pdf is None:
+        return redirect(url_for(
+            "order_inpost_create", order_id=order_id,
+            inpost_error=(str(label_error)[:240] if label_error else "Etykieta nie jest jeszcze gotowa. Spróbuj ponownie."),
+            bundle="1" if request.args.get("bundle") == "1" else None,
+        ))
     filename_root = safe_filename(canonical_order_no(row["id"], row["created_at"], row["order_no"]))
     if request.args.get("bundle") == "1":
         pack_path = norm(session.get(f"inpost_pack_path_{order_id}"))

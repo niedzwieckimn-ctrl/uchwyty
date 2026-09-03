@@ -154,6 +154,10 @@ def get_label(shipment_id, label_format="pdf", label_type="A6"):
     )
 
 
+def get_shipment(shipment_id):
+    return _request(f"/shipments/{int(shipment_id)}")
+
+
 def create_dispatch_order(shipment_ids, pickup):
     organization_id = config_summary()["organization_id"]
     clean_ids = list(dict.fromkeys(str(int(value)) for value in shipment_ids if value))
