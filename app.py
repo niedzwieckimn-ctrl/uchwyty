@@ -2463,7 +2463,7 @@ def generate_order_invoice_pdf(order_row, items, meta):
         invoice_language = {"DE": "de", "AT": "de", "CH": "de", "ES": "es", "IT": "it"}.get(country, "en")
     PDF_COPY = {
         "pl": {"place":"Miejsce","issue":"Data wystawienia","sell":"Data sprzedaży","payment":"Forma płatności","due":"Termin płatności","seller":"Sprzedawca","buyer":"Nabywca","name":"Nazwa/SKU","qty":"Ilość","net_unit":"Netto/szt","gross_unit":"Brutto/szt","net_value":"Wartość netto","discount":"Rabat","net_total":"Suma netto","gross_total":"Suma brutto","wdt":"Wewnątrzwspólnotowa dostawa towarów (WDT) — stawka VAT 0%.","wdt_basis":"Podstawa: art. 42 ustawy o VAT; zastosowanie stawki wymaga spełnienia warunków ustawowych.","account":"konto","phone":"tel","email":"email"},
-        "de": {"place":"Ort","issue":"Rechnungsdatum","sell":"Lieferdatum","payment":"Zahlungsart","due":"Zahlungsfrist","seller":"Verkäufer","buyer":"Käufer","name":"Bezeichnung/SKU","qty":"Menge","net_unit":"Netto/Stk.","gross_unit":"Brutto/Stk.","net_value":"Nettowert","discount":"Rabatt","net_total":"Nettosumme","gross_total":"Bruttosumme","wdt":"Innergemeinschaftliche Lieferung — Umsatzsteuersatz 0 %.","wdt_basis":"Rechtsgrundlage: Art. 42 des polnischen Umsatzsteuergesetzes; der Steuersatz 0 % gilt bei Erfüllung der gesetzlichen Voraussetzungen.","account":"Konto","phone":"Tel.","email":"E-Mail"},
+        "de": {"place":"Ort","issue":"Rechnungsdatum","sell":"Lieferdatum","payment":"Zahlungsart","due":"Zahlungsfrist","seller":"Verkäufer","buyer":"Käufer","name":"Bezeichnung/SKU","qty":"Menge","net_unit":"Netto/Stk.","gross_unit":"Brutto/Stk.","net_value":"Nettowert","discount":"Rabatt","net_total":"Nettosumme","gross_total":"Bruttosumme","wdt":"Innergemeinschaftliche Lieferung – Umsatzsteuersatz 0 %.","wdt_basis":"Rechtsgrundlage: Art. 42 des polnischen Umsatzsteuergesetzes i. V. m. Art. 138 der Richtlinie 2006/112/EG.","account":"Konto","phone":"Tel.","email":"E-Mail"},
         "en": {"place":"Place","issue":"Invoice date","sell":"Supply date","payment":"Payment method","due":"Payment due","seller":"Seller","buyer":"Buyer","name":"Description/SKU","qty":"Qty","net_unit":"Net/unit","gross_unit":"Gross/unit","net_value":"Net value","discount":"Discount","net_total":"Net total","gross_total":"Gross total","wdt":"Intra-Community supply — VAT rate 0%.","wdt_basis":"Legal basis: Article 42 of the Polish VAT Act; the 0% rate applies subject to statutory conditions.","account":"account","phone":"tel.","email":"email"},
         "es": {"place":"Lugar","issue":"Fecha de factura","sell":"Fecha de entrega","payment":"Forma de pago","due":"Vencimiento","seller":"Vendedor","buyer":"Comprador","name":"Descripción/SKU","qty":"Cantidad","net_unit":"Neto/ud.","gross_unit":"Bruto/ud.","net_value":"Valor neto","discount":"Descuento","net_total":"Total neto","gross_total":"Total bruto","wdt":"Entrega intracomunitaria — IVA 0 %.","wdt_basis":"Base legal: art. 42 de la Ley polaca del IVA; el tipo 0 % se aplica si se cumplen los requisitos legales.","account":"cuenta","phone":"tel.","email":"email"},
         "it": {"place":"Luogo","issue":"Data fattura","sell":"Data consegna","payment":"Metodo di pagamento","due":"Scadenza","seller":"Venditore","buyer":"Acquirente","name":"Descrizione/SKU","qty":"Quantità","net_unit":"Netto/pz.","gross_unit":"Lordo/pz.","net_value":"Valore netto","discount":"Sconto","net_total":"Totale netto","gross_total":"Totale lordo","wdt":"Cessione intracomunitaria — IVA 0%.","wdt_basis":"Base giuridica: art. 42 della legge polacca sull’IVA; l’aliquota 0% si applica se sono soddisfatte le condizioni di legge.","account":"conto","phone":"tel.","email":"email"},
@@ -2529,20 +2529,31 @@ def generate_order_invoice_pdf(order_row, items, meta):
     pdf_font, pdf_font_bold = get_pdf_font_names()
 
     header_y = h - 20 * mm
-    cpdf.setFont(pdf_font_bold, 14)
     if invoice_language == "de":
         document_title = "Rechnung – innergemeinschaftliche Lieferung 0 %" if document_vat_rate == 0 else "Rechnung"
+        invoice_no_label = "Rechnungsnummer"
     elif invoice_language == "en":
         document_title = "Invoice – intra-Community supply 0%" if document_vat_rate == 0 else "VAT invoice"
+        invoice_no_label = "Invoice number"
     elif invoice_language == "es":
         document_title = "Factura – entrega intracomunitaria 0 %" if document_vat_rate == 0 else "Factura"
+        invoice_no_label = "Número de factura"
     elif invoice_language == "it":
         document_title = "Fattura – cessione intracomunitaria 0%" if document_vat_rate == 0 else "Fattura"
+        invoice_no_label = "Numero fattura"
     else:
         document_title = "Faktura WDT 0%" if document_vat_rate == 0 else "Faktura VAT"
-    cpdf.drawString(15 * mm, header_y, f"{document_title}: {meta['invoice_no']}")
+        invoice_no_label = "Numer faktury"
 
-    y = h - 34 * mm
+    # Numer faktury musi być w pełni widoczny. Wcześniej tytuł i numer były
+    # rysowane w jednym długim wierszu, a następnie logo przykrywało środek
+    # numeru (na PDF zostawało np. samo „26” z końcówki roku 2026).
+    cpdf.setFont(pdf_font_bold, 13)
+    cpdf.drawString(15 * mm, header_y, fit_pdf_text(document_title, pdf_font_bold, 13, 125 * mm, suffix=""))
+    cpdf.setFont(pdf_font_bold, 10)
+    cpdf.drawString(15 * mm, header_y - 6 * mm, f"{invoice_no_label}: {pdf_txt(meta['invoice_no'])}")
+
+    y = h - 38 * mm
     logo = find_logo_path()
     if logo:
         try:
@@ -2755,9 +2766,13 @@ def generate_order_invoice_pdf(order_row, items, meta):
     if document_vat_rate == 0:
         y -= 9 * mm
         cpdf.setFont(pdf_font, 8.5)
-        cpdf.drawString(15 * mm, y, pdf_copy["wdt"])
-        y -= 4.5 * mm
-        cpdf.drawString(15 * mm, y, pdf_copy["wdt_basis"])
+        legal_width = 180 * mm
+        for legal_line in wrap_pdf_text(pdf_copy["wdt"], pdf_font, 8.5, legal_width):
+            cpdf.drawString(15 * mm, y, legal_line)
+            y -= 4.5 * mm
+        for legal_line in wrap_pdf_text(pdf_copy["wdt_basis"], pdf_font, 8.5, legal_width):
+            cpdf.drawString(15 * mm, y, legal_line)
+            y -= 4.5 * mm
 
     ksef_number = norm(meta.get("ksef_number") or "")
     if ksef_number:
