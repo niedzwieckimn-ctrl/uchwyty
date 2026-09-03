@@ -1021,6 +1021,20 @@ SUPABASE_SYNC_TABLES = [
     ("cash_flow_expenses", "id"),
 ]
 
+# Kolumna jest używana lokalnie przez moduł zamawiania odbioru InPost, ale
+# starszy schemat Supabase jej nie posiada. Nie może przez to blokować
+# synchronizacji całego rekordu zamówienia ani działania pulpitu.
+SUPABASE_LOCAL_ONLY_COLUMNS = {
+    "orders": {"inpost_dispatch_order_id"},
+}
+
+
+def supabase_compatible_rows(table: str, rows: list) -> list:
+    omitted = SUPABASE_LOCAL_ONLY_COLUMNS.get(table, set())
+    if not omitted:
+        return rows
+    return [{key: value for key, value in row.items() if key not in omitted} for row in rows]
+
 # KolejnoĹ›Ä‡ PULL jest waĹĽna: najpierw rodzice, potem dzieci.
 SUPABASE_PULL_TABLES = [
     ("company_profile", "id"),
@@ -1061,6 +1075,7 @@ def supabase_upsert_rows(table: str, rows: list, on_conflict: str):
     if not supabase_enabled():
         raise RuntimeError("Brak konfiguracji SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY")
 
+    rows = supabase_compatible_rows(table, rows)
     qs = urllib.parse.urlencode({"on_conflict": on_conflict})
     url = f"{SUPABASE_URL}/rest/v1/{table}?{qs}"
     payload = json.dumps(rows, ensure_ascii=False).encode("utf-8")
@@ -3688,16 +3703,21 @@ def home():
 
     cur.execute("""
       SELECT COALESCE(SUM(
-        (COALESCE(s.qty,0) + COALESCE(d.in_delivery_qty,0)) * COALESCE((
+        (COALESCE(s.qty,0) + COALESCE(d.in_delivery_qty,0)) * COALESCE(
+        (
           SELECT pr.net_price
           FROM pricing pr
           WHERE TRIM(LOWER(pr.model)) = TRIM(LOWER(p.sku))
-             OR TRIM(LOWER(pr.model)) = TRIM(LOWER(p.model))
-          ORDER BY
-            CASE WHEN TRIM(LOWER(pr.model)) = TRIM(LOWER(p.sku)) THEN 0 ELSE 1 END,
-            pr.created_at DESC
+          ORDER BY pr.created_at DESC
           LIMIT 1
-        ),0)
+        ),
+        (
+          SELECT pr.net_price
+          FROM pricing pr
+          WHERE TRIM(LOWER(pr.model)) = TRIM(LOWER(p.model))
+          ORDER BY pr.created_at DESC
+          LIMIT 1
+        ), 0)
       ), 0) AS v
       FROM products p
       LEFT JOIN stock s ON s.product_id=p.id
