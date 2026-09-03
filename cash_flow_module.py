@@ -8,6 +8,28 @@ from flask import render_template_string
 from inventory_analytics import build_replenishment_analysis, recommended_replenishments
 
 
+# Stały, świadomie uproszczony kurs używany wyłącznie w analizie Cash flow.
+# Nie zmienia kwot ani waluty zapisanych na fakturze.
+EUR_TO_PLN_CASH_FLOW_RATE = 4.30
+
+
+def invoice_cash_flow_context(order_currency, invoice_items_json):
+    """Zwraca pozycje, walutę faktury i kurs analityczny do PLN."""
+    try:
+        items = json.loads(invoice_items_json or "[]")
+        if not isinstance(items, list):
+            items = []
+    except Exception:
+        items = []
+    currency = str(order_currency or "PLN").strip().upper()
+    if items:
+        currency = str(items[0].get("currency") or currency).strip().upper()
+    if currency != "EUR":
+        currency = "PLN"
+    rate = EUR_TO_PLN_CASH_FLOW_RATE if currency == "EUR" else 1.0
+    return items, currency, rate
+
+
 CASH_FLOW_SETTING_KEYS = {
     "account_balance": "0",
     "monthly_zus": "0",
@@ -237,9 +259,11 @@ def register_cash_flow(app, deps):
                  COALESCE(m.paid,0) AS paid,
                  m.paid_at,
                  COALESCE(m.payment_reminder,0) AS payment_reminder,
-                 m.invoice_items_json
+                 m.invoice_items_json,
+                 COALESCE(o.currency,'PLN') AS order_currency
           FROM invoices i
           LEFT JOIN invoice_meta m ON m.invoice_id=i.id
+          LEFT JOIN orders o ON o.id=i.order_id
           ORDER BY COALESCE(i.payment_to, i.issue_date) ASC, i.id DESC
         """)
         invoices_rows = cur.fetchall()
@@ -259,8 +283,13 @@ def register_cash_flow(app, deps):
         sales_chart_by_month = {row["key"]: row for row in sales_chart}
 
         for inv in invoices_rows:
-            gross = to_float(inv["total_gross"], 0)
-            net = to_float(inv["total_net"], 0)
+            invoice_items, invoice_currency, cash_flow_rate = invoice_cash_flow_context(
+                inv["order_currency"], inv["invoice_items_json"]
+            )
+            gross_original = to_float(inv["total_gross"], 0)
+            net_original = to_float(inv["total_net"], 0)
+            gross = gross_original * cash_flow_rate
+            net = net_original * cash_flow_rate
             vat = max(0.0, gross - net)
             paid = int(inv["paid"] or 0) == 1
             issue_d = parse_date_safe(inv["issue_date"])
@@ -274,14 +303,10 @@ def register_cash_flow(app, deps):
                     chart_row["invoices"] += 1
                     chart_row["revenue"] += net
                     invoice_units = 0
-                    try:
-                        invoice_items = json.loads(inv["invoice_items_json"] or "[]")
-                        invoice_units = sum(
-                            int(item.get("qty") or item.get("invoice_qty") or item.get("current_invoice_qty") or 0)
-                            for item in invoice_items
-                        )
-                    except Exception:
-                        invoice_units = 0
+                    invoice_units = sum(
+                        int(item.get("qty") or item.get("invoice_qty") or item.get("current_invoice_qty") or 0)
+                        for item in invoice_items
+                    )
                     if invoice_units <= 0:
                         cur.execute(
                             "SELECT COALESCE(SUM(qty),0) AS qty FROM invoice_allocations WHERE invoice_id=?",
@@ -299,11 +324,8 @@ def register_cash_flow(app, deps):
             if issue_d and issue_d >= today - timedelta(days=30):
                 last_30_net += net
                 last_30_profit += net * 0.60
-                try:
-                    for item in json.loads(inv["invoice_items_json"] or "[]"):
-                        sold_30_qty += int(item.get("qty") or item.get("invoice_qty") or item.get("current_invoice_qty") or 0)
-                except Exception:
-                    pass
+                for item in invoice_items:
+                    sold_30_qty += int(item.get("qty") or item.get("invoice_qty") or item.get("current_invoice_qty") or 0)
 
             if paid:
                 paid_d = parse_date_safe(inv["paid_at"]) or issue_d
@@ -333,6 +355,9 @@ def register_cash_flow(app, deps):
                 "buyer": buyer,
                 "due": due_d.isoformat() if due_d else "-",
                 "gross": gross,
+                "gross_original": gross_original,
+                "currency": invoice_currency,
+                "cash_flow_rate": cash_flow_rate,
                 "days": (due_d - today).days if due_d else 0,
                 "overdue": is_overdue,
                 "reminder": int(inv["payment_reminder"] or 0) == 1,
@@ -615,7 +640,7 @@ def register_cash_flow(app, deps):
                   {% for r in inflow_rows %}
                     <tr>
                       <td><b>{{ r.invoice_no }}</b></td><td>{{ r.buyer }}</td><td>{{ r.due }}</td>
-                      <td>{{ "%.2f"|format(r.gross) }}</td>
+                      <td><b>{{ "%.2f"|format(r.gross) }} PLN</b>{% if r.currency == 'EUR' %}<div class="muted small">{{ "%.2f"|format(r.gross_original) }} EUR × {{ "%.2f"|format(r.cash_flow_rate) }}</div>{% endif %}</td>
                       <td>{% if r.overdue %}<span class="badge" style="color:#b00020;">zaległa {{ -r.days }} dni</span>{% elif r.days <= 7 %}<span class="badge">do 7 dni</span>{% else %}<span class="badge">oczekuje</span>{% endif %}</td>
                     </tr>
                   {% endfor %}
