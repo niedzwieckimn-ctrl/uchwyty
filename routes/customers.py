@@ -582,76 +582,45 @@ def register_routes(context):
         if results_count < 0:
             results_count = 0
         matches = data.get("matches") if isinstance(data.get("matches"), list) else []
-        rows_to_save = []
         created_at = now_iso()
-        seen_products = set()
+        model_candidates = {}
+        exact_model = None
         for item in matches[:30]:
             if not isinstance(item, dict):
                 continue
-            product_sku = norm(item.get("sku"))[:120]
-            product_model = norm(item.get("model"))[:120] or product_sku
+            product_model = norm(item.get("model"))[:120]
             product_name = norm(item.get("name"))[:180]
-            product_key = (product_model.lower(), product_sku.lower())
-            if not product_model or product_key in seen_products:
+            if not product_model:
                 continue
-            seen_products.add(product_key)
-            rows_to_save.append({
-                "customer_email": email,
-                "customer_name": name,
-                "query": query,
-                "product_sku": product_sku,
-                "product_model": product_model,
-                "product_name": product_name,
-                "results_count": results_count,
-                "source": source,
-                "created_at": created_at,
-            })
+            model_candidates.setdefault(product_model.casefold(), (product_model, product_name))
+            if query.casefold() in {product_model.casefold(), product_name.casefold()}:
+                exact_model = (product_model, product_name)
 
-        if not rows_to_save:
-            rows_to_save.append({
-                "customer_email": email,
-                "customer_name": name,
-                "query": query,
-                "product_sku": "",
-                "product_model": "",
-                "product_name": "",
-                "results_count": results_count,
-                "source": source,
-                "created_at": created_at,
-            })
+        selected_model = exact_model
+        if selected_model is None and len(model_candidates) == 1:
+            selected_model = next(iter(model_candidates.values()))
+        rows_to_save = [{
+            "customer_email": email,
+            "customer_name": name,
+            "query": query,
+            "product_sku": "",
+            "product_model": selected_model[0] if selected_model else "",
+            "product_name": selected_model[1] if selected_model else "",
+            "results_count": results_count,
+            "source": source,
+            "created_at": created_at,
+        }]
 
         cutoff = (app_now() - timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
         deduped_rows = []
         c = conn()
         cur = c.cursor()
         for row in rows_to_save:
-            if row.get("product_sku") or row.get("product_model"):
-                cur.execute("""
+            cur.execute("""
                   SELECT 1
                   FROM client_search_logs
                   WHERE LOWER(COALESCE(customer_email,''))=?
                     AND LOWER(COALESCE(query,''))=?
-                    AND LOWER(COALESCE(product_sku,''))=?
-                    AND LOWER(COALESCE(product_model,''))=?
-                    AND COALESCE(source,'stock')=?
-                    AND created_at>=?
-                  LIMIT 1
-                """, (
-                    row.get("customer_email", "").lower(),
-                    row.get("query", "").lower(),
-                    row.get("product_sku", "").lower(),
-                    row.get("product_model", "").lower(),
-                    row.get("source", "stock"),
-                    cutoff,
-                ))
-            else:
-                cur.execute("""
-                  SELECT 1
-                  FROM client_search_logs
-                  WHERE LOWER(COALESCE(customer_email,''))=?
-                    AND LOWER(COALESCE(query,''))=?
-                    AND COALESCE(product_sku,'')=''
-                    AND COALESCE(product_model,'')=''
                     AND COALESCE(source,'stock')=?
                     AND created_at>=?
                   LIMIT 1
