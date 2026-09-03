@@ -405,6 +405,30 @@ def init_db():
     )
     """)
 
+    # Trwałe źródło danych dla faktury tworzonej po liście pakowej.
+    # Sesja przeglądarki może zniknąć po wdrożeniu lub restarcie Rendera.
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS packing_batches(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        root_order_id INTEGER NOT NULL,
+        invoice_id INTEGER,
+        created_at TEXT NOT NULL
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS packing_allocations(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        batch_id INTEGER NOT NULL,
+        order_id INTEGER NOT NULL,
+        order_item_id INTEGER NOT NULL,
+        qty INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(batch_id) REFERENCES packing_batches(id)
+    )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_packing_batches_root_open ON packing_batches(root_order_id, invoice_id, id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_packing_allocations_batch ON packing_allocations(batch_id)")
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS client_search_logs(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3149,6 +3173,74 @@ def order_fully_invoiced(cur, order_id: int) -> bool:
     return all(int(row["qty"] or 0) > 0 and int(done.get(int(row["id"]), 0)) >= int(row["qty"] or 0) for row in rows)
 
 
+def save_packing_selection(root_order_id: int, packing_items: list[dict]) -> int:
+    """Persist one packing choice until it is consumed by an invoice."""
+    rows = []
+    for item in packing_items or []:
+        order_id = to_int(item.get("source_order_id") or item.get("order_id"), 0)
+        item_id = to_int(item.get("order_item_id") or item.get("id"), 0)
+        qty = max(0, to_int(item.get("qty"), 0))
+        if order_id > 0 and item_id > 0 and qty > 0:
+            rows.append((order_id, item_id, qty))
+    if not rows:
+        return 0
+    c = conn()
+    cur = c.cursor()
+    cur.execute(
+        "INSERT INTO packing_batches(root_order_id, invoice_id, created_at) VALUES(?,NULL,?)",
+        (int(root_order_id), now_iso()),
+    )
+    batch_id = int(cur.lastrowid)
+    cur.executemany(
+        """INSERT INTO packing_allocations(batch_id, order_id, order_item_id, qty, created_at)
+           VALUES(?,?,?,?,?)""",
+        [(batch_id, order_id, item_id, qty, now_iso()) for order_id, item_id, qty in rows],
+    )
+    c.commit()
+    c.close()
+    return batch_id
+
+
+def load_open_packing_selection(root_order_id: int) -> dict:
+    c = conn()
+    cur = c.cursor()
+    cur.execute(
+        """SELECT id FROM packing_batches
+           WHERE root_order_id=? AND invoice_id IS NULL
+           ORDER BY id DESC LIMIT 1""",
+        (int(root_order_id),),
+    )
+    batch = cur.fetchone()
+    if not batch:
+        c.close()
+        return {}
+    batch_id = int(batch["id"])
+    cur.execute(
+        "SELECT order_id, order_item_id, qty FROM packing_allocations WHERE batch_id=? ORDER BY id",
+        (batch_id,),
+    )
+    rows = [dict(row) for row in cur.fetchall()]
+    c.close()
+    return {
+        "batch_id": batch_id,
+        "root_order_id": int(root_order_id),
+        "order_ids": sorted({int(row["order_id"]) for row in rows}),
+        "items": [[int(row["order_item_id"]), int(row["qty"])] for row in rows],
+    }
+
+
+def consume_packing_selection(batch_id: int, invoice_id: int):
+    if batch_id <= 0 or invoice_id <= 0:
+        return
+    c = conn()
+    c.execute(
+        "UPDATE packing_batches SET invoice_id=? WHERE id=? AND invoice_id IS NULL",
+        (int(invoice_id), int(batch_id)),
+    )
+    c.commit()
+    c.close()
+
+
 def issue_order_stock(cur, order_id: int) -> list[int]:
     """Odejmij pełne zamówienie dokładnie raz w bieżącej transakcji."""
     cur.execute(
@@ -3754,6 +3846,7 @@ def home():
       ) d ON d.product_id=p.id
       WHERE COALESCE(p.archived,0)=0
     """)
+
     inventory_value_net = float(cur.fetchone()["v"] or 0)
     cur.execute("SELECT COUNT(*) AS n FROM orders WHERE date(created_at)=date('now','localtime')")
     n_orders_today = int(cur.fetchone()["n"] or 0)
@@ -3785,7 +3878,8 @@ def home():
     n_issued_today = int(cur.fetchone()["n"] or 0)
     # Zamowienia, ktore mozna wydac z obecnego stanu. Stan jest rezerwowany
     # od najstarszego zamowienia, aby ta sama sztuka nie byla liczona dwa razy.
-    status_ph = ",".join(["?"] * len(CURRENT_ORDER_STATUSES))
+    issuable_statuses = {"new", "pending", "unconfirmed", "confirmed", "packed", "packed_partial"}
+    status_ph = ",".join(["?"] * len(issuable_statuses))
     cur.execute(f"""
       SELECT o.id, o.order_no, o.created_at, o.note, oi.product_id,
              SUM(oi.qty) AS required_qty
@@ -3795,7 +3889,7 @@ def home():
         AND COALESCE(o.warehouse_issued,0)=0
       GROUP BY o.id, oi.product_id
       ORDER BY o.created_at, o.id, oi.product_id
-    """, tuple(sorted(CURRENT_ORDER_STATUSES)))
+    """, tuple(sorted(issuable_statuses)))
     issue_rows = [dict(r) for r in cur.fetchall()]
     cur.execute("SELECT product_id, MAX(0, COALESCE(qty,0)) AS qty FROM stock")
     issue_stock_pool = {int(r["product_id"]): int(r["qty"] or 0) for r in cur.fetchall()}
@@ -7356,7 +7450,14 @@ def order_invoice(order_id):
     if not o:
         c.close()
         abort(404)
-    related_orders = [dict(o)] if norm(o["status"]).lower() in CURRENT_ORDER_STATUSES else []
+    packing_selection = session.get("latest_packing_selection") or load_open_packing_selection(order_id)
+    packing_order_ids = {
+        to_int(value, 0) for value in packing_selection.get("order_ids", [])
+        if to_int(value, 0) > 0
+    } if isinstance(packing_selection, dict) else set()
+    # Fakturę można wystawić również po wysyłce lub po ręcznej korekcie
+    # statusu. O dostępności pozycji decydują ilości/alokacje, nie status.
+    related_orders = [dict(o)]
     customer_email_key = _email_key(o["customer_email"])
     if customer_email_key:
         status_ph = ",".join(["?"] * len(CURRENT_ORDER_STATUSES))
@@ -7368,6 +7469,14 @@ def order_invoice(order_id):
           ORDER BY created_at DESC, id DESC
         """, (customer_email_key, *sorted(CURRENT_ORDER_STATUSES)))
         related_orders = [dict(r) for r in cur.fetchall()]
+        if int(order_id) not in {int(r["id"]) for r in related_orders}:
+            related_orders.insert(0, dict(o))
+
+    missing_packing_ids = packing_order_ids - {int(r["id"]) for r in related_orders}
+    if missing_packing_ids:
+        packing_ph = ",".join(["?"] * len(missing_packing_ids))
+        cur.execute(f"SELECT * FROM orders WHERE id IN ({packing_ph})", tuple(sorted(missing_packing_ids)))
+        related_orders.extend(dict(r) for r in cur.fetchall())
 
     related_order_ids = [int(r["id"]) for r in related_orders] or [-1]
     related_order_by_id = {int(r["id"]): r for r in related_orders}
@@ -7408,11 +7517,6 @@ def order_invoice(order_id):
         it["invoiced_qty"] = done_qty
         it["remaining_qty"] = max(0, ordered_qty - done_qty)
 
-    packing_selection = session.get("latest_packing_selection") or {}
-    packing_order_ids = {
-        to_int(value, 0) for value in packing_selection.get("order_ids", [])
-        if to_int(value, 0) > 0
-    } if isinstance(packing_selection, dict) else set()
     packing_qty_by_item = {}
     if int(order_id) in packing_order_ids:
         for pair in packing_selection.get("items", []):
@@ -7668,6 +7772,7 @@ def order_invoice(order_id):
                         pass
             _order_id, email_ok, email_error = _send_invoice_to_client(invoice_id)
             if invoice_from_packing:
+                consume_packing_selection(to_int(packing_selection.get("batch_id"), 0), invoice_id)
                 session.pop("latest_packing_selection", None)
             redirect_args = {
                 "generated": "1",
@@ -10785,7 +10890,7 @@ def order_packing_list_download_admin(order_id):
         return "Wybierz co najmniej jedną sztukę do spakowania", 400
 
     packed_order_ids = sorted({int(item["source_order_id"]) for item in items})
-    session["latest_packing_selection"] = {
+    packing_state = {
         "root_order_id": int(order_id),
         "order_ids": packed_order_ids,
         "items": [
@@ -10794,6 +10899,8 @@ def order_packing_list_download_admin(order_id):
             if int(item.get("id") or item.get("order_item_id") or 0) > 0 and int(item.get("qty") or 0) > 0
         ],
     }
+    packing_state["batch_id"] = save_packing_selection(order_id, items)
+    session["latest_packing_selection"] = packing_state
     order_no = canonical_order_no(order_row["id"], order_row["created_at"], order_row["order_no"])
     meta = {
         "invoice_no": order_no,
