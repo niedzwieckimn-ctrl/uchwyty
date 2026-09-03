@@ -649,7 +649,7 @@ def register_cash_flow(app, deps):
               </table>
             </div>
 
-            <div class="card">
+            <div class="card" id="replenishment-ranking">
               <h2>Inteligentny ranking uzupełniania</h2>
               <p class="muted">Łączy faktyczne wydania, dostępny stan, rezerwacje, niezarezerwowany towar w drodze i zainteresowanie klientów. Cel: zapas na {{ reorder_horizon_days }} dni.</p>
               <table>
