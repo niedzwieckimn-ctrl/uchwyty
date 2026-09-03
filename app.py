@@ -2548,8 +2548,12 @@ def generate_order_invoice_pdf(order_row, items, meta):
     # Numer faktury musi być w pełni widoczny. Wcześniej tytuł i numer były
     # rysowane w jednym długim wierszu, a następnie logo przykrywało środek
     # numeru (na PDF zostawało np. samo „26” z końcówki roku 2026).
-    cpdf.setFont(pdf_font_bold, 13)
-    cpdf.drawString(15 * mm, header_y, fit_pdf_text(document_title, pdf_font_bold, 13, 125 * mm, suffix=""))
+    # Niemiecki tytuł WDT jest odrobinę dłuższy niż dostępne 125 mm przy 13 pt.
+    # Używamy 12.5 pt, żeby cały napis (łącznie z „%”) mieścił się bez ucinania
+    # i nadal zachował bezpieczny odstęp od logo.
+    header_title_size = 12.5
+    cpdf.setFont(pdf_font_bold, header_title_size)
+    cpdf.drawString(15 * mm, header_y, fit_pdf_text(document_title, pdf_font_bold, header_title_size, 125 * mm, suffix=""))
     cpdf.setFont(pdf_font_bold, 10)
     cpdf.drawString(15 * mm, header_y - 6 * mm, f"{invoice_no_label}: {pdf_txt(meta['invoice_no'])}")
 
