@@ -4048,6 +4048,7 @@ def client_searches_v2():
     client_stats = {}
     phrase_events_seen = set()
     model_events_seen = set()
+    latest_events = []
 
     for r in rows:
         query = norm(r.get("query"))
@@ -4062,7 +4063,9 @@ def client_searches_v2():
         results_count = to_int(r.get("results_count"), 0)
         created_at = norm(r.get("created_at"))
 
-        model_label = product_model or product_sku
+        # Ranking produktowy jest rankingiem modeli. SKU jest tylko technicznym
+        # wariantem produktu i nie może tworzyć osobnego "wyszukania".
+        model_label = product_model
         model_key = model_label.lower()
         model_event_key = (client_key, query.lower(), model_key, created_at)
         if model_key and results_count > 0 and model_event_key not in model_events_seen:
@@ -4084,6 +4087,7 @@ def client_searches_v2():
         if phrase_event_key in phrase_events_seen:
             continue
         phrase_events_seen.add(phrase_event_key)
+        latest_events.append(r)
 
         phrase = phrase_stats.setdefault(query, {
             "query": query,
@@ -4102,16 +4106,20 @@ def client_searches_v2():
             phrase["last_at"] = created_at
 
         summary_name = client_label if client_label and client_label != "-" else "Nieznany klient"
-        skey = (summary_name, query)
+        skey = summary_name
         summary = client_stats.setdefault(skey, {
             "client_label": summary_name,
-            "query": query,
             "searches_count": 0,
+            "phrases": set(),
+            "models": set(),
             "no_result_count": 0,
             "max_results": 0,
             "last_at": "",
         })
         summary["searches_count"] += 1
+        summary["phrases"].add(query)
+        if model_label:
+            summary["models"].add(model_label)
         if results_count == 0:
             summary["no_result_count"] += 1
         summary["max_results"] = max(summary["max_results"], results_count)
@@ -4134,12 +4142,18 @@ def client_searches_v2():
     phrase_rows.sort(key=lambda r: (r["searches_count"], r["last_at"]), reverse=True)
     phrase_rows = phrase_rows[:10]
 
-    summary_rows = list(client_stats.values())
-    summary_rows.sort(key=lambda r: r["last_at"], reverse=True)
+    summary_rows = []
+    for r in client_stats.values():
+        item = dict(r)
+        item["phrases_count"] = len(item.pop("phrases"))
+        item["models_count"] = len(item.pop("models"))
+        summary_rows.append(item)
+    summary_rows.sort(key=lambda r: (r["searches_count"], r["last_at"]), reverse=True)
     summary_rows = summary_rows[:50]
 
-    latest_rows = rows[:50]
-    total_count = len(rows)
+    latest_events.sort(key=lambda r: norm(r.get("created_at")), reverse=True)
+    latest_rows = latest_events[:50]
+    total_count = len(phrase_events_seen)
 
     tpl = r"""
     {% extends "base.html" %}
@@ -4158,18 +4172,30 @@ def client_searches_v2():
       </div>
 
       <div class="card">
+        <h2>Wyszukiwania według klienta</h2>
+        <div class="muted" style="margin-bottom:8px;">Jedno wpisanie frazy przez klienta jest liczone jako jedno wyszukanie, niezależnie od liczby wyników.</div>
+        <table>
+          <thead><tr><th>Klient</th><th>Wyszukań</th><th>Różnych fraz</th><th>Bez wyników</th><th>Ostatnio</th></tr></thead>
+          <tbody>
+            {% for r in summary_rows %}<tr><td><b>{{ r.client_label }}</b></td><td><span class="badge">{{ r.searches_count }}</span></td><td>{{ r.phrases_count }}</td><td>{{ r.no_result_count or '-' }}</td><td class="muted">{{ r.last_at }}</td></tr>{% endfor %}
+            {% if not summary_rows %}<tr><td colspan="5" class="muted">Brak zapisanych wyszukiwań.</td></tr>{% endif %}
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card">
         <h2>Najczęściej wyszukiwane modele</h2>
         <div class="muted" style="margin-bottom:8px;">
-          Ogólne wyszukiwania przypisane do konkretnego modelu lub SKU — najważniejszy widok na tej stronie.
+          Ranking według modelu. Różne SKU tego samego modelu nie zwiększają licznika.
         </div>
         <table>
           <thead>
-            <tr><th>Model / SKU</th><th>Nazwa</th><th>Ile razy</th><th>Klientów</th><th>Ostatnio</th></tr>
+            <tr><th>Model</th><th>Nazwa</th><th>Wyszukań</th><th>Klientów</th><th>Ostatnio</th></tr>
           </thead>
           <tbody>
             {% for r in name_rows %}
               <tr>
-                <td><b>{{ r.product_model or r.product_sku or '-' }}</b>{% if r.product_sku and r.product_sku != r.product_model %}<div class="muted small">{{ r.product_sku }}</div>{% endif %}</td>
+                <td><b>{{ r.product_model or '-' }}</b></td>
                 <td>{{ r.product_name or '-' }}</td>
                 <td><span class="badge">{{ r.searches_count }}</span></td>
                 <td>{{ r.clients_count }}</td>
@@ -4187,7 +4213,7 @@ def client_searches_v2():
         <h2>Ostatnie wyszukiwania</h2>
         <table>
           <thead>
-            <tr><th>Czas</th><th>Klient</th><th>Fraza</th><th>Nazwa</th><th>Model / SKU</th><th>Wyniki</th></tr>
+            <tr><th>Czas</th><th>Klient</th><th>Fraza</th><th>Nazwa</th><th>Model</th><th>Wyniki</th></tr>
           </thead>
           <tbody>
             {% for r in latest_rows %}
@@ -4196,7 +4222,7 @@ def client_searches_v2():
                 <td>{{ r._client_label or '-' }}</td>
                 <td><b>{{ r.query }}</b></td>
                 <td>{{ r._product_label or '-' }}</td>
-                <td>{{ r.product_model or r.product_sku or '-' }}</td>
+                <td>{{ r.product_model or '-' }}</td>
                 <td>{{ r.results_count }}</td>
               </tr>
             {% endfor %}
@@ -4238,18 +4264,18 @@ def client_searches_v2():
         </div>
 
         <div style="margin-top:18px;">
-          <h2>Wyszukiwania według klienta</h2>
-          <div class="muted" style="margin-bottom:8px;">Tu zobaczysz, która firma szukała danej frazy.</div>
+          <h2>Podsumowanie klientów</h2>
+          <div class="muted" style="margin-bottom:8px;">Zbiorcze statystyki unikalnych wyszukań klientów.</div>
           <table>
             <thead>
-              <tr><th>Klient</th><th>Fraza</th><th>Ile razy</th><th>Bez wyników</th><th>Ostatnio</th></tr>
+              <tr><th>Klient</th><th>Wyszukań</th><th>Różnych fraz</th><th>Bez wyników</th><th>Ostatnio</th></tr>
             </thead>
             <tbody>
               {% for r in summary_rows %}
                 <tr>
                   <td><b>{{ r.client_label }}</b></td>
-                  <td>{{ r.query }}</td>
                   <td><span class="badge">{{ r.searches_count }}</span></td>
+                  <td>{{ r.phrases_count }}</td>
                   <td>{% if r.no_result_count %}<span class="badge">{{ r.no_result_count }}</span>{% else %}-{% endif %}</td>
                   <td class="muted">{{ r.last_at }}</td>
                 </tr>
