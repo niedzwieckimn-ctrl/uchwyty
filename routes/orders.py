@@ -90,6 +90,8 @@ def register_routes(context):
         q = norm(request.args.get("q"))
         tab = norm(request.args.get("tab")) or "new"
         ready_today = norm(request.args.get("ready_today")) == "1"
+        created_today = norm(request.args.get("created_today")) == "1"
+        issued_today = norm(request.args.get("issued_today")) == "1"
         if tab not in {"new", "issued", "realized", "all"}:
             tab = "new"
 
@@ -124,6 +126,18 @@ def register_routes(context):
             where_parts.append("(LOWER(COALESCE(o.status,'')) IN ('in_delivery','issued') OR (COALESCE(o.warehouse_issued,0)=1 AND LOWER(COALESCE(o.status,'')) NOT IN ('completed','cancelled')))")
         elif tab == "realized":
             where_parts.append("LOWER(COALESCE(o.status,''))='completed'")
+
+        if created_today:
+            where_parts.append("date(o.created_at)=date('now','localtime')")
+        if issued_today:
+            where_parts.append("""EXISTS (
+              SELECT 1 FROM invoice_allocations ia
+              WHERE ia.order_id=o.id AND date(ia.created_at)=date('now','localtime')
+              UNION ALL
+              SELECT 1 FROM invoices i
+              WHERE i.order_id=o.id AND date(i.created_at)=date('now','localtime')
+                AND NOT EXISTS (SELECT 1 FROM invoice_allocations ia2 WHERE ia2.invoice_id=i.id)
+            )""")
 
         if q:
             where_parts.append("(order_no LIKE ? OR customer_name LIKE ?)")
