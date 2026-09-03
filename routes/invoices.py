@@ -712,12 +712,13 @@ def register_routes(context):
             (not query or any(query in norm(inv.get(field)).casefold() for field in ("invoice_no", "customer_display", "source_order_no", "source_order_note")))
             and (not selected_customer or inv["customer_display"] == selected_customer)
             and (not selected_month or norm(inv.get("issue_date"))[:7] == selected_month)
-            and (not selected_payment or inv["payment_status"] == selected_payment)
+            and (not selected_payment or (selected_payment == "open" and not inv.get("paid")) or inv["payment_status"] == selected_payment)
             and (not selected_type or inv["document_type"] == selected_type)
             and (not selected_currency or inv["currency"] == selected_currency)
             and (not selected_ksef or (selected_ksef == "none" and inv.get("ksef_status") not in {"sent", "ready", "error"}) or inv.get("ksef_status") == selected_ksef)
             and (not selected_sent or (selected_sent == "sent" and inv.get("sent_to_client")) or (selected_sent == "unsent" and not inv.get("sent_to_client")))
         )]
+        rows.sort(key=lambda inv: (norm(inv.get("issue_date")), int(inv.get("id") or 0)), reverse=True)
 
         notice = ""
         notice_error = False
