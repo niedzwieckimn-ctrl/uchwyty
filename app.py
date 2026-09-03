@@ -2134,7 +2134,7 @@ def generate_client_order_pdf(
         logo_path = find_logo_path()
         if logo_path:
             try:
-                pdf.drawImage(ImageReader(logo_path), left, page_height - 28 * mm, 32 * mm, 20 * mm,
+                pdf.drawImage(ImageReader(logo_path), left, page_height - 42 * mm, 54.4 * mm, 34 * mm,
                               preserveAspectRatio=True, anchor="w", mask="auto")
             except Exception:
                 pass
@@ -2146,8 +2146,8 @@ def generate_client_order_pdf(
         pdf.drawRightString(right, page_height - 21 * mm, fit(order_number, regular_font, 9, 80 * mm))
         pdf.setStrokeColorRGB(*rule_gray)
         pdf.setLineWidth(0.8)
-        pdf.line(left, page_height - 31 * mm, right, page_height - 31 * mm)
-        return page_height - 41 * mm
+        pdf.line(left, page_height - 45 * mm, right, page_height - 45 * mm)
+        return page_height - 55 * mm
 
     def draw_table_header(y):
         pdf.setFillColorRGB(*pale_gray)
@@ -2411,6 +2411,8 @@ def generate_order_invoice_pdf(order_row, items, meta):
 
     pricing_map = {norm(r["model"]): r for r in pricing_rows}
     product_map = {norm(r["sku"]): r for r in product_rows}
+    document_vat_rate = to_int((items[0].get("vat_rate") if items else meta.get("vat_rate")), 23)
+    document_currency = norm((items[0].get("currency") if items else meta.get("currency")) or "PLN").upper()
 
     def pdf_txt(value) -> str:
         return fix_polish_mojibake(norm(value))
@@ -2463,7 +2465,8 @@ def generate_order_invoice_pdf(order_row, items, meta):
 
     header_y = h - 20 * mm
     cpdf.setFont(pdf_font_bold, 14)
-    cpdf.drawString(15 * mm, header_y, f"Faktura VAT: {meta['invoice_no']}")
+    document_title = "Faktura WDT 0%" if document_vat_rate == 0 else "Faktura VAT"
+    cpdf.drawString(15 * mm, header_y, f"{document_title}: {meta['invoice_no']}")
 
     y = h - 34 * mm
     logo = find_logo_path()
@@ -2471,14 +2474,17 @@ def generate_order_invoice_pdf(order_row, items, meta):
         try:
             logo_img = ImageReader(logo)
             img_w, img_h = logo_img.getSize()
-            max_w = 60 * mm
-            max_h = 24 * mm
+            # Logo na fakturze było zbyt małe. Powiększenie pola dokładnie
+            # o 70%, z zachowaniem proporcji obrazu.
+            max_w = 102 * mm
+            max_h = 40.8 * mm
             scale = min(max_w / float(img_w), max_h / float(img_h)) if img_w and img_h else 1.0
             draw_w = float(img_w) * scale
             draw_h = float(img_h) * scale
             draw_x = 195 * mm - draw_w
             draw_y = h - 10 * mm - draw_h
             cpdf.drawImage(logo_img, draw_x, draw_y, width=draw_w, height=draw_h, preserveAspectRatio=True, mask="auto")
+            y = min(y, draw_y - 5 * mm)
         except Exception:
             pass
 
@@ -2515,7 +2521,17 @@ def generate_order_invoice_pdf(order_row, items, meta):
     buyer_email = pdf_txt(meta.get("buyer_email") or "")
     buyer_phone = pdf_txt(meta.get("buyer_phone") or "")
 
-    seller_lines = [seller_name, f"NIP: {seller_nip}", seller_addr]
+    if document_vat_rate == 0:
+        seller_vat_eu = re.sub(r"[\s.-]+", "", seller_nip).upper()
+        if seller_vat_eu and seller_vat_eu != "-" and not seller_vat_eu.startswith("PL"):
+            seller_vat_eu = f"PL{seller_vat_eu}"
+        seller_tax_line = f"VAT UE: {seller_vat_eu}"
+        buyer_tax_line = f"VAT UE: {buyer_tax_no}"
+    else:
+        seller_tax_line = f"NIP: {seller_nip}"
+        buyer_tax_line = f"NIP: {buyer_tax_no}"
+
+    seller_lines = [seller_name, seller_tax_line, seller_addr]
     if seller_phone:
         seller_lines.append(f"tel: {seller_phone}")
     if seller_email:
@@ -2523,7 +2539,7 @@ def generate_order_invoice_pdf(order_row, items, meta):
     if seller_bank:
         seller_lines.append(f"konto: {seller_bank}")
 
-    buyer_lines = [buyer_name, f"NIP: {buyer_tax_no}", buyer_street, f"{buyer_post} {buyer_city}".strip(), buyer_country]
+    buyer_lines = [buyer_name, buyer_tax_line, buyer_street, f"{buyer_post} {buyer_city}".strip(), buyer_country]
     if buyer_phone:
         buyer_lines.append(f"tel: {buyer_phone}")
     if buyer_email:
@@ -2611,7 +2627,8 @@ def generate_order_invoice_pdf(order_row, items, meta):
         line_net_dec = (net_dec * Decimal(qty)).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
         if discount_pct > 0:
             line_net_dec = (line_net_dec * (Decimal("100.0") - Decimal(str(discount_pct))) / Decimal("100.0")).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
-        unit_gross_dec = gross_from_net_23(net_dec)
+        vat_rate = to_int(it.get("vat_rate"), to_int(meta.get("vat_rate"), 23))
+        unit_gross_dec = net_dec if vat_rate == 0 else gross_from_net_23(net_dec)
 
         net = money_float(net_dec)
         gross = money_float(unit_gross_dec)
@@ -2634,7 +2651,7 @@ def generate_order_invoice_pdf(order_row, items, meta):
         cpdf.drawRightString(col_x[4] - 1.5 * mm, text_y, f"{net:.2f}")
         cpdf.drawRightString(col_x[5] - 1.5 * mm, text_y, f"{gross:.2f}")
         cpdf.drawRightString(col_x[6] - 1.5 * mm, text_y, f"{line_net:.2f}")
-        cpdf.drawCentredString(cell_center(col_x[6], col_x[7]), text_y, "23%")
+        cpdf.drawCentredString(cell_center(col_x[6], col_x[7]), text_y, f"{vat_rate}%")
         cpdf.line(table_left, y - row_h + 1, table_right, y - row_h + 1)
         for cx in col_x:
             cpdf.line(cx, y + 1, cx, y - row_h + 1)
@@ -2646,7 +2663,7 @@ def generate_order_invoice_pdf(order_row, items, meta):
             cpdf.setFont(pdf_font, body_font)
 
     total_net_dec = total_net_dec.quantize(MONEY_Q, rounding=ROUND_HALF_UP)
-    total_tax_dec = vat23_from_net(total_net_dec)
+    total_tax_dec = Decimal("0.00") if document_vat_rate == 0 else vat23_from_net(total_net_dec)
     total_gross_dec = (total_net_dec + total_tax_dec).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
     total_net = money_float(total_net_dec)
     total_tax = money_float(total_tax_dec)
@@ -2656,11 +2673,17 @@ def generate_order_invoice_pdf(order_row, items, meta):
     if discount_pct > 0:
         cpdf.drawRightString(198 * mm, y, f"Rabat: {discount_pct:.2f}%")
         y -= 5 * mm
-    cpdf.drawRightString(198 * mm, y, f"Suma netto: {total_net:.2f} PLN")
+    cpdf.drawRightString(198 * mm, y, f"Suma netto: {total_net:.2f} {document_currency}")
     y -= 5 * mm
-    cpdf.drawRightString(198 * mm, y, f"VAT 23%: {total_tax:.2f} PLN")
+    cpdf.drawRightString(198 * mm, y, f"VAT {document_vat_rate}%: {total_tax:.2f} {document_currency}")
     y -= 5 * mm
-    cpdf.drawRightString(198 * mm, y, f"Suma brutto: {total_gross:.2f} PLN")
+    cpdf.drawRightString(198 * mm, y, f"Suma brutto: {total_gross:.2f} {document_currency}")
+    if document_vat_rate == 0:
+        y -= 9 * mm
+        cpdf.setFont(pdf_font, 8.5)
+        cpdf.drawString(15 * mm, y, "Wewnątrzwspólnotowa dostawa towarów (WDT) — stawka VAT 0%.")
+        y -= 4.5 * mm
+        cpdf.drawString(15 * mm, y, "Podstawa: art. 42 ustawy o VAT; zastosowanie stawki wymaga spełnienia warunków ustawowych.")
 
     ksef_number = norm(meta.get("ksef_number") or "")
     if ksef_number:
@@ -2781,7 +2804,7 @@ def generate_invoice_packing_list_pdf(order_row, items, meta, invoice_pdf_path: 
         logo_path = find_logo_path()
         if logo_path:
             try:
-                cpdf.drawImage(ImageReader(logo_path), 15 * mm, h - 28 * mm, 32 * mm, 20 * mm,
+                cpdf.drawImage(ImageReader(logo_path), 15 * mm, h - 42 * mm, 54.4 * mm, 34 * mm,
                                preserveAspectRatio=True, anchor="w", mask="auto")
             except Exception:
                 pass
@@ -2802,8 +2825,8 @@ def generate_invoice_packing_list_pdf(order_row, items, meta, invoice_pdf_path: 
         cpdf.drawRightString(195 * mm, h - 23 * mm, subtitle)
         cpdf.setStrokeColorRGB(*line_color)
         cpdf.setLineWidth(0.8)
-        cpdf.line(15 * mm, h - 31 * mm, 195 * mm, h - 31 * mm)
-        return h - 41 * mm
+        cpdf.line(15 * mm, h - 45 * mm, 195 * mm, h - 45 * mm)
+        return h - 55 * mm
 
     def draw_table_header(current_y):
         cpdf.setFillColorRGB(*pale_blue)
@@ -4243,10 +4266,10 @@ def client_searches_v2():
         ]
 
     phrase_stats = {}
-    name_stats = {}
+    model_stats = {}
     client_stats = {}
     phrase_events_seen = set()
-    name_events_seen = set()
+    model_events_seen = set()
 
     for r in rows:
         query = norm(r.get("query"))
@@ -4256,14 +4279,19 @@ def client_searches_v2():
         client_label = norm(r.get("_client_label"))
         client_key = email or client_label or "anon"
         product_name = norm(r.get("_product_label"))
+        product_model = norm(r.get("product_model"))
+        product_sku = norm(r.get("product_sku"))
         results_count = to_int(r.get("results_count"), 0)
         created_at = norm(r.get("created_at"))
 
-        name_key = product_name.lower()
-        name_event_key = (client_key, query.lower(), name_key, created_at)
-        if name_key and results_count > 0 and name_event_key not in name_events_seen:
-            name_events_seen.add(name_event_key)
-            item = name_stats.setdefault(name_key, {
+        model_label = product_model or product_sku
+        model_key = model_label.lower()
+        model_event_key = (client_key, query.lower(), model_key, created_at)
+        if model_key and results_count > 0 and model_event_key not in model_events_seen:
+            model_events_seen.add(model_event_key)
+            item = model_stats.setdefault(model_key, {
+                "product_model": model_label,
+                "product_sku": product_sku,
                 "product_name": product_name,
                 "searches_count": 0,
                 "clients": set(),
@@ -4313,7 +4341,7 @@ def client_searches_v2():
             summary["last_at"] = created_at
 
     name_rows = []
-    for r in name_stats.values():
+    for r in model_stats.values():
         item = dict(r)
         item["clients_count"] = len(item.pop("clients"))
         name_rows.append(item)
@@ -4352,32 +4380,57 @@ def client_searches_v2():
       </div>
 
       <div class="card">
-        <h2>TOP 10 nazw zwyczajowych</h2>
+        <h2>Najczęściej wyszukiwane modele</h2>
         <div class="muted" style="margin-bottom:8px;">
-          Ranking jest zsumowany po nazwie zwyczajowej, np. Winsor, Carl, Cerne — bez rozbijania na każdy rozmiar SKU.
+          Ogólne wyszukiwania przypisane do konkretnego modelu lub SKU — najważniejszy widok na tej stronie.
         </div>
         <table>
           <thead>
-            <tr><th>Nazwa zwyczajowa</th><th>Ile razy</th><th>Klientów</th><th>Ostatnio</th></tr>
+            <tr><th>Model / SKU</th><th>Nazwa</th><th>Ile razy</th><th>Klientów</th><th>Ostatnio</th></tr>
           </thead>
           <tbody>
             {% for r in name_rows %}
               <tr>
-                <td><b>{{ r.product_name or '-' }}</b></td>
+                <td><b>{{ r.product_model or r.product_sku or '-' }}</b>{% if r.product_sku and r.product_sku != r.product_model %}<div class="muted small">{{ r.product_sku }}</div>{% endif %}</td>
+                <td>{{ r.product_name or '-' }}</td>
                 <td><span class="badge">{{ r.searches_count }}</span></td>
                 <td>{{ r.clients_count }}</td>
                 <td class="muted">{{ r.last_at }}</td>
               </tr>
             {% endfor %}
             {% if not name_rows %}
-              <tr><td colspan="4" class="muted">Brak zapisanych wyszukiwań.</td></tr>
+              <tr><td colspan="5" class="muted">Brak wyszukiwań przypisanych do modeli.</td></tr>
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>Ostatnie wyszukiwania</h2>
+        <table>
+          <thead>
+            <tr><th>Czas</th><th>Klient</th><th>Fraza</th><th>Nazwa</th><th>Model / SKU</th><th>Wyniki</th></tr>
+          </thead>
+          <tbody>
+            {% for r in latest_rows %}
+              <tr>
+                <td class="muted">{{ r.created_at }}</td>
+                <td>{{ r._client_label or '-' }}</td>
+                <td><b>{{ r.query }}</b></td>
+                <td>{{ r._product_label or '-' }}</td>
+                <td>{{ r.product_model or r.product_sku or '-' }}</td>
+                <td>{{ r.results_count }}</td>
+              </tr>
+            {% endfor %}
+            {% if not latest_rows %}
+              <tr><td colspan="6" class="muted">Brak wpisów.</td></tr>
             {% endif %}
           </tbody>
         </table>
       </div>
 
       <details class="card">
-        <summary style="cursor:pointer;font-weight:700;font-size:16px;">Pokaż szczegóły: frazy, klienci i ostatnie wpisy</summary>
+        <summary style="cursor:pointer;font-weight:700;font-size:16px;">Pokaż dodatkowe zestawienia: frazy i klienci</summary>
 
         <div style="margin-top:14px;">
           <h2>Frazy klientów</h2>
@@ -4430,29 +4483,6 @@ def client_searches_v2():
           </table>
         </div>
 
-        <div style="margin-top:18px;">
-          <h2>Ostatnie wpisy</h2>
-          <table>
-            <thead>
-              <tr><th>Czas</th><th>Klient</th><th>Fraza</th><th>Nazwa</th><th>Model / SKU</th><th>Wyniki</th></tr>
-            </thead>
-            <tbody>
-              {% for r in latest_rows %}
-                <tr>
-                  <td class="muted">{{ r.created_at }}</td>
-                  <td>{{ r._client_label or '-' }}</td>
-                  <td><b>{{ r.query }}</b></td>
-                  <td>{{ r._product_label or '-' }}</td>
-                  <td>{{ r.product_model or r.product_sku or '-' }}</td>
-                  <td>{{ r.results_count }}</td>
-                </tr>
-              {% endfor %}
-              {% if not latest_rows %}
-                <tr><td colspan="6" class="muted">Brak wpisów.</td></tr>
-              {% endif %}
-            </tbody>
-          </table>
-        </div>
       </details>
     {% endblock %}
     """
@@ -6472,7 +6502,7 @@ def order_view(order_id):
             <a class="btn primary" href="{{ url_for('order_packing_list_download_admin', order_id=o['id']) }}">Pakuj</a>
             {% if (o['currency'] or 'PLN') == 'EUR' %}
               <a class="btn primary" href="{{ url_for('order_proforma', order_id=o['id']) }}" target="_blank">Proforma EUR</a>
-              <span class="badge" title="Dokument końcowy wystawiasz ręcznie poza modułem KSeF.">Faktura końcowa — ręcznie</span>
+              <a class="btn primary" href="{{ url_for('order_invoice', order_id=o['id']) }}">Faktura WDT 0%</a>
             {% else %}
               <a class="btn primary" href="{{ url_for('order_invoice', order_id=o['id']) }}">Faktura</a>
             {% endif %}
@@ -7357,14 +7387,6 @@ def order_invoice(order_id):
     if not o:
         c.close()
         abort(404)
-    if normalize_order_currency(o["currency"]) == "EUR":
-        c.close()
-        return (
-            "Faktura EUR nie jest wystawiana przez polski moduł KSeF. "
-            "Zamówienie i jego potwierdzenie pozostają poprawnie zapisane w EUR.",
-            409,
-        )
-
     related_orders = [dict(o)] if norm(o["status"]).lower() in CURRENT_ORDER_STATUSES else []
     customer_email_key = _email_key(o["customer_email"])
     if customer_email_key:
@@ -7387,10 +7409,11 @@ def order_invoice(order_id):
              oo.order_no AS source_order_no,
              oo.created_at AS source_order_created_at,
              oo.note AS source_order_note,
-             COALESCE(pr.net_price, 0) AS net_price,
-             COALESCE(pr.gross_price, 0) AS gross_price,
-             (oi.qty * COALESCE(pr.net_price, 0)) AS line_value_net,
-             (oi.qty * COALESCE(pr.gross_price, 0)) AS line_value_gross
+             COALESCE(oi.unit_net_price, pr.net_price, 0) AS net_price,
+             COALESCE(oi.unit_gross_price, oi.unit_net_price, pr.gross_price, pr.net_price, 0) AS gross_price,
+             COALESCE(oi.currency, oo.currency, 'PLN') AS currency,
+             (oi.qty * COALESCE(oi.unit_net_price, pr.net_price, 0)) AS line_value_net,
+             (oi.qty * COALESCE(oi.unit_gross_price, oi.unit_net_price, pr.gross_price, pr.net_price, 0)) AS line_value_gross
       FROM order_items oi
       JOIN orders oo ON oo.id=oi.order_id
       JOIN products p ON p.id=oi.product_id
@@ -7490,6 +7513,7 @@ def order_invoice(order_id):
         msg = "Faktura zostaĹ‚a usuniÄ™ta."
 
     if request.method == "GET":
+        order_currency = normalize_order_currency(o["currency"])
         data = {
             "invoice_no": next_invoice_no(default_issue),
             "place": "KotuszĂłw",
@@ -7500,17 +7524,22 @@ def order_invoice(order_id):
             "buyer_name": norm(client_profile.get("name")) or o["customer_name"] or "",
             "buyer_tax_no": buyer_tax_no,
             "buyer_address": buyer_address_default,
-            "buyer_country": "PL",
+            "buyer_country": "" if order_currency == "EUR" else "PL",
             "buyer_email": o["customer_email"] or "",
             "buyer_phone": norm(client_profile.get("phone")) or o["customer_phone"] or "",
             "discount_percent": "0",
+            "invoice_type": "wdt_0" if order_currency == "EUR" else "domestic_23",
+            "currency": order_currency,
         }
     else:
         data = {k: norm(request.form.get(k)) for k in [
             "invoice_no", "place", "issue_date", "sell_date", "payment_type", "payment_to",
             "buyer_name", "buyer_tax_no", "buyer_address", "buyer_country",
-            "buyer_email", "buyer_phone", "discount_percent"
+            "buyer_email", "buyer_phone", "discount_percent", "invoice_type", "currency"
         ]}
+        order_currency = normalize_order_currency(o["currency"])
+        data["currency"] = order_currency
+        data["invoice_type"] = "wdt_0" if order_currency == "EUR" else "domestic_23"
         if not data.get("buyer_address"):
             data["buyer_address"] = buyer_address_default
         st, pc, city = split_address(data.get("buyer_address", ""))
@@ -7531,6 +7560,37 @@ def order_invoice(order_id):
             data["payment_to"] = (issue_day + timedelta(days=7)).strftime("%Y-%m-%d")
 
         invoice_items = prepare_invoice_items(items, request.form)
+        if norm(request.form.get("submit_action")) != "packing" and data["invoice_type"] == "wdt_0":
+            vat_eu = re.sub(r"[\s.-]+", "", data.get("buyer_tax_no") or "").upper()
+            buyer_country = norm(data.get("buyer_country")).upper()
+            eu_vat_prefixes = {
+                "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "EL",
+                "GR", "HU", "IE", "IT", "LV", "LT", "LU", "MT", "NL", "PT", "RO", "SK",
+                "SI", "ES", "SE",
+            }
+            if not re.fullmatch(r"[A-Z]{2}[A-Z0-9]{6,14}", vat_eu):
+                msg = "Dla WDT 0% podaj prawidłowy numer VAT UE nabywcy z dwuliterowym prefiksem kraju, np. DE123456789."
+                invoice_items = []
+            elif vat_eu[:2] not in eu_vat_prefixes:
+                msg = "Stawka WDT 0% wymaga numeru VAT UE z kraju Unii Europejskiej innego niż Polska."
+                invoice_items = []
+            elif buyer_country in {"", "PL", "POLSKA", "POLAND"}:
+                msg = "Dla WDT 0% podaj kraj nabywcy inny niż Polska."
+                invoice_items = []
+            else:
+                data["buyer_tax_no"] = vat_eu
+                data["vat_rate"] = 0
+                for invoice_item in invoice_items:
+                    invoice_item["vat_rate"] = 0
+                    invoice_item["currency"] = "EUR"
+                    invoice_item["gross_price"] = invoice_item.get("net_price")
+                    invoice_item["line_value_vat"] = 0.0
+                    invoice_item["line_value_gross"] = invoice_item.get("line_value_net")
+        elif norm(request.form.get("submit_action")) != "packing":
+            data["vat_rate"] = 23
+            for invoice_item in invoice_items:
+                invoice_item["vat_rate"] = 23
+                invoice_item["currency"] = "PLN"
         if norm(request.form.get("submit_action")) == "packing":
             if not invoice_items:
                 msg = "Lista pakowania musi zawierac co najmniej jedna pozycje."
@@ -7557,9 +7617,9 @@ def order_invoice(order_id):
         existing_invoice_id = invoice_no_exists(data["invoice_no"])
         if existing_invoice_id:
             msg = f"Faktura o takim numerze już istnieje! Numer: {data['invoice_no']}. Wybierz inny numer faktury."
-        elif not invoice_items:
+        elif not invoice_items and not msg:
             msg = "Faktura musi zawieraÄ‡ co najmniej jednÄ… pozycjÄ™."
-        else:
+        elif invoice_items:
             pdf_path, total_net, total_gross = generate_order_invoice_pdf(o, invoice_items, data)
             packing_pdf_path = generate_invoice_packing_list_pdf(o, invoice_items, data, pdf_path)
             c = conn()
@@ -7634,6 +7694,14 @@ def order_invoice(order_id):
 
       <div class="card">
         <form method="post" class="row">
+          <input type="hidden" name="invoice_type" value="{{ d['invoice_type'] }}">
+          <input type="hidden" name="currency" value="{{ d['currency'] }}">
+          {% if d['invoice_type'] == 'wdt_0' %}
+            <div class="hint" style="grid-column:1/-1;">
+              <b>Faktura WDT 0% w EUR.</b> Przed wystawieniem sprawdź aktywny numer VAT UE nabywcy w VIES.
+              Stawkę 0% stosuj tylko dla dostawy do innego kraju UE i zachowaj dokumenty potwierdzające wywóz oraz dostarczenie towaru.
+            </div>
+          {% endif %}
           <div><label class="muted small">Numer faktury</label><input name="invoice_no" value="{{ d['invoice_no'] }}" required></div>
           <div><label class="muted small">Miejsce</label><input name="place" value="{{ d['place'] }}"></div>
           <div><label class="muted small">Data wystawienia</label><input id="invoice_issue_date" name="issue_date" type="date" value="{{ d['issue_date'] }}"></div>
@@ -7649,7 +7717,7 @@ def order_invoice(order_id):
           <div><label class="muted small">Rabat %</label><input name="discount_percent" value="{{ d['discount_percent'] or "0" }}"></div>
 
           <div><label class="muted small">Nabywca</label><input name="buyer_name" value="{{ d['buyer_name'] }}" required></div>
-          <div><label class="muted small">NIP nabywcy</label><input name="buyer_tax_no" value="{{ d['buyer_tax_no'] }}"></div>
+          <div><label class="muted small">{{ 'VAT UE nabywcy' if d['invoice_type'] == 'wdt_0' else 'NIP nabywcy' }}</label><input name="buyer_tax_no" value="{{ d['buyer_tax_no'] }}" placeholder="{{ 'np. DE123456789' if d['invoice_type'] == 'wdt_0' else '' }}"></div>
           <div><label class="muted small">Adres nabywcy</label><textarea name="buyer_address" placeholder="Ulica&#10;Kod pocztowy Miasto">{{ d['buyer_address'] }}</textarea></div>
           <div><label class="muted small">Kraj</label><input name="buyer_country" value="{{ d['buyer_country'] }}"></div>
           <div><label class="muted small">Email</label><input name="buyer_email" value="{{ d['buyer_email'] }}"></div>
@@ -7661,7 +7729,7 @@ def order_invoice(order_id):
               Wpisz ilość tylko przy pozycjach, które idą na fakturę. Zamówienia klienta zostają jako osobne listy/notatki.
             </div>
             <table>
-              <thead><tr><th>Zamówienie</th><th>Notatka klienta</th><th>SKU</th><th>Model / Nazwa</th><th>Zamówiono</th><th>Zafakturowano</th><th>Pozostało</th><th>Na magazynie</th><th>Ilość na fakturze</th><th>Netto/szt</th><th>Brutto/szt</th></tr></thead>
+              <thead><tr><th>Zamówienie</th><th>Notatka klienta</th><th>SKU</th><th>Model / Nazwa</th><th>Zamówiono</th><th>Zafakturowano</th><th>Pozostało</th><th>Na magazynie</th><th>Ilość na fakturze</th><th>Netto/szt {{ d['currency'] }}</th><th>Brutto/szt {{ d['currency'] }}</th></tr></thead>
               <tbody>
                 {% for it in items %}
                 <tr>
@@ -7686,7 +7754,7 @@ def order_invoice(order_id):
 
           <div class="flex" style="align-items:flex-end;">
             <a class="btn" href="{{ url_for('order_packing_list_download_admin', order_id=o['id']) }}" target="_blank">Pakuj</a>
-            <button class="btn primary" type="submit" name="submit_action" value="invoice">Zapisz fakturÄ™ PDF</button>
+            <button class="btn primary" type="submit" name="submit_action" value="invoice">{{ 'Zapisz fakturę WDT 0% PDF' if d['invoice_type'] == 'wdt_0' else 'Zapisz fakturę PDF' }}</button>
           </div>
         </form>
       </div>
@@ -11413,25 +11481,25 @@ def _invoice_email_context(invoice_id: int):
 
 
 def send_automatic_payment_reminders(reference_time=None) -> dict:
-    """Wysyła jedno przypomnienie dzień po terminie płatności.
+    """Wysyła jedno przypomnienie od dnia następującego po terminie płatności.
 
     Harmonogram uruchamia tę funkcję o 12:00 czasu Europe/Warsaw. Znacznik
     payment_reminder jest zapisywany dopiero po udanej wysyłce, dzięki czemu
     ponowne uruchomienie jest bezpieczne i nie dubluje wiadomości.
     """
     now = reference_time or app_now()
-    due_date = (now.date() - timedelta(days=1)).isoformat()
+    overdue_before_or_on = (now.date() - timedelta(days=1)).isoformat()
     c = conn()
     cur = c.cursor()
     cur.execute("""
       SELECT i.id
       FROM invoices i
       LEFT JOIN invoice_meta m ON m.invoice_id=i.id
-      WHERE SUBSTR(TRIM(COALESCE(i.payment_to,'')),1,10)=?
+      WHERE DATE(SUBSTR(TRIM(COALESCE(i.payment_to,'')),1,10)) <= DATE(?)
         AND COALESCE(m.paid,0)=0
         AND COALESCE(m.payment_reminder,0)=0
       ORDER BY i.id
-    """, (due_date,))
+    """, (overdue_before_or_on,))
     invoice_ids = [int(row["id"]) for row in cur.fetchall()]
     c.close()
 
@@ -11452,7 +11520,7 @@ def send_automatic_payment_reminders(reference_time=None) -> dict:
             app.logger.exception("Automatyczne przypomnienie nie zostało wysłane dla faktury %s", invoice_id)
     return {
         "ok": not failed,
-        "due_date": due_date,
+        "overdue_before_or_on": overdue_before_or_on,
         "eligible": len(invoice_ids),
         "sent": len(sent_ids),
         "sent_ids": sent_ids,
