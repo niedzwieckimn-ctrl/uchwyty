@@ -224,3 +224,75 @@ def test_domain_routes_keep_names_and_read_pages_are_side_effect_free(historical
     after = {table: [tuple(row) for row in c.execute(f"SELECT * FROM {table} ORDER BY 1")] for table in tables}
     c.close()
     assert after == before
+
+
+def test_invoice_list_uses_invoice_currency_instead_of_hardcoded_pln(historical_db, monkeypatch):
+    monkeypatch.setattr(backend, "maybe_pull_shared_from_supabase", lambda *a, **k: None)
+    backend.app.secret_key = "test-secret-key"
+    c = backend.conn()
+    c.execute("UPDATE invoices SET currency='EUR', invoice_type='wdt' WHERE id=1")
+    c.commit()
+    c.close()
+    client = backend.app.test_client()
+    with client.session_transaction() as sess:
+        sess["admin_authenticated"] = True
+        sess["csrf_token"] = "test"
+    response = client.get("/invoices")
+    assert response.status_code == 200
+    page = response.get_data(as_text=True)
+    assert "20,00 EUR" in page
+    assert "20,00 PLN" not in page
+
+
+def test_dashboard_metric_tiles_link_to_details(historical_db, monkeypatch):
+    monkeypatch.setattr(backend, "maybe_pull_shared_from_supabase", lambda *a, **k: None)
+    backend.app.secret_key = "test-secret-key"
+    client = backend.app.test_client()
+    with client.session_transaction() as sess:
+        sess["admin_authenticated"] = True
+        sess["csrf_token"] = "test"
+    page = client.get("/").get_data(as_text=True).replace("&amp;", "&")
+    for href in (
+        "/orders?tab=all&created_today=1",
+        "/orders?tab=all&issued_today=1",
+        "/orders?tab=new&ready_today=1",
+        "/payments/overdue",
+        "/cash-flow#replenishment-ranking",
+        "/stock",
+    ):
+        assert f'href="{href}"' in page
+    assert client.get("/orders?tab=all&created_today=1").status_code == 200
+    assert client.get("/orders?tab=all&issued_today=1").status_code == 200
+
+
+def test_invoice_redesign_filters_are_read_only_and_keep_actions(historical_db, monkeypatch):
+    monkeypatch.setattr(backend, "maybe_pull_shared_from_supabase", lambda *a, **k: None)
+    backend.app.secret_key = "test-secret-key"
+    c = backend.conn()
+    c.execute("UPDATE invoices SET currency='EUR', invoice_type='wdt' WHERE id=1")
+    c.commit()
+    tables = [row[0] for row in c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+    before = {table: [tuple(row) for row in c.execute(f"SELECT * FROM {table} ORDER BY 1")] for table in tables}
+    c.close()
+    client = backend.app.test_client()
+    with client.session_transaction() as sess:
+        sess["admin_authenticated"] = True
+        sess["csrf_token"] = "test"
+    urls = (
+        "/invoices",
+        "/invoices?view=customers",
+        "/invoices?q=Kunde&customer=Kunde&month=2026-01&payment=paid&document_type=wdt&currency=EUR&ksef=none&sent=sent",
+    )
+    for url in urls:
+        response = client.get(url)
+        assert response.status_code == 200
+    page = client.get("/invoices").get_data(as_text=True)
+    assert "Wszystkie faktury" in page and "Wed\u0142ug klient\u00f3w" in page
+    assert "KRAJOWA" in page or "WDT" in page
+    assert "/invoices/1/download" in page
+    assert "/invoices/1/payment-reminder" in page or "/invoices/1/unpaid" in page
+    assert "/invoices/1/ksef/xml" in page
+    c = backend.conn()
+    after = {table: [tuple(row) for row in c.execute(f"SELECT * FROM {table} ORDER BY 1")] for table in tables}
+    c.close()
+    assert after == before
