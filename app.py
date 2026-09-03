@@ -2305,6 +2305,16 @@ def generate_sales_invoice(order_row, items):
     pricing_rows = cur.fetchall()
     cur.execute("SELECT sku, model, name FROM products")
     product_rows = cur.fetchall()
+    customer_language = "pl"
+    try:
+        customer_id = int(order_row["customer_id"] or 0) if order_row and "customer_id" in order_row.keys() else 0
+        if customer_id:
+            cur.execute("SELECT language FROM customers WHERE id=? LIMIT 1", (customer_id,))
+            lang_row = cur.fetchone()
+            if lang_row:
+                customer_language = normalize_client_language(lang_row["language"])
+    except Exception:
+        customer_language = "pl"
     c.close()
 
     pricing_map = {norm(r["model"]): r for r in pricing_rows}
@@ -2431,12 +2441,43 @@ def generate_order_invoice_pdf(order_row, items, meta):
     pricing_rows = cur.fetchall()
     cur.execute("SELECT sku, model, name FROM products")
     product_rows = cur.fetchall()
+    customer_language = "pl"
+    try:
+        customer_id = int(order_row["customer_id"] or 0) if order_row and "customer_id" in order_row.keys() else 0
+        if customer_id:
+            cur.execute("SELECT language FROM customers WHERE id=? LIMIT 1", (customer_id,))
+            lang_row = cur.fetchone()
+            if lang_row:
+                customer_language = normalize_client_language(lang_row["language"])
+    except Exception:
+        customer_language = "pl"
     c.close()
 
     pricing_map = {norm(r["model"]): r for r in pricing_rows}
     product_map = {norm(r["sku"]): r for r in product_rows}
     document_vat_rate = to_int((items[0].get("vat_rate") if items else meta.get("vat_rate")), 23)
     document_currency = norm((items[0].get("currency") if items else meta.get("currency")) or "PLN").upper()
+    invoice_language = customer_language
+    if invoice_language == "pl" and document_vat_rate == 0:
+        country = norm(meta.get("buyer_country")).upper()
+        invoice_language = {"DE": "de", "AT": "de", "CH": "de", "ES": "es", "IT": "it"}.get(country, "en")
+    PDF_COPY = {
+        "pl": {"place":"Miejsce","issue":"Data wystawienia","sell":"Data sprzedaży","payment":"Forma płatności","due":"Termin płatności","seller":"Sprzedawca","buyer":"Nabywca","name":"Nazwa/SKU","qty":"Ilość","net_unit":"Netto/szt","gross_unit":"Brutto/szt","net_value":"Wartość netto","discount":"Rabat","net_total":"Suma netto","gross_total":"Suma brutto","wdt":"Wewnątrzwspólnotowa dostawa towarów (WDT) — stawka VAT 0%.","wdt_basis":"Podstawa: art. 42 ustawy o VAT; zastosowanie stawki wymaga spełnienia warunków ustawowych.","account":"konto","phone":"tel","email":"email"},
+        "de": {"place":"Ort","issue":"Rechnungsdatum","sell":"Lieferdatum","payment":"Zahlungsart","due":"Zahlungsfrist","seller":"Verkäufer","buyer":"Käufer","name":"Bezeichnung/SKU","qty":"Menge","net_unit":"Netto/Stk.","gross_unit":"Brutto/Stk.","net_value":"Nettowert","discount":"Rabatt","net_total":"Nettosumme","gross_total":"Bruttosumme","wdt":"Innergemeinschaftliche Lieferung — Umsatzsteuersatz 0 %.","wdt_basis":"Rechtsgrundlage: Art. 42 des polnischen Umsatzsteuergesetzes; der Steuersatz 0 % gilt bei Erfüllung der gesetzlichen Voraussetzungen.","account":"Konto","phone":"Tel.","email":"E-Mail"},
+        "en": {"place":"Place","issue":"Invoice date","sell":"Supply date","payment":"Payment method","due":"Payment due","seller":"Seller","buyer":"Buyer","name":"Description/SKU","qty":"Qty","net_unit":"Net/unit","gross_unit":"Gross/unit","net_value":"Net value","discount":"Discount","net_total":"Net total","gross_total":"Gross total","wdt":"Intra-Community supply — VAT rate 0%.","wdt_basis":"Legal basis: Article 42 of the Polish VAT Act; the 0% rate applies subject to statutory conditions.","account":"account","phone":"tel.","email":"email"},
+        "es": {"place":"Lugar","issue":"Fecha de factura","sell":"Fecha de entrega","payment":"Forma de pago","due":"Vencimiento","seller":"Vendedor","buyer":"Comprador","name":"Descripción/SKU","qty":"Cantidad","net_unit":"Neto/ud.","gross_unit":"Bruto/ud.","net_value":"Valor neto","discount":"Descuento","net_total":"Total neto","gross_total":"Total bruto","wdt":"Entrega intracomunitaria — IVA 0 %.","wdt_basis":"Base legal: art. 42 de la Ley polaca del IVA; el tipo 0 % se aplica si se cumplen los requisitos legales.","account":"cuenta","phone":"tel.","email":"email"},
+        "it": {"place":"Luogo","issue":"Data fattura","sell":"Data consegna","payment":"Metodo di pagamento","due":"Scadenza","seller":"Venditore","buyer":"Acquirente","name":"Descrizione/SKU","qty":"Quantità","net_unit":"Netto/pz.","gross_unit":"Lordo/pz.","net_value":"Valore netto","discount":"Sconto","net_total":"Totale netto","gross_total":"Totale lordo","wdt":"Cessione intracomunitaria — IVA 0%.","wdt_basis":"Base giuridica: art. 42 della legge polacca sull’IVA; l’aliquota 0% si applica se sono soddisfatte le condizioni di legge.","account":"conto","phone":"tel.","email":"email"},
+    }
+    pdf_copy = PDF_COPY.get(invoice_language, PDF_COPY["pl"])
+    PAYMENT_COPY = {
+        "pl": {"cash":"gotówka","gotowka":"gotówka","gotówka":"gotówka","transfer":"przelew","przelew":"przelew","card":"karta","karta":"karta"},
+        "de": {"cash":"Barzahlung","gotowka":"Barzahlung","gotówka":"Barzahlung","transfer":"Überweisung","przelew":"Überweisung","card":"Karte","karta":"Karte"},
+        "en": {"cash":"cash","gotowka":"cash","gotówka":"cash","transfer":"bank transfer","przelew":"bank transfer","card":"card","karta":"card"},
+        "es": {"cash":"efectivo","gotowka":"efectivo","gotówka":"efectivo","transfer":"transferencia bancaria","przelew":"transferencia bancaria","card":"tarjeta","karta":"tarjeta"},
+        "it": {"cash":"contanti","gotowka":"contanti","gotówka":"contanti","transfer":"bonifico bancario","przelew":"bonifico bancario","card":"carta","karta":"carta"},
+    }
+    payment_raw = norm(meta.get("payment_type")).lower()
+    payment_label = PAYMENT_COPY.get(invoice_language, PAYMENT_COPY["pl"]).get(payment_raw, payment_raw or "-")
 
     def pdf_txt(value) -> str:
         return fix_polish_mojibake(norm(value))
@@ -2489,7 +2530,16 @@ def generate_order_invoice_pdf(order_row, items, meta):
 
     header_y = h - 20 * mm
     cpdf.setFont(pdf_font_bold, 14)
-    document_title = "Faktura WDT 0%" if document_vat_rate == 0 else "Faktura VAT"
+    if invoice_language == "de":
+        document_title = "Rechnung – innergemeinschaftliche Lieferung 0 %" if document_vat_rate == 0 else "Rechnung"
+    elif invoice_language == "en":
+        document_title = "Invoice – intra-Community supply 0%" if document_vat_rate == 0 else "VAT invoice"
+    elif invoice_language == "es":
+        document_title = "Factura – entrega intracomunitaria 0 %" if document_vat_rate == 0 else "Factura"
+    elif invoice_language == "it":
+        document_title = "Fattura – cessione intracomunitaria 0%" if document_vat_rate == 0 else "Fattura"
+    else:
+        document_title = "Faktura WDT 0%" if document_vat_rate == 0 else "Faktura VAT"
     cpdf.drawString(15 * mm, header_y, f"{document_title}: {meta['invoice_no']}")
 
     y = h - 34 * mm
@@ -2514,18 +2564,18 @@ def generate_order_invoice_pdf(order_row, items, meta):
 
     y -= 7 * mm
     cpdf.setFont(pdf_font, 10)
-    cpdf.drawString(15 * mm, y, f"Miejsce: {pdf_txt(meta.get('place') or '-')}")
-    cpdf.drawString(85 * mm, y, f"Data wystawienia: {pdf_txt(meta['issue_date'])}")
-    cpdf.drawString(150 * mm, y, f"Data sprzedaży: {pdf_txt(meta['sell_date'])}")
+    cpdf.drawString(15 * mm, y, f"{pdf_copy['place']}: {pdf_txt(meta.get('place') or '-')}")
+    cpdf.drawString(85 * mm, y, f"{pdf_copy['issue']}: {pdf_txt(meta['issue_date'])}")
+    cpdf.drawString(150 * mm, y, f"{pdf_copy['sell']}: {pdf_txt(meta['sell_date'])}")
 
     y -= 7 * mm
-    cpdf.drawString(15 * mm, y, f"Forma płatności: {pdf_txt(payment_type_pl(meta.get('payment_type')))}")
-    cpdf.drawString(85 * mm, y, f"Termin płatności: {pdf_txt(meta.get('payment_to') or '-')}")
+    cpdf.drawString(15 * mm, y, f"{pdf_copy['payment']}: {pdf_txt(payment_label)}")
+    cpdf.drawString(85 * mm, y, f"{pdf_copy['due']}: {pdf_txt(meta.get('payment_to') or '-')}")
 
     y -= 10 * mm
     cpdf.setFont(pdf_font_bold, 10)
-    cpdf.drawString(15 * mm, y, "Sprzedawca")
-    cpdf.drawString(110 * mm, y, "Nabywca")
+    cpdf.drawString(15 * mm, y, pdf_copy["seller"])
+    cpdf.drawString(110 * mm, y, pdf_copy["buyer"])
 
     y -= 6 * mm
     cpdf.setFont(pdf_font, 9)
@@ -2557,17 +2607,17 @@ def generate_order_invoice_pdf(order_row, items, meta):
 
     seller_lines = [seller_name, seller_tax_line, seller_addr]
     if seller_phone:
-        seller_lines.append(f"tel: {seller_phone}")
+        seller_lines.append(f"{pdf_copy['phone']}: {seller_phone}")
     if seller_email:
-        seller_lines.append(f"email: {seller_email}")
+        seller_lines.append(f"{pdf_copy['email']}: {seller_email}")
     if seller_bank:
-        seller_lines.append(f"konto: {seller_bank}")
+        seller_lines.append(f"{pdf_copy['account']}: {seller_bank}")
 
     buyer_lines = [buyer_name, buyer_tax_line, buyer_street, f"{buyer_post} {buyer_city}".strip(), buyer_country]
     if buyer_phone:
-        buyer_lines.append(f"tel: {buyer_phone}")
+        buyer_lines.append(f"{pdf_copy['phone']}: {buyer_phone}")
     if buyer_email:
-        buyer_lines.append(f"email: {buyer_email}")
+        buyer_lines.append(f"{pdf_copy['email']}: {buyer_email}")
 
     seller_x = 15 * mm
     buyer_x = 108 * mm
@@ -2614,11 +2664,11 @@ def generate_order_invoice_pdf(order_row, items, meta):
     cpdf.setFont(pdf_font_bold, header_font)
     header_y = cell_baseline(y, row_h, pdf_font_bold, header_font)
     cpdf.drawCentredString(cell_center(col_x[0], col_x[1]), header_y, "L.p.")
-    cpdf.drawCentredString(cell_center(col_x[1], col_x[2]), header_y, "Nazwa/SKU")
-    cpdf.drawCentredString(cell_center(col_x[2], col_x[3]), header_y, "Ilość")
-    cpdf.drawCentredString(cell_center(col_x[3], col_x[4]), header_y, "Netto/szt")
-    cpdf.drawCentredString(cell_center(col_x[4], col_x[5]), header_y, "Brutto/szt")
-    cpdf.drawCentredString(cell_center(col_x[5], col_x[6]), header_y, "Wartość netto")
+    cpdf.drawCentredString(cell_center(col_x[1], col_x[2]), header_y, pdf_copy["name"])
+    cpdf.drawCentredString(cell_center(col_x[2], col_x[3]), header_y, pdf_copy["qty"])
+    cpdf.drawCentredString(cell_center(col_x[3], col_x[4]), header_y, pdf_copy["net_unit"])
+    cpdf.drawCentredString(cell_center(col_x[4], col_x[5]), header_y, pdf_copy["gross_unit"])
+    cpdf.drawCentredString(cell_center(col_x[5], col_x[6]), header_y, pdf_copy["net_value"])
     cpdf.drawCentredString(cell_center(col_x[6], col_x[7]), header_y, "VAT")
     cpdf.line(table_left, y + 1, table_right, y + 1)
     cpdf.line(table_left, y - row_h + 1, table_right, y - row_h + 1)
@@ -2695,19 +2745,19 @@ def generate_order_invoice_pdf(order_row, items, meta):
     y -= 6 * mm
     cpdf.setFont(pdf_font_bold, 10)
     if discount_pct > 0:
-        cpdf.drawRightString(198 * mm, y, f"Rabat: {discount_pct:.2f}%")
+        cpdf.drawRightString(198 * mm, y, f"{pdf_copy['discount']}: {discount_pct:.2f}%")
         y -= 5 * mm
-    cpdf.drawRightString(198 * mm, y, f"Suma netto: {total_net:.2f} {document_currency}")
+    cpdf.drawRightString(198 * mm, y, f"{pdf_copy['net_total']}: {total_net:.2f} {document_currency}")
     y -= 5 * mm
     cpdf.drawRightString(198 * mm, y, f"VAT {document_vat_rate}%: {total_tax:.2f} {document_currency}")
     y -= 5 * mm
-    cpdf.drawRightString(198 * mm, y, f"Suma brutto: {total_gross:.2f} {document_currency}")
+    cpdf.drawRightString(198 * mm, y, f"{pdf_copy['gross_total']}: {total_gross:.2f} {document_currency}")
     if document_vat_rate == 0:
         y -= 9 * mm
         cpdf.setFont(pdf_font, 8.5)
-        cpdf.drawString(15 * mm, y, "Wewnątrzwspólnotowa dostawa towarów (WDT) — stawka VAT 0%.")
+        cpdf.drawString(15 * mm, y, pdf_copy["wdt"])
         y -= 4.5 * mm
-        cpdf.drawString(15 * mm, y, "Podstawa: art. 42 ustawy o VAT; zastosowanie stawki wymaga spełnienia warunków ustawowych.")
+        cpdf.drawString(15 * mm, y, pdf_copy["wdt_basis"])
 
     ksef_number = norm(meta.get("ksef_number") or "")
     if ksef_number:
@@ -7770,14 +7820,17 @@ def order_invoice(order_id):
                         sync_local_rows_to_supabase("stock", "product_id", changed_product_ids)
                     except Exception:
                         pass
-            _order_id, email_ok, email_error = _send_invoice_to_client(invoice_id)
+            # Bezpiecznie: samo wystawienie faktury NIE wysyła już automatycznie e-maila.
+            # Wysyłka następuje dopiero po kliknięciu przycisku „Wyślij”.
+            email_ok = False
+            email_error = ""
             if invoice_from_packing:
                 consume_packing_selection(to_int(packing_selection.get("batch_id"), 0), invoice_id)
                 session.pop("latest_packing_selection", None)
             redirect_args = {
                 "generated": "1",
                 "invoice_id": invoice_id,
-                "email_sent": "1" if email_ok else "0",
+                "email_sent": "0",
             }
             if email_error:
                 redirect_args["email_error"] = email_error[:300]
@@ -11555,6 +11608,8 @@ def _invoice_email_context(invoice_id: int):
         o.order_no AS order_no,
         o.customer_email AS customer_email,
         o.customer_name AS customer_name,
+        COALESCE(cu.language, 'pl') AS language,
+        COALESCE(o.currency, 'PLN') AS currency,
         m.pdf_path AS pdf_path,
         m.payment_reminder AS payment_reminder,
         m.paid AS paid,
@@ -11562,6 +11617,7 @@ def _invoice_email_context(invoice_id: int):
         m.seen_at AS seen_at
       FROM invoices i
       LEFT JOIN orders o ON o.id = i.order_id
+      LEFT JOIN customers cu ON cu.id = o.customer_id
       LEFT JOIN invoice_meta m ON m.invoice_id = i.id
       WHERE i.id=?
       LIMIT 1
@@ -11572,12 +11628,8 @@ def _invoice_email_context(invoice_id: int):
         abort(404)
 
     invoice = dict(row)
-    # Wiadomość otwiera panel. Sam PDF pozostaje chroniony tokenem klienta.
-    panel_url = (
-        f"{CLIENT_PANEL_URL}/?"
-        + urllib.parse.urlencode({"section": "invoices", "invoice": invoice_id})
-    )
-    return invoice, panel_url
+    # E-mail z fakturą nie kieruje klienta do panelu. Faktura jest wysyłana jako załącznik PDF.
+    return invoice, ""
 
 
 def send_automatic_payment_reminders(reference_time=None) -> dict:
@@ -11713,7 +11765,26 @@ def _send_invoice_to_client(invoice_id: int) -> tuple[int, bool, str]:
             email_error = "Brak modułu wysyłki e-mail."
         else:
             invoice_row, pdf_url = _invoice_email_context(invoice_id)
-            result = send_invoice_available(invoice_row, pdf_url=pdf_url) or {}
+            pdf_attachment = None
+            try:
+                attachment_bytes = b""
+                attachment_name = safe_filename(row["invoice_no"] or f"invoice_{invoice_id}") + ".pdf"
+                if parse_supabase_storage_ref(stored_pdf_path):
+                    attachment_bytes, downloaded_name = supabase_storage_download_bytes(stored_pdf_path)
+                    if downloaded_name:
+                        attachment_name = downloaded_name
+                else:
+                    candidate = stored_pdf_path if os.path.isabs(stored_pdf_path) else invoice_pdf_abspath(stored_pdf_path)
+                    if candidate and os.path.exists(candidate):
+                        with open(candidate, "rb") as fh:
+                            attachment_bytes = fh.read()
+                if attachment_bytes:
+                    pdf_attachment = {"filename": attachment_name, "content": attachment_bytes}
+            except Exception:
+                app.logger.exception("Nie udało się przygotować załącznika PDF dla faktury %s", invoice_id)
+            if not pdf_attachment:
+                raise RuntimeError("Nie udało się przygotować pliku PDF faktury do wysyłki.")
+            result = send_invoice_available(invoice_row, pdf_url=pdf_url, pdf_attachment=pdf_attachment) or {}
             email_ok = bool(result.get("ok"))
             if not email_ok:
                 email_error = norm(result.get("error")) or "Usługa pocztowa odrzuciła wiadomość."

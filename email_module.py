@@ -40,7 +40,7 @@ def _esc(value) -> str:
     return html.escape(str(value or ""), quote=True)
 
 
-def _email_shell(title: str, content: str, footer: str = "Zespół Niedźwieccy") -> str:
+def _email_shell(title: str, content: str, footer: str = "Zespół Niedźwieccy", closing: str = "Pozdrawiamy") -> str:
     """Wspólny, czytelny układ wszystkich wiadomości transakcyjnych."""
     return (
         "<div style='margin:0;padding:28px 14px;background:#f3f6fb;font-family:Arial,sans-serif;color:#10203d'>"
@@ -48,7 +48,7 @@ def _email_shell(title: str, content: str, footer: str = "Zespół Niedźwieccy"
         "<div style='padding:30px 34px 28px'>"
         f"<h1 style='margin:0 0 24px;font-size:26px;line-height:1.25'>{_esc(title)}</h1>"
         f"{content}"
-        f"<p style='margin:26px 0 0;line-height:1.6;color:#52617c'>Pozdrawiamy,<br><b>{_esc(footer)}</b></p>"
+        f"<p style='margin:26px 0 0;line-height:1.6;color:#52617c'>{_esc(closing)},<br><b>{_esc(footer)}</b></p>"
         "</div></div></div>"
     )
 
@@ -275,6 +275,7 @@ def send_order_confirmation(order: dict, items: list[dict], admin_email: str = "
         f"<p style='margin:0 0 20px;line-height:1.6'>{copy['intro'].format(order_no=_esc(order_no))}</p>"
         f"{details}<div style='overflow-x:auto'>{items_table}</div>"
         f"<p style='margin:22px 0 0;line-height:1.6'>{_esc(copy['reply'])}</p>",
+        closing=copy["regards"],
     )
     text_body = (
         f"{copy['title']}: {order_no}\n"
@@ -287,33 +288,76 @@ def send_order_confirmation(order: dict, items: list[dict], admin_email: str = "
     return send_email(recipients, subject, html_body, text_body)
 
 
-def send_invoice_available(invoice: dict, pdf_url: str = "", admin_email: str = "") -> dict:
+INVOICE_COPY = {
+    "pl": {
+        "subject": "Nowa faktura: {invoice_no}", "title": "Nowa faktura jest dostępna",
+        "intro": "W załączeniu przesyłamy fakturę <b>{invoice_no}</b>.",
+        "invoice_no": "Numer faktury", "customer": "Klient", "gross": "Kwota brutto",
+        "due": "Termin płatności", "attachment": "Faktura PDF jest dołączona do tej wiadomości.",
+        "regards": "Pozdrawiamy",
+    },
+    "de": {
+        "subject": "Neue Rechnung: {invoice_no}", "title": "Ihre neue Rechnung",
+        "intro": "Im Anhang finden Sie die Rechnung <b>{invoice_no}</b>.",
+        "invoice_no": "Rechnungsnummer", "customer": "Kunde", "gross": "Bruttobetrag",
+        "due": "Zahlungsfrist", "attachment": "Die Rechnung ist dieser E-Mail als PDF beigefügt.",
+        "regards": "Freundliche Grüße",
+    },
+    "en": {
+        "subject": "New invoice: {invoice_no}", "title": "Your new invoice",
+        "intro": "Please find invoice <b>{invoice_no}</b> attached.",
+        "invoice_no": "Invoice number", "customer": "Customer", "gross": "Gross amount",
+        "due": "Payment due", "attachment": "The invoice is attached to this email as a PDF.",
+        "regards": "Kind regards",
+    },
+    "es": {
+        "subject": "Nueva factura: {invoice_no}", "title": "Su nueva factura",
+        "intro": "Adjuntamos la factura <b>{invoice_no}</b>.",
+        "invoice_no": "Número de factura", "customer": "Cliente", "gross": "Importe bruto",
+        "due": "Fecha de vencimiento", "attachment": "La factura está adjunta a este correo en formato PDF.",
+        "regards": "Saludos cordiales",
+    },
+    "it": {
+        "subject": "Nuova fattura: {invoice_no}", "title": "La sua nuova fattura",
+        "intro": "In allegato trova la fattura <b>{invoice_no}</b>.",
+        "invoice_no": "Numero fattura", "customer": "Cliente", "gross": "Importo lordo",
+        "due": "Scadenza pagamento", "attachment": "La fattura è allegata a questa e-mail in formato PDF.",
+        "regards": "Cordiali saluti",
+    },
+}
+
+
+def send_invoice_available(invoice: dict, pdf_url: str = "", admin_email: str = "", pdf_attachment=None) -> dict:
     invoice_no = invoice.get("invoice_no") or "faktura"
     buyer_name = invoice.get("buyer_name") or invoice.get("customer_name") or "Klient"
     buyer_email = invoice.get("buyer_email") or invoice.get("customer_email") or ""
+    language = str(invoice.get("language") or "pl").lower()
+    copy = INVOICE_COPY.get(language, INVOICE_COPY["pl"])
+    currency = str(invoice.get("currency") or "PLN").upper()
     recipients = _uniq_emails([buyer_email, admin_email or email_config_summary().get("admin_email")])
-    link_html = _email_button("Otwórz fakturę w panelu", pdf_url)
-    subject = f"Nowa faktura do pobrania: {invoice_no}"
+    subject = copy["subject"].format(invoice_no=invoice_no)
     details = _email_info_box(
-        f"<div><span style='color:#62708c'>Numer faktury:</span> <b>{_esc(invoice_no)}</b></div>"
-        f"<div><span style='color:#62708c'>Klient:</span> <b>{_esc(buyer_name)}</b></div>"
-        f"<div><span style='color:#62708c'>Kwota brutto:</span> <b>{_esc(_money(invoice.get('total_gross')))}</b></div>"
-        f"<div><span style='color:#62708c'>Termin płatności:</span> <b>{_esc(invoice.get('payment_to') or '-')}</b></div>"
+        f"<div><span style='color:#62708c'>{_esc(copy['invoice_no'])}:</span> <b>{_esc(invoice_no)}</b></div>"
+        f"<div><span style='color:#62708c'>{_esc(copy['customer'])}:</span> <b>{_esc(buyer_name)}</b></div>"
+        f"<div><span style='color:#62708c'>{_esc(copy['gross'])}:</span> <b>{_esc(_money(invoice.get('total_gross'), currency))}</b></div>"
+        f"<div><span style='color:#62708c'>{_esc(copy['due'])}:</span> <b>{_esc(invoice.get('payment_to') or '-')}</b></div>"
     )
     html_body = _email_shell(
-        "Nowa faktura jest dostępna",
-        f"<p style='margin:0;line-height:1.6'>Udostępniliśmy fakturę <b>{_esc(invoice_no)}</b>. Możesz ją pobrać w panelu klienta.</p>"
-        f"{details}{link_html}<p style='margin:0;line-height:1.6;color:#52617c'>Po pobraniu faktury komunikat w panelu klienta przestanie się pojawiać.</p>",
+        copy["title"],
+        f"<p style='margin:0;line-height:1.6'>{copy['intro'].format(invoice_no=_esc(invoice_no))}</p>"
+        f"{details}<p style='margin:0;line-height:1.6;color:#52617c'>{_esc(copy['attachment'])}</p>",
+        closing=copy["regards"],
     )
     text_body = (
-        f"Nowa faktura jest dostępna: {invoice_no}\n"
-        f"Kwota brutto: {_money(invoice.get('total_gross'))}\n"
-        f"Termin płatności: {invoice.get('payment_to') or '-'}\n\n"
-        "Po pobraniu faktury komunikat w panelu klienta przestanie się pojawiać.\n"
-        "Pozdrawiamy, Niedźwieccy"
+        f"{copy['title']}: {invoice_no}\n"
+        f"{copy['gross']}: {_money(invoice.get('total_gross'), currency)}\n"
+        f"{copy['due']}: {invoice.get('payment_to') or '-'}\n\n"
+        f"{copy['attachment']}\n{copy['regards']}, Niedźwieccy"
     )
-    return send_email(recipients, subject, html_body, text_body)
-
+    attachments = []
+    if isinstance(pdf_attachment, dict) and pdf_attachment.get("content"):
+        attachments.append(pdf_attachment)
+    return send_email(recipients, subject, html_body, text_body, attachments=attachments)
 
 def send_payment_reminder(invoice: dict, pdf_url: str = "", admin_email: str = "") -> dict:
     invoice_no = invoice.get("invoice_no") or "faktura"
