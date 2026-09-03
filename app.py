@@ -12,6 +12,7 @@ import sqlite3
 import socket
 import time
 import threading
+import logging
 import uuid
 import secrets
 import hmac
@@ -110,6 +111,27 @@ os.makedirs(DATA_DIR, exist_ok=True)
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024  # 20 MB
 app.config["JSON_AS_ASCII"] = False
+
+PERF_LOG_ENABLED = (os.environ.get("PERF_LOG_ENABLED") or "1").strip().lower() in ("1", "true", "yes", "on")
+if PERF_LOG_ENABLED:
+    app.logger.setLevel(logging.INFO)
+_raw_render_template_string = render_template_string
+
+
+def _perf_add(stage: str, elapsed_seconds: float):
+    try:
+        if hasattr(g, "perf_stages"):
+            g.perf_stages[stage] = g.perf_stages.get(stage, 0.0) + elapsed_seconds
+    except RuntimeError:
+        pass
+
+
+def render_template_string(*args, **kwargs):
+    started = time.perf_counter()
+    try:
+        return _raw_render_template_string(*args, **kwargs)
+    finally:
+        _perf_add("render_html", time.perf_counter() - started)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "")
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
@@ -1043,6 +1065,7 @@ SUPABASE_STORAGE_BUCKET = (os.environ.get("SUPABASE_STORAGE_BUCKET") or "invoice
 SUPABASE_AUTO_SYNC_ON_WRITE = (os.environ.get("SUPABASE_AUTO_SYNC_ON_WRITE") or "1").strip().lower() in ("1", "true", "yes", "on")
 SUPABASE_MIN_SYNC_INTERVAL_SEC = float((os.environ.get("SUPABASE_MIN_SYNC_INTERVAL_SEC") or "2").strip())
 SUPABASE_MIN_PULL_INTERVAL_SEC = float((os.environ.get("SUPABASE_MIN_PULL_INTERVAL_SEC") or "2").strip())
+SUPABASE_BACKGROUND_PULL_INTERVAL_SEC = float((os.environ.get("SUPABASE_BACKGROUND_PULL_INTERVAL_SEC") or "30").strip())
 
 SUPABASE_SYNC_TABLES = [
     ("products", "id"),
@@ -1098,9 +1121,12 @@ SUPABASE_PULL_TABLES = [
 ]
 
 _supabase_sync_lock = threading.Lock()
+_supabase_full_io_lock = threading.Lock()
 _supabase_sync_state = {
     "running": False,
+    "pull_running": False,
     "last_started_ts": 0.0,
+    "last_pull_finished_ts": 0.0,
     "last_result": None,
 }
 
@@ -1186,7 +1212,8 @@ def trigger_background_supabase_sync(reason: str = "write"):
 
     def _job():
         try:
-            result = sync_all_to_supabase()
+            with _supabase_full_io_lock:
+                result = sync_all_to_supabase()
             result["reason"] = reason
         except Exception as e:
             result = {"ok": False, "error": str(e), "reason": reason, "synced_at": now_iso()}
@@ -1221,14 +1248,21 @@ def supabase_request(path: str, method: str = "GET", params: dict | None = None,
     if prefer:
         req.add_header("Prefer", prefer)
 
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read()
-        if not raw:
-            return None
-        ctype = (resp.headers.get("Content-Type") or "").lower()
-        if "application/json" in ctype or raw[:1] in (b"[", b"{"):
-            return json.loads(raw.decode("utf-8"))
-        return raw.decode("utf-8", errors="replace")
+    started = time.perf_counter()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+            if not raw:
+                return None
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            if "application/json" in ctype or raw[:1] in (b"[", b"{"):
+                return json.loads(raw.decode("utf-8"))
+            return raw.decode("utf-8", errors="replace")
+    finally:
+        elapsed = time.perf_counter() - started
+        _perf_add("supabase_http", elapsed)
+        if PERF_LOG_ENABLED and elapsed >= 0.25:
+            app.logger.info("PERF SUPABASE %s %s %.2f ms", method, path, elapsed * 1000)
 
 
 def supabase_storage_ref(object_path: str, bucket: str | None = None) -> str:
@@ -1379,16 +1413,40 @@ def supabase_client_search_rows(limit: int = 5000):
     return rows if isinstance(rows, list) else []
 
 
+_client_search_cache_lock = threading.Lock()
+_client_search_cloud_cache = {"rows": [], "running": False, "loaded_at": 0.0}
+
+
+def _trigger_client_search_cache_refresh(limit: int = 5000):
+    if not supabase_enabled():
+        return False
+    with _client_search_cache_lock:
+        if _client_search_cloud_cache["running"] or time.time() - _client_search_cloud_cache["loaded_at"] < 60:
+            return False
+        _client_search_cloud_cache["running"] = True
+
+    def _job():
+        try:
+            rows = supabase_client_search_rows(limit=limit)
+            with _client_search_cache_lock:
+                _client_search_cloud_cache["rows"] = rows
+                _client_search_cloud_cache["loaded_at"] = time.time()
+        except Exception:
+            pass
+        finally:
+            with _client_search_cache_lock:
+                _client_search_cloud_cache["running"] = False
+
+    threading.Thread(target=_job, daemon=True).start()
+    return True
+
+
 def load_client_search_rows(limit: int = 5000):
     local_rows = local_client_search_rows(limit=limit)
-    cloud_rows = []
-    cloud_ok = False
-    if supabase_enabled():
-        try:
-            cloud_rows = supabase_client_search_rows(limit=limit)
-            cloud_ok = True
-        except Exception:
-            cloud_rows = []
+    with _client_search_cache_lock:
+        cloud_rows = list(_client_search_cloud_cache["rows"])
+        cloud_ok = bool(_client_search_cloud_cache["loaded_at"])
+    _trigger_client_search_cache_refresh(limit=limit)
 
     merged = []
     seen = set()
@@ -1530,7 +1588,7 @@ def sqlite_delete_missing_rows(table: str, conflict_col: str, remote_keys: list)
     return deleted
 
 
-def pull_shared_tables_from_supabase(force: bool = False):
+def pull_shared_tables_from_supabase(force: bool = False, delete_missing: bool = True):
     if not supabase_enabled():
         return {"ok": False, "error": "not_configured"}
 
@@ -1545,15 +1603,20 @@ def pull_shared_tables_from_supabase(force: bool = False):
     fetched = {}
 
     for table, conflict_col in SUPABASE_PULL_TABLES:
+        table_started = time.perf_counter()
         try:
             fetched[(table, conflict_col)] = supabase_select_rows(table, order_by=conflict_col)
         except Exception as e:
             result["ok"] = False
             result["tables"][table] = {"status": "error", "stage": "fetch", "error": str(e)}
+        finally:
+            elapsed = time.perf_counter() - table_started
+            result["tables"].setdefault(table, {})["fetch_ms"] = round(elapsed * 1000, 2)
 
     for table, conflict_col in SUPABASE_PULL_TABLES:
         if (table, conflict_col) not in fetched:
             continue
+        table_started = time.perf_counter()
         try:
             remote_rows = fetched[(table, conflict_col)]
             sqlite_upsert_rows(table, remote_rows, conflict_col)
@@ -1563,6 +1626,9 @@ def pull_shared_tables_from_supabase(force: bool = False):
             result["ok"] = False
             result["tables"].setdefault(table, {})
             result["tables"][table].update({"status": "error", "stage": "upsert", "error": str(e)})
+        finally:
+            elapsed = time.perf_counter() - table_started
+            result["tables"].setdefault(table, {})["upsert_ms"] = round(elapsed * 1000, 2)
 
     for table, conflict_col in reversed(SUPABASE_PULL_TABLES):
         if (table, conflict_col) not in fetched:
@@ -1570,6 +1636,11 @@ def pull_shared_tables_from_supabase(force: bool = False):
         if table == "ksef_documents":
             result["tables"].setdefault(table, {})
             result["tables"][table]["deleted_local"] = 0
+            if result["tables"][table].get("upsert") == "ok":
+                result["tables"][table]["status"] = "ok"
+            continue
+        if not delete_missing:
+            result["tables"].setdefault(table, {})["deleted_local"] = 0
             if result["tables"][table].get("upsert") == "ok":
                 result["tables"][table]["status"] = "ok"
             continue
@@ -1594,27 +1665,75 @@ def pull_shared_tables_from_supabase(force: bool = False):
     return result
 
 
-def maybe_pull_shared_from_supabase(force: bool = False):
+def _run_post_pull_reconciliation():
+    started = time.perf_counter()
     try:
-        # `force=True` jest używane również przez chronione akcje POST
-        # (np. ponowna wysyłka potwierdzenia po restarcie Rendera).
-        if force or request.method == "GET":
-            pull_shared_tables_from_supabase(force=force)
-            # Starsze wersje zapisywały każdą rozpoczętą wysyłkę jako
-            # ``shipped``. Po pobraniu danych napraw status na podstawie
-            # faktycznie zrealizowanych pozycji, aby panel klienta nie
-            # sugerował wysłania całego zamówienia.
-            reconcile_legacy_shipped_order_statuses()
-            # Status płatności mógł zostać zapisany przed dodaniem automatycznego
-            # zamykania zamówień. Przeliczenie jest idempotentne i uzupełnia
-            # wyłącznie zaległe statusy na podstawie istniejących faktur.
-            reconcile_paid_order_statuses()
-            # Historycznych faktur zbiorczych nie da się zawsze jednoznacznie
-            # rozdzielić na zamówienia. Zgodnie z regułą biznesową wszystkie
-            # nieanulowane zamówienia starsze niż 14 dni uznajemy za zakończone.
-            reconcile_legacy_orders_by_age()
-    except Exception:
-        pass
+        reconcile_legacy_shipped_order_statuses()
+        reconcile_paid_order_statuses()
+        reconcile_legacy_orders_by_age()
+    finally:
+        elapsed = time.perf_counter() - started
+        _perf_add("reconciliation", elapsed)
+        if PERF_LOG_ENABLED:
+            app.logger.info("PERF reconciliation %.2f ms", elapsed * 1000)
+
+
+def trigger_background_supabase_pull(reason: str = "read"):
+    """Schedule a full refresh without putting network I/O on a GET request."""
+    if not supabase_enabled():
+        return False, "not_configured"
+    now_ts = time.time()
+    with _supabase_sync_lock:
+        if _supabase_sync_state.get("pull_running"):
+            return False, "already_running"
+        last_finished = float(_supabase_sync_state.get("last_pull_finished_ts") or 0.0)
+        if now_ts - last_finished < SUPABASE_BACKGROUND_PULL_INTERVAL_SEC:
+            return False, "throttled"
+        _supabase_sync_state["pull_running"] = True
+
+    def _job():
+        started = time.perf_counter()
+        try:
+            with _supabase_full_io_lock:
+                # Background refresh only merges remote rows. Deletions are
+                # propagated by their explicit write endpoints; cleanup from a
+                # possibly stale snapshot could otherwise erase a newer local write.
+                result = pull_shared_tables_from_supabase(force=True, delete_missing=False)
+                if result.get("ok"):
+                    _run_post_pull_reconciliation()
+            result["reason"] = reason
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc), "reason": reason}
+        finally:
+            elapsed = time.perf_counter() - started
+            result["total_ms"] = round(elapsed * 1000, 2)
+            with _supabase_sync_lock:
+                _supabase_sync_state["pull_running"] = False
+                _supabase_sync_state["last_pull_finished_ts"] = time.time()
+                _supabase_sync_state["last_pull_result"] = result
+            if PERF_LOG_ENABLED:
+                app.logger.info("PERF background_supabase_pull %s", json.dumps(result, ensure_ascii=False, sort_keys=True))
+
+    threading.Thread(target=_job, daemon=True).start()
+    return True, "started"
+
+
+def maybe_pull_shared_from_supabase(force: bool = False):
+    """Keep GET fast; protected write paths may still request a blocking refresh."""
+    try:
+        if request.method == "GET":
+            return trigger_background_supabase_pull(reason=f"GET {request.path}")
+        if force:
+            started = time.perf_counter()
+            with _supabase_full_io_lock:
+                result = pull_shared_tables_from_supabase(force=True)
+                if result.get("ok"):
+                    _run_post_pull_reconciliation()
+            _perf_add("supabase_pull_blocking", time.perf_counter() - started)
+            return result
+    except Exception as exc:
+        app.logger.warning("Synchronizacja Supabase nie powiodła się: %s", type(exc).__name__)
+    return None
 
 
 def sync_local_rows_to_supabase(table: str, conflict_col: str, ids: list):
@@ -3770,6 +3889,29 @@ def _admin_password_ok(candidate: str) -> bool:
         except Exception:
             return False
     return bool(ADMIN_PASSWORD) and hmac.compare_digest(ADMIN_PASSWORD, candidate)
+
+
+@app.before_request
+def _start_request_performance_trace():
+    if PERF_LOG_ENABLED:
+        g.perf_started = time.perf_counter()
+        g.perf_stages = {}
+
+
+@app.after_request
+def _log_request_performance(response):
+    started = getattr(g, "perf_started", None)
+    if PERF_LOG_ENABLED and started is not None:
+        total = time.perf_counter() - started
+        stages = dict(getattr(g, "perf_stages", {}))
+        # supabase_http i reconciliation są podetapami pulla, więc nie mogą
+        # zostać drugi raz odjęte od czasu całego requestu.
+        top_level = stages.get("render_html", 0.0) + stages.get("supabase_pull_blocking", 0.0)
+        stages["view_logic_sql"] = max(0.0, total - top_level)
+        payload = {name: round(value * 1000, 2) for name, value in stages.items()}
+        payload["total"] = round(total * 1000, 2)
+        app.logger.info("PERF %s %s %s", request.method, request.path, json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    return response
 
 
 @app.before_request
@@ -6339,9 +6481,14 @@ _DOMAIN_ROUTE_MODULES = (routes_admin, routes_customers, routes_orders, routes_i
 
 @app.before_request
 def _refresh_domain_route_context():
-    context = globals()
-    for module in _DOMAIN_ROUTE_MODULES:
-        module.__dict__.update(context)
+    # Moduły otrzymują pełny kontekst raz podczas rejestracji. Ponowne kopiowanie
+    # kilku tysięcy nazw do siedmiu słowników przy każdym requestcie nie jest
+    # potrzebne w produkcji. Zachowujemy je wyłącznie dla izolowanych testów,
+    # które celowo podmieniają zależności po imporcie aplikacji.
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        context = globals()
+        for module in _DOMAIN_ROUTE_MODULES:
+            module.__dict__.update(context)
 
 if __name__ == "__main__":
     # debug=True moĹĽesz zostawiÄ‡ na czas budowy
