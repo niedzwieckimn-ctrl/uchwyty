@@ -649,7 +649,10 @@ def register_routes(context):
             from xlutils.copy import copy as copy_xls
         except ImportError:
             return "Brakuje bibliotek generatora Excel", 503
-        template_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets", "nurlin_order_template.xls")
+        template_path = os.path.join(app.root_path, "assets", "nurlin_order_template.xls")
+        if not os.path.isfile(template_path):
+            app.logger.error("Brak wzoru Nurlin: %s", template_path)
+            return "Brakuje pliku assets/nurlin_order_template.xls w repozytorium", 503
         source = xlrd.open_workbook(template_path, formatting_info=True)
         output = copy_xls(source)
         sheet = output.get_sheet(0)
