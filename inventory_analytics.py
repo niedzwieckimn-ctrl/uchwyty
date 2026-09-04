@@ -19,7 +19,9 @@ ACTIVE_ORDER_STATUSES = {
     "new", "pending", "unconfirmed", "confirmed", "packed", "packed_partial",
     "in_delivery", "shipped", "partially_shipped"
 }
-INCOMING_PACKAGE_STATUSES = {"planned", "ordered", "shipped"}
+# ``planned`` jest szkicem P/O, a nie potwierdzonym zakupem. Nie może jeszcze
+# zwiększać dostępności ani obniżać rekomendacji zakupowych.
+INCOMING_PACKAGE_STATUSES = {"ordered", "shipped"}
 CANCELLED_ORDER_STATUSES = {"cancelled", "canceled", "deleted", "usuniete", "anulowane"}
 
 

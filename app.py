@@ -5462,7 +5462,7 @@ def _client_order_items_local(c, order: dict) -> list[dict]:
           FROM china_items ci
           JOIN china_packages cp ON cp.id=ci.package_id
           WHERE ci.product_id=oi.product_id
-            AND cp.status IN ('planned', 'ordered', 'shipped')
+            AND cp.status IN ('ordered', 'shipped')
         ), 0) AS in_delivery
       FROM order_items oi
       LEFT JOIN products p ON p.id=oi.product_id
@@ -5591,7 +5591,7 @@ def _api_order_lookup_impl():
                            FROM china_items ci
                            JOIN china_packages cp ON cp.id=ci.package_id
                            WHERE ci.product_id=p.id
-                             AND cp.status IN ('planned', 'ordered', 'shipped')
+                             AND cp.status IN ('ordered', 'shipped')
                          ),0) AS in_delivery_qty
                   FROM products p
                   LEFT JOIN stock s ON s.product_id=p.id
