@@ -436,7 +436,7 @@ def register_cash_flow(app, deps):
           JOIN china_packages cp ON cp.id=ci.package_id
           LEFT JOIN products p ON p.id=ci.product_id
           LEFT JOIN pricing pr ON lower(pr.model)=lower(COALESCE(p.sku, ci.sku))
-          WHERE lower(COALESCE(cp.status,'')) IN ('ordered','shipped')
+          WHERE lower(COALESCE(cp.status,'')) IN ('ordered','shipped','problem')
         """)
         china_row = cur.fetchone()
         china_qty = int(china_row["qty"] or 0)

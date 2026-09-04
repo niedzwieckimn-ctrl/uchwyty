@@ -30,8 +30,8 @@ from flask import (
     Flask, request, redirect, url_for, jsonify, session, g,
     send_file, abort
 )
-from flask import render_template_string
-from jinja2 import DictLoader
+from flask import render_template, render_template_string
+from jinja2 import ChoiceLoader, DictLoader, FileSystemLoader
 from werkzeug.security import check_password_hash
 
 import qrcode
@@ -53,6 +53,7 @@ import ksef_domestic
 import ksef_foreign
 from cash_flow_module import register_cash_flow, cash_flow_overdue_invoices
 from inventory_analytics import build_replenishment_analysis, recommended_replenishments
+from seventeentrack_module import SeventeenTrackClient, enabled as seventeentrack_is_enabled, map_package_status, monotonic_status, parse_tracking_payload, verify_webhook_signature
 from proforma_module import generate_proforma_pdf
 from inpost_module import (
     InPostError,
@@ -524,6 +525,20 @@ def init_db():
         cur.execute("ALTER TABLE china_packages ADD COLUMN cost_amount REAL NOT NULL DEFAULT 0")
     if "cost_document_no" not in china_package_cols:
         cur.execute("ALTER TABLE china_packages ADD COLUMN cost_document_no TEXT")
+    china_tracking_columns = {
+        "supplier": "TEXT", "ordered_at": "TEXT", "shipped_at": "TEXT",
+        "arrived_at": "TEXT", "warehouse_received": "INTEGER",
+        "warehouse_received_at": "TEXT", "tracking_carrier": "TEXT",
+        "tracking_carrier_code": "INTEGER", "tracking_status": "TEXT",
+        "tracking_substatus": "TEXT", "tracking_last_event": "TEXT",
+        "tracking_last_update": "TEXT", "tracking_synced_at": "TEXT",
+        "tracking_error": "TEXT", "tracking_events_json": "TEXT",
+        "tracking_eta": "TEXT", "tracking_registered_at": "TEXT",
+        "manual_status_at": "TEXT",
+    }
+    for column_name, column_type in china_tracking_columns.items():
+        if column_name not in china_package_cols:
+            cur.execute(f"ALTER TABLE china_packages ADD COLUMN {column_name} {column_type}")
 
     cur.execute("PRAGMA table_info(invoice_meta)")
     invoice_meta_cols = {r[1] for r in cur.fetchall()}
@@ -1066,6 +1081,9 @@ SUPABASE_AUTO_SYNC_ON_WRITE = (os.environ.get("SUPABASE_AUTO_SYNC_ON_WRITE") or 
 SUPABASE_MIN_SYNC_INTERVAL_SEC = float((os.environ.get("SUPABASE_MIN_SYNC_INTERVAL_SEC") or "2").strip())
 SUPABASE_MIN_PULL_INTERVAL_SEC = float((os.environ.get("SUPABASE_MIN_PULL_INTERVAL_SEC") or "2").strip())
 SUPABASE_BACKGROUND_PULL_INTERVAL_SEC = float((os.environ.get("SUPABASE_BACKGROUND_PULL_INTERVAL_SEC") or "30").strip())
+SEVENTEENTRACK_API_KEY = os.environ.get("SEVENTEENTRACK_API_KEY", "").strip()
+SEVENTEENTRACK_ENABLED = os.environ.get("SEVENTEENTRACK_ENABLED", "0").strip()
+SEVENTEENTRACK_TIMEOUT_SEC = int(os.environ.get("SEVENTEENTRACK_TIMEOUT_SEC", "15") or 15)
 
 SUPABASE_SYNC_TABLES = [
     ("products", "id"),
@@ -3944,6 +3962,10 @@ def _log_request_performance(response):
 @app.before_request
 def security_gate():
     path = request.path
+    if path == "/webhooks/17track":
+        # Endpoint nie korzysta z sesji; sam weryfikuje podpis 17TRACK na
+        # surowym body przed dotknięciem danych logistycznych.
+        return None
     if path == "/login":
         if request.method == "POST" and not _rate_limit("admin_login", 8, 15 * 60):
             return "Zbyt wiele prób logowania. Spróbuj później.", 429
@@ -4100,7 +4122,10 @@ function removeRow(btn){
 """
 
 # loader: BASE dostÄ™pny jako "base.html"
-app.jinja_loader = DictLoader({"base.html": BASE})
+app.jinja_loader = ChoiceLoader([
+    DictLoader({"base.html": BASE}),
+    FileSystemLoader(os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")),
+])
 app.jinja_env.globals["canonical_order_no"] = canonical_order_no
 app.jinja_env.globals["order_display_no"] = order_display_no
 app.jinja_env.globals["order_status_label"] = order_status_label if "order_status_label" in globals() else None
@@ -5489,7 +5514,7 @@ def _client_order_items_local(c, order: dict) -> list[dict]:
           FROM china_items ci
           JOIN china_packages cp ON cp.id=ci.package_id
           WHERE ci.product_id=oi.product_id
-            AND cp.status IN ('ordered', 'shipped')
+            AND cp.status IN ('ordered', 'shipped', 'problem')
         ), 0) AS in_delivery
       FROM order_items oi
       LEFT JOIN products p ON p.id=oi.product_id
@@ -5618,7 +5643,7 @@ def _api_order_lookup_impl():
                            FROM china_items ci
                            JOIN china_packages cp ON cp.id=ci.package_id
                            WHERE ci.product_id=p.id
-                             AND cp.status IN ('ordered', 'shipped')
+                             AND cp.status IN ('ordered', 'shipped', 'problem')
                          ),0) AS in_delivery_qty
                   FROM products p
                   LEFT JOIN stock s ON s.product_id=p.id
