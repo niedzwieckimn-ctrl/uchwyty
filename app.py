@@ -338,6 +338,17 @@ def init_db():
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_china_documents_package ON china_documents(package_id, id)")
 
+    # Niezależny, trwały bezpiecznik idempotencji. Rekord P/O może być
+    # synchronizowany z chmurą, ale tej samej dostawy nie wolno przyjąć drugi raz.
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS china_stock_receipts(
+        package_id INTEGER PRIMARY KEY,
+        received_at TEXT NOT NULL,
+        quantities_json TEXT NOT NULL,
+        FOREIGN KEY(package_id) REFERENCES china_packages(id)
+    )
+    """)
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS pricing(
         model TEXT PRIMARY KEY,
@@ -559,6 +570,12 @@ def init_db():
     china_document_cols = {r[1] for r in cur.fetchall()}
     if "document_type" not in china_document_cols:
         cur.execute("ALTER TABLE china_documents ADD COLUMN document_type TEXT NOT NULL DEFAULT 'order'")
+    cur.execute("""
+      INSERT OR IGNORE INTO china_stock_receipts(package_id,received_at,quantities_json)
+      SELECT id,COALESCE(warehouse_received_at,arrived_at,created_at),'[]'
+      FROM china_packages
+      WHERE status='arrived' OR warehouse_received=1 OR arrived_at IS NOT NULL
+    """)
 
     cur.execute("PRAGMA table_info(invoice_meta)")
     invoice_meta_cols = {r[1] for r in cur.fetchall()}
@@ -1112,6 +1129,7 @@ SUPABASE_SYNC_TABLES = [
     ("orders", "id"),
     ("order_items", "id"),
     ("china_packages", "id"),
+    ("china_stock_receipts", "package_id"),
     ("china_items", "id"),
     ("pricing", "model"),
     ("pricing_eur", "sku"),
@@ -1147,6 +1165,7 @@ SUPABASE_PULL_TABLES = [
     ("products", "id"),
     ("orders", "id"),
     ("china_packages", "id"),
+    ("china_stock_receipts", "package_id"),
     ("stock", "product_id"),
     ("order_items", "id"),
     ("china_items", "id"),
@@ -1584,7 +1603,22 @@ def sqlite_upsert_rows(table: str, rows: list, conflict_col: str):
     placeholders = ",".join(["?"] * len(usable_cols))
     update_cols = [c for c in usable_cols if c != conflict_col]
     if update_cols:
-        update_sql = ", ".join([f"{c}=excluded.{c}" for c in update_cols])
+        # Dostarczona/przyjęta paczka jest stanem monotonicznym. Starszy rekord
+        # z Supabase nie może cofnąć jej do shipped ani wyzerować przyjęcia.
+        if table == "china_packages":
+            assignments = []
+            for col in update_cols:
+                if col == "status":
+                    assignments.append("status=CASE WHEN china_packages.status='arrived' THEN china_packages.status ELSE excluded.status END")
+                elif col == "warehouse_received":
+                    assignments.append("warehouse_received=CASE WHEN china_packages.warehouse_received=1 THEN 1 ELSE excluded.warehouse_received END")
+                elif col in {"warehouse_received_at", "arrived_at"}:
+                    assignments.append(f"{col}=COALESCE(china_packages.{col},excluded.{col})")
+                else:
+                    assignments.append(f"{col}=excluded.{col}")
+            update_sql = ", ".join(assignments)
+        else:
+            update_sql = ", ".join([f"{c}=excluded.{c}" for c in update_cols])
         sql = f"INSERT INTO {table}({','.join(usable_cols)}) VALUES({placeholders}) ON CONFLICT({conflict_col}) DO UPDATE SET {update_sql}"
     else:
         sql = f"INSERT INTO {table}({','.join(usable_cols)}) VALUES({placeholders}) ON CONFLICT({conflict_col}) DO NOTHING"
@@ -1672,7 +1706,7 @@ def pull_shared_tables_from_supabase(force: bool = False, delete_missing: bool =
     for table, conflict_col in reversed(SUPABASE_PULL_TABLES):
         if (table, conflict_col) not in fetched:
             continue
-        if table == "ksef_documents":
+        if table in {"ksef_documents", "china_stock_receipts"}:
             result["tables"].setdefault(table, {})
             result["tables"][table]["deleted_local"] = 0
             if result["tables"][table].get("upsert") == "ok":
