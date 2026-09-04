@@ -1188,6 +1188,46 @@ _supabase_sync_state = {
     "initial_pull_attempted": False,
 }
 
+
+def _local_supabase_bootstrap_complete() -> bool:
+    """True only after a complete successful cloud bootstrap of this SQLite DB."""
+    c = conn()
+    try:
+        c.execute("""
+          CREATE TABLE IF NOT EXISTS local_sync_state(
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+          )
+        """)
+        row = c.execute(
+            "SELECT value FROM local_sync_state WHERE key='supabase_bootstrap_complete'"
+        ).fetchone()
+        c.commit()
+        return bool(row and row["value"] == "1")
+    finally:
+        c.close()
+
+
+def _mark_local_supabase_bootstrap_complete():
+    c = conn()
+    try:
+        c.execute("""
+          CREATE TABLE IF NOT EXISTS local_sync_state(
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+          )
+        """)
+        c.execute("""
+          INSERT INTO local_sync_state(key,value,updated_at)
+          VALUES('supabase_bootstrap_complete','1',?)
+          ON CONFLICT(key) DO UPDATE SET value='1',updated_at=excluded.updated_at
+        """, (now_iso(),))
+        c.commit()
+    finally:
+        c.close()
+
 def supabase_enabled() -> bool:
     return bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
 
@@ -1803,10 +1843,7 @@ def maybe_pull_shared_from_supabase(force: bool = False):
             with _supabase_sync_lock:
                 initial_attempted = bool(_supabase_sync_state.get("initial_pull_attempted"))
             if not initial_attempted:
-                c = conn()
-                has_catalog = c.execute("SELECT 1 FROM products LIMIT 1").fetchone() is not None
-                c.close()
-                if has_catalog:
+                if _local_supabase_bootstrap_complete():
                     with _supabase_sync_lock:
                         _supabase_sync_state["initial_pull_attempted"] = True
                 else:
@@ -1814,11 +1851,13 @@ def maybe_pull_shared_from_supabase(force: bool = False):
                     with _supabase_full_io_lock:
                         with _supabase_sync_lock:
                             already_attempted = bool(_supabase_sync_state.get("initial_pull_attempted"))
-                            _supabase_sync_state["initial_pull_attempted"] = True
                         if not already_attempted:
                             result = pull_shared_tables_from_supabase(force=True, delete_missing=False)
                             if result.get("ok"):
                                 _run_post_pull_reconciliation()
+                                _mark_local_supabase_bootstrap_complete()
+                                with _supabase_sync_lock:
+                                    _supabase_sync_state["initial_pull_attempted"] = True
                     _perf_add("supabase_initial_bootstrap", time.perf_counter() - started)
                     return result if not already_attempted else None
             return trigger_background_supabase_pull(reason=f"GET {request.path}")
