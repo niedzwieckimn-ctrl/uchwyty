@@ -435,18 +435,26 @@ def register_routes(context):
             return "Brak numeru trackingowego", 400
         if norm(row["status"]).lower() == "arrived":
             return redirect(url_for("china", tracking_error="Dostarczone P/O jest historyczne — nie zużyto limitu 17TRACK."))
-        if row["tracking_registered_at"]:
-            return redirect(url_for("china", tracking_registered=1))
         try:
-            result = SeventeenTrackClient(SEVENTEENTRACK_API_KEY, SEVENTEENTRACK_TIMEOUT_SEC).register(
+            client = SeventeenTrackClient(SEVENTEENTRACK_API_KEY, SEVENTEENTRACK_TIMEOUT_SEC)
+            result = client.register(
                 row["tracking"], row["tracking_carrier_code"]
             )
+            parcel = SeventeenTrackClient._parcel(row["tracking"], result.get("carrier") or row["tracking_carrier_code"])
+            push_requested = False
+            try:
+                client.request_push([parcel])
+                push_requested = True
+            except Exception:
+                # Sama rejestracja jest sukcesem. Niedostępny push nie może jej
+                # cofnąć; automatyczny batch pobierze status przy kolejnym cyklu.
+                app.logger.exception("17TRACK: numer zarejestrowany, ale nie udało się zlecić push")
             c = conn()
             c.execute("UPDATE china_packages SET tracking_registered_at=?,tracking_carrier_code=COALESCE(?,tracking_carrier_code),tracking_error=NULL WHERE id=?",
                       (now_iso(), result.get("carrier"), package_id))
             c.commit(); c.close()
             sync_china_rows("china_packages", "id", [package_id])
-            return redirect(url_for("china", tracking_registered=1))
+            return redirect(url_for("china", tracking_registered=1, tracking_push=int(push_requested)))
         except Exception as exc:
             c = conn(); c.execute("UPDATE china_packages SET tracking_error=? WHERE id=?", (str(exc)[:500], package_id)); c.commit(); c.close()
             return redirect(url_for("china", tracking_error=str(exc)[:200]))
