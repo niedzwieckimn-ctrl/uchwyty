@@ -13,15 +13,28 @@ def register_routes(context):
         row = cur.execute("SELECT warehouse_received FROM china_packages WHERE id=?", (package_id,)).fetchone()
         if not row or row["warehouse_received"] == 1:
             return []
+        if cur.execute("SELECT 1 FROM china_stock_receipts WHERE package_id=?", (package_id,)).fetchone():
+            cur.execute("UPDATE china_packages SET status='arrived',warehouse_received=1 WHERE id=?", (package_id,))
+            return []
         if norm(current_status).lower() == "arrived" and row["warehouse_received"] is None:
             return []
         items = cur.execute("SELECT product_id,qty FROM china_items WHERE package_id=?", (package_id,)).fetchall()
         if not items:
             return None
+        received_at = now_iso()
+        receipt_payload = json.dumps(
+            [{"product_id": int(item["product_id"]), "qty": int(item["qty"])} for item in items],
+            ensure_ascii=False,
+        )
+        cur.execute("INSERT OR IGNORE INTO china_stock_receipts(package_id,received_at,quantities_json) VALUES(?,?,?)",
+                    (package_id, received_at, receipt_payload))
+        if cur.rowcount != 1:
+            cur.execute("UPDATE china_packages SET status='arrived',warehouse_received=1 WHERE id=?", (package_id,))
+            return []
         for item in items:
             cur.execute("INSERT OR IGNORE INTO stock(product_id,qty) VALUES(?,0)", (item["product_id"],))
             cur.execute("UPDATE stock SET qty=qty+? WHERE product_id=?", (int(item["qty"]), item["product_id"]))
-        cur.execute("UPDATE china_packages SET warehouse_received=1,warehouse_received_at=? WHERE id=?", (now_iso(), package_id))
+        cur.execute("UPDATE china_packages SET warehouse_received=1,warehouse_received_at=? WHERE id=?", (received_at, package_id))
         return list({int(item["product_id"]) for item in items})
 
     def sync_china_rows(table, conflict_col, ids):
@@ -70,6 +83,7 @@ def register_routes(context):
         c.close()
         if changed_stock_ids:
             sync_china_rows("stock", "product_id", changed_stock_ids)
+            sync_china_rows("china_stock_receipts", "package_id", [package_id])
         sync_china_rows("china_packages", "id", [package_id])
         return True
 
@@ -155,7 +169,7 @@ def register_routes(context):
             except Exception: pack["transit_days"] = 0
             raw_tracking_status = norm(pack.get("tracking_status"))
             status_key = "".join(ch for ch in raw_tracking_status.lower() if ch.isalnum())
-            pack["tracking_status_pl"] = tracking_status_labels.get(status_key)
+            pack["tracking_status_pl"] = "Dostarczona" if norm(pack.get("status")).lower() == "arrived" else tracking_status_labels.get(status_key)
             if not pack["tracking_status_pl"]:
                 pack["tracking_status_pl"] = {
                     "arrived": "Dostarczona", "shipped": "W drodze",
@@ -460,6 +474,43 @@ def register_routes(context):
             c = conn(); c.execute("UPDATE china_packages SET tracking_error=?,tracking_synced_at=? WHERE id=?", (str(exc)[:500], now_iso(), package_id)); c.commit(); c.close()
             return redirect(url_for("china", tracking_error=str(exc)[:200]))
 
+    @app.post("/china/tracking/sync-active")
+    def china_tracking_sync_active():
+        """Jedno zbiorcze, limitowane sprawdzenie aktywnych przesyłek."""
+        if not tracking_enabled():
+            return jsonify(ok=False, error="Integracja 17TRACK jest wyłączona"), 503
+        if not _rate_limit("17track_auto_batch", 12, 60 * 60):
+            return jsonify(ok=True, checked=0, updated=0, status="rate_limited")
+        cutoff = (app_now() - timedelta(minutes=10)).isoformat(timespec="seconds")
+        c = conn()
+        rows = c.execute("""SELECT id,tracking,tracking_carrier_code FROM china_packages
+          WHERE status!='arrived' AND COALESCE(tracking,'')!=''
+            AND (tracking_synced_at IS NULL OR tracking_synced_at<?)
+          ORDER BY COALESCE(tracking_synced_at,'') ASC LIMIT 40""", (cutoff,)).fetchall()
+        c.close()
+        if not rows:
+            return jsonify(ok=True, checked=0, updated=0, status="fresh")
+        try:
+            parcels = [SeventeenTrackClient._parcel(row["tracking"], row["tracking_carrier_code"]) for row in rows]
+            updates = SeventeenTrackClient(SEVENTEENTRACK_API_KEY, SEVENTEENTRACK_TIMEOUT_SEC).get_tracking_info(parcels)
+            by_number = {norm(update.get("number") or (update.get("data") or {}).get("number")): update
+                         for update in updates if isinstance(update, dict)}
+            updated = 0
+            checked_at = now_iso()
+            for row in rows:
+                update = by_number.get(norm(row["tracking"]))
+                if update:
+                    updated += int(apply_tracking_update(int(row["id"]), update))
+                else:
+                    c = conn()
+                    c.execute("UPDATE china_packages SET tracking_synced_at=? WHERE id=?", (checked_at, row["id"]))
+                    c.commit(); c.close()
+                    sync_china_rows("china_packages", "id", [row["id"]])
+            return jsonify(ok=True, checked=len(rows), updated=updated, checked_at=checked_at)
+        except Exception as exc:
+            app.logger.exception("Automatyczne zbiorcze sprawdzenie 17TRACK nie powiodło się")
+            return jsonify(ok=False, error=str(exc)[:200]), 502
+
     @app.post("/webhooks/17track")
     def seventeentrack_webhook():
         if request.content_length and request.content_length > 1024 * 1024:
@@ -501,18 +552,17 @@ def register_routes(context):
         if norm(pack["status"]).lower() != "arrived":
             c.close(); return "Najpierw oznacz przesyłkę jako dostarczoną", 409
         # Historyczne arrived bez nowych znaczników traktujemy jako już przyjęte.
-        if pack["warehouse_received"] == 1 or (pack["warehouse_received"] is None and not pack["tracking_synced_at"] and not pack["manual_status_at"]):
+        if pack["warehouse_received"] == 1 or cur.execute("SELECT 1 FROM china_stock_receipts WHERE package_id=?", (package_id,)).fetchone() or (pack["warehouse_received"] is None and not pack["tracking_synced_at"] and not pack["manual_status_at"]):
             c.close(); return "Ta dostawa została już przyjęta lub jest historyczna", 409
         items = cur.execute("SELECT product_id,qty FROM china_items WHERE package_id=?", (package_id,)).fetchall()
         if not items:
             c.close(); return "Nie można przyjąć pustej paczki", 409
-        cur.execute("BEGIN IMMEDIATE")
-        for item in items:
-            cur.execute("INSERT OR IGNORE INTO stock(product_id,qty) VALUES(?,0)", (item["product_id"],))
-            cur.execute("UPDATE stock SET qty=qty+? WHERE product_id=?", (int(item["qty"]), item["product_id"]))
-        cur.execute("UPDATE china_packages SET warehouse_received=1,warehouse_received_at=? WHERE id=? AND COALESCE(warehouse_received,0)=0", (now_iso(), package_id))
+        changed_stock_ids = receive_into_stock(cur, package_id, pack["status"])
+        if not changed_stock_ids:
+            c.close(); return "Ta dostawa została już przyjęta", 409
         c.commit(); c.close()
-        sync_china_rows("stock", "product_id", list({int(item["product_id"]) for item in items}))
+        sync_china_rows("stock", "product_id", changed_stock_ids)
+        sync_china_rows("china_stock_receipts", "package_id", [package_id])
         sync_china_rows("china_packages", "id", [package_id])
         return redirect(url_for("china", received=1))
 
