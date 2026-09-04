@@ -329,6 +329,7 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         package_id INTEGER NOT NULL,
         original_name TEXT NOT NULL,
+        document_type TEXT NOT NULL DEFAULT 'order',
         stored_path TEXT NOT NULL,
         size_bytes INTEGER NOT NULL,
         created_at TEXT NOT NULL,
@@ -548,10 +549,16 @@ def init_db():
         "tracking_error": "TEXT", "tracking_events_json": "TEXT",
         "tracking_eta": "TEXT", "tracking_registered_at": "TEXT",
         "manual_status_at": "TEXT",
+        "shipping_method": "TEXT",
     }
     for column_name, column_type in china_tracking_columns.items():
         if column_name not in china_package_cols:
             cur.execute(f"ALTER TABLE china_packages ADD COLUMN {column_name} {column_type}")
+
+    cur.execute("PRAGMA table_info(china_documents)")
+    china_document_cols = {r[1] for r in cur.fetchall()}
+    if "document_type" not in china_document_cols:
+        cur.execute("ALTER TABLE china_documents ADD COLUMN document_type TEXT NOT NULL DEFAULT 'order'")
 
     cur.execute("PRAGMA table_info(invoice_meta)")
     invoice_meta_cols = {r[1] for r in cur.fetchall()}
