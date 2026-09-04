@@ -493,6 +493,7 @@ def init_db():
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_packing_batches_root_open ON packing_batches(root_order_id, invoice_id, id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_packing_allocations_batch ON packing_allocations(batch_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_invoices_issue_date ON invoices(issue_date DESC, id DESC)")
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS client_search_logs(
