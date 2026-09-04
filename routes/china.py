@@ -673,8 +673,21 @@ def register_routes(context):
         # OpenOffice skaluje pionowo bitmapę BIFF inaczej niż Excel. Korekta
         # skali utrzymuje znak w obrębie pierwszego wiersza bez nachodzenia na
         # instrukcję i dane nadawcy.
+        logo_scale_x = 0.96
+        logo_scale_y = 0.30
+        logo_width = 150 * logo_scale_x
+        logo_height = 45 * logo_scale_y
+        merged_header_width = sum(sheet.col_width(column) for column in range(5))
+        logo_x = max(0, int((merged_header_width - logo_width) / 2))
+        logo_y = max(0, int((sheet.row_height(0) - logo_height) / 2))
         sheet.insert_bitmap_data(
-            nurlin_logo_bmp, 0, 0, x=0, y=0, scale_x=0.96, scale_y=0.30
+            nurlin_logo_bmp,
+            0,
+            0,
+            x=logo_x,
+            y=logo_y,
+            scale_x=logo_scale_x,
+            scale_y=logo_scale_y,
         )
         # Długi adres nadawcy w B3:E3 zawija się w OpenOffice do dwóch linii.
         # Wzorzec ma wysokość jednej linii, przez co druga była ucinana.
@@ -694,6 +707,10 @@ def register_routes(context):
             if output_style_index is not None:
                 sheet._Worksheet__rows[row]._Row__cells[column].xf_idx = output_style_index
 
+        sender_details = norm(source_sheet.cell_value(2, 1)).replace(
+            "PL8661754936", "PL8661754935"
+        )
+        write_with_template_style(2, 1, sender_details)
         write_with_template_style(5, 1, norm(pack["shipping_method"]) or "AIR FedEx Express DAP")
         for index in range(item_capacity):
             row = item_start_row + index
