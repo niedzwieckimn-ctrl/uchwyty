@@ -161,7 +161,7 @@ def register_routes(context):
                          FROM china_items ci
                          JOIN china_packages cp ON cp.id=ci.package_id
                          WHERE ci.product_id=oi.product_id
-                           AND cp.status IN ('ordered', 'shipped')
+                           AND cp.status IN ('ordered', 'shipped', 'problem')
                        ),0)
                      ) < oi.qty
                  ) THEN 1 ELSE 0 END AS has_shortage
@@ -209,7 +209,7 @@ def register_routes(context):
                            FROM china_items ci
                            JOIN china_packages cp ON cp.id=ci.package_id
                            WHERE ci.product_id=p.id
-                             AND cp.status IN ('ordered', 'shipped')
+                             AND cp.status IN ('ordered', 'shipped', 'problem')
                          ),0) AS in_delivery_qty
                   FROM products p
                   LEFT JOIN stock s ON s.product_id=p.id
@@ -604,7 +604,7 @@ def register_routes(context):
                     FROM china_items ci
                     JOIN china_packages cp ON cp.id=ci.package_id
                     WHERE ci.product_id=oi.product_id
-                      AND cp.status IN ('ordered', 'shipped')
+                      AND cp.status IN ('ordered', 'shipped', 'problem')
                  ), 0) AS in_delivery
           FROM order_items oi
           JOIN orders ord ON ord.id=oi.order_id
@@ -648,7 +648,7 @@ def register_routes(context):
                                FROM china_items ci
                                JOIN china_packages cp ON cp.id=ci.package_id
                                WHERE ci.product_id=p.id
-                                 AND cp.status IN ('ordered', 'shipped')
+                                 AND cp.status IN ('ordered', 'shipped', 'problem')
                              ),0) AS in_delivery_qty
                       FROM products p
                       LEFT JOIN stock s ON s.product_id=p.id

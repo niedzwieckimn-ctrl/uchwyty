@@ -3,7 +3,26 @@
 def register_routes(context):
     globals().update(context)
 
-    valid_statuses = {"planned", "ordered", "shipped", "arrived"}
+    valid_statuses = {"planned", "ordered", "shipped", "arrived", "problem"}
+
+    def tracking_enabled():
+        return seventeentrack_is_enabled(SEVENTEENTRACK_ENABLED, SEVENTEENTRACK_API_KEY)
+
+    def receive_into_stock(cur, package_id, current_status):
+        """Przyjmuje P/O dokładnie raz; historycznego arrived nie dotyka."""
+        row = cur.execute("SELECT warehouse_received FROM china_packages WHERE id=?", (package_id,)).fetchone()
+        if not row or row["warehouse_received"] == 1:
+            return []
+        if norm(current_status).lower() == "arrived" and row["warehouse_received"] is None:
+            return []
+        items = cur.execute("SELECT product_id,qty FROM china_items WHERE package_id=?", (package_id,)).fetchall()
+        if not items:
+            return None
+        for item in items:
+            cur.execute("INSERT OR IGNORE INTO stock(product_id,qty) VALUES(?,0)", (item["product_id"],))
+            cur.execute("UPDATE stock SET qty=qty+? WHERE product_id=?", (int(item["qty"]), item["product_id"]))
+        cur.execute("UPDATE china_packages SET warehouse_received=1,warehouse_received_at=? WHERE id=?", (now_iso(), package_id))
+        return list({int(item["product_id"]) for item in items})
 
     def sync_china_rows(table, conflict_col, ids):
         """Best-effort, kierunkowy zapis zmienionych rekordów bez pełnego push."""
@@ -18,6 +37,35 @@ def register_routes(context):
         """Odtwarza potrzebny fragment po zimnym starcie lokalnego SQLite."""
         if not supabase_enabled():
             return 0
+
+    def apply_tracking_update(package_id, payload):
+        """Aktualizuje wyłącznie pola logistyczne; nigdy nie dotyka stock."""
+        info = parse_tracking_payload(payload)
+        c = conn()
+        cur = c.cursor()
+        cur.execute("SELECT status FROM china_packages WHERE id=?", (package_id,))
+        row = cur.fetchone()
+        if not row:
+            c.close()
+            return False
+        next_status = monotonic_status(row["status"], map_package_status(info["status"]))
+        now = now_iso()
+        changed_stock_ids = receive_into_stock(cur, package_id, row["status"]) if next_status == "arrived" and norm(row["status"]).lower() != "arrived" else []
+        cur.execute("""UPDATE china_packages SET status=?, tracking_carrier=?, tracking_carrier_code=?,
+          tracking_status=?, tracking_substatus=?, tracking_last_event=?, tracking_last_update=?,
+          tracking_synced_at=?, tracking_error=NULL, tracking_events_json=?, tracking_eta=?,
+          shipped_at=CASE WHEN ?='shipped' AND shipped_at IS NULL THEN ? ELSE shipped_at END,
+          arrived_at=CASE WHEN ?='arrived' AND arrived_at IS NULL THEN ? ELSE arrived_at END
+          WHERE id=?""", (next_status, info["carrier"], info["carrier_code"], info["status"],
+          info["substatus"], info["last_event"], info["last_update"], now,
+          json.dumps(info["events"], ensure_ascii=False), info["eta"], next_status, now,
+          next_status, now, package_id))
+        c.commit()
+        c.close()
+        if changed_stock_ids:
+            sync_china_rows("stock", "product_id", changed_stock_ids)
+        sync_china_rows("china_packages", "id", [package_id])
+        return True
         try:
             rows = supabase_select_rows(table, order_by=conflict_col, extra_params=filters)
             return sqlite_upsert_rows(table, rows, conflict_col)
@@ -39,7 +87,69 @@ def register_routes(context):
             hydrate_china_table("china_items")
             cur.execute("SELECT * FROM china_packages ORDER BY id DESC LIMIT 200")
             packs = cur.fetchall()
+
+        all_packs = [dict(row) for row in packs]
+        item_rows = [dict(row) for row in cur.execute("""SELECT ci.package_id,ci.sku,ci.qty,p.model,p.name
+          FROM china_items ci LEFT JOIN products p ON p.id=ci.product_id ORDER BY ci.id""").fetchall()]
         c.close()
+
+        contents = {}
+        for item in item_rows:
+            contents.setdefault(int(item["package_id"]), []).append(item)
+        query = norm(request.args.get("q")).lower()
+        status_filter = norm(request.args.get("status")).lower()
+        tracking_filter = norm(request.args.get("tracking_filter")).lower()
+        scope = norm(request.args.get("scope")).lower()
+        supplier_filter = norm(request.args.get("supplier")).lower()
+        date_from = norm(request.args.get("date_from"))
+        date_to = norm(request.args.get("date_to"))
+        problem_only = request.args.get("problems") == "1"
+
+        def has_problem(pack):
+            return norm(pack.get("status")).lower() == "problem" or bool(norm(pack.get("tracking_error"))) or norm(pack.get("tracking_status")).lower() in {"deliveryfailure","exception","expired","failure"}
+
+        filtered = []
+        for pack in all_packs:
+            haystack = " ".join((norm(pack.get("package_no")), norm(pack.get("supplier")), norm(pack.get("tracking")))).lower()
+            created_day = norm(pack.get("created_at"))[:10]
+            if query and query not in haystack: continue
+            if status_filter and norm(pack.get("status")).lower() != status_filter: continue
+            if supplier_filter and norm(pack.get("supplier")).lower() != supplier_filter: continue
+            if tracking_filter == "yes" and not norm(pack.get("tracking")): continue
+            if tracking_filter == "no" and norm(pack.get("tracking")): continue
+            if scope == "active" and norm(pack.get("status")).lower() == "arrived": continue
+            if scope == "arrived" and norm(pack.get("status")).lower() != "arrived": continue
+            if date_from and created_day < date_from: continue
+            if date_to and created_day > date_to: continue
+            if problem_only and not has_problem(pack): continue
+            pack["items"] = contents.get(int(pack["id"]), [])
+            pack["item_count"] = len(pack["items"])
+            pack["units"] = sum(int(item.get("qty") or 0) for item in pack["items"])
+            filtered.append(pack)
+
+        status_counts = {key: sum(1 for p in all_packs if norm(p.get("status")).lower() == key) for key in valid_statuses}
+        active = [p for p in all_packs if norm(p.get("status")).lower() in {"planned","ordered","shipped","problem"}]
+        kpis = {
+            "all": len(all_packs), **status_counts,
+            "in_transit_value": sum(float(p.get("cost_amount") or 0) for p in all_packs if norm(p.get("status")).lower() in {"ordered","shipped","problem"}),
+            "active_value": sum(float(p.get("cost_amount") or 0) for p in active),
+            "without_tracking": sum(1 for p in active if not norm(p.get("tracking"))),
+        }
+        now = app_now()
+        alerts = []
+        for p in active:
+            try: age = (now.date() - datetime.fromisoformat(norm(p.get("created_at")).replace("Z", "+00:00")).date()).days
+            except Exception: age = 0
+            status = norm(p.get("status")).lower()
+            if not norm(p.get("tracking")) and age > 5: alerts.append((p, "Brak trackingu od ponad 5 dni"))
+            if status == "shipped" and not norm(p.get("tracking")): alerts.append((p, "Wysłana, ale bez trackingu"))
+            if status == "shipped" and age > 20: alerts.append((p, f"W drodze co najmniej {age} dni"))
+            if float(p.get("cost_amount") or 0) <= 0: alerts.append((p, "Brak kosztu"))
+            if has_problem(p): alerts.append((p, norm(p.get("tracking_error")) or "Problem trackingowy"))
+
+        suppliers = sorted({norm(p.get("supplier")) for p in all_packs if norm(p.get("supplier"))})
+        return render_template("china_list.html", title="Chiny (P/O)", packs=filtered, kpis=kpis,
+            alerts=alerts, suppliers=suppliers, contents=contents, tracking_api_enabled=tracking_enabled())
 
         tpl = r"""
         {% extends "base.html" %}
@@ -149,6 +259,7 @@ def register_routes(context):
         status = norm(request.form.get("status")) or "planned"
         tracking = norm(request.form.get("tracking"))
         note = norm(request.form.get("note"))
+        supplier = norm(request.form.get("supplier"))
         cost_amount = to_float(request.form.get("cost_amount"), 0)
         cost_document_no = norm(request.form.get("cost_document_no")) or package_no
 
@@ -161,9 +272,12 @@ def register_routes(context):
         cur = c.cursor()
         try:
             cur.execute("""
-              INSERT INTO china_packages(package_no, status, tracking, note, cost_amount, cost_document_no, created_at)
-              VALUES(?,?,?,?,?,?,?)
-            """, (package_no, status, tracking, note, cost_amount, cost_document_no, now_iso()))
+              INSERT INTO china_packages(package_no,status,tracking,note,cost_amount,cost_document_no,
+                supplier,ordered_at,shipped_at,warehouse_received,created_at)
+              VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            """, (package_no,status,tracking,note,cost_amount,cost_document_no,supplier,
+              now_iso() if status in {"ordered","shipped"} else None,
+              now_iso() if status == "shipped" else None,0,now_iso()))
             package_id = cur.lastrowid
             c.commit()
         except sqlite3.IntegrityError:
@@ -195,30 +309,25 @@ def register_routes(context):
 
         old_status = pack["status"]
 
-        cur.execute("SELECT product_id, qty FROM china_items WHERE package_id=?", (package_id,))
-        items = cur.fetchall()
-
-        if old_status == "arrived" and status != "arrived":
+        if norm(old_status).lower() == "arrived" and status != "arrived":
             c.close()
-            return "Przyjęcie jest operacją końcową. Nie można cofnąć paczki ARRIVED.", 409
-        if old_status != "arrived" and status == "arrived" and not items:
+            return "Dostarczonej i przyjętej paczki nie można cofnąć do towaru w drodze", 409
+
+        now = now_iso()
+        changed_stock_ids = receive_into_stock(cur, package_id, old_status) if status == "arrived" and norm(old_status).lower() != "arrived" else []
+        if status == "arrived" and norm(old_status).lower() != "arrived" and changed_stock_ids is None:
             c.close()
             return "Nie można przyjąć pustej paczki", 409
-
-        # PrzejĹ›cie NA arrived: fizycznie przyjÄ™to towar -> dodaj na stan.
-        if old_status != "arrived" and status == "arrived":
-            for it in items:
-                pid = it["product_id"]
-                qty = int(it["qty"])
-                cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (pid,))
-                cur.execute("UPDATE stock SET qty = qty + ? WHERE product_id=?", (qty, pid))
-
-        cur.execute("UPDATE china_packages SET status=? WHERE id=?", (status, package_id))
+        cur.execute("""UPDATE china_packages SET status=?,manual_status_at=?,
+          ordered_at=CASE WHEN ? IN ('ordered','shipped') AND ordered_at IS NULL THEN ? ELSE ordered_at END,
+          shipped_at=CASE WHEN ?='shipped' AND shipped_at IS NULL THEN ? ELSE shipped_at END,
+          arrived_at=CASE WHEN ?='arrived' AND arrived_at IS NULL THEN ? ELSE arrived_at END
+          WHERE id=?""", (status,now,status,now,status,now,status,now,package_id))
         c.commit()
         c.close()
+        if changed_stock_ids:
+            sync_china_rows("stock", "product_id", changed_stock_ids)
         sync_china_rows("china_packages", "id", [package_id])
-        if old_status != "arrived" and status == "arrived":
-            sync_china_rows("stock", "product_id", list({int(it["product_id"]) for it in items}))
         return redirect(url_for("china"))
 
 
@@ -243,6 +352,110 @@ def register_routes(context):
         if ref.endswith(f"/china/{package_id}"):
             return redirect(url_for("china_package", package_id=package_id))
         return redirect(url_for("china"))
+
+    @app.post("/china/<int:package_id>/tracking/register")
+    def china_tracking_register(package_id):
+        if not _rate_limit("17track_admin", 40, 60):
+            return "Zbyt wiele żądań do 17TRACK", 429
+        if not tracking_enabled():
+            return redirect(url_for("china", tracking_error="Integracja 17TRACK jest wyłączona lub brakuje klucza API."))
+        c = conn()
+        row = c.execute("SELECT tracking,tracking_carrier_code,tracking_registered_at FROM china_packages WHERE id=?", (package_id,)).fetchone()
+        c.close()
+        if not row or not norm(row["tracking"]):
+            return "Brak numeru trackingowego", 400
+        if row["tracking_registered_at"]:
+            return redirect(url_for("china", tracking_registered=1))
+        try:
+            result = SeventeenTrackClient(SEVENTEENTRACK_API_KEY, SEVENTEENTRACK_TIMEOUT_SEC).register(
+                row["tracking"], row["tracking_carrier_code"]
+            )
+            c = conn()
+            c.execute("UPDATE china_packages SET tracking_registered_at=?,tracking_carrier_code=COALESCE(?,tracking_carrier_code),tracking_error=NULL WHERE id=?",
+                      (now_iso(), result.get("carrier"), package_id))
+            c.commit(); c.close()
+            sync_china_rows("china_packages", "id", [package_id])
+            return redirect(url_for("china", tracking_registered=1))
+        except Exception as exc:
+            c = conn(); c.execute("UPDATE china_packages SET tracking_error=? WHERE id=?", (str(exc)[:500], package_id)); c.commit(); c.close()
+            return redirect(url_for("china", tracking_error=str(exc)[:200]))
+
+    @app.post("/china/<int:package_id>/tracking/sync")
+    def china_tracking_sync(package_id):
+        if not _rate_limit("17track_admin", 40, 60):
+            return "Zbyt wiele żądań do 17TRACK", 429
+        if not tracking_enabled():
+            return redirect(url_for("china", tracking_error="Integracja 17TRACK jest wyłączona lub brakuje klucza API."))
+        c = conn()
+        row = c.execute("SELECT tracking,tracking_carrier_code FROM china_packages WHERE id=?", (package_id,)).fetchone()
+        c.close()
+        if not row or not norm(row["tracking"]):
+            return "Brak numeru trackingowego", 400
+        try:
+            parcel = SeventeenTrackClient._parcel(row["tracking"], row["tracking_carrier_code"])
+            updates = SeventeenTrackClient(SEVENTEENTRACK_API_KEY, SEVENTEENTRACK_TIMEOUT_SEC).get_tracking_info([parcel])
+            if updates:
+                apply_tracking_update(package_id, updates[0])
+            return redirect(url_for("china", tracking_synced=1))
+        except Exception as exc:
+            c = conn(); c.execute("UPDATE china_packages SET tracking_error=?,tracking_synced_at=? WHERE id=?", (str(exc)[:500], now_iso(), package_id)); c.commit(); c.close()
+            return redirect(url_for("china", tracking_error=str(exc)[:200]))
+
+    @app.post("/webhooks/17track")
+    def seventeentrack_webhook():
+        if request.content_length and request.content_length > 1024 * 1024:
+            return jsonify(ok=False, error="payload_too_large"), 413
+        if not _rate_limit("17track_webhook", 300, 60):
+            return jsonify(ok=False, error="rate_limit"), 429
+        if not tracking_enabled():
+            return jsonify(ok=False, error="disabled"), 503
+        raw = request.get_data(cache=True)
+        if not verify_webhook_signature(raw, request.headers.get("sign", ""), SEVENTEENTRACK_API_KEY):
+            return jsonify(ok=False, error="invalid_signature"), 401
+        try:
+            payload = request.get_json(force=True)
+        except Exception:
+            return jsonify(ok=False, error="invalid_json"), 400
+        data = payload.get("data") or {}
+        updates = data.get("accepted") if isinstance(data, dict) and isinstance(data.get("accepted"), list) else [data]
+        changed = 0
+        for update in updates:
+            number = norm(update.get("number")) if isinstance(update, dict) else ""
+            if not number:
+                continue
+            c = conn(); rows = c.execute("SELECT id FROM china_packages WHERE tracking=?", (number,)).fetchall(); c.close()
+            if not rows:
+                app.logger.warning("Webhook 17TRACK dla nieznanego numeru %s", number)
+                continue
+            for row in rows:
+                changed += int(apply_tracking_update(int(row["id"]), update))
+        return jsonify(ok=True, updated=changed)
+
+    @app.post("/china/<int:package_id>/receive")
+    def china_receive(package_id):
+        """Jedyna świadoma akcja P/O, która może zwiększyć fizyczny stan."""
+        c = conn(); cur = c.cursor()
+        cur.execute("SELECT status,warehouse_received,tracking_synced_at,manual_status_at FROM china_packages WHERE id=?", (package_id,))
+        pack = cur.fetchone()
+        if not pack:
+            c.close(); abort(404)
+        if norm(pack["status"]).lower() != "arrived":
+            c.close(); return "Najpierw oznacz przesyłkę jako dostarczoną", 409
+        # Historyczne arrived bez nowych znaczników traktujemy jako już przyjęte.
+        if pack["warehouse_received"] == 1 or (pack["warehouse_received"] is None and not pack["tracking_synced_at"] and not pack["manual_status_at"]):
+            c.close(); return "Ta dostawa została już przyjęta lub jest historyczna", 409
+        items = cur.execute("SELECT product_id,qty FROM china_items WHERE package_id=?", (package_id,)).fetchall()
+        if not items:
+            c.close(); return "Nie można przyjąć pustej paczki", 409
+        cur.execute("BEGIN IMMEDIATE")
+        for item in items:
+            cur.execute("INSERT OR IGNORE INTO stock(product_id,qty) VALUES(?,0)", (item["product_id"],))
+            cur.execute("UPDATE stock SET qty=qty+? WHERE product_id=?", (int(item["qty"]), item["product_id"]))
+        cur.execute("UPDATE china_packages SET warehouse_received=1,warehouse_received_at=? WHERE id=? AND COALESCE(warehouse_received,0)=0", (now_iso(), package_id))
+        c.commit(); c.close()
+        sync_china_rows("stock", "product_id", list({int(item["product_id"]) for item in items}))
+        sync_china_rows("china_packages", "id", [package_id])
+        return redirect(url_for("china", received=1))
 
 
 

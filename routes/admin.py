@@ -43,7 +43,7 @@ def register_routes(context):
         n_products = cur.fetchone()["n"]
         cur.execute("SELECT COUNT(*) AS n FROM orders WHERE status IN ('new','packed','packed_partial','confirmed','in_delivery','shipped','partially_shipped')")
         n_orders_current = cur.fetchone()["n"]
-        cur.execute("SELECT COUNT(*) AS n FROM china_packages WHERE status IN ('planned','ordered','shipped')")
+        cur.execute("SELECT COUNT(*) AS n FROM china_packages WHERE status IN ('planned','ordered','shipped','problem')")
         n_china_active = cur.fetchone()["n"]
         cur.execute("SELECT COALESCE(SUM(qty),0) AS n FROM stock")
         n_stock_qty = cur.fetchone()["n"]
@@ -51,7 +51,7 @@ def register_routes(context):
           SELECT COALESCE(SUM(ci.qty),0) AS n
           FROM china_items ci
           JOIN china_packages cp ON cp.id=ci.package_id
-          WHERE cp.status IN ('ordered', 'shipped')
+          WHERE cp.status IN ('ordered', 'shipped', 'problem')
         """)
         n_in_delivery_qty = cur.fetchone()["n"]
 
@@ -79,7 +79,7 @@ def register_routes(context):
             SELECT ci.product_id, SUM(ci.qty) AS in_delivery_qty
             FROM china_items ci
             JOIN china_packages cp ON cp.id=ci.package_id
-            WHERE cp.status IN ('ordered', 'shipped')
+            WHERE cp.status IN ('ordered', 'shipped', 'problem')
             GROUP BY ci.product_id
           ) d ON d.product_id=p.id
           WHERE COALESCE(p.archived,0)=0
