@@ -37,6 +37,12 @@ def register_routes(context):
         """Odtwarza potrzebny fragment po zimnym starcie lokalnego SQLite."""
         if not supabase_enabled():
             return 0
+        try:
+            rows = supabase_select_rows(table, order_by=conflict_col, extra_params=filters)
+            return sqlite_upsert_rows(table, rows, conflict_col)
+        except Exception:
+            app.logger.exception("Nie udało się odtworzyć tabeli %s z Supabase", table)
+            return 0
 
     def apply_tracking_update(package_id, payload):
         """Aktualizuje wyłącznie pola logistyczne; nigdy nie dotyka stock."""
@@ -66,12 +72,6 @@ def register_routes(context):
             sync_china_rows("stock", "product_id", changed_stock_ids)
         sync_china_rows("china_packages", "id", [package_id])
         return True
-        try:
-            rows = supabase_select_rows(table, order_by=conflict_col, extra_params=filters)
-            return sqlite_upsert_rows(table, rows, conflict_col)
-        except Exception:
-            app.logger.exception("Nie udało się odtworzyć tabeli %s z Supabase", table)
-            return 0
 
 
     @app.get("/china")
@@ -99,6 +99,7 @@ def register_routes(context):
         query = norm(request.args.get("q")).lower()
         status_filter = norm(request.args.get("status")).lower()
         tracking_filter = norm(request.args.get("tracking_filter")).lower()
+        receipt_filter = norm(request.args.get("receipt_filter")).lower()
         scope = norm(request.args.get("scope")).lower()
         supplier_filter = norm(request.args.get("supplier")).lower()
         date_from = norm(request.args.get("date_from"))
@@ -117,6 +118,8 @@ def register_routes(context):
             if supplier_filter and norm(pack.get("supplier")).lower() != supplier_filter: continue
             if tracking_filter == "yes" and not norm(pack.get("tracking")): continue
             if tracking_filter == "no" and norm(pack.get("tracking")): continue
+            if receipt_filter == "yes" and pack.get("warehouse_received") != 1: continue
+            if receipt_filter == "no" and pack.get("warehouse_received") == 1: continue
             if scope == "active" and norm(pack.get("status")).lower() == "arrived": continue
             if scope == "arrived" and norm(pack.get("status")).lower() != "arrived": continue
             if date_from and created_day < date_from: continue
@@ -125,6 +128,11 @@ def register_routes(context):
             pack["items"] = contents.get(int(pack["id"]), [])
             pack["item_count"] = len(pack["items"])
             pack["units"] = sum(int(item.get("qty") or 0) for item in pack["items"])
+            try: pack["age_days"] = max(0, (app_now().date() - datetime.fromisoformat(created_day).date()).days)
+            except Exception: pack["age_days"] = 0
+            shipped_day = norm(pack.get("shipped_at"))[:10]
+            try: pack["transit_days"] = max(0, (app_now().date() - datetime.fromisoformat(shipped_day).date()).days)
+            except Exception: pack["transit_days"] = 0
             filtered.append(pack)
 
         status_counts = {key: sum(1 for p in all_packs if norm(p.get("status")).lower() == key) for key in valid_statuses}
@@ -137,19 +145,29 @@ def register_routes(context):
         }
         now = app_now()
         alerts = []
+        alert_metrics = {"missing_tracking": 0, "long_transit": 0, "stale_tracking": 0, "missing_cost": 0}
         for p in active:
             try: age = (now.date() - datetime.fromisoformat(norm(p.get("created_at")).replace("Z", "+00:00")).date()).days
             except Exception: age = 0
             status = norm(p.get("status")).lower()
-            if not norm(p.get("tracking")) and age > 5: alerts.append((p, "Brak trackingu od ponad 5 dni"))
+            if not norm(p.get("tracking")) and age > 5:
+                alerts.append((p, "Brak trackingu od ponad 5 dni")); alert_metrics["missing_tracking"] += 1
             if status == "shipped" and not norm(p.get("tracking")): alerts.append((p, "Wysłana, ale bez trackingu"))
-            if status == "shipped" and age > 20: alerts.append((p, f"W drodze co najmniej {age} dni"))
-            if float(p.get("cost_amount") or 0) <= 0: alerts.append((p, "Brak kosztu"))
+            if status == "shipped" and age > 20:
+                alerts.append((p, f"W drodze co najmniej {age} dni")); alert_metrics["long_transit"] += 1
+            if float(p.get("cost_amount") or 0) <= 0:
+                alerts.append((p, "Brak kosztu")); alert_metrics["missing_cost"] += 1
+            if norm(p.get("tracking")) and norm(p.get("tracking_synced_at")):
+                try: stale_days = (now.date() - datetime.fromisoformat(norm(p.get("tracking_synced_at"))[:10]).date()).days
+                except Exception: stale_days = 0
+                if stale_days > 10:
+                    alerts.append((p, f"Tracking bez aktualizacji od {stale_days} dni")); alert_metrics["stale_tracking"] += 1
             if has_problem(p): alerts.append((p, norm(p.get("tracking_error")) or "Problem trackingowy"))
 
         suppliers = sorted({norm(p.get("supplier")) for p in all_packs if norm(p.get("supplier"))})
         return render_template("china_list.html", title="Chiny (P/O)", packs=filtered, kpis=kpis,
-            alerts=alerts, suppliers=suppliers, contents=contents, tracking_api_enabled=tracking_enabled())
+            alerts=alerts, alert_metrics=alert_metrics, suppliers=suppliers, contents=contents,
+            tracking_api_enabled=tracking_enabled())
 
         tpl = r"""
         {% extends "base.html" %}
