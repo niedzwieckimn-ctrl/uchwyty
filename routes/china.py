@@ -3,6 +3,28 @@
 def register_routes(context):
     globals().update(context)
 
+    valid_statuses = {"planned", "ordered", "shipped", "arrived"}
+
+    def sync_china_rows(table, conflict_col, ids):
+        """Best-effort, kierunkowy zapis zmienionych rekordów bez pełnego push."""
+        if not supabase_enabled():
+            return
+        try:
+            sync_local_rows_to_supabase(table, conflict_col, ids)
+        except Exception:
+            app.logger.exception("Nie udało się zsynchronizować %s z Supabase", table)
+
+    def hydrate_china_table(table, conflict_col="id", filters=None):
+        """Odtwarza potrzebny fragment po zimnym starcie lokalnego SQLite."""
+        if not supabase_enabled():
+            return 0
+        try:
+            rows = supabase_select_rows(table, order_by=conflict_col, extra_params=filters)
+            return sqlite_upsert_rows(table, rows, conflict_col)
+        except Exception:
+            app.logger.exception("Nie udało się odtworzyć tabeli %s z Supabase", table)
+            return 0
+
 
     @app.get("/china")
     def china():
@@ -12,6 +34,11 @@ def register_routes(context):
         cur = c.cursor()
         cur.execute("SELECT * FROM china_packages ORDER BY id DESC LIMIT 200")
         packs = cur.fetchall()
+        if not packs and hydrate_china_table("china_packages"):
+            hydrate_china_table("products")
+            hydrate_china_table("china_items")
+            cur.execute("SELECT * FROM china_packages ORDER BY id DESC LIMIT 200")
+            packs = cur.fetchall()
         c.close()
 
         tpl = r"""
@@ -127,6 +154,8 @@ def register_routes(context):
 
         if not package_no or cost_amount <= 0:
             return "Podaj numer P/O oraz koszt większy od zera", 400
+        if status not in valid_statuses or status == "arrived":
+            return "Nowa paczka nie może być od razu oznaczona jako arrived", 400
 
         c = conn()
         cur = c.cursor()
@@ -135,11 +164,15 @@ def register_routes(context):
               INSERT INTO china_packages(package_no, status, tracking, note, cost_amount, cost_document_no, created_at)
               VALUES(?,?,?,?,?,?,?)
             """, (package_no, status, tracking, note, cost_amount, cost_document_no, now_iso()))
+            package_id = cur.lastrowid
             c.commit()
         except sqlite3.IntegrityError:
-            pass
+            return "Paczka o tym numerze już istnieje", 409
         finally:
-            c.close()
+            if c:
+                c.close()
+
+        sync_china_rows("china_packages", "id", [package_id])
 
         return redirect(url_for("china"))
 
@@ -148,7 +181,7 @@ def register_routes(context):
     @app.post("/china/<int:package_id>/status")
     def china_status(package_id):
         status = norm(request.form.get("status"))
-        if status not in {"planned", "ordered", "shipped", "arrived"}:
+        if status not in valid_statuses:
             return "NieprawidĹ‚owy status", 400
 
         c = conn()
@@ -165,6 +198,13 @@ def register_routes(context):
         cur.execute("SELECT product_id, qty FROM china_items WHERE package_id=?", (package_id,))
         items = cur.fetchall()
 
+        if old_status == "arrived" and status != "arrived":
+            c.close()
+            return "Przyjęcie jest operacją końcową. Nie można cofnąć paczki ARRIVED.", 409
+        if old_status != "arrived" and status == "arrived" and not items:
+            c.close()
+            return "Nie można przyjąć pustej paczki", 409
+
         # PrzejĹ›cie NA arrived: fizycznie przyjÄ™to towar -> dodaj na stan.
         if old_status != "arrived" and status == "arrived":
             for it in items:
@@ -173,17 +213,12 @@ def register_routes(context):
                 cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (pid,))
                 cur.execute("UPDATE stock SET qty = qty + ? WHERE product_id=?", (qty, pid))
 
-        # CofniÄ™cie Z arrived na inny status: towar wraca jako "w drodze" -> odejmij ze stanu.
-        elif old_status == "arrived" and status != "arrived":
-            for it in items:
-                pid = it["product_id"]
-                qty = int(it["qty"])
-                cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (pid,))
-                cur.execute("UPDATE stock SET qty = qty - ? WHERE product_id=?", (qty, pid))
-
         cur.execute("UPDATE china_packages SET status=? WHERE id=?", (status, package_id))
         c.commit()
         c.close()
+        sync_china_rows("china_packages", "id", [package_id])
+        if old_status != "arrived" and status == "arrived":
+            sync_china_rows("stock", "product_id", list({int(it["product_id"]) for it in items}))
         return redirect(url_for("china"))
 
 
@@ -202,6 +237,7 @@ def register_routes(context):
         cur.execute("UPDATE china_packages SET tracking=? WHERE id=?", (tracking, package_id))
         c.commit()
         c.close()
+        sync_china_rows("china_packages", "id", [package_id])
 
         ref = request.referrer or ""
         if ref.endswith(f"/china/{package_id}"):
@@ -221,6 +257,9 @@ def register_routes(context):
         cur = c.cursor()
         cur.execute("SELECT * FROM china_packages WHERE id=?", (package_id,))
         pack = cur.fetchone()
+        if not pack and hydrate_china_table("china_packages", filters={"id": f"eq.{package_id}"}):
+            cur.execute("SELECT * FROM china_packages WHERE id=?", (package_id,))
+            pack = cur.fetchone()
         if not pack:
             c.close()
             abort(404)
@@ -240,17 +279,35 @@ def register_routes(context):
 
     @app.get("/china/<int:package_id>")
     def china_package(package_id):
-        # WyĹ‚Ä…czony pull z Supabase tylko dla moduĹ‚u Chiny.
         c = conn()
         cur = c.cursor()
         cur.execute("SELECT * FROM china_packages WHERE id=?", (package_id,))
         pack = cur.fetchone()
+        pack_hydrated = False
+        if not pack and hydrate_china_table("china_packages", filters={"id": f"eq.{package_id}"}):
+            cur.execute("SELECT * FROM china_packages WHERE id=?", (package_id,))
+            pack = cur.fetchone()
+            pack_hydrated = bool(pack)
         if not pack:
             c.close()
             abort(404)
 
         cur.execute("SELECT id, sku, model, name FROM products WHERE COALESCE(archived,0)=0 ORDER BY sku LIMIT 5000")
         products_rows = cur.fetchall()
+
+        # Na Renderze lokalny SQLite może wystartować pusty. Pełny pull wszystkich
+        # tabel nie powinien blokować tego widoku, ale bez katalogu nie da się
+        # dodać zawartości paczki. W takim przypadku pobieramy synchronicznie
+        # wyłącznie tabelę products, jeden raz na zimnym starcie.
+        if not products_rows and supabase_enabled():
+            try:
+                remote_products = supabase_select_rows("products", order_by="id")
+                if remote_products:
+                    sqlite_upsert_rows("products", remote_products, "id")
+                    cur.execute("SELECT id, sku, model, name FROM products WHERE COALESCE(archived,0)=0 ORDER BY sku LIMIT 5000")
+                    products_rows = cur.fetchall()
+            except Exception as exc:
+                app.logger.warning("Nie udało się pobrać katalogu produktów dla paczki z Chin: %s", type(exc).__name__)
 
         cur.execute("""
           SELECT ci.*, p.model, p.name
@@ -260,6 +317,15 @@ def register_routes(context):
           ORDER BY ci.id DESC
         """, (package_id,))
         items = cur.fetchall()
+        if pack_hydrated and not items and hydrate_china_table("china_items", filters={"package_id": f"eq.{package_id}"}):
+            cur.execute("""
+              SELECT ci.*, p.model, p.name
+              FROM china_items ci
+              JOIN products p ON p.id=ci.product_id
+              WHERE ci.package_id=?
+              ORDER BY ci.id DESC
+            """, (package_id,))
+            items = cur.fetchall()
         c.close()
 
         tpl = r"""
@@ -397,28 +463,53 @@ def register_routes(context):
             c.close()
             return "Produkt nie istnieje", 404
 
-        cur.execute("SELECT id FROM china_packages WHERE id=?", (package_id,))
-        if not cur.fetchone():
+        cur.execute("SELECT id, status FROM china_packages WHERE id=?", (package_id,))
+        pack = cur.fetchone()
+        if not pack:
             c.close()
             return "Paczka nie istnieje", 404
+        if norm(pack["status"]).lower() == "arrived":
+            c.close()
+            return "Nie można zmieniać zawartości przyjętej paczki", 409
 
-        cur.execute(
-            "INSERT INTO china_items(package_id, product_id, sku, qty, created_at) VALUES (?,?,?,?,?)",
-            (package_id, product_id, p["sku"], qty, now_iso())
-        )
+        cur.execute("SELECT id, qty FROM china_items WHERE package_id=? AND product_id=? ORDER BY id LIMIT 1", (package_id, product_id))
+        existing = cur.fetchone()
+        if existing:
+            item_id = int(existing["id"])
+            cur.execute("UPDATE china_items SET qty=qty+? WHERE id=?", (qty, item_id))
+        else:
+            cur.execute(
+                "INSERT INTO china_items(package_id, product_id, sku, qty, created_at) VALUES (?,?,?,?,?)",
+                (package_id, product_id, p["sku"], qty, now_iso())
+            )
+            item_id = cur.lastrowid
         c.commit()
         c.close()
+        sync_china_rows("china_items", "id", [item_id])
         return redirect(url_for("china_package", package_id=package_id))
 
 
 
     @app.post("/china/<int:package_id>/items/<int:item_id>/delete")
     def china_item_delete(package_id, item_id):
+        c = conn()
+        cur = c.cursor()
+        cur.execute("SELECT status FROM china_packages WHERE id=?", (package_id,))
+        pack = cur.fetchone()
+        if not pack:
+            c.close()
+            return "Paczka nie istnieje", 404
+        if norm(pack["status"]).lower() == "arrived":
+            c.close()
+            return "Nie można zmieniać zawartości przyjętej paczki", 409
+        cur.execute("SELECT id FROM china_items WHERE id=? AND package_id=?", (item_id, package_id))
+        if not cur.fetchone():
+            c.close()
+            return "Pozycja nie istnieje", 404
+
         if supabase_enabled():
             supabase_delete_rows("china_items", {"id": item_id})
 
-        c = conn()
-        cur = c.cursor()
         cur.execute("DELETE FROM china_items WHERE id=? AND package_id=?", (item_id, package_id))
         c.commit()
         c.close()

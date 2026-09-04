@@ -51,7 +51,7 @@ def register_routes(context):
           SELECT COALESCE(SUM(ci.qty),0) AS n
           FROM china_items ci
           JOIN china_packages cp ON cp.id=ci.package_id
-          WHERE cp.status IN ('planned', 'ordered', 'shipped')
+          WHERE cp.status IN ('ordered', 'shipped')
         """)
         n_in_delivery_qty = cur.fetchone()["n"]
 
@@ -79,7 +79,7 @@ def register_routes(context):
             SELECT ci.product_id, SUM(ci.qty) AS in_delivery_qty
             FROM china_items ci
             JOIN china_packages cp ON cp.id=ci.package_id
-            WHERE cp.status IN ('planned', 'ordered', 'shipped')
+            WHERE cp.status IN ('ordered', 'shipped')
             GROUP BY ci.product_id
           ) d ON d.product_id=p.id
           WHERE COALESCE(p.archived,0)=0
