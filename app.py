@@ -325,6 +325,19 @@ def init_db():
     """)
 
     cur.execute("""
+    CREATE TABLE IF NOT EXISTS china_documents(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        package_id INTEGER NOT NULL,
+        original_name TEXT NOT NULL,
+        stored_path TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(package_id) REFERENCES china_packages(id)
+    )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_china_documents_package ON china_documents(package_id, id)")
+
+    cur.execute("""
     CREATE TABLE IF NOT EXISTS pricing(
         model TEXT PRIMARY KEY,
         net_price REAL NOT NULL DEFAULT 0,
