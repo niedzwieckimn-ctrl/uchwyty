@@ -51,11 +51,11 @@
     <tr class="main-row">
       <td><input class="po-check" type="checkbox" aria-label="Wybierz {{p.package_no}}"></td>
       <td><b>{{p.package_no}}</b></td><td>{{p.supplier or '—'}}</td>
-      <td><form method="post" action="{{url_for('china_status',package_id=p.id)}}"><select class="po-badge {{p.status}}" name="status" onchange="this.form.submit()">{% for v,l in [('planned','Planowana'),('ordered','Zamówiona'),('shipped','Wysłana'),('arrived','Dostarczona'),('problem','Problem')] %}<option value="{{v}}" {% if p.status==v %}selected{% endif %}>{{l}}</option>{% endfor %}</select></form></td>
+      <td><form method="post" action="{{url_for('china_status',package_id=p.id)}}"><select data-package-status="{{p.id}}" class="po-badge {{p.status}}" name="status" onchange="this.form.submit()">{% for v,l in [('planned','Planowana'),('ordered','Zamówiona'),('shipped','Wysłana'),('arrived','Dostarczona'),('problem','Problem')] %}<option value="{{v}}" {% if p.status==v %}selected{% endif %}>{{l}}</option>{% endfor %}</select></form></td>
       <td class="po-track">{% if p.tracking %}<a target="_blank" rel="noopener" href="https://t.17track.net/en#nums={{p.tracking|urlencode}}">{{p.tracking}} ↗</a><div class="po-meta">{{p.tracking_carrier or 'przewoźnik nierozpoznany'}}</div>{% else %}<span class="muted">—</span>{% endif %}</td>
       <td><b>{{'%.2f'|format(p.cost_amount or 0)}}</b><div class="po-meta">PLN</div></td>
       <td>{{(p.ordered_at or p.created_at or '')[:10]}}<div class="po-meta">{{(p.ordered_at or p.created_at or '')[11:16]}}</div></td>
-      <td><b style="color:{% if p.status=='arrived' %}#087c36{% elif p.status=='problem' %}#b4233c{% else %}#174fb8{% endif %}">{{p.tracking_status_pl}}</b>{% if p.tracking_eta_display %}<div class="po-meta">Przewidywana dostawa: {{p.tracking_eta_display}}</div>{% elif p.status=='shipped' %}<div class="po-meta">{{p.transit_days}} dni w drodze</div>{% elif p.status=='arrived' %}<div class="po-meta">Przesyłka dostarczona</div>{% else %}<div class="po-meta">{{p.age_days}} dni od utworzenia</div>{% endif %}</td>
+      <td><b data-tracking-label="{{p.id}}" style="color:{% if p.status=='arrived' %}#087c36{% elif p.status=='problem' %}#b4233c{% else %}#174fb8{% endif %}">{{p.tracking_status_pl}}</b>{% if p.tracking_eta_display %}<div class="po-meta">Przewidywana dostawa: {{p.tracking_eta_display}}</div>{% elif p.status=='shipped' %}<div class="po-meta">{{p.transit_days}} dni w drodze</div>{% elif p.status=='arrived' %}<div class="po-meta">Przesyłka dostarczona</div>{% else %}<div class="po-meta">{{p.age_days}} dni od utworzenia</div>{% endif %}</td>
       <td><b>{{p.item_count}} pozycji</b><div class="po-meta">{{p.units}} szt.</div></td>
       <td><button class="btn" type="button" onclick="let x=document.getElementById('d{{p.id}}');x.hidden=!x.hidden">Szczegóły</button></td>
     </tr>
@@ -82,14 +82,17 @@
       const body=new FormData(); body.append('csrf_token',token);
       const response=await fetch('{{url_for("china_tracking_sync_active")}}',{method:'POST',body,credentials:'same-origin'});
       const result=await response.json();
-      if(state) state.textContent=result.ok?'● Automatyczne śledzenie aktywne':'● Błąd automatycznego śledzenia';
-      if(result.ok && result.checked>0 && !sessionStorage.getItem('china-auto-reloaded')){
-        sessionStorage.setItem('china-auto-reloaded','1'); location.reload(); return;
+      if(state) state.textContent=result.ok?(result.checked>0?'● Statusy zaktualizowane bez przeładowania':'● Automatyczne śledzenie aktywne'):'● Błąd automatycznego śledzenia';
+      const labels={delivered:'Dostarczona',outfordelivery:'W doręczeniu',intransit:'W drodze',availableforpickup:'Gotowa do odbioru',pickup:'Gotowa do odbioru',deliveryfailure:'Nieudane doręczenie',exception:'Problem z przesyłką',expired:'Tracking wygasł'};
+      for(const item of (result.packages||[])){
+        const select=document.querySelector('[data-package-status="'+item.id+'"]');
+        if(select){select.value=item.status;select.className='po-badge '+item.status;}
+        const label=document.querySelector('[data-tracking-label="'+item.id+'"]');
+        if(label){const key=String(item.tracking_status||'').toLowerCase().replace(/[^a-z0-9]/g,'');label.textContent=item.status==='arrived'?'Dostarczona':(labels[key]||label.textContent);if(item.status==='arrived')label.style.color='#087c36';}
       }
     }catch(error){if(state) state.textContent='● Brak połączenia z 17TRACK';}
     finally{running=false;}
   }
-  sessionStorage.removeItem('china-auto-reloaded');
   setTimeout(refreshTracking,700);
   setInterval(refreshTracking,5*60*1000);
 })();
