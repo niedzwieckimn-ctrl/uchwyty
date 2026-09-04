@@ -628,10 +628,23 @@ def register_routes(context):
     def invoices():
         maybe_pull_shared_from_supabase()
         q = norm(request.args.get("q"))
+        selected_customer = norm(request.args.get("customer"))
+        selected_month = norm(request.args.get("month"))
+        selected_payment = norm(request.args.get("payment"))
+        selected_type = norm(request.args.get("document_type"))
+        selected_currency = norm(request.args.get("currency")).upper()
+        selected_ksef = norm(request.args.get("ksef"))
+        selected_sent = norm(request.args.get("sent"))
+        history_search_active = any((
+            q, selected_customer, selected_month, selected_payment,
+            selected_type, selected_currency, selected_ksef, selected_sent,
+        ))
+        default_limited = not history_search_active
+        cutoff_date = (app_now().date() - timedelta(days=30)).isoformat()
         c = conn()
         cur = c.cursor()
-        params = []
-        where = ""
+        params = [] if history_search_active else [cutoff_date]
+        where = "" if history_search_active else "WHERE i.issue_date >= ?"
 
         cur.execute(f"""
           SELECT
@@ -667,13 +680,6 @@ def register_routes(context):
         view = norm(request.args.get("view")) or "all"
         if view not in {"all", "customers"}:
             view = "all"
-        selected_customer = norm(request.args.get("customer"))
-        selected_month = norm(request.args.get("month"))
-        selected_payment = norm(request.args.get("payment"))
-        selected_type = norm(request.args.get("document_type"))
-        selected_currency = norm(request.args.get("currency")).upper()
-        selected_ksef = norm(request.args.get("ksef"))
-        selected_sent = norm(request.args.get("sent"))
         today = app_now().date().isoformat()
         current_month = today[:7]
 
@@ -787,6 +793,7 @@ def register_routes(context):
             selected_payment=selected_payment, selected_type=selected_type,
             selected_currency=selected_currency, selected_ksef=selected_ksef,
             selected_sent=selected_sent, notice=notice, notice_error=notice_error,
+            default_limited=default_limited, cutoff_date=cutoff_date,
         )
 
         tpl = r"""
