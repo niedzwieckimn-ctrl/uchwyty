@@ -655,17 +655,27 @@ def register_routes(context):
             return "Brakuje pliku assets/nurlin_order_template.xls w repozytorium", 503
         source = xlrd.open_workbook(template_path, formatting_info=True)
         output = copy_xls(source)
+        source_sheet = source.sheet_by_index(0)
         sheet = output.get_sheet(0)
-        sheet.write(5, 1, norm(pack["shipping_method"]) or "AIR FedEx Express DAP")
+
+        def write_with_template_style(row, column, value):
+            """Zapisuje wartość bez usuwania formatowania komórki wzorca XLS."""
+            sheet.write(row, column, value)
+            # xlutils zachowuje w skoroszycie tę samą kolejność rekordów XF co
+            # xlrd. Po zapisie wartości przywracamy indeks stylu komórki wzorca.
+            written_cell = sheet._Worksheet__rows[row]._Row__cells[column]
+            written_cell.xf_idx = source_sheet.cell(row, column).xf_index
+
+        write_with_template_style(5, 1, norm(pack["shipping_method"]) or "AIR FedEx Express DAP")
         for index in range(44):
             row = 8 + index
-            sheet.write(row, 0, index + 1)
+            write_with_template_style(row, 0, index + 1)
             # Wzór przekazany przez dostawcę zawiera przykładowe wcześniejsze
             # pozycje, ceny i wagi. Nowe zamówienie nie może ich odziedziczyć.
             for column in range(1, 6):
-                sheet.write(row, column, "")
-            sheet.write(row, 1, items[index]["sku"] if index < len(items) else "")
-            sheet.write(row, 3, int(items[index]["qty"]) if index < len(items) else "")
+                write_with_template_style(row, column, "")
+            write_with_template_style(row, 1, items[index]["sku"] if index < len(items) else "")
+            write_with_template_style(row, 3, int(items[index]["qty"]) if index < len(items) else "")
         buffer = io.BytesIO()
         output.save(buffer); buffer.seek(0)
         filename = f"Nurlin_{safe_filename(pack['package_no'])}.xls"
