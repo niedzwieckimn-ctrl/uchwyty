@@ -506,7 +506,14 @@ def register_routes(context):
                     c.execute("UPDATE china_packages SET tracking_synced_at=? WHERE id=?", (checked_at, row["id"]))
                     c.commit(); c.close()
                     sync_china_rows("china_packages", "id", [row["id"]])
-            return jsonify(ok=True, checked=len(rows), updated=updated, checked_at=checked_at)
+            ids = [int(row["id"]) for row in rows]
+            c = conn()
+            placeholders = ",".join("?" for _ in ids)
+            current = [dict(row) for row in c.execute(
+                f"SELECT id,status,tracking_status,tracking_eta FROM china_packages WHERE id IN ({placeholders})", ids
+            ).fetchall()]
+            c.close()
+            return jsonify(ok=True, checked=len(rows), updated=updated, checked_at=checked_at, packages=current)
         except Exception as exc:
             app.logger.exception("Automatyczne zbiorcze sprawdzenie 17TRACK nie powiodło się")
             return jsonify(ok=False, error=str(exc)[:200]), 502
