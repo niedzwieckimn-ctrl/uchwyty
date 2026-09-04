@@ -360,10 +360,12 @@ def register_routes(context):
         if not tracking_enabled():
             return redirect(url_for("china", tracking_error="Integracja 17TRACK jest wyłączona lub brakuje klucza API."))
         c = conn()
-        row = c.execute("SELECT tracking,tracking_carrier_code,tracking_registered_at FROM china_packages WHERE id=?", (package_id,)).fetchone()
+        row = c.execute("SELECT status,tracking,tracking_carrier_code,tracking_registered_at FROM china_packages WHERE id=?", (package_id,)).fetchone()
         c.close()
         if not row or not norm(row["tracking"]):
             return "Brak numeru trackingowego", 400
+        if norm(row["status"]).lower() == "arrived":
+            return redirect(url_for("china", tracking_error="Dostarczone P/O jest historyczne — nie zużyto limitu 17TRACK."))
         if row["tracking_registered_at"]:
             return redirect(url_for("china", tracking_registered=1))
         try:
@@ -387,10 +389,12 @@ def register_routes(context):
         if not tracking_enabled():
             return redirect(url_for("china", tracking_error="Integracja 17TRACK jest wyłączona lub brakuje klucza API."))
         c = conn()
-        row = c.execute("SELECT tracking,tracking_carrier_code FROM china_packages WHERE id=?", (package_id,)).fetchone()
+        row = c.execute("SELECT status,tracking,tracking_carrier_code FROM china_packages WHERE id=?", (package_id,)).fetchone()
         c.close()
         if not row or not norm(row["tracking"]):
             return "Brak numeru trackingowego", 400
+        if norm(row["status"]).lower() == "arrived":
+            return redirect(url_for("china", tracking_error="Dostarczone P/O jest historyczne — nie zużyto limitu 17TRACK."))
         try:
             parcel = SeventeenTrackClient._parcel(row["tracking"], row["tracking_carrier_code"])
             updates = SeventeenTrackClient(SEVENTEENTRACK_API_KEY, SEVENTEENTRACK_TIMEOUT_SEC).get_tracking_info([parcel])
