@@ -9,7 +9,7 @@
 <div class="po-page">
   <div class="po-top">
     <div><h1>Chiny (P/O)</h1><div class="muted">Zarządzaj zamówieniami i paczkami z Chin. Śledź status, tracking i zawartość.</div></div>
-    <div class="actions"><button class="btn primary" type="button" onclick="document.getElementById('new-po').classList.add('open')">＋ Nowe P/O</button></div>
+    <div class="actions"><span id="auto-track-state" class="po-api {{'on' if tracking_api_enabled else 'off'}}">● {{'Automatyczne śledzenie aktywne' if tracking_api_enabled else '17TRACK wyłączony'}}</span> <button class="btn primary" type="button" onclick="document.getElementById('new-po').classList.add('open')">＋ Nowe P/O</button></div>
   </div>
 
   {% if request.args.get('tracking_error') %}<div class="card po-alert"><b>17TRACK:</b> {{ request.args.get('tracking_error') }}</div>{% endif %}
@@ -69,4 +69,29 @@
 </div>
 
 <div id="new-po" class="po-modal" onclick="if(event.target===this)this.classList.remove('open')"><div class="po-modal-box"><div class="flex"><h2>Nowe P/O</h2><button type="button" class="btn po-right" onclick="document.getElementById('new-po').classList.remove('open')">×</button></div><form method="post" action="{{url_for('china_create')}}" class="po-modal-grid"><label>Numer P/O<input name="package_no" required></label><label>Dostawca<input name="supplier" list="po-suppliers" placeholder="np. Nurlin"><datalist id="po-suppliers">{% for s in suppliers %}<option value="{{s}}">{% endfor %}<option value="Nurlin"></datalist></label><label>Status<select name="status"><option value="planned">Planowana</option><option value="ordered">Zamówiona</option><option value="shipped">Wysłana</option></select></label><label>Sposób wysyłki<input name="shipping_method" placeholder="np. AIR FedEx Express DAP"></label><label>Tracking<input name="tracking"></label><label>Koszt PLN<input type="number" min="0.01" step="0.01" name="cost_amount" required></label><label>Dokument kosztowy<input name="cost_document_no"></label><label class="wide">Notatka<input name="note"></label><div class="wide"><button class="btn primary">Utwórz P/O</button></div></form></div></div>
+{% if tracking_api_enabled %}<script>
+(function(){
+  let running=false;
+  async function refreshTracking(){
+    if(running || document.hidden) return;
+    running=true;
+    const state=document.getElementById('auto-track-state');
+    if(state) state.textContent='● Sprawdzam aktywne przesyłki…';
+    try{
+      const token=(document.querySelector('form[method="post"] input[name="csrf_token"]')||{}).value||'';
+      const body=new FormData(); body.append('csrf_token',token);
+      const response=await fetch('{{url_for("china_tracking_sync_active")}}',{method:'POST',body,credentials:'same-origin'});
+      const result=await response.json();
+      if(state) state.textContent=result.ok?'● Automatyczne śledzenie aktywne':'● Błąd automatycznego śledzenia';
+      if(result.ok && result.checked>0 && !sessionStorage.getItem('china-auto-reloaded')){
+        sessionStorage.setItem('china-auto-reloaded','1'); location.reload(); return;
+      }
+    }catch(error){if(state) state.textContent='● Brak połączenia z 17TRACK';}
+    finally{running=false;}
+  }
+  sessionStorage.removeItem('china-auto-reloaded');
+  setTimeout(refreshTracking,700);
+  setInterval(refreshTracking,5*60*1000);
+})();
+</script>{% endif %}
 {% endblock %}
