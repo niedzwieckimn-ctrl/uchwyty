@@ -642,8 +642,6 @@ def register_routes(context):
             abort(404)
         if "nurlin" not in norm(pack["supplier"]).lower():
             return "Generator jest dostępny tylko dla dostawcy Nurlin", 409
-        if len(items) > 44:
-            return "Wzór Nurlin mieści maksymalnie 44 pozycje", 409
         try:
             import xlrd
             from xlutils.copy import copy as copy_xls
@@ -654,8 +652,18 @@ def register_routes(context):
             app.logger.error("Brak wzoru Nurlin: %s", template_path)
             return "Brakuje pliku assets/nurlin_order_template.xls w repozytorium", 503
         source = xlrd.open_workbook(template_path, formatting_info=True)
+        source_sheet = source.sheet_by_index(0)
+        item_start_row = 8
+        item_capacity = max(0, source_sheet.nrows - item_start_row)
+        if len(items) > item_capacity:
+            return f"Wzór Nurlin mieści maksymalnie {item_capacity} pozycji", 409
         output = copy_xls(source)
         sheet = output.get_sheet(0)
+        # Długi adres nadawcy w B3:E3 zawija się w OpenOffice do dwóch linii.
+        # Wzorzec ma wysokość jednej linii, przez co druga była ucinana.
+        sender_row = sheet.row(2)
+        sender_row.height = max(sender_row.height, 480)
+        sender_row.height_mismatch = True
 
         def write_with_template_style(row, column, value):
             """Zapisuje wartość bez usuwania formatowania komórki wzorca XLS."""
@@ -670,8 +678,8 @@ def register_routes(context):
                 sheet._Worksheet__rows[row]._Row__cells[column].xf_idx = output_style_index
 
         write_with_template_style(5, 1, norm(pack["shipping_method"]) or "AIR FedEx Express DAP")
-        for index in range(44):
-            row = 8 + index
+        for index in range(item_capacity):
+            row = item_start_row + index
             write_with_template_style(row, 0, index + 1)
             # Wzór przekazany przez dostawcę zawiera przykładowe wcześniejsze
             # pozycje, ceny i wagi. Nowe zamówienie nie może ich odziedziczyć.
