@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block content %}
+<style>
+.po-head{display:flex;align-items:center;gap:16px;margin-bottom:18px}.po-head .right{margin-left:auto}.po-kpis{display:grid;grid-template-columns:repeat(4,minmax(150px,1fr));gap:12px;margin-bottom:18px}.po-kpi{background:#fff;border:1px solid var(--line);border-radius:18px;padding:14px 16px}.po-kpi span{display:block;color:var(--muted);font-size:12px;font-weight:700;text-transform:uppercase}.po-kpi b{display:block;font-size:23px;margin-top:3px}.po-alert{border-left:4px solid var(--amber);padding:10px 14px}.po-filters{display:grid;grid-template-columns:2fr repeat(5,1fr);gap:10px}.po-table{font-size:14px}.po-table td{vertical-align:middle}.po-status{border:0;border-radius:999px;padding:7px 10px;font-weight:700;background:#edf3ff;color:#3158c9}.po-status.arrived{background:#e5f8f0;color:#167552}.po-status.problem{background:#ffebee;color:#b42335}.track-meta{font-size:12px;color:var(--muted)}.po-details{background:#f8faff;padding:16px;border-radius:16px;margin-top:10px}.po-detail-grid{display:grid;grid-template-columns:1fr 1fr 1.4fr;gap:18px}.po-modal{display:none;position:fixed;top:0;right:0;bottom:0;left:285px;background:#17233c66;z-index:50;padding:5vh 20px}.po-modal.open{display:block}.po-modal-box{background:#fff;max-width:850px;margin:auto;border-radius:22px;padding:24px;max-height:90vh;overflow:auto}.po-modal .row{grid-template-columns:repeat(2,1fr)}
+@media(max-width:1050px){.po-kpis{grid-template-columns:repeat(2,1fr)}.po-filters,.po-detail-grid{grid-template-columns:1fr 1fr}.po-table{display:block;overflow-x:auto}}@media(max-width:760px){.po-modal{left:0}}@media(max-width:650px){.po-kpis,.po-filters,.po-detail-grid,.po-modal .row{grid-template-columns:1fr}}
+</style>
+
+<div class="po-head"><div><h1 style="margin:0">Chiny (P/O)</h1><div class="muted">Panel importów i przesyłek</div></div><div class="right"><button class="btn primary" type="button" onclick="document.getElementById('new-po').classList.add('open')">+ Nowe P/O</button></div></div>
+
+{% if request.args.get('tracking_error') %}<div class="card po-alert"><b>17TRACK:</b> {{ request.args.get('tracking_error') }}</div>{% endif %}
+<div class="po-kpis">
+  <a class="po-kpi" href="{{ url_for('china') }}"><span>Wszystkie P/O</span><b>{{ kpis.all }}</b></a>
+  <a class="po-kpi" href="{{ url_for('china',status='planned') }}"><span>Planowane</span><b>{{ kpis.planned }}</b></a>
+  <a class="po-kpi" href="{{ url_for('china',status='ordered') }}"><span>Zamówione</span><b>{{ kpis.ordered }}</b></a>
+  <a class="po-kpi" href="{{ url_for('china',status='shipped') }}"><span>Wysłane</span><b>{{ kpis.shipped }}</b></a>
+  <a class="po-kpi" href="{{ url_for('china',status='arrived') }}"><span>Dostarczone</span><b>{{ kpis.arrived }}</b></a>
+  <div class="po-kpi"><span>Wartość w drodze</span><b>{{ '%.2f'|format(kpis.in_transit_value) }} zł</b></div>
+  <div class="po-kpi"><span>Aktywne P/O</span><b>{{ '%.2f'|format(kpis.active_value) }} zł</b></div>
+  <a class="po-kpi" href="{{ url_for('china',tracking_filter='no',scope='active') }}"><span>Bez trackingu</span><b>{{ kpis.without_tracking }}</b></a>
+</div>
+
+{% if alerts %}<details class="card" open><summary><b>Alerty operacyjne ({{ alerts|length }})</b></summary>{% for p,msg in alerts %}<div class="po-alert"><b>{{ p.package_no }}</b> — {{ msg }}</div>{% endfor %}</details>{% endif %}
+
+<form class="card po-filters" method="get">
+ <input name="q" value="{{ request.args.get('q','') }}" placeholder="P/O, dostawca lub tracking">
+ <select name="status"><option value="">Każdy status</option>{% for v,l in [('planned','Planowana'),('ordered','Zamówiona'),('shipped','Wysłana'),('arrived','Dostarczona'),('problem','Problem')] %}<option value="{{v}}" {% if request.args.get('status')==v %}selected{% endif %}>{{l}}</option>{% endfor %}</select>
+ <select name="supplier"><option value="">Każdy dostawca</option>{% for s in suppliers %}<option {% if request.args.get('supplier')==s %}selected{% endif %}>{{s}}</option>{% endfor %}</select>
+ <select name="tracking_filter"><option value="">Tracking: wszystkie</option><option value="yes">Ma tracking</option><option value="no">Brak trackingu</option></select>
+ <select name="scope"><option value="">Aktywne i dostarczone</option><option value="active">Tylko aktywne</option><option value="arrived">Tylko dostarczone</option></select>
+ <label class="small">Od <input type="date" name="date_from" value="{{request.args.get('date_from','')}}"></label><label class="small">Do <input type="date" name="date_to" value="{{request.args.get('date_to','')}}"></label>
+ <label><input type="checkbox" name="problems" value="1" {% if request.args.get('problems')=='1' %}checked{% endif %}> Tylko problemy</label><button class="btn primary">Filtruj</button><a class="btn" href="{{url_for('china')}}">Wyczyść</a>
+</form>
+
+<div class="card"><div style="overflow-x:auto"><table class="po-table"><thead><tr><th>P/O</th><th>Dostawca</th><th>Status</th><th>Tracking</th><th>Koszt</th><th>Data</th><th>ETA / aktualizacja</th><th>Zawartość</th><th>Akcje</th></tr></thead><tbody>
+{% for p in packs %}<tr>
+ <td><b>{{p.package_no}}</b></td><td>{{p.supplier or '—'}}</td>
+ <td><form method="post" action="{{url_for('china_status',package_id=p.id)}}"><select class="po-status {{p.status}}" name="status" onchange="this.form.submit()">{% for v,l in [('planned','Planowana'),('ordered','Zamówiona'),('shipped','Wysłana'),('arrived','Dostarczona'),('problem','Problem')] %}<option value="{{v}}" {% if p.status==v %}selected{% endif %}>{{l}}</option>{% endfor %}</select></form></td>
+ <td>{% if p.tracking %}<a target="_blank" href="https://t.17track.net/en#nums={{p.tracking|urlencode}}"><b>{{p.tracking}}</b></a><div class="track-meta">{{p.tracking_carrier or ''}} {{p.tracking_status or ''}}</div>{% else %}<span class="muted">Brak</span>{% endif %}</td>
+ <td>{{'%.2f'|format(p.cost_amount or 0)}} zł</td><td>{{(p.ordered_at or p.created_at or '')[:10]}}</td>
+ <td>{{p.tracking_eta or '—'}}<div class="track-meta">{{p.tracking_last_update or p.tracking_synced_at or ''}}</div></td>
+ <td><b>{{p.item_count}} poz.</b><div class="track-meta">{{p.units}} szt.</div></td>
+ <td><button class="btn" type="button" onclick="document.getElementById('d{{p.id}}').hidden=!document.getElementById('d{{p.id}}').hidden">Szczegóły</button></td>
+</tr><tr id="d{{p.id}}" hidden><td colspan="9"><div class="po-details"><div class="po-detail-grid">
+ <section><h3>Szczegóły P/O</h3><div>Dokument: {{p.cost_document_no or '—'}}</div><div>Notatka: {{p.note or '—'}}</div><a class="btn" href="{{url_for('china_package',package_id=p.id)}}">Edytuj zawartość</a></section>
+ <section><h3>Tracking</h3><div>{{p.tracking_last_event or 'Brak zdarzeń'}}</div>{% if p.tracking_error %}<div style="color:var(--red)">{{p.tracking_error}}</div>{% endif %}{% if p.tracking %}<div class="flex"><form method="post" action="{{url_for('china_tracking_register',package_id=p.id)}}"><button class="btn">Rejestruj</button></form><form method="post" action="{{url_for('china_tracking_sync',package_id=p.id)}}"><button class="btn" {% if not tracking_api_enabled %}disabled{% endif %}>Odśwież</button></form></div>{% endif %}</section>
+ <section><h3>Zawartość</h3>{% for i in p['items'] %}<div>{{i.sku}} · {{i.model or i.name or ''}} <b class="right">{{i.qty}} szt.</b></div>{% else %}<div class="muted">Brak pozycji</div>{% endfor %}</section>
+ </div></div></td></tr>{% else %}<tr><td colspan="9" class="muted">Brak P/O spełniających filtry.</td></tr>{% endfor %}
+</tbody></table></div></div>
+
+<div id="new-po" class="po-modal" onclick="if(event.target===this)this.classList.remove('open')"><div class="po-modal-box"><div class="flex"><h2>Nowe P/O</h2><button type="button" class="btn right" onclick="document.getElementById('new-po').classList.remove('open')">×</button></div><form method="post" action="{{url_for('china_create')}}" class="row"><div><label>Numer P/O</label><input name="package_no" required></div><div><label>Dostawca</label><input name="supplier"></div><div><label>Status</label><select name="status"><option value="planned">Planowana</option><option value="ordered">Zamówiona</option><option value="shipped">Wysłana</option></select></div><div><label>Tracking</label><input name="tracking"></div><div><label>Koszt PLN</label><input type="number" min="0.01" step="0.01" name="cost_amount" required></div><div><label>Dokument kosztowy</label><input name="cost_document_no"></div><div style="grid-column:1/-1"><label>Notatka</label><input name="note"></div><button class="btn primary">Utwórz P/O</button></form></div></div>
+{% endblock %}
