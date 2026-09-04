@@ -313,6 +313,7 @@ def register_routes(context):
         tracking = norm(request.form.get("tracking"))
         note = norm(request.form.get("note"))
         supplier = norm(request.form.get("supplier"))
+        shipping_method = norm(request.form.get("shipping_method"))
         cost_amount = to_float(request.form.get("cost_amount"), 0)
         cost_document_no = norm(request.form.get("cost_document_no")) or package_no
 
@@ -326,9 +327,10 @@ def register_routes(context):
         try:
             cur.execute("""
               INSERT INTO china_packages(package_no,status,tracking,note,cost_amount,cost_document_no,
-                supplier,ordered_at,shipped_at,warehouse_received,created_at)
-              VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                supplier,shipping_method,ordered_at,shipped_at,warehouse_received,created_at)
+              VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
             """, (package_no,status,tracking,note,cost_amount,cost_document_no,supplier,
+              shipping_method,
               now_iso() if status in {"ordered","shipped"} else None,
               now_iso() if status == "shipped" else None,0,now_iso()))
             package_id = cur.lastrowid
@@ -520,6 +522,9 @@ def register_routes(context):
         if not uploaded or not norm(uploaded.filename):
             return "Wybierz dokument PDF", 400
         original_name = os.path.basename(norm(uploaded.filename))[:180]
+        document_type = norm(request.form.get("document_type")).lower()
+        if document_type not in {"invoice", "zc429", "order"}:
+            return "Wybierz typ dokumentu: Faktura, ZC429 lub Zamówienie", 400
         if not original_name.lower().endswith(".pdf"):
             return "Do przesyłki można dodać wyłącznie dokument PDF", 400
         data = uploaded.read(10 * 1024 * 1024 + 1)
@@ -536,8 +541,8 @@ def register_routes(context):
         stored_path = os.path.join(docs_dir, stored_name)
         with open(stored_path, "wb") as handle:
             handle.write(data)
-        c.execute("INSERT INTO china_documents(package_id,original_name,stored_path,size_bytes,created_at) VALUES(?,?,?,?,?)",
-                  (package_id, original_name, stored_path, len(data), now_iso()))
+        c.execute("INSERT INTO china_documents(package_id,original_name,document_type,stored_path,size_bytes,created_at) VALUES(?,?,?,?,?,?)",
+                  (package_id, original_name, document_type, stored_path, len(data), now_iso()))
         c.commit(); c.close()
         return redirect(url_for("china", document_uploaded=1))
 
@@ -561,6 +566,42 @@ def register_routes(context):
         except OSError:
             app.logger.exception("Nie udało się usunąć dokumentu P/O %s", document_id)
         return redirect(url_for("china", document_deleted=1))
+
+    @app.get("/china/<int:package_id>/nurlin-order.xls")
+    def china_nurlin_order(package_id):
+        c = conn()
+        pack = c.execute("SELECT * FROM china_packages WHERE id=?", (package_id,)).fetchone()
+        items = c.execute("SELECT sku,qty FROM china_items WHERE package_id=? ORDER BY id", (package_id,)).fetchall()
+        c.close()
+        if not pack:
+            abort(404)
+        if "nurlin" not in norm(pack["supplier"]).lower():
+            return "Generator jest dostępny tylko dla dostawcy Nurlin", 409
+        if len(items) > 44:
+            return "Wzór Nurlin mieści maksymalnie 44 pozycje", 409
+        try:
+            import xlrd
+            from xlutils.copy import copy as copy_xls
+        except ImportError:
+            return "Brakuje bibliotek generatora Excel", 503
+        template_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets", "nurlin_order_template.xls")
+        source = xlrd.open_workbook(template_path, formatting_info=True)
+        output = copy_xls(source)
+        sheet = output.get_sheet(0)
+        sheet.write(5, 1, norm(pack["shipping_method"]) or "AIR FedEx Express DAP")
+        for index in range(44):
+            row = 8 + index
+            sheet.write(row, 0, index + 1)
+            # Wzór przekazany przez dostawcę zawiera przykładowe wcześniejsze
+            # pozycje, ceny i wagi. Nowe zamówienie nie może ich odziedziczyć.
+            for column in range(1, 6):
+                sheet.write(row, column, "")
+            sheet.write(row, 1, items[index]["sku"] if index < len(items) else "")
+            sheet.write(row, 3, int(items[index]["qty"]) if index < len(items) else "")
+        buffer = io.BytesIO()
+        output.save(buffer); buffer.seek(0)
+        filename = f"Nurlin_{safe_filename(pack['package_no'])}.xls"
+        return send_file(buffer, mimetype="application/vnd.ms-excel", as_attachment=True, download_name=filename)
 
 
 
