@@ -655,16 +655,19 @@ def register_routes(context):
             return "Brakuje pliku assets/nurlin_order_template.xls w repozytorium", 503
         source = xlrd.open_workbook(template_path, formatting_info=True)
         output = copy_xls(source)
-        source_sheet = source.sheet_by_index(0)
         sheet = output.get_sheet(0)
 
         def write_with_template_style(row, column, value):
             """Zapisuje wartość bez usuwania formatowania komórki wzorca XLS."""
+            output_row = sheet._Worksheet__rows.get(row)
+            output_cell = output_row._Row__cells.get(column) if output_row else None
+            output_style_index = output_cell.xf_idx if output_cell is not None else None
             sheet.write(row, column, value)
-            # xlutils zachowuje w skoroszycie tę samą kolejność rekordów XF co
-            # xlrd. Po zapisie wartości przywracamy indeks stylu komórki wzorca.
-            written_cell = sheet._Worksheet__rows[row]._Row__cells[column]
-            written_cell.xf_idx = source_sheet.cell(row, column).xf_index
+            # Indeksy XF w skoroszycie zapisanym przez xlutils nie odpowiadają
+            # indeksom xlrd 1:1. Zachowujemy więc indeks stylu istniejącej
+            # komórki z już skopiowanego arkusza, a nie numer z pliku źródłowego.
+            if output_style_index is not None:
+                sheet._Worksheet__rows[row]._Row__cells[column].xf_idx = output_style_index
 
         write_with_template_style(5, 1, norm(pack["shipping_method"]) or "AIR FedEx Express DAP")
         for index in range(44):
