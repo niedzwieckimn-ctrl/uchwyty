@@ -91,11 +91,17 @@ def register_routes(context):
         all_packs = [dict(row) for row in packs]
         item_rows = [dict(row) for row in cur.execute("""SELECT ci.package_id,ci.sku,ci.qty,p.model,p.name
           FROM china_items ci LEFT JOIN products p ON p.id=ci.product_id ORDER BY ci.id""").fetchall()]
+        document_rows = [dict(row) for row in cur.execute(
+            "SELECT * FROM china_documents ORDER BY id DESC"
+        ).fetchall()]
         c.close()
 
         contents = {}
         for item in item_rows:
             contents.setdefault(int(item["package_id"]), []).append(item)
+        documents = {}
+        for document in document_rows:
+            documents.setdefault(int(document["package_id"]), []).append(document)
         query = norm(request.args.get("q")).lower()
         status_filter = norm(request.args.get("status")).lower()
         tracking_filter = norm(request.args.get("tracking_filter")).lower()
@@ -110,6 +116,19 @@ def register_routes(context):
             return norm(pack.get("status")).lower() == "problem" or bool(norm(pack.get("tracking_error"))) or norm(pack.get("tracking_status")).lower() in {"deliveryfailure","exception","expired","failure"}
 
         filtered = []
+        tracking_status_labels = {
+            "notfound": "Brak danych",
+            "info_received": "Dane przesyłki przekazane",
+            "inforeceived": "Dane przesyłki przekazane",
+            "intransit": "W drodze",
+            "outfordelivery": "W doręczeniu",
+            "availableforpickup": "Gotowa do odbioru",
+            "pickup": "Gotowa do odbioru",
+            "delivered": "Dostarczona",
+            "deliveryfailure": "Nieudane doręczenie",
+            "exception": "Problem z przesyłką",
+            "expired": "Tracking wygasł",
+        }
         for pack in all_packs:
             haystack = " ".join((norm(pack.get("package_no")), norm(pack.get("supplier")), norm(pack.get("tracking")))).lower()
             created_day = norm(pack.get("created_at"))[:10]
@@ -126,6 +145,7 @@ def register_routes(context):
             if date_to and created_day > date_to: continue
             if problem_only and not has_problem(pack): continue
             pack["items"] = contents.get(int(pack["id"]), [])
+            pack["documents"] = documents.get(int(pack["id"]), [])
             pack["item_count"] = len(pack["items"])
             pack["units"] = sum(int(item.get("qty") or 0) for item in pack["items"])
             try: pack["age_days"] = max(0, (app_now().date() - datetime.fromisoformat(created_day).date()).days)
@@ -133,6 +153,21 @@ def register_routes(context):
             shipped_day = norm(pack.get("shipped_at"))[:10]
             try: pack["transit_days"] = max(0, (app_now().date() - datetime.fromisoformat(shipped_day).date()).days)
             except Exception: pack["transit_days"] = 0
+            raw_tracking_status = norm(pack.get("tracking_status"))
+            status_key = "".join(ch for ch in raw_tracking_status.lower() if ch.isalnum())
+            pack["tracking_status_pl"] = tracking_status_labels.get(status_key)
+            if not pack["tracking_status_pl"]:
+                pack["tracking_status_pl"] = {
+                    "arrived": "Dostarczona", "shipped": "W drodze",
+                    "ordered": "Zamówiona", "planned": "Planowana",
+                    "problem": "Problem z przesyłką",
+                }.get(norm(pack.get("status")).lower(), "Brak statusu")
+            # 17TRACK potrafi zwrócić ETA jako obiekt {source, from, to}.
+            # W bazie starszych wdrożeń taki obiekt bywa zapisany jako tekst;
+            # do widoku wyciągamy wyłącznie czytelną datę graniczną.
+            raw_eta = norm(pack.get("tracking_eta"))
+            eta_dates = re.findall(r"\d{4}-\d{2}-\d{2}", raw_eta)
+            pack["tracking_eta_display"] = eta_dates[-1] if eta_dates else (raw_eta if len(raw_eta) <= 20 else "")
             filtered.append(pack)
 
         status_counts = {key: sum(1 for p in all_packs if norm(p.get("status")).lower() == key) for key in valid_statuses}
@@ -478,6 +513,54 @@ def register_routes(context):
         sync_china_rows("stock", "product_id", list({int(item["product_id"]) for item in items}))
         sync_china_rows("china_packages", "id", [package_id])
         return redirect(url_for("china", received=1))
+
+    @app.post("/china/<int:package_id>/documents")
+    def china_document_upload(package_id):
+        uploaded = request.files.get("document")
+        if not uploaded or not norm(uploaded.filename):
+            return "Wybierz dokument PDF", 400
+        original_name = os.path.basename(norm(uploaded.filename))[:180]
+        if not original_name.lower().endswith(".pdf"):
+            return "Do przesyłki można dodać wyłącznie dokument PDF", 400
+        data = uploaded.read(10 * 1024 * 1024 + 1)
+        if not data or len(data) > 10 * 1024 * 1024:
+            return "Dokument PDF musi mieć maksymalnie 10 MB", 413
+        if not data.startswith(b"%PDF-"):
+            return "Wybrany plik nie jest prawidłowym dokumentem PDF", 400
+        c = conn()
+        if not c.execute("SELECT 1 FROM china_packages WHERE id=?", (package_id,)).fetchone():
+            c.close(); abort(404)
+        docs_dir = os.path.join(os.path.dirname(DB_PATH), "china_documents")
+        os.makedirs(docs_dir, exist_ok=True)
+        stored_name = f"po_{package_id}_{uuid.uuid4().hex}.pdf"
+        stored_path = os.path.join(docs_dir, stored_name)
+        with open(stored_path, "wb") as handle:
+            handle.write(data)
+        c.execute("INSERT INTO china_documents(package_id,original_name,stored_path,size_bytes,created_at) VALUES(?,?,?,?,?)",
+                  (package_id, original_name, stored_path, len(data), now_iso()))
+        c.commit(); c.close()
+        return redirect(url_for("china", document_uploaded=1))
+
+    @app.get("/china/documents/<int:document_id>")
+    def china_document_download(document_id):
+        c = conn(); row = c.execute("SELECT * FROM china_documents WHERE id=?", (document_id,)).fetchone(); c.close()
+        if not row or not os.path.isfile(row["stored_path"]):
+            abort(404)
+        return send_file(row["stored_path"], mimetype="application/pdf", as_attachment=False,
+                         download_name=row["original_name"])
+
+    @app.post("/china/documents/<int:document_id>/delete")
+    def china_document_delete(document_id):
+        c = conn(); row = c.execute("SELECT stored_path FROM china_documents WHERE id=?", (document_id,)).fetchone()
+        if not row:
+            c.close(); abort(404)
+        c.execute("DELETE FROM china_documents WHERE id=?", (document_id,)); c.commit(); c.close()
+        try:
+            if os.path.isfile(row["stored_path"]):
+                os.remove(row["stored_path"])
+        except OSError:
+            app.logger.exception("Nie udało się usunąć dokumentu P/O %s", document_id)
+        return redirect(url_for("china", document_deleted=1))
 
 
 
