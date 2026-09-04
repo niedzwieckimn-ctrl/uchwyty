@@ -1128,6 +1128,7 @@ _supabase_sync_state = {
     "last_started_ts": 0.0,
     "last_pull_finished_ts": 0.0,
     "last_result": None,
+    "initial_pull_attempted": False,
 }
 
 def supabase_enabled() -> bool:
@@ -1722,6 +1723,32 @@ def maybe_pull_shared_from_supabase(force: bool = False):
     """Keep GET fast; protected write paths may still request a blocking refresh."""
     try:
         if request.method == "GET":
+            # Po zimnym starcie Rendera lokalny SQLite bywa pusty. Pokazanie
+            # użytkownikowi pulpitu z samymi zerami jest gorsze niż jednorazowe
+            # oczekiwanie na odtworzenie danych. Blokujemy wyłącznie pierwszy
+            # odczyt pustej instalacji; późniejsze GET-y nadal synchronizują się
+            # w tle i nie czekają na sieć.
+            with _supabase_sync_lock:
+                initial_attempted = bool(_supabase_sync_state.get("initial_pull_attempted"))
+            if not initial_attempted:
+                c = conn()
+                has_catalog = c.execute("SELECT 1 FROM products LIMIT 1").fetchone() is not None
+                c.close()
+                if has_catalog:
+                    with _supabase_sync_lock:
+                        _supabase_sync_state["initial_pull_attempted"] = True
+                else:
+                    started = time.perf_counter()
+                    with _supabase_full_io_lock:
+                        with _supabase_sync_lock:
+                            already_attempted = bool(_supabase_sync_state.get("initial_pull_attempted"))
+                            _supabase_sync_state["initial_pull_attempted"] = True
+                        if not already_attempted:
+                            result = pull_shared_tables_from_supabase(force=True, delete_missing=False)
+                            if result.get("ok"):
+                                _run_post_pull_reconciliation()
+                    _perf_add("supabase_initial_bootstrap", time.perf_counter() - started)
+                    return result if not already_attempted else None
             return trigger_background_supabase_pull(reason=f"GET {request.path}")
         if force:
             started = time.perf_counter()
