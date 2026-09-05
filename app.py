@@ -4925,6 +4925,15 @@ def _client_stock_catalog_rows(profile: dict) -> list[dict]:
     catalog = []
     for raw in rows:
         row = dict(raw)
+        product_id = to_int(row.get("product_id"), 0)
+        incoming_qty = incoming_by_product.get(product_id, 0)
+        physical_qty = max(0, to_int(row.get("qty_physical"), 0))
+        reserved_qty = max(0, to_int(row.get("qty_reserved"), 0))
+        # Ta sama wartość, którą magazyn pokazuje w kolumnie
+        # „Dostępne w drodze”: z dostawy odejmujemy tę część rezerwacji,
+        # której nie pokrywa aktualny stan fizyczny.
+        reserved_incoming = min(incoming_qty, max(0, reserved_qty - physical_qty))
+        available_incoming = max(0, incoming_qty - reserved_incoming)
         sku_key = norm(row.get("sku")).lower()
         if price_list == "eu_eur":
             price = eur_by_sku.get(sku_key) or {}
@@ -4944,9 +4953,9 @@ def _client_stock_catalog_rows(profile: dict) -> list[dict]:
             "currency": currency,
             "price_list": price_list,
             "price_available": bool(net_price > 0),
-            "image_id": image_by_product.get(to_int(row.get("product_id"), 0), 0),
-            "qty_in_delivery": incoming_by_product.get(to_int(row.get("product_id"), 0), 0),
-            "ean": ean_by_product.get(to_int(row.get("product_id"), 0), ""),
+            "image_id": image_by_product.get(product_id, 0),
+            "qty_in_delivery": available_incoming,
+            "ean": ean_by_product.get(product_id, ""),
         })
         catalog.append(row)
     return catalog
