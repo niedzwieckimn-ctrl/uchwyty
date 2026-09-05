@@ -4837,6 +4837,18 @@ def _client_stock_catalog_rows(profile: dict) -> list[dict]:
     """Return live Supabase stock with the server-selected customer price list."""
     price_list = normalize_client_price_list((profile or {}).get("price_list"))
     currency = price_list_currency(price_list)
+    # Źródło wartości musi być identyczne z ekranem /stock. Widok katalogowy
+    # Supabase nie uwzględniał wszystkich aktywnych/częściowo wydanych zamówień,
+    # dlatego potrafił zwrócić inną rezerwację niż kolumna magazynu.
+    local_available_incoming = {}
+    try:
+        analysis_rows = build_replenishment_analysis(conn, today=app_now().date(), horizon_days=60)
+        local_available_incoming = {
+            to_int(item.get("id"), 0): max(0, to_int(item.get("available_incoming"), 0))
+            for item in analysis_rows
+        }
+    except Exception:
+        app.logger.warning("Nie udało się pobrać wartości Dostępne w drodze dla panelu klienta", exc_info=True)
     rows = supabase_request(
         "/rest/v1/client_stock_catalog_v",
         method="GET",
@@ -4933,7 +4945,10 @@ def _client_stock_catalog_rows(profile: dict) -> list[dict]:
         # „Dostępne w drodze”: z dostawy odejmujemy tę część rezerwacji,
         # której nie pokrywa aktualny stan fizyczny.
         reserved_incoming = min(incoming_qty, max(0, reserved_qty - physical_qty))
-        available_incoming = max(0, incoming_qty - reserved_incoming)
+        available_incoming = local_available_incoming.get(
+            product_id,
+            max(0, incoming_qty - reserved_incoming),
+        )
         sku_key = norm(row.get("sku")).lower()
         if price_list == "eu_eur":
             price = eur_by_sku.get(sku_key) or {}
