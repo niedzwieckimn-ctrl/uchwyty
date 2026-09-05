@@ -929,11 +929,13 @@ def register_routes(context):
     def stock_images():
         c = conn()
         if request.method == "GET":
-            rows = c.execute("""SELECT i.id,i.filename,COUNT(a.product_id) assignments
+            rows = c.execute("""SELECT i.id,i.filename,COUNT(a.product_id) assignments,
+              GROUP_CONCAT(p.sku, ', ') assigned_skus
               FROM product_images i LEFT JOIN product_image_assignments a ON a.image_id=i.id
+              LEFT JOIN products p ON p.id=a.product_id
               GROUP BY i.id ORDER BY i.id DESC""").fetchall()
             c.close()
-            return jsonify(ok=True, images=[{"id":int(r["id"]),"filename":r["filename"],"assignments":int(r["assignments"]),"url":url_for("inventory_image",image_id=r["id"])} for r in rows])
+            return jsonify(ok=True, images=[{"id":int(r["id"]),"filename":r["filename"],"assignments":int(r["assignments"]),"assigned_skus":r["assigned_skus"] or "","url":url_for("inventory_image",image_id=r["id"])} for r in rows])
         upload = request.files.get("image")
         if not upload:
             c.close(); return jsonify(ok=False,error="Wybierz plik SVG, PNG albo JPG"),400
@@ -948,22 +950,48 @@ def register_routes(context):
         if not os.path.exists(stored_path):
             with open(stored_path, "wb") as handle:
                 handle.write(cleaned)
+        if supabase_enabled():
+            try:
+                stored_path = supabase_storage_upload_file(
+                    stored_path,
+                    "product-images/" + stored_name,
+                    content_type={".svg":"image/svg+xml",".png":"image/png",".jpg":"image/jpeg"}[stored_extension],
+                )
+            except Exception as exc:
+                c.close()
+                app.logger.exception("Nie udało się trwale zapisać zdjęcia produktu")
+                return jsonify(ok=False,error="Nie udało się zapisać zdjęcia w Supabase Storage: " + str(exc)),502
         c.execute("INSERT OR IGNORE INTO product_images(stored_path,filename,created_at) VALUES(?,?,?)", (stored_path,os.path.basename(norm(upload.filename)),now_iso()))
         image_id = int(c.execute("SELECT id FROM product_images WHERE stored_path=?", (stored_path,)).fetchone()["id"])
         c.commit(); c.close()
+        if supabase_enabled():
+            try:
+                sync_local_rows_to_supabase("product_images", "id", [image_id])
+            except Exception as exc:
+                return jsonify(ok=False,error="Plik zapisano, ale nie zapisano jego danych w Supabase. Uruchom migrację zdjęć: " + str(exc)),502
         return jsonify(ok=True,image_id=image_id)
 
 
     @app.get("/stock/images/<int:image_id>")
     def inventory_image(image_id):
         c = conn(); row = c.execute("SELECT stored_path FROM product_images WHERE id=?",(image_id,)).fetchone(); c.close()
-        if not row or not os.path.isfile(row["stored_path"]):
+        if not row:
             abort(404)
-        extension = os.path.splitext(row["stored_path"])[1].lower()
+        storage_ref = parse_supabase_storage_ref(row["stored_path"])
+        extension = os.path.splitext(storage_ref[1] if storage_ref else row["stored_path"])[1].lower()
         mimetype = {".svg":"image/svg+xml", ".png":"image/png", ".jpg":"image/jpeg", ".jpeg":"image/jpeg"}.get(extension)
         if not mimetype:
             abort(404)
-        response = send_file(row["stored_path"], mimetype=mimetype, conditional=True, max_age=604800)
+        if storage_ref:
+            try:
+                image_bytes, filename = supabase_storage_download_bytes(row["stored_path"])
+            except Exception:
+                abort(404)
+            response = send_file(io.BytesIO(image_bytes), download_name=filename, mimetype=mimetype, conditional=True, max_age=604800)
+        else:
+            if not os.path.isfile(row["stored_path"]):
+                abort(404)
+            response = send_file(row["stored_path"], mimetype=mimetype, conditional=True, max_age=604800)
         if extension == ".svg":
             response.headers["Content-Security-Policy"] = "default-src 'none'; style-src 'unsafe-inline'; sandbox"
         response.headers["X-Content-Type-Options"] = "nosniff"
@@ -993,7 +1021,16 @@ def register_routes(context):
             c.execute(f"DELETE FROM product_image_assignments WHERE image_id=? AND product_id IN ({marks})",(image_id,*visible))
         for pid in ids:
             c.execute("INSERT INTO product_image_assignments(product_id,image_id,created_at) VALUES(?,?,?) ON CONFLICT(product_id) DO UPDATE SET image_id=excluded.image_id,created_at=excluded.created_at",(pid,image_id,now_iso()))
-        c.commit(); c.close(); return jsonify(ok=True,assigned=len(ids))
+        c.commit(); c.close()
+        if supabase_enabled():
+            try:
+                for pid in visible:
+                    if pid not in ids:
+                        supabase_delete_rows("product_image_assignments", {"product_id":pid})
+                sync_local_rows_to_supabase("product_image_assignments", "product_id", ids)
+            except Exception as exc:
+                return jsonify(ok=False,error="Przypisania zapisano lokalnie, ale synchronizacja Supabase nie powiodła się: " + str(exc)),502
+        return jsonify(ok=True,assigned=len(ids))
 
 
 
