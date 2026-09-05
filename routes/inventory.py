@@ -699,6 +699,19 @@ def register_routes(context):
         page = min(page, pages)
         start = (page - 1) * per_page
         rows = rows[start:start + per_page]
+        page_image_ids = sorted({int(row["image_id"]) for row in rows if row.get("image_id")})
+        thumbnail_urls = {}
+        if page_image_ids:
+            c = conn()
+            placeholders = ",".join("?" for _ in page_image_ids)
+            image_rows = [dict(r) for r in c.execute(
+                f"SELECT id, stored_path FROM product_images WHERE id IN ({placeholders})",
+                page_image_ids,
+            ).fetchall()]
+            c.close()
+            thumbnail_urls = _signed_product_thumbnail_urls(image_rows)
+        for row in rows:
+            row["thumbnail_url"] = thumbnail_urls.get(to_int(row.get("image_id"), 0), "")
         def page_url(number):
             return url_for("stock", q=q, filter=active_filter, per_page=per_page, page=number)
         page_numbers = sorted(set(n for n in (1, page-1, page, page+1, pages) if 1 <= n <= pages))
@@ -934,6 +947,40 @@ def register_routes(context):
         return supabase_storage_ref("product-images/thumbs/" + thumb_name, bucket)
 
 
+    def _signed_product_thumbnail_urls(image_rows, expires_in=3600):
+        """Zwraca szybkie, czasowe adresy miniatur bez pośrednictwa Render."""
+        refs_by_id = {}
+        paths_by_bucket = {}
+        for row in image_rows:
+            image_id = to_int(row.get("id"), 0)
+            stored_path = norm(row.get("stored_path"))
+            storage_ref = parse_supabase_storage_ref(stored_path)
+            if not image_id or not storage_ref:
+                continue
+            extension = os.path.splitext(storage_ref[1])[1].lower()
+            direct_ref = stored_path if extension == ".svg" else _product_thumbnail_ref(stored_path)
+            parsed_ref = parse_supabase_storage_ref(direct_ref)
+            if not parsed_ref:
+                continue
+            bucket, object_path = parsed_ref
+            refs_by_id[image_id] = (bucket, object_path)
+            paths_by_bucket.setdefault(bucket, []).append(object_path)
+
+        signed_by_bucket = {}
+        for bucket, object_paths in paths_by_bucket.items():
+            try:
+                signed_by_bucket[bucket] = supabase_storage_create_signed_urls(
+                    bucket, object_paths, expires_in=expires_in
+                )
+            except Exception:
+                app.logger.warning("Nie udało się podpisać adresów miniatur magazynu", exc_info=True)
+                signed_by_bucket[bucket] = {}
+        return {
+            image_id: signed_by_bucket.get(bucket, {}).get(object_path, "")
+            for image_id, (bucket, object_path) in refs_by_id.items()
+        }
+
+
     def _ensure_product_thumbnail(stored_path, original_bytes=None, check_existing=True):
         storage_ref = parse_supabase_storage_ref(stored_path)
         extension = os.path.splitext(storage_ref[1] if storage_ref else norm(stored_path))[1].lower()
@@ -975,13 +1022,14 @@ def register_routes(context):
     def stock_images():
         c = conn()
         if request.method == "GET":
-            rows = c.execute("""SELECT i.id,i.filename,COUNT(a.product_id) assignments,
+            rows = [dict(r) for r in c.execute("""SELECT i.id,i.filename,i.stored_path,COUNT(a.product_id) assignments,
               GROUP_CONCAT(p.sku, ', ') assigned_skus
               FROM product_images i LEFT JOIN product_image_assignments a ON a.image_id=i.id
               LEFT JOIN products p ON p.id=a.product_id
-              GROUP BY i.id ORDER BY i.id DESC""").fetchall()
+              GROUP BY i.id ORDER BY i.id DESC""").fetchall()]
             c.close()
-            return jsonify(ok=True, images=[{"id":int(r["id"]),"filename":r["filename"],"assignments":int(r["assignments"]),"assigned_skus":r["assigned_skus"] or "","url":url_for("inventory_image",image_id=r["id"])} for r in rows])
+            thumbnail_urls = _signed_product_thumbnail_urls(rows)
+            return jsonify(ok=True, images=[{"id":int(r["id"]),"filename":r["filename"],"assignments":int(r["assignments"]),"assigned_skus":r["assigned_skus"] or "","url":thumbnail_urls.get(int(r["id"])) or url_for("inventory_image",image_id=r["id"],thumb=1)} for r in rows])
         uploads = [item for item in request.files.getlist("images") if item and norm(item.filename)]
         if not uploads:
             upload = request.files.get("image")
@@ -1042,12 +1090,22 @@ def register_routes(context):
         mimetype = {".svg":"image/svg+xml", ".png":"image/png", ".jpg":"image/jpeg", ".jpeg":"image/jpeg"}.get(extension)
         if not mimetype:
             abort(404)
+        wants_thumbnail = request.args.get("thumb") == "1" and extension != ".svg"
+        served_path = _product_thumbnail_ref(row["stored_path"]) if wants_thumbnail and storage_ref else row["stored_path"]
+        served_extension = ".webp" if wants_thumbnail and storage_ref else extension
+        served_mimetype = "image/webp" if served_extension == ".webp" else mimetype
         if storage_ref:
             try:
-                image_bytes, filename = supabase_storage_download_bytes(row["stored_path"])
+                image_bytes, filename = supabase_storage_download_bytes(served_path)
             except Exception:
-                abort(404)
-            response = send_file(io.BytesIO(image_bytes), download_name=filename, mimetype=mimetype, conditional=True, max_age=604800)
+                if not wants_thumbnail:
+                    abort(404)
+                try:
+                    image_bytes, filename = supabase_storage_download_bytes(row["stored_path"])
+                    served_mimetype = mimetype
+                except Exception:
+                    abort(404)
+            response = send_file(io.BytesIO(image_bytes), download_name=filename, mimetype=served_mimetype, conditional=True, max_age=604800)
         else:
             if not os.path.isfile(row["stored_path"]):
                 abort(404)
