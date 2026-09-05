@@ -4125,6 +4125,7 @@ def security_gate():
         path in CLIENT_API_PATHS
         or path.startswith("/api/invoices/")
         or path.startswith("/api/client/orders/")
+        or path.startswith("/api/client/product-images/")
     )
     if is_client_api:
         if request.method == "OPTIONS":
@@ -4852,6 +4853,63 @@ def _client_stock_catalog_rows(profile: dict) -> list[dict]:
     if not isinstance(rows, list):
         raise RuntimeError("Nieprawidłowa odpowiedź katalogu magazynowego")
 
+    # Do panelu klienta przekazujemy jedynie zagregowaną liczbę sztuk w
+    # aktywnych dostawach oraz identyfikator przypisanego zdjęcia. Nie
+    # ujawniamy numerów P/O, dostawców, kosztów ani danych trackingowych.
+    assignments = supabase_request(
+        "/rest/v1/product_image_assignments",
+        method="GET",
+        params={"select": "product_id,image_id", "limit": 5000},
+        timeout=20,
+    ) or []
+    image_by_product = {
+        to_int(item.get("product_id"), 0): to_int(item.get("image_id"), 0)
+        for item in assignments if isinstance(item, dict)
+    }
+    product_details = supabase_request(
+        "/rest/v1/products",
+        method="GET",
+        params={"select": "id,ean", "archived": "eq.0", "limit": 5000},
+        timeout=20,
+    ) or []
+    ean_by_product = {
+        to_int(item.get("id"), 0): norm(item.get("ean"))
+        for item in product_details if isinstance(item, dict)
+    }
+
+    active_packages = supabase_request(
+        "/rest/v1/china_packages",
+        method="GET",
+        params={
+            "select": "id",
+            "status": "in.(ordered,shipped,problem)",
+            "limit": 5000,
+        },
+        timeout=20,
+    ) or []
+    active_package_ids = {
+        to_int(item.get("id"), 0) for item in active_packages if isinstance(item, dict)
+    }
+    incoming_by_product = {}
+    if active_package_ids:
+        package_filter = ",".join(str(value) for value in sorted(active_package_ids) if value)
+        incoming_rows = supabase_request(
+            "/rest/v1/china_items",
+            method="GET",
+            params={
+                "select": "product_id,package_id,qty",
+                "package_id": f"in.({package_filter})",
+                "limit": 10000,
+            },
+            timeout=20,
+        ) or []
+        for item in incoming_rows:
+            if not isinstance(item, dict):
+                continue
+            product_id = to_int(item.get("product_id"), 0)
+            if product_id:
+                incoming_by_product[product_id] = incoming_by_product.get(product_id, 0) + max(0, to_int(item.get("qty"), 0))
+
     eur_by_sku = {}
     if price_list == "eu_eur":
         eur_rows = supabase_request(
@@ -4886,6 +4944,9 @@ def _client_stock_catalog_rows(profile: dict) -> list[dict]:
             "currency": currency,
             "price_list": price_list,
             "price_available": bool(net_price > 0),
+            "image_id": image_by_product.get(to_int(row.get("product_id"), 0), 0),
+            "qty_in_delivery": incoming_by_product.get(to_int(row.get("product_id"), 0), 0),
+            "ean": ean_by_product.get(to_int(row.get("product_id"), 0), ""),
         })
         catalog.append(row)
     return catalog
