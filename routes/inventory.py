@@ -1062,6 +1062,37 @@ def register_routes(context):
         return jsonify(ok=True,results=[dict(r) for r in rows])
 
 
+    @app.post("/api/stock/images/<int:image_id>/delete")
+    def stock_image_delete(image_id):
+        c = conn()
+        row = c.execute("SELECT stored_path FROM product_images WHERE id=?", (image_id,)).fetchone()
+        if not row:
+            c.close(); return jsonify(ok=False,error="Nie ma takiego zdjęcia"),404
+        assignments = to_int(c.execute(
+            "SELECT COUNT(*) n FROM product_image_assignments WHERE image_id=?", (image_id,)
+        ).fetchone()["n"], 0)
+        if assignments:
+            c.close(); return jsonify(ok=False,error="Najpierw usuń przypisania tego zdjęcia do produktów"),409
+        stored_path = norm(row["stored_path"])
+        try:
+            if parse_supabase_storage_ref(stored_path):
+                supabase_storage_delete(stored_path)
+                supabase_delete_rows("product_images", {"id": image_id})
+            elif os.path.isfile(stored_path):
+                image_dir = os.path.realpath(os.path.join(os.path.dirname(DB_PATH), "product_images"))
+                target = os.path.realpath(stored_path)
+                if os.path.commonpath((image_dir, target)) == image_dir:
+                    os.remove(target)
+            c.execute("DELETE FROM product_images WHERE id=?", (image_id,))
+            c.commit(); c.close()
+            _client_product_image_cache.pop(image_id, None)
+            return jsonify(ok=True)
+        except Exception as exc:
+            c.close()
+            app.logger.exception("Nie udało się usunąć nieprzypisanego zdjęcia %s", image_id)
+            return jsonify(ok=False,error="Nie udało się usunąć zdjęcia: " + str(exc)),502
+
+
     @app.post("/api/stock/images/<int:image_id>/assign")
     def stock_image_assign(image_id):
         data=request.get_json(silent=True) or {}
