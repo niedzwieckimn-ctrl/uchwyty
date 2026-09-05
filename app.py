@@ -324,6 +324,40 @@ def init_db():
     )
     """)
 
+    # Metadane interfejsu magazynu. Te tabele nie uczestniczą w obliczaniu
+    # stanów, rezerwacji ani dostaw.
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS product_images(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        stored_path TEXT UNIQUE NOT NULL,
+        filename TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS product_image_assignments(
+        product_id INTEGER PRIMARY KEY,
+        image_id INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(product_id) REFERENCES products(id),
+        FOREIGN KEY(image_id) REFERENCES product_images(id)
+    )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_product_image_assignments_image ON product_image_assignments(image_id)")
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS stock_adjustments(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id INTEGER NOT NULL,
+        old_qty INTEGER NOT NULL,
+        new_qty INTEGER NOT NULL,
+        delta INTEGER NOT NULL,
+        mode TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(product_id) REFERENCES products(id)
+    )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_stock_adjustments_product ON stock_adjustments(product_id, id DESC)")
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS china_documents(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
