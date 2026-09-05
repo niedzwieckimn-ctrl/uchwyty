@@ -631,6 +631,10 @@ def register_routes(context):
 
     @app.get("/stock")
     def stock():
+        # Przy zwykłym użyciu synchronizacja działa w tle. Jedynie po zimnym
+        # starcie z pustą lokalną bazą istniejący mechanizm wykonuje jednorazowy
+        # bootstrap przed renderem, aby nie pokazywać fałszywych zer.
+        maybe_pull_shared_from_supabase()
         q = norm(request.args.get("q"))
         active_filter = norm(request.args.get("filter")) or "all"
         page = max(1, to_int(request.args.get("page"), 1))
