@@ -52,7 +52,7 @@ import invoice_foreign
 import ksef_domestic
 import ksef_foreign
 from cash_flow_module import register_cash_flow, cash_flow_overdue_invoices
-from inventory_analytics import build_replenishment_analysis, recommended_replenishments
+from inventory_analytics import ACTIVE_ORDER_STATUSES, build_replenishment_analysis, recommended_replenishments
 from seventeentrack_module import SeventeenTrackClient, enabled as seventeentrack_is_enabled, map_package_status, monotonic_status, parse_tracking_payload, verify_webhook_signature
 from proforma_module import generate_proforma_pdf
 from inpost_module import (
@@ -1522,7 +1522,7 @@ def local_client_search_rows(limit: int = 5000):
     c = conn()
     cur = c.cursor()
     cur.execute("""
-      SELECT customer_email, customer_name, query, product_sku, product_model, product_name, results_count, source, created_at
+      SELECT id AS local_id, customer_email, customer_name, query, product_sku, product_model, product_name, results_count, source, created_at
       FROM client_search_logs
       ORDER BY created_at DESC, id DESC
       LIMIT ?
@@ -1539,7 +1539,7 @@ def supabase_client_search_rows(limit: int = 5000):
         "/rest/v1/client_search_logs",
         method="GET",
         params={
-            "select": "customer_email,customer_name,query,product_sku,product_model,product_name,results_count,source,created_at",
+            "select": "id,customer_email,customer_name,query,product_sku,product_model,product_name,results_count,source,created_at",
             "order": "created_at.desc",
             "limit": str(limit),
         },
@@ -1604,8 +1604,8 @@ def load_client_search_rows(limit: int = 5000):
     _trigger_client_search_cache_refresh(limit=limit)
 
     merged = []
-    seen = set()
-    for row in list(cloud_rows) + list(local_rows):
+    merged_by_key = {}
+    for origin, row in [("cloud", item) for item in cloud_rows] + [("local", item) for item in local_rows]:
         cleaned = {
             "customer_email": norm((row or {}).get("customer_email")).lower(),
             "customer_name": norm((row or {}).get("customer_name")),
@@ -1616,6 +1616,8 @@ def load_client_search_rows(limit: int = 5000):
             "results_count": to_int((row or {}).get("results_count"), 0),
             "source": norm((row or {}).get("source")) or "stock",
             "created_at": norm((row or {}).get("created_at")),
+            "cloud_id": to_int((row or {}).get("id"), 0) if origin == "cloud" else 0,
+            "local_id": to_int((row or {}).get("local_id"), 0) if origin == "local" else 0,
         }
         if not cleaned["query"]:
             continue
@@ -1630,9 +1632,12 @@ def load_client_search_rows(limit: int = 5000):
             cleaned["source"],
             cleaned["created_at"],
         )
-        if key in seen:
+        existing = merged_by_key.get(key)
+        if existing:
+            existing["cloud_id"] = existing.get("cloud_id") or cleaned["cloud_id"]
+            existing["local_id"] = existing.get("local_id") or cleaned["local_id"]
             continue
-        seen.add(key)
+        merged_by_key[key] = cleaned
         merged.append(cleaned)
 
     merged.sort(key=lambda r: r.get("created_at") or "", reverse=True)
@@ -4290,6 +4295,45 @@ app.jinja_env.globals["carrier_tracking_url"] = carrier_tracking_url
 # =========================
 # PAGES
 # =========================
+@app.post("/searches/delete-selected")
+def delete_selected_client_searches():
+    selected = request.form.getlist("selected_search")
+    cloud_ids, local_ids = set(), set()
+    for value in selected:
+        parts = norm(value).split(":", 1)
+        if len(parts) != 2:
+            continue
+        cloud_id, local_id = to_int(parts[0], 0), to_int(parts[1], 0)
+        if cloud_id:
+            cloud_ids.add(cloud_id)
+        if local_id:
+            local_ids.add(local_id)
+    if not cloud_ids and not local_ids:
+        return redirect(url_for("client_searches", delete_error="Zaznacz co najmniej jeden wpis."))
+    try:
+        if cloud_ids and supabase_enabled():
+            supabase_request(
+                "/rest/v1/client_search_logs",
+                method="DELETE",
+                params={"id": "in.(" + ",".join(str(value) for value in sorted(cloud_ids)) + ")"},
+                prefer="return=minimal",
+                timeout=30,
+            )
+        if local_ids:
+            c = conn()
+            marks = ",".join("?" for _ in local_ids)
+            c.execute(f"DELETE FROM client_search_logs WHERE id IN ({marks})", tuple(sorted(local_ids)))
+            c.commit()
+            c.close()
+        with _client_search_cache_lock:
+            _client_search_cloud_cache["rows"] = []
+            _client_search_cloud_cache["loaded_at"] = 0.0
+        return redirect(url_for("client_searches", deleted=len(selected)))
+    except Exception as exc:
+        app.logger.exception("Nie udało się usunąć wybranych wyszukiwań")
+        return redirect(url_for("client_searches", delete_error="Nie udało się usunąć wpisów: " + str(exc)))
+
+
 def client_searches_v2():
     q = norm(request.args.get("q"))
     rows, source_label = load_client_search_rows(limit=5000)
@@ -4559,13 +4603,23 @@ def client_searches_v2():
 
       <div class="card">
         <h2>Ostatnie wyszukiwania</h2>
+        {% if request.args.get('deleted') %}<div style="color:#087f5b;margin-bottom:10px;font-weight:700;">✓ Usunięto zaznaczone wyszukiwania: {{ request.args.get('deleted') }}</div>{% endif %}
+        {% if request.args.get('delete_error') %}<div style="color:#c92a2a;margin-bottom:10px;font-weight:700;">{{ request.args.get('delete_error') }}</div>{% endif %}
+        <form id="deleteSearchesForm" method="post" action="{{ url_for('delete_selected_client_searches') }}" onsubmit="return confirmDeleteSearches()">
+        <div class="flex" style="margin-bottom:10px;">
+          <button class="btn" type="button" onclick="toggleAllSearches(true)">Zaznacz wszystkie</button>
+          <button class="btn" type="button" onclick="toggleAllSearches(false)">Odznacz wszystkie</button>
+          <button class="btn" type="submit" style="color:#c92a2a;border-color:#ffc9c9;">Usuń zaznaczone</button>
+          <span id="selectedSearchCount" class="muted">Zaznaczono: 0</span>
+        </div>
         <table>
           <thead>
-            <tr><th>Czas</th><th>Klient</th><th>Fraza</th><th>Nazwa</th><th>Model</th><th>Wyniki</th></tr>
+            <tr><th style="width:42px"><input id="allSearchesCheckbox" type="checkbox" onchange="toggleAllSearches(this.checked)" aria-label="Zaznacz wszystkie"></th><th>Czas</th><th>Klient</th><th>Fraza</th><th>Nazwa</th><th>Model</th><th>Wyniki</th></tr>
           </thead>
           <tbody>
             {% for r in latest_rows %}
               <tr>
+                <td><input class="searchDeleteBox" type="checkbox" name="selected_search" value="{{ r.cloud_id or 0 }}:{{ r.local_id or 0 }}" onchange="updateSelectedSearchCount()" aria-label="Zaznacz wyszukiwanie {{ r.query }}"></td>
                 <td class="muted">{{ r.created_at }}</td>
                 <td>{{ r._client_label or '-' }}</td>
                 <td><b>{{ r.query }}</b></td>
@@ -4575,10 +4629,11 @@ def client_searches_v2():
               </tr>
             {% endfor %}
             {% if not latest_rows %}
-              <tr><td colspan="6" class="muted">Brak wpisów.</td></tr>
+              <tr><td colspan="7" class="muted">Brak wpisów.</td></tr>
             {% endif %}
           </tbody>
         </table>
+        </form>
       </div>
 
       <details class="card">
@@ -4636,6 +4691,21 @@ def client_searches_v2():
         </div>
 
       </details>
+      <script>
+        function searchDeleteBoxes(){ return [...document.querySelectorAll('.searchDeleteBox')]; }
+        function updateSelectedSearchCount(){
+          const boxes=searchDeleteBoxes(), selected=boxes.filter(box=>box.checked).length;
+          document.getElementById('selectedSearchCount').textContent='Zaznaczono: '+selected;
+          const all=document.getElementById('allSearchesCheckbox');
+          if(all){ all.checked=boxes.length>0&&selected===boxes.length; all.indeterminate=selected>0&&selected<boxes.length; }
+        }
+        function toggleAllSearches(checked){ searchDeleteBoxes().forEach(box=>box.checked=checked); updateSelectedSearchCount(); }
+        function confirmDeleteSearches(){
+          const count=searchDeleteBoxes().filter(box=>box.checked).length;
+          if(!count){ alert('Zaznacz co najmniej jeden wpis.'); return false; }
+          return confirm('Usunąć zaznaczone wyszukiwania ('+count+')?');
+        }
+      </script>
     {% endblock %}
     """
     return render_template_string(tpl, title="Top wyszukiwania", base_url=BASE_URL, db_path=DB_PATH,
@@ -4856,6 +4926,60 @@ def _client_stock_catalog_rows(profile: dict) -> list[dict]:
     if not isinstance(rows, list):
         raise RuntimeError("Nieprawidłowa odpowiedź katalogu magazynowego")
 
+    # Widok client_stock_catalog_v nie zawsze zawiera aktualne rezerwacje
+    # zamówień wysłanych częściowo. Liczymy je z tych samych rekordów co
+    # magazyn: niewydana ilość pozycji aktywnego zamówienia po odjęciu
+    # invoice_allocations. Jest to obliczenie tylko do odczytu.
+    reserved_by_product = {}
+    try:
+        order_rows = supabase_request(
+            "/rest/v1/orders",
+            method="GET",
+            params={"select": "id,status,warehouse_issued", "limit": 5000},
+            timeout=30,
+        ) or []
+        active_order_ids = {
+            to_int(item.get("id"), 0)
+            for item in order_rows if isinstance(item, dict)
+            and not to_int(item.get("warehouse_issued"), 0)
+            and norm(item.get("status")).lower() in ACTIVE_ORDER_STATUSES
+        }
+        if active_order_ids:
+            order_filter = ",".join(str(value) for value in sorted(active_order_ids) if value)
+            order_item_rows = supabase_request(
+                "/rest/v1/order_items",
+                method="GET",
+                params={
+                    "select": "id,order_id,product_id,qty",
+                    "order_id": f"in.({order_filter})",
+                    "limit": 10000,
+                },
+                timeout=30,
+            ) or []
+            allocation_rows = supabase_request(
+                "/rest/v1/invoice_allocations",
+                method="GET",
+                params={"select": "order_item_id,qty", "limit": 10000},
+                timeout=30,
+            ) or []
+            allocated_by_item = {}
+            for item in allocation_rows:
+                if not isinstance(item, dict):
+                    continue
+                item_id = to_int(item.get("order_item_id"), 0)
+                if item_id:
+                    allocated_by_item[item_id] = allocated_by_item.get(item_id, 0) + max(0, to_int(item.get("qty"), 0))
+            for item in order_item_rows:
+                if not isinstance(item, dict):
+                    continue
+                product_id = to_int(item.get("product_id"), 0)
+                item_id = to_int(item.get("id"), 0)
+                remaining = max(0, to_int(item.get("qty"), 0) - allocated_by_item.get(item_id, 0))
+                if product_id and remaining:
+                    reserved_by_product[product_id] = reserved_by_product.get(product_id, 0) + remaining
+    except Exception:
+        app.logger.warning("Nie udało się przeliczyć rezerwacji panelu klienta", exc_info=True)
+
     # Do panelu klienta przekazujemy jedynie zagregowaną liczbę sztuk w
     # aktywnych dostawach oraz identyfikator przypisanego zdjęcia. Nie
     # ujawniamy numerów P/O, dostawców, kosztów ani danych trackingowych.
@@ -4931,7 +5055,7 @@ def _client_stock_catalog_rows(profile: dict) -> list[dict]:
         product_id = to_int(row.get("product_id"), 0)
         incoming_qty = incoming_by_product.get(product_id, 0)
         physical_qty = max(0, to_int(row.get("qty_physical"), 0))
-        reserved_qty = max(0, to_int(row.get("qty_reserved"), 0))
+        reserved_qty = max(0, reserved_by_product.get(product_id, to_int(row.get("qty_reserved"), 0)))
         # Ta sama wartość, którą magazyn pokazuje w kolumnie
         # „Dostępne w drodze”: z dostawy odejmujemy tę część rezerwacji,
         # której nie pokrywa aktualny stan fizyczny.
