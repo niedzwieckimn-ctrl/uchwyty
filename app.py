@@ -1466,6 +1466,22 @@ def supabase_storage_download_bytes(storage_ref: str) -> tuple[bytes, str]:
         return resp.read(), os.path.basename(object_path)
 
 
+def supabase_storage_delete(storage_ref: str):
+    parsed = parse_supabase_storage_ref(storage_ref)
+    if not parsed:
+        raise RuntimeError("Nieprawidłowa ścieżka Supabase Storage")
+    bucket, object_path = parsed
+    req = urllib.request.Request(supabase_storage_object_url(bucket, object_path), method="DELETE")
+    req.add_header("apikey", SUPABASE_SERVICE_ROLE_KEY)
+    req.add_header("Authorization", f"Bearer {SUPABASE_SERVICE_ROLE_KEY}")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            resp.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            raise
+
+
 def supabase_insert_row(table: str, row: dict):
     res = supabase_request(
         f"/rest/v1/{table}",
