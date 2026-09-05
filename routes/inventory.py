@@ -998,6 +998,8 @@ def register_routes(context):
         return response
 
 
+    _client_image_thumbnail_cache = {}
+
     @app.get("/api/client/product-images/<int:image_id>")
     def client_product_image(image_id):
         # Endpoint przechodzi przez autoryzację klienta w security_gate.
@@ -1021,6 +1023,30 @@ def register_routes(context):
             image_bytes, filename = supabase_storage_download_bytes(stored_path)
         except Exception:
             abort(404)
+        if request.args.get("thumb") == "1" and extension != ".svg":
+            cached = _client_image_thumbnail_cache.get(image_id)
+            if cached:
+                image_bytes, mimetype = cached
+            else:
+                try:
+                    from PIL import Image
+                    source = Image.open(io.BytesIO(image_bytes))
+                    source.thumbnail((240, 180), Image.Resampling.LANCZOS)
+                    if source.mode not in ("RGB", "L"):
+                        background = Image.new("RGB", source.size, "white")
+                        if "A" in source.getbands():
+                            background.paste(source, mask=source.getchannel("A"))
+                        else:
+                            background.paste(source)
+                        source = background
+                    output = io.BytesIO()
+                    source.save(output, format="WEBP", quality=78, method=4)
+                    image_bytes, mimetype = output.getvalue(), "image/webp"
+                    if len(_client_image_thumbnail_cache) >= 250:
+                        _client_image_thumbnail_cache.clear()
+                    _client_image_thumbnail_cache[image_id] = (image_bytes, mimetype)
+                except Exception:
+                    app.logger.warning("Nie udało się utworzyć miniatury zdjęcia %s", image_id, exc_info=True)
         response = send_file(io.BytesIO(image_bytes), download_name=filename, mimetype=mimetype, conditional=True, max_age=604800)
         if extension == ".svg":
             response.headers["Content-Security-Policy"] = "default-src 'none'; style-src 'unsafe-inline'; sandbox"
