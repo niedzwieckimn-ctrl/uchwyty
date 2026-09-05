@@ -998,6 +998,37 @@ def register_routes(context):
         return response
 
 
+    @app.get("/api/client/product-images/<int:image_id>")
+    def client_product_image(image_id):
+        # Endpoint przechodzi przez autoryzację klienta w security_gate.
+        # Metadane czytamy z Supabase, aby działał także po zimnym starcie
+        # Render, zanim lokalna kopia tabel zdjęć zostanie uzupełniona.
+        rows = supabase_request(
+            "/rest/v1/product_images",
+            method="GET",
+            params={"select": "stored_path", "id": f"eq.{image_id}", "limit": 1},
+            timeout=20,
+        ) or []
+        if not rows:
+            abort(404)
+        stored_path = norm(rows[0].get("stored_path"))
+        storage_ref = parse_supabase_storage_ref(stored_path)
+        extension = os.path.splitext(storage_ref[1] if storage_ref else stored_path)[1].lower()
+        mimetype = {".svg":"image/svg+xml", ".png":"image/png", ".jpg":"image/jpeg", ".jpeg":"image/jpeg"}.get(extension)
+        if not mimetype or not storage_ref:
+            abort(404)
+        try:
+            image_bytes, filename = supabase_storage_download_bytes(stored_path)
+        except Exception:
+            abort(404)
+        response = send_file(io.BytesIO(image_bytes), download_name=filename, mimetype=mimetype, conditional=True, max_age=604800)
+        if extension == ".svg":
+            response.headers["Content-Security-Policy"] = "default-src 'none'; style-src 'unsafe-inline'; sandbox"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Cache-Control"] = "private, max-age=604800"
+        return response
+
+
     @app.get("/api/stock/images/<int:image_id>/products")
     def stock_image_products(image_id):
         q = norm(request.args.get("q")); like=f"%{q}%"
