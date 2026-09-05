@@ -631,154 +631,99 @@ def register_routes(context):
 
     @app.get("/stock")
     def stock():
-        maybe_pull_shared_from_supabase()
         q = norm(request.args.get("q"))
+        active_filter = norm(request.args.get("filter")) or "all"
+        page = max(1, to_int(request.args.get("page"), 1))
+        per_page = to_int(request.args.get("per_page"), 25)
+        if per_page not in (25, 50, 100):
+            per_page = 25
         rows = build_replenishment_analysis(conn, today=app_now().date(), horizon_days=60)
-        stock_total = sum(to_int(row.get("stock_qty"), 0) for row in rows)
-        stock_with_china_total = sum(
-            to_int(row.get("stock_qty"), 0) + to_int(row.get("incoming_qty"), 0)
-            for row in rows
-        )
-        reserved_total = sum(
-            to_int(row.get("reserved_qty"), 0) + to_int(row.get("reserved_incoming"), 0)
-            for row in rows
-        )
+        all_rows = rows
+        for row in rows:
+            available = to_int(row.get("available_qty"), 0)
+            incoming = to_int(row.get("incoming_qty"), 0)
+            reserved = to_int(row.get("reserved_qty"), 0)
+            stock_qty = to_int(row.get("stock_qty"), 0)
+            if reserved > stock_qty + incoming:
+                row["status_label"], row["status_class"] = "Problem", "inv-red"
+            elif available <= 0 and incoming > 0:
+                row["status_label"], row["status_class"] = "Tylko w drodze", "inv-blue"
+            elif available <= 0:
+                row["status_label"], row["status_class"] = "Brak", "inv-red"
+            elif available <= 5:
+                row["status_label"], row["status_class"] = "Niski stan", "inv-orange"
+            elif reserved > 0:
+                row["status_label"], row["status_class"] = "Zarezerwowany", "inv-orange"
+            else:
+                row["status_label"], row["status_class"] = "OK", "inv-green"
+
+        counts = {
+            "missing": sum(1 for r in all_rows if to_int(r.get("available_qty"), 0) == 0),
+            "low": sum(1 for r in all_rows if 0 < to_int(r.get("available_qty"), 0) <= 5),
+            "incoming": sum(1 for r in all_rows if to_int(r.get("incoming_qty"), 0) > 0),
+            "reserved": sum(1 for r in all_rows if to_int(r.get("reserved_qty"), 0) > 0),
+            "problem": sum(1 for r in all_rows if to_int(r.get("reserved_qty"), 0) > to_int(r.get("stock_qty"), 0) + to_int(r.get("incoming_qty"), 0)),
+        }
         if q:
             query = q.casefold()
             rows = [
                 row for row in rows
                 if any(query in norm(row.get(field)).casefold() for field in ("sku", "model", "ean", "name"))
             ]
-        rows = sorted(rows, key=lambda row: norm(row.get("sku")).casefold())[:1000]
+        predicates = {
+            "missing": lambda r: to_int(r.get("available_qty"), 0) == 0,
+            "low": lambda r: 0 < to_int(r.get("available_qty"), 0) <= 5,
+            "incoming": lambda r: to_int(r.get("incoming_qty"), 0) > 0,
+            "reserved": lambda r: to_int(r.get("reserved_qty"), 0) > 0,
+            "unreserved": lambda r: to_int(r.get("reserved_qty"), 0) == 0,
+            "problem": lambda r: to_int(r.get("reserved_qty"), 0) > to_int(r.get("stock_qty"), 0) + to_int(r.get("incoming_qty"), 0),
+        }
+        if active_filter in predicates:
+            rows = [row for row in rows if predicates[active_filter](row)]
+        rows = sorted(rows, key=lambda row: norm(row.get("sku")).casefold())
 
-        tpl = r"""
-        {% extends "base.html" %}
-        {% block content %}
-          <style>
-            .stock-summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;margin-bottom:16px}
-            .stock-summary-card{background:#fff;border:1px solid #e7eaf2;border-radius:22px;padding:18px 20px;box-shadow:var(--shadow)}
-            .stock-summary-card span{display:block;color:#718096;font-size:12px;font-weight:700}
-            .stock-summary-card b{display:block;margin-top:5px;color:#17233c;font-size:28px;letter-spacing:-.6px}
-            .stock-summary-card small{display:block;margin-top:4px;color:#2da176;font-size:11px}
-            @media(max-width:760px){.stock-summary{grid-template-columns:1fr}}
-          </style>
+        c = conn()
+        image_by_product = {int(r["product_id"]): int(r["image_id"]) for r in c.execute(
+            "SELECT product_id, image_id FROM product_image_assignments"
+        ).fetchall()}
+        c.close()
+        for row in rows:
+            row["image_id"] = image_by_product.get(int(row["id"]))
 
-          <div class="stock-summary">
-            <div class="stock-summary-card">
-              <span>Na stanie łącznie</span>
-              <b>{{ stock_total }} szt.</b>
-              <small>Fizycznie w magazynie</small>
-            </div>
-            <div class="stock-summary-card">
-              <span>Na stanie + CHINY</span>
-              <b>{{ stock_with_china_total }} szt.</b>
-              <small>Magazyn oraz towar w drodze</small>
-            </div>
-            <div class="stock-summary-card">
-              <span>W zamówieniach</span>
-              <b>{{ reserved_total }} szt.</b>
-              <small>Rezerwacje aktywnych zamówień</small>
-            </div>
-          </div>
-
-          <div class="card">
-            <div class="flex">
-              <h1 style="margin:0;">Magazyn</h1>
-            </div>
-            <form method="get" class="grid3" style="margin-top:10px;">
-              <input name="q" value="{{ q }}" placeholder="Szukaj produktu: SKU / model / EAN / nazwa">
-              <button class="btn primary" type="submit">Szukaj</button>
-              <a class="btn" href="{{ url_for('stock') }}">WyczyĹ›Ä‡</a>
-            </form>
-          </div>
-
-          <div class="card">
-            <h2>Korekta stanu</h2>
-            <div class="row">
-              <div>
-                <label class="muted small">Produkt (SKU)</label>
-                <input list="skuList" id="skuInput" placeholder="np. CH010-BB-N28">
-                <datalist id="skuList">
-                  {% for r in rows %}
-                    <option value="{{ r['sku'] }}">{{ r['sku'] }}</option>
-                  {% endfor %}
-                </datalist>
-              </div>
-              <div>
-                <label class="muted small">Zmiana (np. +10 albo -3)</label>
-                <input id="deltaInput" placeholder="+10">
-              </div>
-            </div>
-            <div class="flex" style="margin-top:10px;">
-              <button class="btn ok" onclick="applyDelta(); return false;">Zapisz korektÄ™</button>
-              <div class="muted" id="deltaMsg"></div>
-            </div>
-          </div>
-
-          <div class="card">
-            <h2>Stany (max 1000)</h2>
-            <div class="muted" style="margin-bottom:8px;">
-              Rezerwacje obejmują wszystkie aktywne, niewydane zamówienia. Jeżeli bieżący stan nie wystarcza, brakująca część rezerwuje towar w drodze.
-            </div>
-            <table>
-              <thead>
-                <tr><th>SKU</th><th>Model</th><th>EAN</th><th>Nazwa</th><th>Stan</th><th>Rezerwacje</th><th>Dostępne</th><th>W drodze</th><th>Zarezerwowane w drodze</th><th>Dostępne w drodze</th></tr>
-              </thead>
-              <tbody>
-                {% for r in rows %}
-                  <tr>
-                    <td><b>{{ r['sku'] }}</b></td>
-                    <td>{{ r['model'] or "" }}</td>
-                    <td>{{ r['ean'] or "" }}</td>
-                    <td>{{ r['name'] or "" }}</td>
-                    <td><span class="badge">{{ r['stock_qty'] }}</span></td>
-                    <td><span class="badge">{{ r['reserved_qty'] }}</span></td>
-                    <td><span class="badge">{{ r['available_qty'] }}</span></td>
-                    <td><span class="badge">{{ r['incoming_qty'] }}</span></td>
-                    <td><span class="badge">{{ r['reserved_incoming'] }}</span></td>
-                    <td><span class="badge">{{ r['available_incoming'] }}</span></td>
-                  </tr>
-                {% endfor %}
-                {% if not rows %}
-                  <tr><td colspan="10" class="muted">Brak produktów.</td></tr>
-                {% endif %}
-              </tbody>
-            </table>
-          </div>
-
-    <script>
-    async function applyDelta(){
-      const sku = document.getElementById("skuInput").value.trim();
-      const delta = document.getElementById("deltaInput").value.trim();
-      const msg = document.getElementById("deltaMsg");
-      msg.innerText = "";
-      if(!sku){ msg.innerText = "Podaj SKU"; return; }
-      if(!delta){ msg.innerText = "Podaj zmianÄ™"; return; }
-
-      const r = await fetch("/api/stock_delta", {
-        method:"POST",
-        headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({sku, delta})
-      });
-      const j = await r.json();
-      if(!j.ok){ msg.innerText = "BĹ‚Ä…d: " + (j.error || ""); return; }
-      msg.innerText = "OK. Nowy stan: " + j.new_qty;
-      setTimeout(()=>location.reload(), 500);
-    }
-    </script>
-
-        {% endblock %}
-        """
-        return render_template_string(
-            tpl,
+        total = len(rows)
+        pages = max(1, (total + per_page - 1) // per_page)
+        page = min(page, pages)
+        start = (page - 1) * per_page
+        rows = rows[start:start + per_page]
+        def page_url(number):
+            return url_for("stock", q=q, filter=active_filter, per_page=per_page, page=number)
+        page_numbers = sorted(set(n for n in (1, page-1, page, page+1, pages) if 1 <= n <= pages))
+        kpis = [
+            {"label":"Dostępne od ręki", "value":f"{sum(to_int(r.get('available_qty'),0) for r in all_rows)} szt.", "note":"Fizycznie dostępne", "url":url_for("stock")},
+            {"label":"W drodze (Chiny)", "value":f"{sum(to_int(r.get('incoming_qty'),0) for r in all_rows)} szt.", "note":"W aktywnych dostawach", "url":url_for("stock", filter="incoming")},
+            {"label":"Zarezerwowane", "value":f"{sum(to_int(r.get('reserved_qty'),0) for r in all_rows)} szt.", "note":"W aktywnych zamówieniach", "url":url_for("stock", filter="reserved")},
+            {"label":"Niski stan", "value":f"{counts['low']} SKU", "note":"1–5 dostępnych", "url":url_for("stock", filter="low")},
+            {"label":"Braki", "value":f"{counts['missing']} SKU", "note":"0 dostępnych", "url":url_for("stock", filter="missing")},
+            {"label":"Wszystkie produkty", "value":len(all_rows), "note":"Aktywne SKU", "url":url_for("stock")},
+        ]
+        alerts = [
+            {"value":counts["missing"], "label":"brak dostępnych sztuk", "url":url_for("stock", filter="missing")},
+            {"value":counts["low"], "label":"niski stan", "url":url_for("stock", filter="low")},
+            {"value":counts["problem"], "label":"rezerwacje większe niż zapas", "url":url_for("stock", filter="problem")},
+            {"value":sum(1 for r in all_rows if to_int(r.get("available_qty"),0)==0 and to_int(r.get("incoming_qty"),0)>0), "label":"dostępne tylko w drodze", "url":url_for("stock", filter="incoming")},
+        ]
+        return render_template(
+            "stock.html",
             title="Magazyn",
             base_url=BASE_URL,
             db_path=DB_PATH,
             rows=rows,
             q=q,
-            stock_total=stock_total,
-            stock_with_china_total=stock_with_china_total,
-            reserved_total=reserved_total,
+            active_filter=active_filter,
+            filters=(("missing","Braki"),("low","Niski stan"),("incoming","W drodze"),("reserved","Z rezerwacją"),("unreserved","Bez rezerwacji")),
+            kpis=kpis, alerts=alerts, page=page, pages=pages, per_page=per_page,
+            total=total, first_item=(start+1 if total else 0), last_item=min(start+per_page,total),
+            page_numbers=page_numbers, page_url=page_url,
         )
 
 
@@ -815,6 +760,188 @@ def register_routes(context):
         c.commit()
         c.close()
         return jsonify(ok=True, new_qty=new_qty)
+
+
+    @app.get("/api/stock/autocomplete")
+    def stock_autocomplete():
+        q = norm(request.args.get("q"))
+        if len(q) < 2:
+            return jsonify(ok=True, results=[])
+        like = f"%{q}%"
+        c = conn()
+        rows = c.execute("""
+          SELECT p.id,p.sku,p.model,p.name,p.ean,COALESCE(s.qty,0) stock
+          FROM products p LEFT JOIN stock s ON s.product_id=p.id
+          WHERE COALESCE(p.archived,0)=0
+            AND (p.sku LIKE ? OR p.model LIKE ? OR p.name LIKE ? OR p.ean LIKE ?)
+          ORDER BY CASE WHEN p.sku LIKE ? THEN 0 ELSE 1 END,p.sku LIMIT 15
+        """, (like,like,like,like,f"{q}%")).fetchall()
+        ids = [int(r["id"]) for r in rows]
+        reservations = {}
+        if ids:
+            marks = ",".join("?" for _ in ids)
+            active = ("new","pending","unconfirmed","confirmed","packed","packed_partial","in_delivery","shipped","partially_shipped")
+            status_marks = ",".join("?" for _ in active)
+            reserved_rows = c.execute(f"""SELECT oi.product_id,
+              COALESCE(SUM(MAX(0,oi.qty-COALESCE(a.allocated_qty,0))),0) reserved
+              FROM order_items oi JOIN orders o ON o.id=oi.order_id
+              LEFT JOIN (SELECT order_item_id,SUM(qty) allocated_qty FROM invoice_allocations GROUP BY order_item_id) a ON a.order_item_id=oi.id
+              WHERE oi.product_id IN ({marks}) AND COALESCE(o.warehouse_issued,0)=0
+                AND lower(COALESCE(o.status,'')) IN ({status_marks}) GROUP BY oi.product_id""", (*ids,*active)).fetchall()
+            reservations = {int(x["product_id"]):int(x["reserved"] or 0) for x in reserved_rows}
+        c.close()
+        return jsonify(ok=True, results=[{
+            "id":int(r["id"]), "sku":r["sku"], "model":r["model"], "name":r["name"],
+            "ean":r["ean"], "stock":int(r["stock"] or 0),
+            "reserved":reservations.get(int(r["id"]),0),
+            "available":max(0,int(r["stock"] or 0)-reservations.get(int(r["id"]),0)),
+        } for r in rows])
+
+
+    @app.get("/api/stock/products/<int:product_id>")
+    def stock_product_details(product_id):
+        analysis = build_replenishment_analysis(conn, today=app_now().date(), horizon_days=60)
+        product = next((r for r in analysis if int(r["id"]) == product_id), None)
+        if not product:
+            return jsonify(ok=False, error="Nie ma takiego produktu"), 404
+        c = conn()
+        incoming = [dict(r) for r in c.execute("""
+          SELECT cp.package_no,cp.status,ci.qty,cp.created_at
+          FROM china_items ci JOIN china_packages cp ON cp.id=ci.package_id
+          WHERE ci.product_id=? AND lower(COALESCE(cp.status,'')) IN ('ordered','shipped','problem')
+          ORDER BY cp.created_at DESC LIMIT 20
+        """, (product_id,)).fetchall()]
+        adjustments = [dict(r) for r in c.execute("""
+          SELECT old_qty,new_qty,delta,mode,created_at FROM stock_adjustments
+          WHERE product_id=? ORDER BY id DESC LIMIT 10
+        """, (product_id,)).fetchall()]
+        c.close()
+        keys = ("id","sku","model","name","ean","stock_qty","reserved_qty","available_qty","incoming_qty","reserved_incoming","available_incoming","status_label")
+        return jsonify(ok=True, product={k:product.get(k) for k in keys}, incoming=incoming, adjustments=adjustments)
+
+
+    @app.post("/api/stock/correction")
+    def stock_correction():
+        data = request.get_json(silent=True) or {}
+        product_id = to_int(data.get("product_id"), 0)
+        mode = norm(data.get("mode"))
+        quantity = to_int(data.get("quantity"), None)
+        if not product_id or mode not in ("delta", "set") or quantity is None:
+            return jsonify(ok=False, error="Niepełne dane korekty"), 400
+        c = conn()
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            product = c.execute("SELECT sku FROM products WHERE id=? AND COALESCE(archived,0)=0", (product_id,)).fetchone()
+            if not product:
+                c.rollback(); return jsonify(ok=False, error="Nie ma takiego produktu"), 404
+            c.execute("INSERT OR IGNORE INTO stock(product_id,qty) VALUES(?,0)", (product_id,))
+            old_qty = int(c.execute("SELECT qty FROM stock WHERE product_id=?", (product_id,)).fetchone()["qty"])
+            new_qty = old_qty + quantity if mode == "delta" else quantity
+            if new_qty < 0:
+                c.rollback(); return jsonify(ok=False, error="Stan nie może być ujemny"), 400
+            c.execute("UPDATE stock SET qty=? WHERE product_id=?", (new_qty,product_id))
+            c.execute("INSERT INTO stock_adjustments(product_id,old_qty,new_qty,delta,mode,created_at) VALUES(?,?,?,?,?,?)",
+                      (product_id,old_qty,new_qty,new_qty-old_qty,mode,now_iso()))
+            c.commit()
+        finally:
+            c.close()
+        if supabase_enabled():
+            try:
+                sync_local_rows_to_supabase("stock", "product_id", [product_id])
+            except Exception:
+                app.logger.warning("Korekta zapisana lokalnie, synchronizacja Supabase nieudana", exc_info=True)
+        return jsonify(ok=True, sku=product["sku"], old_qty=old_qty, new_qty=new_qty)
+
+
+    def _sanitize_svg(raw):
+        import xml.etree.ElementTree as ET
+        if len(raw) > 1024 * 1024:
+            raise ValueError("Plik jest większy niż 1 MB")
+        if b"<!DOCTYPE" in raw.upper() or b"<!ENTITY" in raw.upper():
+            raise ValueError("Niedozwolona deklaracja SVG")
+        try:
+            root = ET.fromstring(raw)
+        except ET.ParseError:
+            raise ValueError("Nieprawidłowy plik SVG")
+        if root.tag.split("}")[-1].lower() != "svg":
+            raise ValueError("Plik nie jest SVG")
+        forbidden = {"script","foreignobject","iframe","object","embed","audio","video"}
+        for parent in list(root.iter()):
+            for child in list(parent):
+                if child.tag.split("}")[-1].lower() in forbidden:
+                    parent.remove(child)
+            for key in list(parent.attrib):
+                short = key.split("}")[-1].lower()
+                value = str(parent.attrib.get(key) or "").strip().lower()
+                if short.startswith("on") or short in ("href","src") and (value.startswith("javascript:") or value.startswith("data:text/html")):
+                    del parent.attrib[key]
+        return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+    @app.route("/api/stock/images", methods=["GET","POST"])
+    def stock_images():
+        c = conn()
+        if request.method == "GET":
+            rows = c.execute("""SELECT i.id,i.filename,COUNT(a.product_id) assignments
+              FROM product_images i LEFT JOIN product_image_assignments a ON a.image_id=i.id
+              GROUP BY i.id ORDER BY i.id DESC""").fetchall()
+            c.close()
+            return jsonify(ok=True, images=[{"id":int(r["id"]),"filename":r["filename"],"assignments":int(r["assignments"]),"url":url_for("inventory_image",image_id=r["id"])} for r in rows])
+        upload = request.files.get("image")
+        if not upload or not norm(upload.filename).lower().endswith(".svg"):
+            c.close(); return jsonify(ok=False,error="Wybierz plik SVG"),400
+        try:
+            cleaned = _sanitize_svg(upload.read(1024*1024+1))
+        except ValueError as exc:
+            c.close(); return jsonify(ok=False,error=str(exc)),400
+        image_dir = os.path.join(os.path.dirname(DB_PATH), "product_images")
+        os.makedirs(image_dir, exist_ok=True)
+        stored_name = hashlib.sha256(cleaned).hexdigest() + ".svg"
+        stored_path = os.path.join(image_dir, stored_name)
+        if not os.path.exists(stored_path):
+            with open(stored_path, "wb") as handle:
+                handle.write(cleaned)
+        c.execute("INSERT OR IGNORE INTO product_images(stored_path,filename,created_at) VALUES(?,?,?)", (stored_path,os.path.basename(norm(upload.filename)),now_iso()))
+        image_id = int(c.execute("SELECT id FROM product_images WHERE stored_path=?", (stored_path,)).fetchone()["id"])
+        c.commit(); c.close()
+        return jsonify(ok=True,image_id=image_id)
+
+
+    @app.get("/stock/images/<int:image_id>.svg")
+    def inventory_image(image_id):
+        c = conn(); row = c.execute("SELECT stored_path FROM product_images WHERE id=?",(image_id,)).fetchone(); c.close()
+        if not row or not os.path.isfile(row["stored_path"]):
+            abort(404)
+        response = send_file(row["stored_path"], mimetype="image/svg+xml", conditional=True, max_age=604800)
+        response.headers["Content-Security-Policy"] = "default-src 'none'; style-src 'unsafe-inline'; sandbox"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return response
+
+
+    @app.get("/api/stock/images/<int:image_id>/products")
+    def stock_image_products(image_id):
+        q = norm(request.args.get("q")); like=f"%{q}%"
+        c=conn(); rows=c.execute("""SELECT p.id,p.sku,p.model,p.name,p.ean,
+          CASE WHEN a.image_id=? THEN 1 ELSE 0 END assigned
+          FROM products p LEFT JOIN product_image_assignments a ON a.product_id=p.id
+          WHERE COALESCE(p.archived,0)=0 AND (?='' OR p.sku LIKE ? OR p.model LIKE ? OR p.name LIKE ? OR p.ean LIKE ?)
+          ORDER BY assigned DESC,p.sku LIMIT 100""",(image_id,q,like,like,like,like)).fetchall(); c.close()
+        return jsonify(ok=True,results=[dict(r) for r in rows])
+
+
+    @app.post("/api/stock/images/<int:image_id>/assign")
+    def stock_image_assign(image_id):
+        data=request.get_json(silent=True) or {}; ids=sorted(set(to_int(x,0) for x in data.get("product_ids",[]) if to_int(x,0)>0))[:500]
+        visible=sorted(set(to_int(x,0) for x in data.get("visible_ids",[]) if to_int(x,0)>0))[:500]
+        c=conn()
+        if not c.execute("SELECT 1 FROM product_images WHERE id=?",(image_id,)).fetchone():
+            c.close(); return jsonify(ok=False,error="Nie ma takiego zdjęcia"),404
+        if visible:
+            marks=",".join("?" for _ in visible)
+            c.execute(f"DELETE FROM product_image_assignments WHERE image_id=? AND product_id IN ({marks})",(image_id,*visible))
+        for pid in ids:
+            c.execute("INSERT INTO product_image_assignments(product_id,image_id,created_at) VALUES(?,?,?) ON CONFLICT(product_id) DO UPDATE SET image_id=excluded.image_id,created_at=excluded.created_at",(pid,image_id,now_iso()))
+        c.commit(); c.close(); return jsonify(ok=True,assigned=len(ids))
 
 
 
