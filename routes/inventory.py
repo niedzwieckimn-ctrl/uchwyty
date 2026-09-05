@@ -809,6 +809,10 @@ def register_routes(context):
         if not product:
             return jsonify(ok=False, error="Nie ma takiego produktu"), 404
         c = conn()
+        image_row = c.execute(
+            "SELECT image_id FROM product_image_assignments WHERE product_id=?",
+            (product_id,),
+        ).fetchone()
         incoming = [dict(r) for r in c.execute("""
           SELECT cp.package_no,cp.status,ci.qty,cp.created_at
           FROM china_items ci JOIN china_packages cp ON cp.id=ci.package_id
@@ -821,7 +825,11 @@ def register_routes(context):
         """, (product_id,)).fetchall()]
         c.close()
         keys = ("id","sku","model","name","ean","stock_qty","reserved_qty","available_qty","incoming_qty","reserved_incoming","available_incoming","status_label")
-        return jsonify(ok=True, product={k:product.get(k) for k in keys}, incoming=incoming, adjustments=adjustments)
+        product_payload = {k:product.get(k) for k in keys}
+        product_payload["image_url"] = url_for(
+            "inventory_image", image_id=int(image_row["image_id"])
+        ) if image_row else ""
+        return jsonify(ok=True, product=product_payload, incoming=incoming, adjustments=adjustments)
 
 
     @app.post("/api/stock/correction")
