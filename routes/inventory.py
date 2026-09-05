@@ -936,40 +936,50 @@ def register_routes(context):
               GROUP BY i.id ORDER BY i.id DESC""").fetchall()
             c.close()
             return jsonify(ok=True, images=[{"id":int(r["id"]),"filename":r["filename"],"assignments":int(r["assignments"]),"assigned_skus":r["assigned_skus"] or "","url":url_for("inventory_image",image_id=r["id"])} for r in rows])
-        upload = request.files.get("image")
-        if not upload:
+        uploads = [item for item in request.files.getlist("images") if item and norm(item.filename)]
+        if not uploads:
+            upload = request.files.get("image")
+            uploads = [upload] if upload and norm(upload.filename) else []
+        if not uploads:
             c.close(); return jsonify(ok=False,error="Wybierz plik SVG, PNG albo JPG"),400
-        try:
-            cleaned, stored_extension = _prepare_product_image(upload)
-        except ValueError as exc:
-            c.close(); return jsonify(ok=False,error=str(exc)),400
+        if len(uploads) > 30:
+            c.close(); return jsonify(ok=False,error="Jednorazowo możesz dodać maksymalnie 30 zdjęć"),400
+        prepared = []
+        for upload in uploads:
+            try:
+                cleaned, stored_extension = _prepare_product_image(upload)
+            except ValueError as exc:
+                c.close(); return jsonify(ok=False,error=f"{upload.filename}: {exc}"),400
+            prepared.append((upload, cleaned, stored_extension))
         image_dir = os.path.join(os.path.dirname(DB_PATH), "product_images")
         os.makedirs(image_dir, exist_ok=True)
-        stored_name = hashlib.sha256(cleaned).hexdigest() + stored_extension
-        stored_path = os.path.join(image_dir, stored_name)
-        if not os.path.exists(stored_path):
-            with open(stored_path, "wb") as handle:
-                handle.write(cleaned)
-        if supabase_enabled():
-            try:
-                stored_path = supabase_storage_upload_file(
-                    stored_path,
-                    "product-images/" + stored_name,
-                    content_type={".svg":"image/svg+xml",".png":"image/png",".jpg":"image/jpeg"}[stored_extension],
-                )
-            except Exception as exc:
-                c.close()
-                app.logger.exception("Nie udało się trwale zapisać zdjęcia produktu")
-                return jsonify(ok=False,error="Nie udało się zapisać zdjęcia w Supabase Storage: " + str(exc)),502
-        c.execute("INSERT OR IGNORE INTO product_images(stored_path,filename,created_at) VALUES(?,?,?)", (stored_path,os.path.basename(norm(upload.filename)),now_iso()))
-        image_id = int(c.execute("SELECT id FROM product_images WHERE stored_path=?", (stored_path,)).fetchone()["id"])
+        image_ids = []
+        for upload, cleaned, stored_extension in prepared:
+            stored_name = hashlib.sha256(cleaned).hexdigest() + stored_extension
+            stored_path = os.path.join(image_dir, stored_name)
+            if not os.path.exists(stored_path):
+                with open(stored_path, "wb") as handle:
+                    handle.write(cleaned)
+            if supabase_enabled():
+                try:
+                    stored_path = supabase_storage_upload_file(
+                        stored_path,
+                        "product-images/" + stored_name,
+                        content_type={".svg":"image/svg+xml",".png":"image/png",".jpg":"image/jpeg"}[stored_extension],
+                    )
+                except Exception as exc:
+                    c.close()
+                    app.logger.exception("Nie udało się trwale zapisać zdjęć produktów")
+                    return jsonify(ok=False,error="Nie udało się zapisać zdjęć w Supabase Storage: " + str(exc)),502
+            c.execute("INSERT OR IGNORE INTO product_images(stored_path,filename,created_at) VALUES(?,?,?)", (stored_path,os.path.basename(norm(upload.filename)),now_iso()))
+            image_ids.append(int(c.execute("SELECT id FROM product_images WHERE stored_path=?", (stored_path,)).fetchone()["id"]))
         c.commit(); c.close()
         if supabase_enabled():
             try:
-                sync_local_rows_to_supabase("product_images", "id", [image_id])
+                sync_local_rows_to_supabase("product_images", "id", image_ids)
             except Exception as exc:
                 return jsonify(ok=False,error="Plik zapisano, ale nie zapisano jego danych w Supabase. Uruchom migrację zdjęć: " + str(exc)),502
-        return jsonify(ok=True,image_id=image_id)
+        return jsonify(ok=True,image_id=image_ids[-1],image_ids=image_ids,count=len(image_ids))
 
 
     @app.get("/stock/images/<int:image_id>")
