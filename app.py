@@ -4955,6 +4955,7 @@ def _client_stock_catalog_rows(profile: dict) -> list[dict]:
             "price_available": bool(net_price > 0),
             "image_id": image_by_product.get(product_id, 0),
             "qty_in_delivery": available_incoming,
+            "qty_available_in_delivery": available_incoming,
             "ean": ean_by_product.get(product_id, ""),
         })
         catalog.append(row)
