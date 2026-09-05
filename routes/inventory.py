@@ -1042,26 +1042,35 @@ def register_routes(context):
 
     @app.post("/api/stock/images/<int:image_id>/assign")
     def stock_image_assign(image_id):
-        data=request.get_json(silent=True) or {}; ids=sorted(set(to_int(x,0) for x in data.get("product_ids",[]) if to_int(x,0)>0))[:500]
-        visible=sorted(set(to_int(x,0) for x in data.get("visible_ids",[]) if to_int(x,0)>0))[:500]
+        data=request.get_json(silent=True) or {}
+        # Zapisujemy wyłącznie różnicę względem stanu wyświetlonego użytkownikowi.
+        # Dzięki temu wyszukanie jednego nowego SKU nie usuwa wcześniejszych przypisań.
+        if "assign_ids" in data or "unassign_ids" in data:
+            ids=sorted(set(to_int(x,0) for x in data.get("assign_ids",[]) if to_int(x,0)>0))[:500]
+            removed=sorted(set(to_int(x,0) for x in data.get("unassign_ids",[]) if to_int(x,0)>0))[:500]
+        else:
+            # Zgodność ze starszą wersją panelu.
+            ids=sorted(set(to_int(x,0) for x in data.get("product_ids",[]) if to_int(x,0)>0))[:500]
+            visible=sorted(set(to_int(x,0) for x in data.get("visible_ids",[]) if to_int(x,0)>0))[:500]
+            removed=[pid for pid in visible if pid not in ids]
         c=conn()
         if not c.execute("SELECT 1 FROM product_images WHERE id=?",(image_id,)).fetchone():
             c.close(); return jsonify(ok=False,error="Nie ma takiego zdjęcia"),404
-        if visible:
-            marks=",".join("?" for _ in visible)
-            c.execute(f"DELETE FROM product_image_assignments WHERE image_id=? AND product_id IN ({marks})",(image_id,*visible))
+        if removed:
+            marks=",".join("?" for _ in removed)
+            c.execute(f"DELETE FROM product_image_assignments WHERE image_id=? AND product_id IN ({marks})",(image_id,*removed))
         for pid in ids:
             c.execute("INSERT INTO product_image_assignments(product_id,image_id,created_at) VALUES(?,?,?) ON CONFLICT(product_id) DO UPDATE SET image_id=excluded.image_id,created_at=excluded.created_at",(pid,image_id,now_iso()))
         c.commit(); c.close()
         if supabase_enabled():
             try:
-                for pid in visible:
-                    if pid not in ids:
-                        supabase_delete_rows("product_image_assignments", {"product_id":pid})
+                for pid in removed:
+                    supabase_delete_rows("product_image_assignments", {"product_id":pid, "image_id":image_id})
                 sync_local_rows_to_supabase("product_image_assignments", "product_id", ids)
             except Exception as exc:
                 return jsonify(ok=False,error="Przypisania zapisano lokalnie, ale synchronizacja Supabase nie powiodła się: " + str(exc)),502
-        return jsonify(ok=True,assigned=len(ids))
+        c=conn(); assigned=int(c.execute("SELECT COUNT(*) n FROM product_image_assignments WHERE image_id=?",(image_id,)).fetchone()["n"]); c.close()
+        return jsonify(ok=True,assigned=assigned,changed=len(ids)+len(removed))
 
 
 
