@@ -1198,6 +1198,8 @@ SUPABASE_PULL_TABLES = [
     ("pricing_eur", "sku"),
     ("customers", "id"),
     ("products", "id"),
+    ("product_images", "id"),
+    ("product_image_assignments", "product_id"),
     ("orders", "id"),
     ("china_packages", "id"),
     ("china_stock_receipts", "package_id"),
