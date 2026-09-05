@@ -1019,34 +1019,62 @@ def register_routes(context):
         mimetype = {".svg":"image/svg+xml", ".png":"image/png", ".jpg":"image/jpeg", ".jpeg":"image/jpeg"}.get(extension)
         if not mimetype or not storage_ref:
             abort(404)
-        try:
-            image_bytes, filename = supabase_storage_download_bytes(stored_path)
-        except Exception:
-            abort(404)
-        if request.args.get("thumb") == "1" and extension != ".svg":
+        wants_thumbnail = request.args.get("thumb") == "1" and extension != ".svg"
+        if wants_thumbnail:
             cached = _client_image_thumbnail_cache.get(image_id)
             if cached:
                 image_bytes, mimetype = cached
+                filename = f"product-{image_id}.webp"
             else:
+                bucket = storage_ref[0]
+                thumb_object = "product-images/thumbs/" + hashlib.sha256(stored_path.encode("utf-8")).hexdigest() + ".webp"
+                thumb_ref = supabase_storage_ref(thumb_object, bucket)
+                thumb_ready = True
                 try:
-                    from PIL import Image
-                    source = Image.open(io.BytesIO(image_bytes))
-                    source.thumbnail((240, 180), Image.Resampling.LANCZOS)
-                    if source.mode not in ("RGB", "L"):
-                        background = Image.new("RGB", source.size, "white")
-                        if "A" in source.getbands():
-                            background.paste(source, mask=source.getchannel("A"))
-                        else:
-                            background.paste(source)
-                        source = background
-                    output = io.BytesIO()
-                    source.save(output, format="WEBP", quality=78, method=4)
-                    image_bytes, mimetype = output.getvalue(), "image/webp"
+                    image_bytes, filename = supabase_storage_download_bytes(thumb_ref)
+                except Exception:
+                    try:
+                        from PIL import Image
+                        original_bytes, _ = supabase_storage_download_bytes(stored_path)
+                        source = Image.open(io.BytesIO(original_bytes))
+                        source.thumbnail((240, 180), Image.Resampling.LANCZOS)
+                        if source.mode not in ("RGB", "L"):
+                            background = Image.new("RGB", source.size, "white")
+                            if "A" in source.getbands():
+                                background.paste(source, mask=source.getchannel("A"))
+                            else:
+                                background.paste(source)
+                            source = background
+                        output = io.BytesIO()
+                        source.save(output, format="WEBP", quality=76, method=4)
+                        image_bytes, mimetype = output.getvalue(), "image/webp"
+                        filename = f"product-{image_id}.webp"
+                        local_dir = os.path.join(os.path.dirname(DB_PATH), "product_images", "thumbs")
+                        os.makedirs(local_dir, exist_ok=True)
+                        local_thumb = os.path.join(local_dir, os.path.basename(thumb_object))
+                        with open(local_thumb, "wb") as handle:
+                            handle.write(image_bytes)
+                        try:
+                            supabase_storage_upload_file(local_thumb, thumb_object, bucket=bucket, content_type="image/webp")
+                        except Exception:
+                            app.logger.warning("Nie udało się trwale zapisać miniatury %s", image_id, exc_info=True)
+                    except Exception:
+                        app.logger.warning("Nie udało się utworzyć miniatury zdjęcia %s", image_id, exc_info=True)
+                        thumb_ready = False
+                        try:
+                            image_bytes, filename = supabase_storage_download_bytes(stored_path)
+                        except Exception:
+                            abort(404)
+                if thumb_ready:
+                    mimetype = "image/webp"
                     if len(_client_image_thumbnail_cache) >= 250:
                         _client_image_thumbnail_cache.clear()
                     _client_image_thumbnail_cache[image_id] = (image_bytes, mimetype)
-                except Exception:
-                    app.logger.warning("Nie udało się utworzyć miniatury zdjęcia %s", image_id, exc_info=True)
+        else:
+            try:
+                image_bytes, filename = supabase_storage_download_bytes(stored_path)
+            except Exception:
+                abort(404)
         response = send_file(io.BytesIO(image_bytes), download_name=filename, mimetype=mimetype, conditional=True, max_age=604800)
         if extension == ".svg":
             response.headers["Content-Security-Policy"] = "default-src 'none'; style-src 'unsafe-inline'; sandbox"
