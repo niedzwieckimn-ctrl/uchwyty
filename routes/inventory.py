@@ -925,6 +925,52 @@ def register_routes(context):
             raise ValueError("Uszkodzony lub nieprawidłowy plik graficzny")
 
 
+    def _product_thumbnail_ref(stored_path):
+        storage_ref = parse_supabase_storage_ref(stored_path)
+        if not storage_ref:
+            return ""
+        bucket, _ = storage_ref
+        thumb_name = hashlib.sha256(norm(stored_path).encode("utf-8")).hexdigest() + ".webp"
+        return supabase_storage_ref("product-images/thumbs/" + thumb_name, bucket)
+
+
+    def _ensure_product_thumbnail(stored_path, original_bytes=None, check_existing=True):
+        storage_ref = parse_supabase_storage_ref(stored_path)
+        extension = os.path.splitext(storage_ref[1] if storage_ref else norm(stored_path))[1].lower()
+        if extension == ".svg" or not storage_ref:
+            return "skipped"
+        thumb_ref = _product_thumbnail_ref(stored_path)
+        if check_existing:
+            try:
+                supabase_storage_download_bytes(thumb_ref)
+                return "exists"
+            except Exception:
+                pass
+        if original_bytes is None:
+            original_bytes, _ = supabase_storage_download_bytes(stored_path)
+        from PIL import Image
+        source = Image.open(io.BytesIO(original_bytes))
+        source.thumbnail((320, 240), Image.Resampling.LANCZOS)
+        if source.mode not in ("RGB", "L"):
+            background = Image.new("RGB", source.size, "white")
+            if "A" in source.getbands():
+                background.paste(source, mask=source.getchannel("A"))
+            else:
+                background.paste(source)
+            source = background
+        output = io.BytesIO()
+        source.save(output, format="WEBP", quality=78, method=4)
+        thumb_bytes = output.getvalue()
+        thumb_dir = os.path.join(os.path.dirname(DB_PATH), "product_images", "thumbs")
+        os.makedirs(thumb_dir, exist_ok=True)
+        local_thumb = os.path.join(thumb_dir, os.path.basename(parse_supabase_storage_ref(thumb_ref)[1]))
+        with open(local_thumb, "wb") as handle:
+            handle.write(thumb_bytes)
+        bucket, object_path = parse_supabase_storage_ref(thumb_ref)
+        supabase_storage_upload_file(local_thumb, object_path, bucket=bucket, content_type="image/webp")
+        return "created"
+
+
     @app.route("/api/stock/images", methods=["GET","POST"])
     def stock_images():
         c = conn()
@@ -971,6 +1017,10 @@ def register_routes(context):
                     c.close()
                     app.logger.exception("Nie udało się trwale zapisać zdjęć produktów")
                     return jsonify(ok=False,error="Nie udało się zapisać zdjęć w Supabase Storage: " + str(exc)),502
+                try:
+                    _ensure_product_thumbnail(stored_path, original_bytes=cleaned, check_existing=False)
+                except Exception:
+                    app.logger.warning("Oryginał zapisano, ale nie udało się utworzyć miniatury %s", upload.filename, exc_info=True)
             c.execute("INSERT OR IGNORE INTO product_images(stored_path,filename,created_at) VALUES(?,?,?)", (stored_path,os.path.basename(norm(upload.filename)),now_iso()))
             image_ids.append(int(c.execute("SELECT id FROM product_images WHERE stored_path=?", (stored_path,)).fetchone()["id"]))
         c.commit(); c.close()
@@ -1032,17 +1082,26 @@ def register_routes(context):
         mimetype = {".svg":"image/svg+xml", ".png":"image/png", ".jpg":"image/jpeg", ".jpeg":"image/jpeg"}.get(extension)
         if not mimetype or not storage_ref:
             abort(404)
-        cached = _client_product_image_cache.get(image_id)
+        wants_thumbnail = request.args.get("thumb") == "1" and extension != ".svg"
+        cache_key = (image_id, "thumb" if wants_thumbnail else "full")
+        cached = _client_product_image_cache.get(cache_key)
         if cached:
             image_bytes, filename, mimetype = cached
         else:
             try:
-                image_bytes, filename = supabase_storage_download_bytes(stored_path)
+                if wants_thumbnail:
+                    image_bytes, filename = supabase_storage_download_bytes(_product_thumbnail_ref(stored_path))
+                    mimetype = "image/webp"
+                else:
+                    image_bytes, filename = supabase_storage_download_bytes(stored_path)
             except Exception:
-                abort(404)
+                try:
+                    image_bytes, filename = supabase_storage_download_bytes(stored_path)
+                except Exception:
+                    abort(404)
             if len(_client_product_image_cache) >= 250:
                 _client_product_image_cache.clear()
-            _client_product_image_cache[image_id] = (image_bytes, filename, mimetype)
+            _client_product_image_cache[cache_key] = (image_bytes, filename, mimetype)
         response = send_file(io.BytesIO(image_bytes), download_name=filename, mimetype=mimetype, conditional=True, max_age=604800)
         if extension == ".svg":
             response.headers["Content-Security-Policy"] = "default-src 'none'; style-src 'unsafe-inline'; sandbox"
@@ -1062,6 +1121,20 @@ def register_routes(context):
         return jsonify(ok=True,results=[dict(r) for r in rows])
 
 
+    @app.post("/api/stock/images/<int:image_id>/thumbnail")
+    def stock_image_thumbnail(image_id):
+        c = conn(); row = c.execute("SELECT stored_path FROM product_images WHERE id=?", (image_id,)).fetchone(); c.close()
+        if not row:
+            return jsonify(ok=False,error="Nie ma takiego zdjęcia"),404
+        try:
+            status = _ensure_product_thumbnail(norm(row["stored_path"]))
+            _client_product_image_cache.pop((image_id, "thumb"), None)
+            return jsonify(ok=True,status=status)
+        except Exception as exc:
+            app.logger.exception("Nie udało się utworzyć miniatury %s", image_id)
+            return jsonify(ok=False,error="Nie udało się utworzyć miniatury: " + str(exc)),502
+
+
     @app.post("/api/stock/images/<int:image_id>/delete")
     def stock_image_delete(image_id):
         c = conn()
@@ -1076,6 +1149,12 @@ def register_routes(context):
         stored_path = norm(row["stored_path"])
         try:
             if parse_supabase_storage_ref(stored_path):
+                thumb_ref = _product_thumbnail_ref(stored_path)
+                if thumb_ref:
+                    try:
+                        supabase_storage_delete(thumb_ref)
+                    except Exception:
+                        app.logger.warning("Nie udało się usunąć miniatury %s", image_id, exc_info=True)
                 supabase_storage_delete(stored_path)
                 supabase_delete_rows("product_images", {"id": image_id})
             elif os.path.isfile(stored_path):
@@ -1085,7 +1164,8 @@ def register_routes(context):
                     os.remove(target)
             c.execute("DELETE FROM product_images WHERE id=?", (image_id,))
             c.commit(); c.close()
-            _client_product_image_cache.pop(image_id, None)
+            _client_product_image_cache.pop((image_id, "thumb"), None)
+            _client_product_image_cache.pop((image_id, "full"), None)
             return jsonify(ok=True)
         except Exception as exc:
             c.close()
