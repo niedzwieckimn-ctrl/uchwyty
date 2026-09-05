@@ -1581,6 +1581,26 @@ def load_client_search_rows(limit: int = 5000):
     with _client_search_cache_lock:
         cloud_rows = list(_client_search_cloud_cache["rows"])
         cloud_ok = bool(_client_search_cloud_cache["loaded_at"])
+
+    # Po restarcie Render lokalna baza i pamięć procesu mogą być jeszcze puste.
+    # Pierwsza wersja uruchamiała wtedy wyłącznie odczyt w tle, więc użytkownik
+    # widział pusty raport aż do ręcznego odświeżenia strony. Tylko w tym zimnym
+    # przypadku pobieramy jedną, konkretną tabelę synchronicznie. Kolejne wejścia
+    # korzystają z lokalnych danych/cache, a odświeżenie chmury odbywa się w tle.
+    if not local_rows and not cloud_ok and supabase_enabled():
+        try:
+            cloud_rows = supabase_client_search_rows(limit=limit)
+            with _client_search_cache_lock:
+                _client_search_cloud_cache["rows"] = list(cloud_rows)
+                _client_search_cloud_cache["loaded_at"] = time.time()
+            cloud_ok = True
+        except Exception as exc:
+            app.logger.warning(
+                "Nie udalo sie zaladowac historii wyszukiwan przy pierwszym wejsciu: %s",
+                type(exc).__name__,
+            )
+
+    # Po błędzie pierwszego odczytu pozostaw również lekki retry w tle.
     _trigger_client_search_cache_refresh(limit=limit)
 
     merged = []
