@@ -1029,7 +1029,7 @@ def register_routes(context):
               GROUP BY i.id ORDER BY i.id DESC""").fetchall()]
             c.close()
             thumbnail_urls = _signed_product_thumbnail_urls(rows)
-            return jsonify(ok=True, images=[{"id":int(r["id"]),"filename":r["filename"],"assignments":int(r["assignments"]),"assigned_skus":r["assigned_skus"] or "","url":thumbnail_urls.get(int(r["id"])) or url_for("inventory_image",image_id=r["id"],thumb=1)} for r in rows])
+            return jsonify(ok=True, images=[{"id":int(r["id"]),"filename":r["filename"],"assignments":int(r["assignments"]),"assigned_skus":r["assigned_skus"] or "","url":thumbnail_urls.get(int(r["id"])) or url_for("inventory_image",image_id=r["id"],thumb=1),"fallback_url":url_for("inventory_image",image_id=r["id"])} for r in rows])
         uploads = [item for item in request.files.getlist("images") if item and norm(item.filename)]
         if not uploads:
             upload = request.files.get("image")
