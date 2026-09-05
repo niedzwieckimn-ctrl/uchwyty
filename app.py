@@ -1482,6 +1482,30 @@ def supabase_storage_delete(storage_ref: str):
             raise
 
 
+def supabase_storage_create_signed_urls(bucket: str, object_paths: list[str], expires_in: int = 3600) -> dict:
+    paths = [norm(path).lstrip("/") for path in object_paths if norm(path)]
+    if not paths:
+        return {}
+    url = f"{SUPABASE_URL}/storage/v1/object/sign/{urllib.parse.quote(bucket, safe='')}"
+    payload = json.dumps({"expiresIn": int(expires_in), "paths": paths}).encode("utf-8")
+    req = urllib.request.Request(url, data=payload, method="POST")
+    req.add_header("apikey", SUPABASE_SERVICE_ROLE_KEY)
+    req.add_header("Authorization", f"Bearer {SUPABASE_SERVICE_ROLE_KEY}")
+    req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=45) as resp:
+        result = json.loads(resp.read().decode("utf-8") or "[]")
+    signed = {}
+    for item in result if isinstance(result, list) else []:
+        path = norm(item.get("path"))
+        signed_url = norm(item.get("signedURL") or item.get("signedUrl"))
+        if not path or not signed_url:
+            continue
+        if signed_url.startswith("/"):
+            signed_url = SUPABASE_URL + "/storage/v1" + signed_url
+        signed[path] = signed_url
+    return signed
+
+
 def supabase_insert_row(table: str, row: dict):
     res = supabase_request(
         f"/rest/v1/{table}",
@@ -5009,6 +5033,41 @@ def _client_stock_catalog_rows(profile: dict) -> list[dict]:
         to_int(item.get("product_id"), 0): to_int(item.get("image_id"), 0)
         for item in assignments if isinstance(item, dict)
     }
+    thumbnail_url_by_image = {}
+    image_ids = sorted({image_id for image_id in image_by_product.values() if image_id})
+    if image_ids:
+        try:
+            image_filter = ",".join(str(value) for value in image_ids)
+            image_rows = supabase_request(
+                "/rest/v1/product_images",
+                method="GET",
+                params={"select": "id,stored_path", "id": f"in.({image_filter})", "limit": 5000},
+                timeout=20,
+            ) or []
+            paths_by_bucket = {}
+            path_by_image = {}
+            for item in image_rows:
+                if not isinstance(item, dict):
+                    continue
+                image_id = to_int(item.get("id"), 0)
+                stored_path = norm(item.get("stored_path"))
+                storage_ref = parse_supabase_storage_ref(stored_path)
+                if not image_id or not storage_ref:
+                    continue
+                bucket, _ = storage_ref
+                thumb_path = "product-images/thumbs/" + hashlib.sha256(stored_path.encode("utf-8")).hexdigest() + ".webp"
+                paths_by_bucket.setdefault(bucket, []).append(thumb_path)
+                path_by_image[image_id] = (bucket, thumb_path)
+            signed_by_bucket = {
+                bucket: supabase_storage_create_signed_urls(bucket, paths, expires_in=3600)
+                for bucket, paths in paths_by_bucket.items()
+            }
+            for image_id, (bucket, thumb_path) in path_by_image.items():
+                thumbnail_url_by_image[image_id] = signed_by_bucket.get(bucket, {}).get(thumb_path, "")
+        except Exception:
+            # Brak podpisanego URL nie blokuje katalogu. Frontend skorzysta
+            # wtedy ze zgodnego wstecznie endpointu przez Render.
+            app.logger.warning("Nie udało się utworzyć bezpośrednich adresów miniatur", exc_info=True)
     product_details = supabase_request(
         "/rest/v1/products",
         method="GET",
@@ -5097,6 +5156,7 @@ def _client_stock_catalog_rows(profile: dict) -> list[dict]:
             "price_list": price_list,
             "price_available": bool(net_price > 0),
             "image_id": image_by_product.get(product_id, 0),
+            "thumbnail_url": thumbnail_url_by_image.get(image_by_product.get(product_id, 0), ""),
             "qty_in_delivery": available_incoming,
             "qty_available_in_delivery": available_incoming,
             "ean": ean_by_product.get(product_id, ""),
