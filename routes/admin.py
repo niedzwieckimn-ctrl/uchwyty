@@ -116,16 +116,23 @@ def register_routes(context):
         n_issued_today = int(cur.fetchone()["n"] or 0)
         # Zamowienia, ktore mozna wydac z obecnego stanu. Stan jest rezerwowany
         # od najstarszego zamowienia, aby ta sama sztuka nie byla liczona dwa razy.
-        issuable_statuses = {"new", "pending", "unconfirmed", "confirmed", "packed", "packed_partial"}
+        issuable_statuses = {
+            "new", "pending", "unconfirmed", "confirmed", "packed",
+            "packed_partial", "partially_shipped",
+        }
         status_ph = ",".join(["?"] * len(issuable_statuses))
         cur.execute(f"""
           SELECT o.id, o.order_no, o.created_at, o.note, oi.product_id,
-                 SUM(oi.qty) AS required_qty
+                 SUM(MAX(0, oi.qty - COALESCE((
+                   SELECT SUM(ia.qty) FROM invoice_allocations ia
+                   WHERE ia.order_item_id=oi.id
+                 ),0))) AS required_qty
           FROM orders o
           JOIN order_items oi ON oi.order_id=o.id
           WHERE LOWER(COALESCE(o.status,'')) IN ({status_ph})
             AND COALESCE(o.warehouse_issued,0)=0
           GROUP BY o.id, oi.product_id
+          HAVING required_qty > 0
           ORDER BY o.created_at, o.id, oi.product_id
         """, tuple(sorted(issuable_statuses)))
         issue_rows = [dict(r) for r in cur.fetchall()]
