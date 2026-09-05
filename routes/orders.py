@@ -248,12 +248,17 @@ def register_routes(context):
             # musi miescic sie w fizycznym stanie. Towar w drodze nie wystarcza.
             status_ph = ",".join(["?"] * len(CURRENT_ORDER_STATUSES))
             cur.execute(f"""
-              SELECT o.id, o.created_at, oi.product_id, SUM(oi.qty) AS required_qty
+              SELECT o.id, o.created_at, oi.product_id,
+                     SUM(MAX(0, oi.qty - COALESCE((
+                       SELECT SUM(ia.qty) FROM invoice_allocations ia
+                       WHERE ia.order_item_id=oi.id
+                     ),0))) AS required_qty
               FROM orders o
               JOIN order_items oi ON oi.order_id=o.id
               WHERE LOWER(COALESCE(o.status,'')) IN ({status_ph})
                 AND COALESCE(o.warehouse_issued,0)=0
               GROUP BY o.id, oi.product_id
+              HAVING required_qty > 0
               ORDER BY o.created_at, o.id, oi.product_id
             """, tuple(sorted(CURRENT_ORDER_STATUSES)))
             ready_demand = [dict(r) for r in cur.fetchall()]
