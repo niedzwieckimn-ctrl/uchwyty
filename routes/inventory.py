@@ -878,6 +878,41 @@ def register_routes(context):
         return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
+    def _prepare_product_image(upload):
+        """Waliduje rzeczywistą zawartość i usuwa metadane z rastrów."""
+        filename = norm(upload.filename)
+        extension = os.path.splitext(filename.lower())[1]
+        if extension not in (".svg", ".png", ".jpg", ".jpeg"):
+            raise ValueError("Dozwolone formaty: SVG, PNG, JPG i JPEG")
+        max_size = 5 * 1024 * 1024
+        raw = upload.read(max_size + 1)
+        if len(raw) > max_size:
+            raise ValueError("Plik jest większy niż 5 MB")
+        if extension == ".svg":
+            return _sanitize_svg(raw), ".svg"
+        try:
+            from PIL import Image
+            source = Image.open(io.BytesIO(raw))
+            source.verify()
+            source = Image.open(io.BytesIO(raw))
+            if source.format not in ("PNG", "JPEG"):
+                raise ValueError("Plik nie jest prawidłowym PNG lub JPG")
+            if source.width * source.height > 25_000_000:
+                raise ValueError("Obraz ma zbyt dużą rozdzielczość")
+            output = io.BytesIO()
+            if source.format == "JPEG":
+                if source.mode not in ("RGB", "L"):
+                    source = source.convert("RGB")
+                source.save(output, format="JPEG", quality=88, optimize=True)
+                return output.getvalue(), ".jpg"
+            source.save(output, format="PNG", optimize=True)
+            return output.getvalue(), ".png"
+        except ValueError:
+            raise
+        except Exception:
+            raise ValueError("Uszkodzony lub nieprawidłowy plik graficzny")
+
+
     @app.route("/api/stock/images", methods=["GET","POST"])
     def stock_images():
         c = conn()
@@ -888,15 +923,15 @@ def register_routes(context):
             c.close()
             return jsonify(ok=True, images=[{"id":int(r["id"]),"filename":r["filename"],"assignments":int(r["assignments"]),"url":url_for("inventory_image",image_id=r["id"])} for r in rows])
         upload = request.files.get("image")
-        if not upload or not norm(upload.filename).lower().endswith(".svg"):
-            c.close(); return jsonify(ok=False,error="Wybierz plik SVG"),400
+        if not upload:
+            c.close(); return jsonify(ok=False,error="Wybierz plik SVG, PNG albo JPG"),400
         try:
-            cleaned = _sanitize_svg(upload.read(1024*1024+1))
+            cleaned, stored_extension = _prepare_product_image(upload)
         except ValueError as exc:
             c.close(); return jsonify(ok=False,error=str(exc)),400
         image_dir = os.path.join(os.path.dirname(DB_PATH), "product_images")
         os.makedirs(image_dir, exist_ok=True)
-        stored_name = hashlib.sha256(cleaned).hexdigest() + ".svg"
+        stored_name = hashlib.sha256(cleaned).hexdigest() + stored_extension
         stored_path = os.path.join(image_dir, stored_name)
         if not os.path.exists(stored_path):
             with open(stored_path, "wb") as handle:
@@ -907,13 +942,18 @@ def register_routes(context):
         return jsonify(ok=True,image_id=image_id)
 
 
-    @app.get("/stock/images/<int:image_id>.svg")
+    @app.get("/stock/images/<int:image_id>")
     def inventory_image(image_id):
         c = conn(); row = c.execute("SELECT stored_path FROM product_images WHERE id=?",(image_id,)).fetchone(); c.close()
         if not row or not os.path.isfile(row["stored_path"]):
             abort(404)
-        response = send_file(row["stored_path"], mimetype="image/svg+xml", conditional=True, max_age=604800)
-        response.headers["Content-Security-Policy"] = "default-src 'none'; style-src 'unsafe-inline'; sandbox"
+        extension = os.path.splitext(row["stored_path"])[1].lower()
+        mimetype = {".svg":"image/svg+xml", ".png":"image/png", ".jpg":"image/jpeg", ".jpeg":"image/jpeg"}.get(extension)
+        if not mimetype:
+            abort(404)
+        response = send_file(row["stored_path"], mimetype=mimetype, conditional=True, max_age=604800)
+        if extension == ".svg":
+            response.headers["Content-Security-Policy"] = "default-src 'none'; style-src 'unsafe-inline'; sandbox"
         response.headers["X-Content-Type-Options"] = "nosniff"
         return response
 
