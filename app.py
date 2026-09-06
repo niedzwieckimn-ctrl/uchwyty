@@ -4160,9 +4160,9 @@ def _log_request_performance(response):
 @app.before_request
 def security_gate():
     path = request.path
-    if path == "/webhooks/17track":
-        # Endpoint nie korzysta z sesji; sam weryfikuje podpis 17TRACK na
-        # surowym body przed dotknięciem danych logistycznych.
+    if path in {"/webhooks/17track", "/webhooks/inpost"}:
+        # Endpointy webhooków nie korzystają z sesji. 17TRACK sprawdza podpis,
+        # a InPost dodatkowo potwierdza stan przesyłki swoim API przed zapisem.
         return None
     if path == "/login":
         if request.method == "POST" and not _rate_limit("admin_login", 8, 15 * 60):
