@@ -5422,25 +5422,43 @@ def _order_packing_list_email_attachment(order: dict) -> dict:
         os.path.join(customer_dir, f"{safe_filename(order_no)}.pdf"),
         order_no,
     )
-    if not os.path.exists(expected_path):
+    status = norm(order.get("status")).lower()
+    recreate_remaining = status == "partially_shipped"
+    if recreate_remaining or not os.path.exists(expected_path):
         c = conn()
         try:
             cur = c.cursor()
             cur.execute("""
-              SELECT oi.id, oi.product_id, oi.qty,
+              SELECT oi.id, oi.product_id,
+                     CASE WHEN ? THEN
+                       MAX(0, COALESCE(oi.qty,0) - COALESCE((
+                         SELECT SUM(ia.qty) FROM invoice_allocations ia
+                         WHERE ia.order_item_id=oi.id
+                       ),0))
+                     ELSE COALESCE(oi.qty,0) END AS qty,
                      COALESCE(NULLIF(oi.sku,''), p.sku, '') AS sku,
                      COALESCE(p.model, '') AS model,
                      COALESCE(p.name, '') AS name
               FROM order_items oi
               LEFT JOIN products p ON p.id=oi.product_id
-              WHERE oi.order_id=? AND COALESCE(oi.qty,0)>0
+              WHERE oi.order_id=?
               ORDER BY oi.id
-            """, (order_id,))
-            items = [dict(row) for row in cur.fetchall()]
+            """, (1 if recreate_remaining else 0, order_id))
+            items = [dict(row) for row in cur.fetchall() if to_int(row["qty"], 0) > 0]
+            if recreate_remaining:
+                cur.execute(
+                    "SELECT COUNT(*) AS n FROM invoice_allocations WHERE order_id=?",
+                    (order_id,),
+                )
+                has_allocation_history = to_int(cur.fetchone()["n"], 0) > 0
         finally:
             c.close()
+        if recreate_remaining and not has_allocation_history:
+            raise ValueError(
+                "brak zapisu ilości z pierwszej części; wygeneruj listę pakowania dla pozostałych pozycji przed oznaczeniem wysyłki"
+            )
         if not items:
-            raise ValueError("zamówienie nie ma pozycji do listy pakowania")
+            raise ValueError("zamówienie nie ma niewysłanych pozycji do listy pakowania")
         note = norm(order.get("note"))
         for item in items:
             item["source_order_no"] = order_no
