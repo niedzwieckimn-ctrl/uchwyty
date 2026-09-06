@@ -4,6 +4,146 @@ def register_routes(context):
     globals().update(context)
 
 
+    def _inpost_status_is_collected(status):
+        value = norm(status).lower()
+        return value in {
+            "collected_by_courier", "taken_by_courier", "adopted_at_source_branch",
+            "sent_from_source_branch", "adopted_at_sorting_center",
+            "sent_from_sorting_center", "out_for_delivery", "ready_to_pickup",
+            "pickup_reminder_sent", "delivered", "returned_to_sender",
+        }
+
+
+    def _inpost_event_is_collected(event_code):
+        value = norm(event_code).upper()
+        if not value:
+            return False
+        # FMD.1001 oznacza jedynie gotowość do odbioru. Dopiero FMD.1002
+        # potwierdza przejęcie paczki przez kuriera. Późniejsze etapy również
+        # dowodzą, że przesyłka opuściła magazyn.
+        return value in {"FMD.1002", "FMD.1003", "FMD.1004", "FMD.1005"} or value.startswith(("MMD.", "LMD.", "EOL."))
+
+
+    @app.post("/webhooks/inpost")
+    def inpost_tracking_webhook():
+        if not _rate_limit("inpost_webhook", 240, 60):
+            return jsonify(ok=False, error="rate_limit"), 429
+        data = request.get_json(silent=True) or {}
+        payload = data.get("payload") if isinstance(data.get("payload"), dict) else data
+        nested_shipment = payload.get("shipment") if isinstance(payload.get("shipment"), dict) else {}
+        shipment_id = norm(
+            payload.get("shipment_id") or payload.get("shipmentId")
+            or nested_shipment.get("id") or data.get("shipment_id")
+        )
+        tracking_no = re.sub(r"\s+", "", norm(
+            payload.get("tracking_number") or payload.get("trackingNumber")
+            or data.get("tracking_number") or data.get("trackingNumber")
+        ))
+        event_code = norm(payload.get("eventCode") or payload.get("event_code") or data.get("eventCode"))
+
+        maybe_pull_shared_from_supabase(force=True)
+        c = conn()
+        try:
+            cur = c.cursor()
+            row = None
+            if shipment_id.isdigit():
+                row = cur.execute(
+                    "SELECT * FROM orders WHERE inpost_shipment_id=? ORDER BY id LIMIT 1",
+                    (shipment_id,),
+                ).fetchone()
+            if not row and tracking_no:
+                row = cur.execute(
+                    "SELECT * FROM orders WHERE REPLACE(COALESCE(tracking_no,''),' ','')=? ORDER BY id LIMIT 1",
+                    (tracking_no,),
+                ).fetchone()
+            if not row:
+                # Nieznane zdarzenie potwierdzamy, ale nie dotykamy zamówień.
+                return jsonify(ok=True, ignored="shipment_not_found")
+            order = dict(row)
+            authoritative_id = norm(order.get("inpost_shipment_id"))
+            try:
+                remote_shipment = inpost_get_shipment(authoritative_id)
+            except Exception as exc:
+                app.logger.warning("Webhook InPost: nie udało się potwierdzić przesyłki %s: %s", authoritative_id, exc)
+                return jsonify(ok=False, error="inpost_verification_failed"), 503
+            remote_status = norm(remote_shipment.get("status"))
+            remote_tracking = re.sub(r"\s+", "", norm(remote_shipment.get("tracking_number"))) or tracking_no
+            # eventCode jest tylko wskazówką. Decyzję podejmujemy wyłącznie na
+            # podstawie statusu ponownie pobranego z uwierzytelnionego API.
+            if not _inpost_status_is_collected(remote_status):
+                return jsonify(ok=True, ignored="not_collected", status=remote_status)
+
+            package_rows = cur.execute(
+                "SELECT * FROM orders WHERE inpost_shipment_id=? ORDER BY id",
+                (authoritative_id,),
+            ).fetchall()
+            package_orders = [dict(item) for item in package_rows] or [order]
+            package_order_ids = [to_int(item.get("id"), 0) for item in package_orders]
+            tracking_hash = hashlib.sha256(remote_tracking.encode("utf-8")).hexdigest()[:16]
+            event_keys = [f"order_shipped:{order_id}:inpost:{tracking_hash}" for order_id in package_order_ids]
+            if event_keys and all(_email_event_already_ok(key) for key in event_keys):
+                return jsonify(ok=True, duplicate=True, status=remote_status)
+
+            try:
+                packing_attachment = _order_packing_list_email_attachment(order)
+            except Exception as exc:
+                app.logger.exception("Webhook InPost: nie udało się przygotować listy pakowania")
+                return jsonify(ok=False, error=("packing_list_failed: " + str(exc))[:300]), 503
+
+            shipped_at = now_iso()
+            placeholders = ",".join("?" for _ in package_order_ids)
+            cur.execute(
+                f"""UPDATE orders SET
+                    status=CASE
+                      WHEN LOWER(COALESCE(status,'')) IN ('issued','completed') THEN status
+                      WHEN LOWER(COALESCE(status,''))='packed_partial' THEN 'partially_shipped'
+                      ELSE 'shipped'
+                    END,
+                    tracking_no=CASE WHEN ?<>'' THEN ? ELSE tracking_no END,
+                    carrier='inpost', shipped_at=?
+                    WHERE id IN ({placeholders})""",
+                (remote_tracking, remote_tracking, shipped_at, *package_order_ids),
+            )
+            c.commit()
+            package_orders = [dict(item) for item in cur.execute(
+                f"SELECT * FROM orders WHERE id IN ({placeholders}) ORDER BY id",
+                tuple(package_order_ids),
+            ).fetchall()]
+        finally:
+            c.close()
+
+        if supabase_enabled():
+            try:
+                for package_order in package_orders:
+                    supabase_update_rows(
+                        "orders",
+                        {
+                            "status": package_order.get("status"),
+                            "tracking_no": remote_tracking,
+                            "carrier": "inpost",
+                            "shipped_at": shipped_at,
+                            "warehouse_issued": int(package_order.get("warehouse_issued") or 0),
+                        },
+                        {"id": int(package_order["id"])},
+                    )
+            except Exception as exc:
+                app.logger.exception("Webhook InPost: błąd synchronizacji zamówień: %s", exc)
+                return jsonify(ok=False, error="supabase_sync_failed"), 503
+
+        try:
+            result = _send_orders_shipped_email(package_orders, remote_tracking, "inpost", packing_attachment)
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc)}
+        for package_order, event_key in zip(package_orders, event_keys):
+            _record_email_event(
+                event_key, "order_shipped", package_order.get("id"),
+                package_order.get("customer_email"), result,
+            )
+        if not result.get("ok"):
+            return jsonify(ok=False, error=norm(result.get("error")) or "email_failed"), 503
+        return jsonify(ok=True, shipped=True, orders=package_order_ids, status=remote_status)
+
+
     @app.route("/orders/<int:order_id>/inpost", methods=["GET", "POST"])
     def order_inpost_create(order_id):
         # Po utworzeniu przesyłki nie pobieramy natychmiast starszej kopii rekordu
