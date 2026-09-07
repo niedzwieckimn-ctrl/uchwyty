@@ -344,11 +344,14 @@ def register_routes(context):
                     cur.execute("SELECT id FROM invoices WHERE invoice_no=? LIMIT 1", (data["invoice_no"],))
                     rr = cur.fetchone()
                     invoice_id = int(rr["id"]) if rr else 0
+                import invoice_jobs
+                invoice_jobs.stage(cur,invoice_id,invoice_items,now_iso())
                 c.commit()
                 c.close()
-                stored_pdf_path = upload_invoice_pdfs_to_supabase(invoice_id, data["invoice_no"], pdf_path, packing_pdf_path)
-                upsert_invoice_meta(invoice_id, stored_pdf_path, json.dumps(invoice_items, ensure_ascii=False), sent_to_client=None)
-                allocation_ids = replace_invoice_allocations(invoice_id, invoice_items)
+                resume_invoice_job(invoice_id)
+                c=conn()
+                allocation_ids=[row[0] for row in c.execute("SELECT id FROM invoice_allocations WHERE invoice_id=?",(invoice_id,))]
+                c.close()
                 touched_order_ids = [int(x.get("source_order_id") or x.get("order_id") or 0) for x in invoice_items]
                 completed_order_ids, changed_product_ids = finalize_fully_invoiced_orders(touched_order_ids)
                 if supabase_enabled():
@@ -592,7 +595,7 @@ def register_routes(context):
           LEFT JOIN invoice_meta m ON m.invoice_id = i.id
           LEFT JOIN ksef_documents k ON k.invoice_id = i.id
           LEFT JOIN orders o ON o.id = i.order_id
-          WHERE (
+          WHERE i.publication_state='complete' AND (
               LOWER(COALESCE(i.buyer_email,'')) = ?
               OR LOWER(COALESCE(o.customer_email,'')) = ?
             )
@@ -1122,13 +1125,27 @@ def register_routes(context):
             upsert_ksef_doc(invoice_id, "error", last_error="Wpisz numer KSeF, żeby oznaczyć fakturę jako wysłaną.")
             return redirect(next_url)
         upsert_ksef_doc(invoice_id, "sent", ksef_number=ksef_number, last_error="")
+        try:
+            regenerate_invoice_pdf_after_ksef_send(invoice_id, ksef_number)
+        except Exception as exc:
+            app.logger.exception("Nie udało się odświeżyć PDF faktury %s po zapisaniu numeru KSeF", invoice_id)
+            upsert_ksef_doc(invoice_id, "sent", ksef_number=ksef_number,
+                            last_error=("Numer KSeF zapisano, ale PDF wymaga ponownego wygenerowania: " + str(exc))[:500])
         return redirect(next_url)
 
 
 
 
+    @app.post("/invoices/<int:invoice_id>/resume")
+    def invoice_resume(invoice_id):
+        assert_invoice_mutable(invoice_id)
+        resume_invoice_job(invoice_id)
+        return redirect(url_for("invoices"))
+
+
     @app.post("/invoices/<int:invoice_id>/ksef/send")
     def invoice_ksef_send(invoice_id):
+        require_complete_invoice(invoice_id)
         next_url = request.form.get("next") or url_for("ksef_dashboard")
         current_ksef = load_ksef_doc(invoice_id)
         if current_ksef.get("status") == "sent":
@@ -1155,12 +1172,33 @@ def register_routes(context):
             upsert_ksef_doc(invoice_id, "error", xml_path=path, last_error="Brak modułu ksef_api.py albo zależności requests/cryptography.")
             return redirect(next_url)
 
-        result = send_invoice_to_ksef(xml)
-        if result.get("ok"):
-            ksef_number = result.get("ksef_number") or (f"ref: {result.get('invoice_reference_number')}" if result.get("invoice_reference_number") else "")
-            upsert_ksef_doc(invoice_id, "sent", xml_path=path, ksef_number=ksef_number)
+        previous = ksef_attempt(invoice_id, claim=True)
+        if previous:
+            if not previous.get("session_ref") or not previous.get("invoice_ref"):
+                upsert_ksef_doc(invoice_id, "unknown", last_error="Wynik poprzedniej próby jest nieznany. Sprawdź sesję KSeF; automatyczne ponowne wysłanie zablokowane.")
+                return redirect(next_url)
+            from ksef_api import resume_invoice_status
+            try:
+                result = resume_invoice_status(previous["session_ref"], previous["invoice_ref"])
+            except Exception as exc:
+                upsert_ksef_doc(invoice_id, "unknown", last_error=str(exc))
+                return redirect(next_url)
         else:
-            upsert_ksef_doc(invoice_id, "error", xml_path=path, last_error=result.get("message") or "Nie udało się wysłać faktury do KSeF.")
+            upsert_ksef_doc(invoice_id, "sending", xml_path=path)
+            result = send_invoice_to_ksef(xml, checkpoint=lambda sr, ir: ksef_attempt(invoice_id, sr, ir))
+        if result.get("session_reference_number"):
+            ksef_attempt(invoice_id, result["session_reference_number"], result.get("invoice_reference_number"))
+        number = result.get("ksef_number") or ""
+        state = "sent" if number else result.get("state", "processing" if result.get("ok") else "unknown")
+        upsert_ksef_doc(invoice_id, state, xml_path=path, ksef_number=number,
+                        last_error=result.get("message") if state in {"unknown", "rejected"} else "")
+        if number:
+            try:
+                regenerate_invoice_pdf_after_ksef_send(invoice_id, number)
+            except Exception as exc:
+                app.logger.exception("Nie udało się odświeżyć PDF faktury %s po przyjęciu przez KSeF", invoice_id)
+                upsert_ksef_doc(invoice_id, "sent", xml_path=path, ksef_number=number,
+                                last_error=("Numer KSeF zapisano, ale PDF wymaga ponownego wygenerowania: " + str(exc))[:500])
         return redirect(next_url)
 
 
@@ -1168,6 +1206,12 @@ def register_routes(context):
 
     @app.get("/invoices/<int:invoice_id>/ksef/xml")
     def invoice_ksef_xml(invoice_id):
+        require_complete_invoice(invoice_id)
+        current = load_ksef_doc(invoice_id)
+        if ksef_document_locked(current) or ksef_attempt(invoice_id):
+            if current.get("xml_path") and os.path.exists(current["xml_path"]):
+                return send_file(current["xml_path"], mimetype="application/xml", as_attachment=True)
+            return "Brak zachowanego XML chronionego dokumentu", 409
         inv, company, items, problems = build_invoice_ksef_payload(invoice_id)
         if not inv:
             return "Nie znaleziono faktury", 404
@@ -1194,9 +1238,22 @@ def register_routes(context):
 
     @app.get("/invoices/<int:invoice_id>/download")
     def invoice_download_admin(invoice_id):
+        require_complete_invoice(invoice_id)
         row = load_invoice_with_meta(invoice_id)
         if not row:
             return "Nie znaleziono faktury", 404
+
+        # Faktura mogła zostać zapisana jako PDF przed przyjęciem jej przez
+        # KSeF. Odtwórz dokument z nadanym numerem także dla starszych faktur.
+        ksef_number = norm(load_ksef_doc(invoice_id).get("ksef_number"))
+        if ksef_number:
+            try:
+                if not regenerate_invoice_pdf_after_ksef_send(invoice_id, ksef_number):
+                    return "Nie udało się odtworzyć faktury z numerem KSeF", 409
+                row = load_invoice_with_meta(invoice_id) or row
+            except Exception as exc:
+                app.logger.exception("Nie udało się przygotować PDF faktury %s z numerem KSeF", invoice_id)
+                return ("Numer KSeF jest zapisany, ale nie udało się przygotować aktualnego PDF: " + str(exc))[:500], 503
 
         if parse_supabase_storage_ref(row.get("pdf_path", "")):
             try:
@@ -1420,6 +1477,7 @@ def register_routes(context):
 
     @app.get("/api/invoices/<int:invoice_id>/download")
     def api_invoice_download(invoice_id):
+        require_complete_invoice(invoice_id)
         maybe_pull_shared_from_supabase()
         email = _email_key(g.client_user["email"])
         c = conn()
@@ -1469,6 +1527,19 @@ def register_routes(context):
                     sync_invoice_meta_to_supabase(invoice_id)
                 except Exception:
                     pass
+
+        # Samonaprawa dokumentów utworzonych przed zapisaniem numeru KSeF.
+        ksef_number = norm(load_ksef_doc(invoice_id).get("ksef_number"))
+        if ksef_number:
+            try:
+                if not regenerate_invoice_pdf_after_ksef_send(invoice_id, ksef_number):
+                    return "Nie udało się odtworzyć faktury z numerem KSeF", 409
+                refreshed = load_invoice_with_meta(invoice_id)
+                if refreshed:
+                    row = refreshed
+            except Exception as exc:
+                app.logger.exception("Nie udało się przygotować PDF faktury %s dla klienta z numerem KSeF", invoice_id)
+                return ("Numer KSeF jest zapisany, ale nie udało się przygotować aktualnego PDF: " + str(exc))[:500], 503
 
         if parse_supabase_storage_ref(row["pdf_path"]):
             try:
@@ -1606,7 +1677,7 @@ def register_routes(context):
         if not inv:
             return "Nie znaleziono faktury", 404
         ksef_doc = load_ksef_doc(invoice_id)
-        if ksef_doc.get("status") == "sent":
+        if ksef_document_locked(ksef_doc) or ksef_attempt(invoice_id):
             tpl = r"""
             {% extends "base.html" %}
             {% block content %}
@@ -1718,77 +1789,12 @@ def register_routes(context):
                     data["buyer_name"], data["buyer_tax_no"], st, pc, city,
                     data["buyer_country"], data["buyer_email"], data["buyer_phone"], data["invoice_type"], data["currency"], invoice_id
                 ))
+                import invoice_jobs
+                invoice_jobs.stage(cur,invoice_id,invoice_items,now_iso())
                 c.commit()
                 c.close()
 
-                updated = load_invoice_with_meta(invoice_id)
-                if invoice_items and updated:
-                    order_for_pdf = order_row
-                    if not order_for_pdf:
-                        first_order_id = int(invoice_items[0].get("source_order_id") or invoice_items[0].get("order_id") or 0)
-                        if first_order_id:
-                            c = conn()
-                            cur = c.cursor()
-                            cur.execute("SELECT * FROM orders WHERE id=?", (first_order_id,))
-                            order_for_pdf = cur.fetchone()
-                            c.close()
-
-                    pdf_path, total_net, total_gross = generate_order_invoice_pdf(order_for_pdf, invoice_items, invoice_meta_payload(updated))
-                    packing_pdf_path = generate_invoice_packing_list_pdf(order_for_pdf, invoice_items, invoice_meta_payload(updated), pdf_path)
-                    stored_pdf_path = upload_invoice_pdfs_to_supabase(invoice_id, data["invoice_no"], pdf_path, packing_pdf_path)
-                    allocation_ids = replace_invoice_allocations(invoice_id, invoice_items)
-                    new_order_ids = sorted({int(x.get("source_order_id") or x.get("order_id") or 0) for x in invoice_items})
-                    touched_order_ids = sorted(set(old_order_ids + new_order_ids))
-                    changed_order_ids, changed_product_ids = reconcile_orders_after_invoice_change(touched_order_ids)
-
-                    c = conn()
-                    cur = c.cursor()
-                    cur.execute("UPDATE invoices SET total_net=?, total_gross=? WHERE id=?", (total_net, total_gross, invoice_id))
-                    c.commit()
-                    c.close()
-
-                    meta = load_invoice_meta(invoice_id) or {}
-                    upsert_invoice_meta(
-                        invoice_id,
-                        stored_pdf_path,
-                        json.dumps(invoice_items, ensure_ascii=False),
-                        sent_to_client=int(meta.get("sent_to_client") or 0),
-                        seen_by_client=0,
-                        seen_at=None,
-                        payment_reminder=int(meta.get("payment_reminder") or 0),
-                        paid=int(meta.get("paid") or 0),
-                        paid_at=meta.get("paid_at")
-                    )
-
-                if supabase_enabled():
-                    try:
-                        sync_local_rows_to_supabase("invoices", "id", [invoice_id])
-                    except Exception:
-                        pass
-                    try:
-                        sync_invoice_meta_to_supabase(invoice_id)
-                    except Exception:
-                        pass
-                    try:
-                        supabase_delete_rows("invoice_allocations", {"invoice_id": invoice_id})
-                    except Exception:
-                        pass
-                    if allocation_ids:
-                        try:
-                            sync_local_rows_to_supabase("invoice_allocations", "id", allocation_ids)
-                        except Exception:
-                            pass
-                    if changed_order_ids:
-                        try:
-                            sync_local_rows_to_supabase("orders", "id", changed_order_ids)
-                        except Exception:
-                            pass
-                    if changed_product_ids:
-                        try:
-                            sync_local_rows_to_supabase("stock", "product_id", changed_product_ids)
-                        except Exception:
-                            pass
-
+                resume_invoice_job(invoice_id)
                 return redirect(url_for("invoices", edited="1", invoice_id=invoice_id))
 
         buyer_address = "\n".join([x for x in [
