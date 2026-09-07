@@ -948,6 +948,14 @@ def register_routes(context):
                                     <button class="btn" type="submit">Cofnij opłacenie</button>
                                   </form>
                                 {% endif %}
+                                {% if inv.ksef_status == 'sent' and not inv.ksef_number %}
+                                  <span class="badge danger">Brak numeru KSeF — uzupełnij go, aby odtworzyć PDF</span>
+                                  <form method="post" action="{{ url_for('invoice_ksef_mark_sent', invoice_id=inv.id) }}" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
+                                    <input type="hidden" name="next" value="{{ request.full_path }}">
+                                    <input name="ksef_number" placeholder="Numer KSeF" required style="width:240px;">
+                                    <button class="btn primary" type="submit">Zapisz numer i odtwórz PDF</button>
+                                  </form>
+                                {% endif %}
                                 {% if inv.ksef_status != 'sent' %}
                                   <a class="btn" href="{{ url_for('invoice_ksef_xml', invoice_id=inv.id) }}">XML KSeF FA(3)</a>
                                   <form method="post" action="{{ url_for('invoice_ksef_validate', invoice_id=inv.id) }}">
@@ -1077,7 +1085,15 @@ def register_routes(context):
                           <button class="btn" type="submit">Sprawdź</button>
                         </form>
                         <a class="btn primary" href="{{ url_for('invoice_ksef_xml', invoice_id=inv.id) }}">Pobierz XML KSeF FA(3)</a>
-                        {% if inv.ksef_status != 'sent' %}
+                        {% if inv.ksef_status == 'sent' and not inv.ksef_number %}
+                                  <span class="badge danger">Brak numeru KSeF — uzupełnij go, aby odtworzyć PDF</span>
+                                  <form method="post" action="{{ url_for('invoice_ksef_mark_sent', invoice_id=inv.id) }}" style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
+                                    <input type="hidden" name="next" value="{{ request.full_path }}">
+                                    <input name="ksef_number" placeholder="Numer KSeF" required style="width:240px;">
+                                    <button class="btn primary" type="submit">Zapisz numer i odtwórz PDF</button>
+                                  </form>
+                                {% endif %}
+                                {% if inv.ksef_status != 'sent' %}
                           <form method="post" action="{{ url_for('invoice_ksef_send', invoice_id=inv.id) }}" onsubmit="return confirm('UWAGA: to jest realna wysyłka faktury do KSeF. Po wysłaniu faktura otrzyma numer KSeF i nie będzie można jej edytować. Kontynuować?');">
                             <input type="hidden" name="next" value="{{ request.full_path }}">
                             <button class="btn primary" type="submit">Wyślij do KSeF</button>
