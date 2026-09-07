@@ -4,6 +4,24 @@ from pathlib import Path
 
 INVOICES_LIST_TEMPLATE = (Path(__file__).resolve().parent.parent / "templates" / "invoices_list.html").read_text(encoding="utf-8")
 
+
+def require_complete_invoice(invoice_id):
+    """Allow publication actions only for an existing, fully prepared invoice."""
+    row = load_invoice_with_meta(invoice_id)
+    if not row:
+        abort(404, description="Nie znaleziono faktury")
+
+    publication_state = norm(row.get("publication_state") or "complete").lower()
+    if publication_state != "complete":
+        abort(
+            409,
+            description=(
+                "Faktura nie została jeszcze przygotowana w całości. "
+                "Wznów przygotowanie dokumentu przed pobraniem, wysłaniem lub operacją KSeF."
+            ),
+        )
+    return row
+
 def register_routes(context):
     globals().update(context)
 
