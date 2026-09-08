@@ -415,7 +415,7 @@ def register_routes(context):
                 }
                 if email_error:
                     redirect_args["email_error"] = email_error[:300]
-                return redirect(url_for("order_inpost_create", order_id=order_id, invoice_id=invoice_id))
+                return redirect(url_for("order_packing_list_download_admin", order_id=order_id, after_invoice="1"))
 
         tpl = r"""
         {% extends "base.html" %}

@@ -542,7 +542,8 @@ def register_routes(context):
     def order_packing_list_download_admin(order_id):
         """Generuje wspolna liste pakowania dla zamowien tego samego klienta."""
         selected_carrier = norm(request.form.get("carrier") or request.args.get("carrier")).lower()
-        if selected_carrier not in {"inpost", "other"}:
+        after_invoice = request.args.get("after_invoice") == "1"
+        if after_invoice:
             tpl = r"""
             {% extends "base.html" %}{% block content %}
               <style>
@@ -559,25 +560,27 @@ def register_routes(context):
               </style>
               <div class="card">
                 <div class="flex">
-                  <div><h1 style="margin:0 0 8px;">Pakuj zamówienie</h1><div class="muted">Najpierw wybierz sposób wysyłki, a następnie zawartość paczki.</div></div>
+                  <div><h1 style="margin:0 0 8px;">Wybierz kuriera</h1><div class="muted">Faktura jest już wystawiona. Wybierz sposób nadania paczki.</div></div>
                   <a class="btn right" href="{{ url_for('order_view', order_id=order_id) }}">← Zamówienie</a>
                 </div>
               </div>
               <div class="carrier-options">
-                <a class="card carrier-option" href="{{ url_for('order_packing_list_download_admin', order_id=order_id, carrier='inpost') }}">
+                <a class="card carrier-option" href="{{ url_for('order_inpost_create', order_id=order_id, bundle='1') }}">
                   <div class="carrier-option-head"><span class="carrier-icon">I</span><h2>InPost</h2></div>
-                  <p class="muted">Wybierz zamówienia i ilości, określ rodzaj paczki, a następnie wygeneruj etykietę A6 oraz wspólną listę pakową A4.</p>
+                  <p class="muted">Uzupełnij dane paczki, utwórz etykietę A6 i zamów podjazd kuriera.</p>
                   <div class="carrier-action"><span class="btn primary">Wybierz InPost →</span></div>
                 </a>
-                <a class="card carrier-option other" href="{{ url_for('order_packing_list_download_admin', order_id=order_id, carrier='other') }}">
+                <a class="card carrier-option other" href="{{ url_for('order_view', order_id=order_id) }}">
                   <div class="carrier-option-head"><span class="carrier-icon">↗</span><h2>Inny przewoźnik</h2></div>
-                  <p class="muted">Wybierz zamówienia i ilości, a następnie pobierz jedną zbiorczą listę pakową A4 — bez zamawiania kuriera.</p>
-                  <div class="carrier-action"><span class="btn">Wybierz innego przewoźnika →</span></div>
+                  <p class="muted">Wróć do zamówienia i wpisz numer nadania innego przewoźnika ręcznie.</p>
+                  <div class="carrier-action"><span class="btn">Inny przewoźnik →</span></div>
                 </a>
               </div>
             {% endblock %}
             """
-            return render_template_string(tpl, title="Pakuj", base_url=BASE_URL, db_path=DB_PATH, order_id=order_id)
+            return render_template_string(tpl, title="Wybierz kuriera", base_url=BASE_URL, db_path=DB_PATH, order_id=order_id)
+        if selected_carrier not in {"inpost", "other", "pending"}:
+            selected_carrier = "pending"
         maybe_pull_shared_from_supabase()
         c = conn()
         cur = c.cursor()
@@ -653,7 +656,7 @@ def register_routes(context):
             {% extends "base.html" %}{% block content %}
               <div class="card">
                 <div class="flex"><div><h1 style="margin:0 0 8px;">Wybierz zawartość paczki</h1>
-                  <div class="muted">{% if carrier == 'inpost' %}InPost: po zatwierdzeniu wybierzesz paczkę i wygenerujesz etykietę A6.{% else %}Inny przewoźnik: zostanie pobrana wyłącznie zbiorcza lista pakowa A4.{% endif %}</div>
+                  <div class="muted">Po zatwierdzeniu przejdziesz do faktury z wybranymi pozycjami. Wybór kuriera nastąpi po jej wystawieniu.</div>
                 </div><a class="btn right" href="{{ url_for('order_view', order_id=order_id) }}">← Zamówienie</a></div>
               </div>
               <div class="card"><form method="post">
@@ -666,7 +669,7 @@ def register_routes(context):
                   <td><input type="number" min="0" max="{{ item.max_pack_qty }}" name="pack_qty_{{ item.id }}" value="{{ item.selected_pack_qty }}" style="width:110px;"></td>
                 </tr>{% endfor %}</tbody></table>
                 <button class="btn primary" type="submit" style="margin-top:16px;">
-                  {% if carrier == 'inpost' %}Dalej: paczka i etykieta InPost{% else %}Pobierz zbiorczą listę A4{% endif %}
+                  Dalej: sprawdź fakturę
                 </button>
               </form></div>
             {% endblock %}
@@ -702,9 +705,11 @@ def register_routes(context):
         pack_path = generate_invoice_packing_list_pdf(order_row, items, meta)
         mark_orders_packed(packed_order_ids, packing_path=pack_path, packing_items=items)
         filename_suffix = "_zbiorcza" if len(packed_order_ids) > 1 else ""
-        if selected_carrier == "inpost":
+        if selected_carrier in {"inpost", "pending"}:
             session[f"inpost_pack_path_{order_id}"] = pack_path
-            return redirect(url_for("order_inpost_create", order_id=order_id, bundle="1"))
+            # Listę pakową potwierdza faktura. Dopiero jej zapis prowadzi do
+            # tworzenia etykiety, więc nie można ominąć rozliczenia stanu.
+            return redirect(url_for("order_invoice", order_id=order_id, from_packing="1"))
         return send_file(
             pack_path,
             mimetype="application/pdf",
