@@ -162,6 +162,10 @@ def register_routes(context):
                 abort(404)
             order = dict(row)
             package_orders = _packed_package_orders(cur, order)
+            awaiting_invoice = bool(cur.execute(
+                "SELECT 1 FROM packing_batches WHERE root_order_id=? AND invoice_id IS NULL LIMIT 1",
+                (order_id,),
+            ).fetchone())
         finally:
             c.close()
 
@@ -174,6 +178,8 @@ def register_routes(context):
             elif norm(order.get("inpost_shipment_id")):
                 enqueue_automatic_inpost_pickup(order["inpost_shipment_id"])
                 return redirect(url_for("order_inpost_label", order_id=order_id, bundle="1" if bundle else None))
+            elif awaiting_invoice:
+                return redirect(url_for("order_invoice", order_id=order_id, from_packing="1"))
             elif not inpost_label_allowed_for_status(order.get("status")):
                 error = "Najpierw wybierz zawartość paczki w kreatorze Pakuj."
             else:
