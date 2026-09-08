@@ -7,7 +7,7 @@ def register_routes(context):
     def _inpost_status_is_collected(status):
         value = norm(status).lower()
         return value in {
-            "collected_by_courier", "taken_by_courier", "adopted_at_source_branch",
+            "collected_from_sender", "taken_by_courier_from_pok", "adopted_at_target_branch", "out_for_delivery_to_address", "collected_by_courier", "taken_by_courier", "adopted_at_source_branch",
             "sent_from_source_branch", "adopted_at_sorting_center",
             "sent_from_sorting_center", "out_for_delivery", "ready_to_pickup",
             "pickup_reminder_sent", "delivered", "returned_to_sender",
@@ -81,26 +81,17 @@ def register_routes(context):
             package_order_ids = [to_int(item.get("id"), 0) for item in package_orders]
             tracking_hash = hashlib.sha256(remote_tracking.encode("utf-8")).hexdigest()[:16]
             event_keys = [f"order_shipped:{order_id}:inpost:{tracking_hash}" for order_id in package_order_ids]
-            if event_keys and all(_email_event_already_ok(key) for key in event_keys):
-                return jsonify(ok=True, duplicate=True, status=remote_status)
-
-            try:
-                packing_attachment = _order_packing_list_email_attachment(order)
-            except Exception as exc:
-                app.logger.exception("Webhook InPost: nie udało się przygotować listy pakowania")
-                return jsonify(ok=False, error=("packing_list_failed: " + str(exc))[:300]), 503
-
-            shipped_at = now_iso()
+            shipped_at = norm(order.get("shipped_at")) or now_iso()
             placeholders = ",".join("?" for _ in package_order_ids)
             cur.execute(
                 f"""UPDATE orders SET
                     status=CASE
                       WHEN LOWER(COALESCE(status,'')) IN ('issued','completed') THEN status
-                      WHEN LOWER(COALESCE(status,''))='packed_partial' THEN 'partially_shipped'
+                      WHEN LOWER(COALESCE(status,'')) IN ('packed_partial','partially_shipped') THEN 'partially_shipped'
                       ELSE 'shipped'
                     END,
                     tracking_no=CASE WHEN ?<>'' THEN ? ELSE tracking_no END,
-                    carrier='inpost', shipped_at=?
+                    carrier='inpost', shipped_at=CASE WHEN TRIM(COALESCE(shipped_at,''))='' THEN ? ELSE shipped_at END
                     WHERE id IN ({placeholders})""",
                 (remote_tracking, remote_tracking, shipped_at, *package_order_ids),
             )
@@ -121,7 +112,7 @@ def register_routes(context):
                             "status": package_order.get("status"),
                             "tracking_no": remote_tracking,
                             "carrier": "inpost",
-                            "shipped_at": shipped_at,
+                            "shipped_at": package_order.get("shipped_at"),
                             "warehouse_issued": int(package_order.get("warehouse_issued") or 0),
                         },
                         {"id": int(package_order["id"])},
@@ -129,6 +120,16 @@ def register_routes(context):
             except Exception as exc:
                 app.logger.exception("Webhook InPost: błąd synchronizacji zamówień: %s", exc)
                 return jsonify(ok=False, error="supabase_sync_failed"), 503
+
+        if event_keys and all(_email_event_already_ok(key) for key in event_keys):
+            return jsonify(ok=True, duplicate=True, status=remote_status)
+
+        try:
+            packing_attachment = _order_packing_list_email_attachment(order)
+        except Exception as exc:
+            app.logger.exception("Webhook InPost: nie udało się przygotować listy pakowania")
+            return jsonify(ok=False, error=("packing_list_failed: " + str(exc))[:300]), 503
+
 
         try:
             result = _send_orders_shipped_email(package_orders, remote_tracking, "inpost", packing_attachment)
@@ -171,6 +172,7 @@ def register_routes(context):
             if not cfg["configured"]:
                 error = "Brak konfiguracji InPost na Renderze: " + ", ".join(cfg["missing"])
             elif norm(order.get("inpost_shipment_id")):
+                enqueue_automatic_inpost_pickup(order["inpost_shipment_id"])
                 return redirect(url_for("order_inpost_label", order_id=order_id, bundle="1" if bundle else None))
             elif not inpost_label_allowed_for_status(order.get("status")):
                 error = "Najpierw wybierz zawartość paczki w kreatorze Pakuj."
@@ -253,6 +255,10 @@ def register_routes(context):
                         c.commit()
                     finally:
                         c.close()
+                    try:
+                        enqueue_automatic_inpost_pickup(shipment_id)
+                    except Exception:
+                        app.logger.exception("Etykieta utworzona, ale kolejka podjazdu wymaga sprawdzenia")
                     if supabase_enabled():
                         try:
                             sync_local_rows_to_supabase("orders", "id", package_ids)
@@ -272,7 +278,8 @@ def register_routes(context):
         {% extends "base.html" %}{% block content %}
           <div class="card"><div class="flex"><div><h1 style="margin:0 0 8px;">Etykieta InPost</h1><div class="muted">Jedna przesyłka dla zamówień: {{ package_labels|join(', ') }}</div></div><a class="btn right" href="{{ url_for('order_view', order_id=o.id) }}">← Zamówienie</a></div></div>
           <div class="card">
-            {% if created and o.inpost_shipment_id %}<div class="hint" style="border-color:#a7e8cf;background:#edfbf6;color:#17684e;margin-bottom:15px;"><b>Przesyłka InPost została utworzona z odbiorem przez kuriera.</b>{% if o.tracking_no %} Numer: <b>{{ o.tracking_no }}</b>.{% else %} InPost przygotowuje jeszcze numer przesyłki.{% endif %} PDF pobierzesz przyciskiem poniżej.</div>{% endif %}
+            {% if created and o.inpost_shipment_id %}<div class="hint" style="border-color:#a7e8cf;background:#edfbf6;color:#17684e;margin-bottom:15px;"><b>Przesyłka InPost została utworzona. Stan podjazdu jest pokazany poniżej.</b>{% if o.tracking_no %} Numer: <b>{{ o.tracking_no }}</b>.{% else %} InPost przygotowuje jeszcze numer przesyłki.{% endif %} PDF pobierzesz przyciskiem poniżej.</div>{% endif %}
+            {% if pickup %}<div class="hint"><b>{{ pickup.label }}</b>{% if pickup.dispatch_id %} — ID {{ pickup.dispatch_id }}{% endif %}{% if pickup.external_id %}, numer {{ pickup.external_id }}{% endif %}{% if pickup.error %}<p>{{ pickup.error }}</p>{% endif %}<a class="btn" href="{{ url_for('inpost_dispatch_order') }}">Podjazdy i dane odbioru</a></div>{% endif %}
             {% if error %}<div class="hint" style="border-color:#fecaca;background:#fff1f2;margin-bottom:15px;">{{ error }}</div>{% endif %}
             {% if not cfg.configured %}<div class="hint">Dodaj na Renderze zmienną <b>INPOST_API_TOKEN</b>. ID organizacji aplikacja pobierze automatycznie.</div>{% endif %}
             {% if o.inpost_shipment_id %}<div class="flex"><span class="badge">Przesyłka już utworzona</span><a class="btn primary" href="{{ url_for('order_inpost_label', order_id=o.id, bundle='1' if bundle else None) }}">{% if bundle %}Pobierz listę A4 + etykietę A6 (PDF){% else %}Pobierz etykietę A6 (PDF){% endif %}</a><a class="btn" href="{{ url_for('order_view', order_id=o.id) }}">Wróć do zamówienia</a></div>{% else %}
@@ -289,13 +296,13 @@ def register_routes(context):
               <div><label class="muted small">Pobranie COD (PLN)</label><input type="number" name="cod" value="0" min="0" step="0.01"><div class="muted small">Ochrona musi być ≥ pobraniu.</div></div>
               <div><label class="muted small">Uwagi dla InPost</label><input name="comments" maxlength="100"></div>
               <div style="grid-column:1/-1" class="flex"><label><input type="checkbox" name="sms" value="1"> Serwis SMS</label><label><input type="checkbox" name="email" value="1"> Serwis Email</label><label><input type="checkbox" name="rod" value="1"> Zwrot dokumentów</label><label><input type="checkbox" name="saturday" value="1"> Doręczenie w sobotę</label></div>
-              <div style="grid-column:1/-1"><button class="btn primary" type="submit" onclick="return confirm('Utworzyć płatną przesyłkę InPost dla tej paczki?')">Utwórz przesyłkę i pobierz PDF A6</button></div>
+              <div style="grid-column:1/-1"><button class="btn primary" type="submit" onclick="return confirm('Utworzyć płatną przesyłkę InPost i automatycznie zamówić podjazd?')">Utwórz przesyłkę i zamów podjazd</button></div>
             </form>{% endif %}
           </div>
         {% endblock %}
         """
         labels = [canonical_order_no(item["id"], item["created_at"], item["order_no"]) for item in package_orders]
-        return render_template_string(tpl, title="Etykieta InPost", base_url=BASE_URL, db_path=DB_PATH, o=order, cfg=cfg, error=error, package_labels=labels, bundle=bundle, created=just_created)
+        return render_template_string(tpl, title="Etykieta InPost", base_url=BASE_URL, db_path=DB_PATH, o=order, cfg=cfg, error=error, package_labels=labels, bundle=bundle, created=just_created, pickup=inpost_pickup_status(order.get("inpost_shipment_id")))
 
 
 
@@ -376,87 +383,43 @@ def register_routes(context):
 
     @app.route("/inpost/dispatch", methods=["GET", "POST"])
     def inpost_dispatch_order():
-        maybe_pull_shared_from_supabase(force=True)
-        c = conn()
-        try:
-            cur = c.cursor()
-            cur.execute("""SELECT inpost_shipment_id, MIN(id) AS order_id,
-                                  GROUP_CONCAT(order_no, ', ') AS order_numbers,
-                                  MAX(tracking_no) AS tracking_no, MAX(created_at) AS created_at
-                           FROM orders
-                           WHERE TRIM(COALESCE(inpost_shipment_id,''))<>''
-                             AND TRIM(COALESCE(inpost_dispatch_order_id,''))=''
-                           GROUP BY inpost_shipment_id ORDER BY MAX(id) DESC""")
-            pending = [dict(row) for row in cur.fetchall()]
-            company_row = cur.execute("SELECT * FROM company_profile WHERE id=1").fetchone()
-            company = dict(company_row) if company_row else {}
-        finally:
-            c.close()
-        street, post_code, city = split_address(company.get("address") or "")
-        error = norm(request.args.get("error"))
-        created = norm(request.args.get("created"))
-        if request.method == "POST":
-            selected = list(dict.fromkeys(norm(value) for value in request.form.getlist("shipment_id") if norm(value)))
-            allowed = {norm(row["inpost_shipment_id"]) for row in pending}
-            selected = [value for value in selected if value in allowed]
-            pickup = {
-                "name": norm(request.form.get("name")), "street": norm(request.form.get("street")),
-                "post_code": norm(request.form.get("post_code")), "city": norm(request.form.get("city")),
-                "phone": norm(request.form.get("phone")), "email": norm(request.form.get("email")),
-                "comment": norm(request.form.get("comment")),
-            }
-            try:
-                result = inpost_create_dispatch_order(selected, pickup)
-                dispatch_id = norm(result.get("id"))
-                if not dispatch_id:
-                    raise InPostError("API nie zwróciło identyfikatora zlecenia odbioru")
-                c = conn()
+        import inpost_pickups, sys
+        backend=sys.modules["app"] if "app" in sys.modules else sys.modules["__main__"]
+        store=inpost_pickups.Store(backend)
+        pickup=inpost_pickups.company_pickup(backend)
+        message=""
+        if request.method=="POST":
+            sid=norm(request.form.get("shipment_id"))
+            if request.form.get("action")=="correct":
+                supplied={key:norm(request.form.get(key)) for key in pickup}
                 try:
-                    placeholders = ",".join(["?"] * len(selected))
-                    c.execute(
-                        f"UPDATE orders SET inpost_dispatch_order_id=? WHERE inpost_shipment_id IN ({placeholders})",
-                        (dispatch_id, *selected),
-                    )
-                    c.commit()
-                    cur = c.cursor()
-                    cur.execute(f"SELECT id FROM orders WHERE inpost_shipment_id IN ({placeholders})", tuple(selected))
-                    changed_ids = [int(row["id"]) for row in cur.fetchall()]
-                finally:
-                    c.close()
-                if supabase_enabled() and changed_ids:
-                    sync_local_rows_to_supabase("orders", "id", changed_ids)
-                return redirect(url_for("inpost_dispatch_order", created=dispatch_id))
-            except InPostError as exc:
-                error = str(exc)
-        tpl = r"""
-        {% extends "base.html" %}{% block content %}
-          <div class="card"><div class="flex"><div><h1 style="margin:0 0 8px;">Zamów kuriera InPost</h1><div class="muted">Zlecenie odbioru powstaje dopiero dla zaznaczonych, wcześniej utworzonych przesyłek.</div></div><a class="btn right" href="{{ url_for('orders') }}">← Zamówienia</a></div></div>
-          <div class="card">
-            {% if created %}<div class="hint" style="margin-bottom:14px;">Zamówiono kuriera. ID zlecenia: <b>{{ created }}</b></div>{% endif %}
-            {% if error %}<div class="hint" style="border-color:#fecaca;background:#fff1f2;margin-bottom:14px;">{{ error }}</div>{% endif %}
-            <form method="post">
-              <h2>Przesyłki oczekujące na odbiór</h2>
-              <table><thead><tr><th></th><th>Zamówienia</th><th>Tracking</th><th>ID ShipX</th></tr></thead><tbody>
-              {% for row in pending %}<tr><td><input type="checkbox" name="shipment_id" value="{{ row.inpost_shipment_id }}"></td><td>{{ row.order_numbers }}</td><td>{{ row.tracking_no or '-' }}</td><td>{{ row.inpost_shipment_id }}</td></tr>{% endfor %}
-              {% if not pending %}<tr><td colspan="4" class="muted">Brak przesyłek oczekujących na zamówienie kuriera.</td></tr>{% endif %}
-              </tbody></table>
-              {% if pending %}<div class="row" style="margin-top:18px;">
-                <div><label class="muted small">Nazwa punktu odbioru</label><input name="name" value="{{ company.company_name or 'Magazyn' }}" required></div>
-                <div><label class="muted small">Ulica i numer</label><input name="street" value="{{ street }}" required></div>
-                <div><label class="muted small">Kod pocztowy</label><input name="post_code" value="{{ post_code }}" required></div>
-                <div><label class="muted small">Miasto</label><input name="city" value="{{ city }}" required></div>
-                <div><label class="muted small">Telefon</label><input name="phone" value="{{ company.phone or '' }}" required></div>
-                <div><label class="muted small">Email</label><input name="email" value="{{ company.email or '' }}"></div>
-                <div><label class="muted small">Komentarz</label><input name="comment" maxlength="100"></div>
-                <div style="grid-column:1/-1"><button class="btn primary" type="submit" onclick="return confirm('Zamówić kuriera po zaznaczone przesyłki?')">Zamów kuriera</button></div>
-              </div>{% endif %}
-            </form>
-          </div>
-        {% endblock %}
-        """
-        return render_template_string(tpl, title="Zamów kuriera InPost", base_url=BASE_URL, db_path=DB_PATH, pending=pending, company=company, street=street, post_code=post_code, city=city, error=error, created=created)
-
-
+                    if not store.correct_address(sid,supplied):
+                        return "Nie można zmienić danych już wysłanego lub nierozstrzygniętego zlecenia.",409
+                except ValueError as exc:
+                    return str(exc),400
+            inpost_pickups.process_one(backend,sid)
+            message="Sprawdzono kolejkę podjazdów. Aktualny wynik jest pokazany przy przesyłce."
+        jobs=store.rows()
+        for job in jobs:
+            job["label"]=inpost_pickups.LABELS.get(job["state"],job["state"])
+            job["pickup"]=json.loads(job["pickup_json"])
+        return render_template_string("""{% extends 'base.html' %}{% block content %}
+          <div class="card"><h1>Podjazdy kuriera InPost</h1>
+          <p>Po przygotowaniu etykiety aplikacja czeka na potwierdzenie przesyłki przez InPost i zleca podjazd.
+          Utworzenie etykiety ani zlecenia podjazdu nie oznacza fizycznego wydania towaru.</p>
+          <a class="btn" href="{{ url_for('orders') }}">Zamówienia</a>{% if message %}<p>{{ message }}</p>{% endif %}</div>
+          {% for job in jobs %}<div class="card"><h2>Przesyłka {{ job.shipment_id }}</h2>
+          <p><b>{{ job.label }}</b>{% if job.dispatch_id %} — ID {{ job.dispatch_id }}{% endif %}{% if job.external_id %}, numer {{ job.external_id }}{% endif %}</p>
+          <p>Odbiór: {{ job.pickup.name }}, {{ job.pickup.street }}, {{ job.pickup.post_code }} {{ job.pickup.city }}, tel. {{ job.pickup.phone }}</p>
+          {% if job.error %}<p class="hint">{{ job.error }}</p>{% endif %}
+          {% if not job.attempted and job.state in ['configuration_error','pending'] %}
+          <form method="post"><input type="hidden" name="shipment_id" value="{{ job.shipment_id }}"><input type="hidden" name="action" value="correct">
+          {% for key,label in [('name','Nazwa'),('street','Ulica i numer'),('post_code','Kod pocztowy'),('city','Miasto'),('phone','Telefon'),('email','E-mail'),('comment','Uwagi')] %}
+          <label>{{ label }}<input name="{{ key }}" value="{{ job.pickup.get(key,'') }}" {% if key not in ['email','comment'] %}required{% endif %}></label>{% endfor %}
+          <button class="btn" type="submit">Zapisz dane i zleć podjazd</button></form>
+          {% elif job.state not in ['rejected','collected'] %}<form method="post"><input type="hidden" name="shipment_id" value="{{ job.shipment_id }}"><button class="btn" type="submit">Sprawdź wcześniejsze zlecenie</button></form>{% endif %}
+          </div>{% endfor %}{% if not jobs %}<div class="card">Brak przesyłek w kolejce automatycznych podjazdów.</div>{% endif %}
+        {% endblock %}""",title="Podjazdy InPost",jobs=jobs,message=message)
 
 
     @app.post("/orders/<int:order_id>/shipped")

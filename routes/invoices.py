@@ -257,6 +257,9 @@ def register_routes(context):
 
             invoice_items = prepare_invoice_items(items, request.form)
             if norm(request.form.get("submit_action")) != "packing" and invoice_from_packing:
+                actual = {int(x.get("order_item_id") or x.get("id") or 0): int(x.get("qty") or 0) for x in invoice_items if int(x.get("qty") or 0)>0}
+                if actual != packing_qty_by_item:
+                    return "Ilości faktury muszą odpowiadać zapisanej liście pakowej. Zmień najpierw zawartość paczki.", 409
                 invalid_packing_qty = next((
                     item for item in invoice_items
                     if int(item.get("qty") or 0) > packing_qty_by_item.get(
@@ -329,14 +332,17 @@ def register_routes(context):
                         "buyer_name": data.get("buyer_name") or o["customer_name"] or "Klient",
                         "buyer_email": data.get("buyer_email") or o["customer_email"] or "",
                     }
+                    import inpost_history, sys
+                    backend = sys.modules.get("app") or sys.modules["__main__"]
+                    try:
+                        inpost_history.prepare_next(backend, sorted(set(packed_order_ids)))
+                    except ValueError as exc:
+                        return str(exc), 409
                     packing_path = generate_invoice_packing_list_pdf(o, invoice_items, packing_meta)
                     mark_orders_packed(packed_order_ids, packing_path=packing_path, packing_items=invoice_items)
-                    return send_file(
-                        packing_path,
-                        mimetype="application/pdf",
-                        as_attachment=True,
-                        download_name=f"{safe_filename(packing_order_no)}_lista_pakowania.pdf",
-                    )
+                    batch_id = save_packing_selection(order_id, invoice_items)
+                    session["latest_packing_selection"] = load_open_packing_selection(order_id)
+                    return redirect(url_for("order_invoice", order_id=order_id, from_packing="1"))
             existing_invoice_id = invoice_no_exists(data["invoice_no"])
             if existing_invoice_id:
                 msg = f"Faktura o takim numerze już istnieje! Numer: {data['invoice_no']}. Wybierz inny numer faktury."
@@ -409,7 +415,7 @@ def register_routes(context):
                 }
                 if email_error:
                     redirect_args["email_error"] = email_error[:300]
-                return redirect(url_for("invoices", **redirect_args))
+                return redirect(url_for("order_inpost_create", order_id=order_id, invoice_id=invoice_id))
 
         tpl = r"""
         {% extends "base.html" %}
@@ -1174,6 +1180,10 @@ def register_routes(context):
     def invoice_resume(invoice_id):
         assert_invoice_mutable(invoice_id)
         resume_invoice_job(invoice_id)
+        c=conn()
+        ids=[row[0] for row in c.execute("SELECT DISTINCT order_id FROM invoice_allocations WHERE invoice_id=?",(invoice_id,))]
+        c.close()
+        finalize_fully_invoiced_orders(ids)
         return redirect(url_for("invoices"))
 
 
@@ -1182,7 +1192,8 @@ def register_routes(context):
         require_complete_invoice(invoice_id)
         next_url = request.form.get("next") or url_for("ksef_dashboard")
         current_ksef = load_ksef_doc(invoice_id)
-        if current_ksef.get("status") == "sent":
+        if norm(current_ksef.get("ksef_number")):
+            _send_invoice_to_client(invoice_id)
             return redirect(next_url)
         inv, company, items, problems = build_invoice_ksef_payload(invoice_id)
         if not inv:
@@ -1206,6 +1217,8 @@ def register_routes(context):
             upsert_ksef_doc(invoice_id, "error", xml_path=path, last_error="Brak modułu ksef_api.py albo zależności requests/cryptography.")
             return redirect(next_url)
 
+        if current_ksef.get("status") in {"sending","processing","unknown"} and not ksef_attempt(invoice_id):
+            return "Brak referencji wcześniejszej wysyłki. Sprawdź wynik w KSeF przed ponowieniem.", 409
         previous = ksef_attempt(invoice_id, claim=True)
         if previous:
             if not previous.get("session_ref") or not previous.get("invoice_ref"):
@@ -1228,7 +1241,9 @@ def register_routes(context):
                         last_error=result.get("message") if state in {"unknown", "rejected"} else "")
         if number:
             try:
-                regenerate_invoice_pdf_after_ksef_send(invoice_id, number)
+                _order_id, mail_ok, mail_error = _send_invoice_to_client(invoice_id)
+                if not mail_ok:
+                    raise RuntimeError(mail_error)
             except Exception as exc:
                 app.logger.exception("Nie udało się odświeżyć PDF faktury %s po przyjęciu przez KSeF", invoice_id)
                 upsert_ksef_doc(invoice_id, "sent", xml_path=path, ksef_number=number,
@@ -1829,6 +1844,8 @@ def register_routes(context):
                 c.close()
 
                 resume_invoice_job(invoice_id)
+                touched = old_order_ids + [int(x.get("source_order_id") or x.get("order_id") or 0) for x in invoice_items]
+                reconcile_orders_after_invoice_change(touched)
                 return redirect(url_for("invoices", edited="1", invoice_id=invoice_id))
 
         buyer_address = "\n".join([x for x in [
