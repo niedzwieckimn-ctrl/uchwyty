@@ -2,6 +2,7 @@ import json
 import os
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 
 
@@ -98,6 +99,8 @@ def _request(path, method="GET", payload=None, accept="application/json"):
         raise InPostError(f"InPost HTTP {exc.code}: {safe_message}") from exc
     except urllib.error.URLError as exc:
         raise InPostError(f"Brak połączenia z InPost: {exc.reason}") from exc
+    except TimeoutError as exc:
+        raise InPostError("Przekroczono czas oczekiwania na odpowiedź InPost. Wynik zostanie sprawdzony przed ponowieniem.") from exc
 
 
 def organization_id():
@@ -164,9 +167,8 @@ def create_courier_shipment(receiver, parcel, reference, service="inpost_courier
         },
         "parcels": [dict(parcel_payload) for _ in range(max(1, min(99, int(parcel.get("quantity", 1)))))],
         "service": service,
-        # Dla przesyłek kurierskich sposób nadania musi być częścią samej
-        # przesyłki. Na umowie kurierskiej InPost oznacza to odbiór przez
-        # kuriera, bez dokładania przez użytkownika drugiego ręcznego kroku.
+        # This selects the sending method. A separate dispatch_orders POST
+        # is still required after the shipment reaches confirmed status.
         "custom_attributes": {"sending_method": "dispatch_order"},
         "reference": reference[:100],
         "comments": (parcel.get("comments") or "")[:100],
@@ -197,6 +199,28 @@ def get_shipment(shipment_id):
     return _request(f"/shipments/{int(shipment_id)}")
 
 
+def find_shipment_by_reference(reference, created_at=""):
+    """Find an uncertain POST result without creating a second shipment."""
+    expected = str(reference or "").strip()
+    if not expected:
+        return None
+    org = organization_id()
+    for page in range(1, 11):
+        params = {"page": page, "per_page": 100, "sort_by": "created_at", "sort_order": "desc"}
+        if created_at:
+            params["created_at_gteq"] = str(created_at)
+        result = _request(f"/organizations/{org}/shipments?{urllib.parse.urlencode(params)}")
+        items = list(result.get("items") or []) if isinstance(result, dict) else []
+        matches = [item for item in items if str(item.get("reference") or "").strip() == expected]
+        if len(matches) > 1:
+            raise InPostError("InPost zwrócił kilka przesyłek z tym samym identyfikatorem partii. Wymagana jest ręczna kontrola.")
+        if matches:
+            return matches[0]
+        if len(items) < 100:
+            break
+    return None
+
+
 def create_dispatch_order(shipment_ids, pickup):
     resolved_organization_id = organization_id()
     clean_ids = list(dict.fromkeys(str(int(value)) for value in shipment_ids if value))
@@ -221,3 +245,23 @@ def create_dispatch_order(shipment_ids, pickup):
         },
     }
     return _request(f"/organizations/{resolved_organization_id}/dispatch_orders", "POST", payload)
+
+
+def get_dispatch_order(dispatch_id):
+    return _request(f"/dispatch_orders/{int(dispatch_id)}")
+
+
+def find_dispatch_order_for_shipment(shipment_id):
+    """Read-only reconciliation after an uncertain POST; never create here."""
+    org = organization_id()
+    for page in range(1, 101):
+        response = _request(f"/organizations/{org}/dispatch_orders?page={page}&per_page=100")
+        rows = response.get("items") or []
+        for row in rows:
+            if str(shipment_id) in {str(item.get("id")) for item in row.get("shipments") or []}:
+                return get_dispatch_order(row["id"])
+        per_page = int(response.get("per_page") or 100)
+        if not rows or page * per_page >= int(response.get("count") or 0):
+            return None
+    # A bounded search never authorizes another POST after an uncertain result.
+    raise InPostError("Nie zakończono przeszukiwania historii podjazdów. Wymagane sprawdzenie w InPost.")

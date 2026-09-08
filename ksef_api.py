@@ -276,11 +276,11 @@ def _poll_invoice_number(session: requests.Session, cfg: KsefConfig, access_toke
         status_code = ((last_status.get("status") or {}).get("code"))
         if status_code and int(status_code) >= 400:
             details = (last_status.get("status") or {}).get("details") or []
-            raise KsefApiError("KSeF odrzucił fakturę: " + "; ".join(map(str, details or [last_status])))
+            return "", last_status
     return "", last_status
 
 
-def send_invoice_to_ksef(xml_text: str) -> Dict[str, Any]:
+def send_invoice_to_ksef(xml_text: str, checkpoint=None) -> Dict[str, Any]:
     cfg = _cfg()
     if cfg.missing:
         return {
@@ -299,12 +299,17 @@ def send_invoice_to_ksef(xml_text: str) -> Dict[str, Any]:
             token_key, symmetric_key = _get_public_keys(session, cfg)
             access_token = _authenticate(session, cfg, token_key)
             session_ref = _open_online_session(session, cfg, access_token, symmetric_key, aes_key, iv)
+            if checkpoint:
+                checkpoint(session_ref, "")
             invoice_ref = _send_encrypted_invoice(session, cfg, access_token, session_ref, xml_bytes, aes_key, iv)
+            if checkpoint:
+                checkpoint(session_ref, invoice_ref)
             ksef_number, status = _poll_invoice_number(session, cfg, access_token, session_ref, invoice_ref)
 
         return {
             "ok": True,
-            "message": "Faktura wysłana do KSeF.",
+            "state": "accepted" if ksef_number else ("rejected" if int((status.get("status") or {}).get("code") or 0) >= 400 else "processing"),
+            "message": "Odczytano wynik zgłoszenia KSeF.",
             "env": cfg.env,
             "base_url": cfg.base_url,
             "session_reference_number": session_ref,
@@ -326,3 +331,16 @@ def send_invoice_to_ksef(xml_text: str) -> Dict[str, Any]:
             "env": cfg.env,
             "base_url": cfg.base_url,
         }
+
+
+def resume_invoice_status(session_ref, invoice_ref):
+    """Read the original submission; never resend during reconciliation."""
+    cfg = _cfg()
+    with requests.Session() as session:
+        token_key, _ = _get_public_keys(session, cfg)
+        access_token = _authenticate(session, cfg, token_key)
+        number, status = _poll_invoice_number(session, cfg, access_token, session_ref, invoice_ref)
+    code = int((status.get("status") or {}).get("code") or 0)
+    return {"ok": True, "state": "accepted" if number else ("rejected" if code >= 400 else "processing"),
+            "ksef_number": number, "raw_status": status,
+            "session_reference_number": session_ref, "invoice_reference_number": invoice_ref}

@@ -60,6 +60,8 @@ from inpost_module import (
     config_summary as inpost_config_summary,
     create_courier_shipment,
     create_dispatch_order as inpost_create_dispatch_order,
+    get_dispatch_order as inpost_get_dispatch_order,
+    find_dispatch_order_for_shipment as inpost_find_dispatch_order,
     get_label as inpost_get_label,
     get_shipment as inpost_get_shipment,
 )
@@ -713,6 +715,14 @@ def init_db():
     cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_idempotency_key ON orders(idempotency_key) WHERE idempotency_key IS NOT NULL")
 
     c.commit()
+    import invoice_jobs, invoice_stock
+    invoice_jobs.initialize(c)
+    invoice_stock.initialize(c)
+    import inpost_history
+    c.execute(inpost_history.SCHEMA)
+    c.commit()
+    from inpost_pickups import initialize as initialize_pickups
+    initialize_pickups(c)
     c.close()
 
 init_db()
@@ -3787,7 +3797,7 @@ def finalize_fully_invoiced_orders(order_ids: list[int]):
 
         warehouse_issued = int(order_row["warehouse_issued"] or 0)
         if warehouse_issued == 0:
-            changed_product_ids.extend(issue_order_stock(cur, order_id))
+            # The invoice publication already deducted its exact quantities.
             warehouse_issued = 1
 
         current_status = norm(order_row["status"]).lower()
@@ -3887,73 +3897,18 @@ def finalize_legacy_shipped_orders_with_full_invoice():
 
 
 def reconcile_orders_after_invoice_change(order_ids: list[int]):
-    touched = sorted({int(x) for x in order_ids if x})
-    if not touched:
-        return [], []
-
-    c = conn()
-    cur = c.cursor()
-    changed_order_ids = []
-    changed_product_ids = []
-
-    for order_id in touched:
-        cur.execute("SELECT id, status, warehouse_issued FROM orders WHERE id=?", (order_id,))
-        order_row = cur.fetchone()
-        if not order_row:
-            continue
-
-        fully = order_fully_invoiced(cur, order_id)
-        warehouse_issued = int(order_row["warehouse_issued"] or 0)
-        current_status = norm(order_row["status"]).lower()
-
-        if fully and warehouse_issued == 0:
-            cur.execute("SELECT product_id, qty FROM order_items WHERE order_id=?", (order_id,))
-            for it in cur.fetchall():
-                pid = int(it["product_id"])
-                qty = int(it["qty"] or 0)
-                cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (pid,))
-                cur.execute("UPDATE stock SET qty = qty - ? WHERE product_id=?", (qty, pid))
-                changed_product_ids.append(pid)
-            preserved = {"shipped", "partially_shipped", "completed", "issued", "cancelled"}
-            next_status = current_status if current_status in preserved else "packed"
-            if next_status == "packed":
-                cur.execute("""
-                  UPDATE orders
-                  SET status=?, warehouse_issued=1, packed_at=COALESCE(packed_at, ?)
-                  WHERE id=?
-                """, (next_status, now_iso(), order_id))
-            else:
-                cur.execute("UPDATE orders SET status=?, warehouse_issued=1 WHERE id=?", (next_status, order_id))
-            changed_order_ids.append(order_id)
-
-        elif not fully and warehouse_issued == 1:
-            cur.execute("SELECT product_id, qty FROM order_items WHERE order_id=?", (order_id,))
-            for it in cur.fetchall():
-                pid = int(it["product_id"])
-                qty = int(it["qty"] or 0)
-                cur.execute("INSERT OR IGNORE INTO stock(product_id, qty) VALUES (?, 0)", (pid,))
-                cur.execute("UPDATE stock SET qty = qty + ? WHERE product_id=?", (qty, pid))
-                changed_product_ids.append(pid)
-            next_status = "confirmed" if current_status in {"issued", "packed", "packed_partial"} else (current_status or "confirmed")
-            cur.execute("UPDATE orders SET status=?, warehouse_issued=0 WHERE id=?", (next_status, order_id))
-            changed_order_ids.append(order_id)
-
-    c.commit()
-    c.close()
-
-    if supabase_enabled():
-        if changed_order_ids:
-            try:
-                sync_local_rows_to_supabase("orders", "id", changed_order_ids)
-            except Exception:
-                pass
-        if changed_product_ids:
-            try:
-                sync_local_rows_to_supabase("stock", "product_id", list(set(changed_product_ids)))
-            except Exception:
-                pass
-
-    return changed_order_ids, list(set(changed_product_ids))
+    touched=sorted({int(x) for x in order_ids if x})
+    c=conn()
+    try:
+        cur=c.cursor()
+        for oid in touched:
+            fully=order_fully_invoiced(cur,oid)
+            cur.execute("UPDATE orders SET warehouse_issued=? WHERE id=?",(int(fully),oid))
+        c.commit()
+    finally:c.close()
+    if supabase_enabled() and touched:
+        sync_local_rows_to_supabase("orders","id",touched)
+    return touched, []
 
 
 def invoice_edit_items(invoice_id: int, invoice_row: dict):
@@ -4938,6 +4893,30 @@ def _packed_package_orders(cur, order):
     )
     rows = [dict(row) for row in cur.fetchall()]
     return rows or [order]
+
+
+def enqueue_automatic_inpost_pickup(shipment_id):
+    import inpost_pickups, sys
+    if not inpost_pickups.enabled():
+        return
+    backend=sys.modules[__name__]
+    inpost_pickups.Store(backend).enqueue(shipment_id,inpost_pickups.company_pickup(backend))
+    inpost_pickups.process_one(backend,shipment_id)
+    inpost_pickups.start_worker(backend)
+
+
+def inpost_pickup_status(shipment_id):
+    import inpost_pickups, sys
+    if not shipment_id:
+        return {}
+    try:
+        rows=inpost_pickups.Store(sys.modules[__name__]).rows(shipment_id)
+        if not rows:return {"label":"Podjazd nie został jeszcze zlecony","error":""}
+        row=rows[0]
+        return dict(row,label=inpost_pickups.LABELS.get(row["state"],row["state"]))
+    except Exception:
+        app.logger.exception("Nie udało się odczytać stanu podjazdu")
+        return {"label":"Nie udało się sprawdzić podjazdu","error":"Sprawdź połączenie z bazą i migrację kolejki podjazdów."}
 
 
 def inpost_label_allowed_for_status(status) -> bool:
@@ -6329,6 +6308,32 @@ def ksef_schema_path() -> str:
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "fa3_schemat.xsd")
 
 
+def ksef_document_locked(doc):
+    return bool(doc.get("ksef_number") or doc.get("sent_at") or
+                doc.get("status") in {"sending", "processing", "unknown", "sent", "accepted"})
+
+def assert_invoice_mutable(invoice_id):
+    if ksef_document_locked(load_ksef_doc(invoice_id)) or ksef_attempt(invoice_id):
+        abort(409, description="Dokument KSeF jest chroniony. Najpierw wyjaśnij wynik wysyłki; przyjęty dokument wymaga korekty.")
+
+def require_complete_invoice(invoice_id):
+    c = conn()
+    try:
+        row=c.execute("SELECT publication_state FROM invoices WHERE id=?",(invoice_id,)).fetchone()
+        if row and row[0] != "complete":
+            abort(409, description="Faktura jest w przygotowaniu. Wznów zapis dokumentu.")
+    finally:
+        c.close()
+
+def resume_invoice_job(invoice_id):
+    import invoice_jobs, sys
+    return invoice_jobs.finish(sys.modules[__name__], invoice_id)
+
+def ksef_attempt(invoice_id, session_ref=None, invoice_ref=None, claim=False):
+    import workflow_ksef, sys
+    return workflow_ksef.attempt(sys.modules[__name__], invoice_id, session_ref, invoice_ref, claim)
+
+
 def load_ksef_doc(invoice_id: int) -> dict:
     c = conn()
     cur = c.cursor()
@@ -6690,6 +6695,7 @@ def _set_invoice_payment_state(invoice_id: int, *, reminder: int | None = None, 
                 pass
 
 def _delete_invoice_everywhere(invoice_id: int):
+    assert_invoice_mutable(invoice_id)
     inv = load_invoice_with_meta(invoice_id)
     if not inv:
         abort(404)
@@ -6712,6 +6718,9 @@ def _delete_invoice_everywhere(invoice_id: int):
     if int(inv.get("order_id") or 0) and int(inv.get("order_id") or 0) not in touched_order_ids:
         touched_order_ids.append(int(inv.get("order_id") or 0))
     c.close()
+
+    import invoice_stock, sys
+    invoice_stock.clear(sys.modules[__name__], invoice_id)
 
     ok_pdf, abs_path = invoice_pdf_exists(inv.get("pdf_path", ""), inv.get("invoice_no", ""))
     try:
@@ -6846,6 +6855,13 @@ def send_automatic_payment_reminders(reference_time=None) -> dict:
 
 
 def _send_invoice_to_client(invoice_id: int) -> tuple[int, bool, str]:
+    require_complete_invoice(invoice_id)
+    if not norm(load_ksef_doc(invoice_id).get("ksef_number")):
+        return 0, False, "Faktura czeka na przyjęcie i numer KSeF."
+    if int((load_invoice_meta(invoice_id) or {}).get("sent_to_client") or 0):
+        return 0, True, ""
+    if not regenerate_invoice_pdf_after_ksef_send(invoice_id, load_ksef_doc(invoice_id)["ksef_number"]):
+        return 0, False, "Nie udało się przygotować PDF z numerem KSeF."
     c = conn()
     cur = c.cursor()
     cur.execute("""
@@ -6915,14 +6931,6 @@ def _send_invoice_to_client(invoice_id: int) -> tuple[int, bool, str]:
                         packing_pdf_path = generate_invoice_packing_list_pdf(order_row, items, invoice_meta_payload(dict(row)), local_pdf_path)
             stored_pdf_path = upload_invoice_pdfs_to_supabase(invoice_id, row["invoice_no"], local_pdf_path, packing_pdf_path)
 
-    upsert_invoice_meta(invoice_id, stored_pdf_path, meta.get("invoice_items_json",""), sent_to_client=1, seen_by_client=0, seen_at=None)
-
-    if supabase_enabled():
-        try:
-            sync_invoice_meta_to_supabase(invoice_id)
-        except Exception:
-            pass
-
     email_ok = False
     email_error = ""
     try:
@@ -6956,6 +6964,12 @@ def _send_invoice_to_client(invoice_id: int) -> tuple[int, bool, str]:
     except Exception as exc:
         email_error = str(exc) or type(exc).__name__
         app.logger.exception("Nie udało się wysłać e-maila z fakturą %s", invoice_id)
+
+    if email_ok:
+        upsert_invoice_meta(invoice_id, stored_pdf_path, meta.get("invoice_items_json",""), sent_to_client=1,
+                            seen_by_client=int(meta.get("seen_by_client") or 0), seen_at=meta.get("seen_at"))
+        if supabase_enabled():
+            sync_invoice_meta_to_supabase(invoice_id)
 
     if not email_ok:
         app.logger.error("Nie wysłano e-maila z fakturą %s: %s", invoice_id, email_error)
@@ -6994,6 +7008,12 @@ def _refresh_domain_route_context():
         context = globals()
         for module in _DOMAIN_ROUTE_MODULES:
             module.__dict__.update(context)
+
+# The durable queue is resumed after a process restart. Each database claim
+# protects the same shipment across processes; the thread lock is only local.
+import inpost_pickups as _inpost_pickups
+import sys as _pickup_sys
+_inpost_pickups.start_worker(_pickup_sys.modules[__name__])
 
 if __name__ == "__main__":
     # debug=True moĹĽesz zostawiÄ‡ na czas budowy
