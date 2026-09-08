@@ -42,7 +42,8 @@ def company_pickup(b):
     street,post_code,city=b.split_address(company.get('address') or '')
     defaults={'name':company.get('company_name') or 'Magazyn','street':street,
               'post_code':post_code,'city':city,'phone':company.get('phone') or '',
-              'email':company.get('email') or '', 'comment':''}
+              'email':company.get('email') or '',
+              'comment':'Odbiór przesyłek z magazynu.'}
     return {k:os.environ.get('INPOST_PICKUP_'+k.upper(),str(v)).strip() for k,v in defaults.items()}
 
 def validate(pickup):
@@ -53,6 +54,12 @@ def validate(pickup):
     phone=re.sub(r'\D','',pickup.get('phone',''))
     if len(phone)==11 and phone.startswith('48'):phone=phone[2:]
     if len(phone)!=9:raise ValueError('Podaj polski numer telefonu kontaktowego miejsca odbioru.')
+    if not pickup.get('comment','').strip():
+        raise ValueError('Wpisz krótką uwagę dla kuriera, np. „Odbiór przesyłek z magazynu”.')
+
+def _validation_error(error):
+    text=str(error or '').lower()
+    return 'http 400' in text and ('validation error' in text or '"required"' in text)
 
 class Store:
     def __init__(self,b):self.b=b
@@ -114,6 +121,12 @@ def process_one(b,sid):
     store=Store(b);job=store.claim(sid)
     if not job:return
     try:
+        # HTTP 400 is a definite rejection: it is safe to correct the data and
+        # submit again. It is not an uncertain timeout, which must stay blocked.
+        if job['attempted'] and _validation_error(job.get('error')):
+            store.update(job,state='configuration_error',attempted=0,
+                         error='InPost odrzucił dane podjazdu. Uzupełnij formularz i zleć ponownie.')
+            return
         if job.get('dispatch_id'):
             result=b.inpost_get_dispatch_order(job['dispatch_id'])
         elif job['attempted']:
@@ -145,7 +158,10 @@ def process_one(b,sid):
     except Exception as exc:
         # Preserve durable intent; failure of this update leaves the lease and
         # attempted flag for a future worker to reconcile safely.
-        store.update(job,state='unknown' if job['attempted'] or job.get('dispatch_id') else 'pending',error=str(exc))
+        if _validation_error(exc):
+            store.update(job,state='configuration_error',attempted=0,error=str(exc))
+        else:
+            store.update(job,state='unknown' if job['attempted'] or job.get('dispatch_id') else 'pending',error=str(exc))
 
 def process_due(b):
     if not enabled():return
