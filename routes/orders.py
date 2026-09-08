@@ -693,6 +693,18 @@ def register_routes(context):
 
         cur.execute("SELECT id, sku, model, name FROM products WHERE COALESCE(archived,0)=0 ORDER BY sku LIMIT 5000")
         products_rows = cur.fetchall()
+        cur.execute("""
+          SELECT i.*, COALESCE(m.sent_to_client,0) AS sent_to_client,
+                 COALESCE(k.status,'') AS ksef_status,
+                 COALESCE(k.ksef_number,'') AS ksef_number
+          FROM invoices i
+          LEFT JOIN invoice_meta m ON m.invoice_id=i.id
+          LEFT JOIN ksef_documents k ON k.invoice_id=i.id
+          WHERE i.order_id=?
+          ORDER BY i.id DESC
+          LIMIT 1
+        """, (order_id,))
+        invoice_row = cur.fetchone()
         c.close()
 
         order_url = build_public_url(url_for("order_view", order_id=order_id))
@@ -700,10 +712,87 @@ def register_routes(context):
         tpl = r"""
         {% extends "base.html" %}
         {% block content %}
-          <div class="card">
-            <div class="flex">
-              <h1 style="margin:0;">{{ order_display_no(o['id'], o['created_at'], o['order_no'], o['note']) }}</h1>
+          <style>
+            .order-shell{max-width:1240px;margin:0 auto}.order-head{padding:22px 24px}.order-headline{display:flex;align-items:flex-start;gap:12px;flex-wrap:wrap}.order-headline h1{font-size:30px;margin:0}.order-kicker{color:#5577ee;font-size:12px;font-weight:750;margin-bottom:5px}.order-created{margin-top:5px}.order-primary{margin-left:auto}
+            .order-progress{display:grid;grid-template-columns:repeat(5,1fr);padding:22px 26px 18px;overflow:visible}.progress-step{position:relative;text-align:center;color:#7b879d;font-size:11px;font-weight:650}.progress-step:before{content:"";position:absolute;left:-50%;right:50%;top:12px;height:2px;background:#dfe5f0}.progress-step:first-child:before{display:none}.progress-dot{position:relative;z-index:1;display:grid;place-items:center;width:25px;height:25px;margin:0 auto 8px;border-radius:50%;background:#eef1f6;color:#76839a;border:1px solid #dce2ec;font-size:11px}.progress-step.done:before,.progress-step.active:before{background:#32b37f}.progress-step.done .progress-dot{background:#28ad77;border-color:#28ad77;color:#fff}.progress-step.active .progress-dot{background:#5577ee;border-color:#5577ee;color:#fff;box-shadow:0 0 0 5px rgba(85,119,238,.12)}.progress-step.done,.progress-step.active{color:#253553}.progress-label{display:block;font-size:12px}.progress-current{display:block;margin-top:2px;font-size:10px;color:#5577ee}
+            .order-work{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(280px,.65fr);gap:16px}.panel-title{display:flex;align-items:center;gap:10px;margin-bottom:14px}.panel-icon{display:grid;place-items:center;width:34px;height:34px;border-radius:11px;background:#edf3ff;color:#4569de;font-size:17px}.panel-title h2{margin:0}.order-actions{display:flex;gap:9px;flex-wrap:wrap}.shipment-grid{display:grid;grid-template-columns:145px 1fr;gap:9px 12px;font-size:13px}.shipment-grid .muted{font-size:12px}.status-line{display:inline-flex;align-items:center;gap:7px;color:#16835f;font-weight:700}.status-line:before{content:"";width:8px;height:8px;border-radius:50%;background:#28ad77}.doc-list{display:grid;gap:9px}.doc-row{display:flex;align-items:center;gap:10px;padding:10px 11px;border:1px solid #e8ecf3;border-radius:13px;background:#fbfcff}.doc-mark{display:grid;place-items:center;width:30px;height:30px;border-radius:9px;background:#edf3ff;color:#4569de}.doc-row .btn{margin-left:auto;padding:7px 10px;font-size:11px}.order-bottom{display:grid;grid-template-columns:1fr 1fr;gap:16px}.order-bottom .card{margin-bottom:16px}.compact-note{padding:11px 13px}.more-options summary{list-style:none;cursor:pointer}.more-options summary::-webkit-details-marker{display:none}.more-options[open] summary{margin-bottom:14px}.manual-panel{padding-top:14px;border-top:1px solid #edf0f5}.manual-panel form{margin-top:10px}.danger-zone{margin-top:14px;padding-top:14px;border-top:1px solid #f2dce0}
+            @media(max-width:900px){.order-work,.order-bottom{grid-template-columns:1fr}.order-progress{padding-left:8px;padding-right:8px}.progress-label{font-size:10px}.order-primary{margin-left:0;width:100%}.order-primary .btn{width:100%}}
+            @media(max-width:560px){.order-progress{grid-template-columns:1fr;gap:8px;padding:16px}.progress-step{display:grid;grid-template-columns:28px 1fr;text-align:left;align-items:center}.progress-step:before{left:12px;right:auto;top:-10px;width:2px;height:18px}.progress-dot{margin:0}.progress-current{grid-column:2}.shipment-grid{grid-template-columns:1fr}.order-headline h1{font-size:25px}}
+          </style>
+          {% set status=(o['status'] or '')|lower %}
+          {% set initial=status in ['new','pending','unconfirmed'] %}
+          {% set confirmed=status == 'confirmed' %}
+          {% set packing=status in ['packed','packed_partial','in_delivery','issued'] %}
+          {% set shipping=status in ['shipped','partially_shipped'] %}
+          {% set finished=status == 'completed' %}
+          <div class="order-shell">
+          <div class="card order-head">
+            <div class="order-headline">
+              <div>
+                <div class="order-kicker">← <a href="{{ url_for('orders') }}">Powrót do listy zamówień</a></div>
+                <h1>{{ order_display_no(o['id'], o['created_at'], o['order_no'], o['note']) }}</h1>
+                <div class="muted order-created">Utworzono: {{ o['created_at'] }} · Kod do skanowania: {{ canonical_order_no(o['id'], o['created_at'], o['order_no']) }}</div>
+              </div>
               <span class="badge {{ order_status_css(o['status']) }}">{{ order_status_label(o['status']) }}</span>
+              <div class="order-primary">
+                {% if finished %}<span class="btn ok">Zamówienie zrealizowane</span>
+                {% elif o['inpost_shipment_id'] %}<a class="btn primary" href="{{ url_for('order_inpost_label', order_id=o['id'], bundle='1') }}">Pobierz etykietę</a>
+                {% else %}<a class="btn primary" href="{{ url_for('order_packing_list_download_admin', order_id=o['id']) }}">Kontynuuj realizację →</a>{% endif %}
+              </div>
+            </div>
+          </div>
+
+          <div class="card order-progress">
+            <div class="progress-step {% if not initial %}done{% else %}active{% endif %}"><span class="progress-dot">{% if not initial %}✓{% else %}1{% endif %}</span><span class="progress-label">Niepotwierdzone</span>{% if initial %}<span class="progress-current">Aktualny status</span>{% endif %}</div>
+            <div class="progress-step {% if packing or shipping or finished %}done{% elif confirmed %}active{% endif %}"><span class="progress-dot">{% if packing or shipping or finished %}✓{% else %}2{% endif %}</span><span class="progress-label">Potwierdzone</span>{% if confirmed %}<span class="progress-current">Aktualny status</span>{% endif %}</div>
+            <div class="progress-step {% if shipping or finished %}done{% elif packing %}active{% endif %}"><span class="progress-dot">{% if shipping or finished %}✓{% else %}3{% endif %}</span><span class="progress-label">{% if status == 'packed_partial' %}Pakowanie częściowej wysyłki{% elif status == 'in_delivery' %}W dostawie{% elif status == 'issued' %}W realizacji{% else %}W trakcie pakowania / czeka na kuriera{% endif %}</span>{% if packing %}<span class="progress-current">Aktualny status</span>{% endif %}</div>
+            <div class="progress-step {% if finished %}done{% elif shipping %}active{% endif %}"><span class="progress-dot">{% if finished %}✓{% else %}4{% endif %}</span><span class="progress-label">{% if status == 'partially_shipped' %}Wysłane częściowo{% else %}Wysłane{% endif %}</span>{% if shipping %}<span class="progress-current">Aktualny status</span>{% endif %}</div>
+            <div class="progress-step {% if finished %}active{% endif %}"><span class="progress-dot">5</span><span class="progress-label">Zrealizowane</span>{% if finished %}<span class="progress-current">Aktualny status</span>{% endif %}</div>
+          </div>
+
+          <div class="order-work">
+            <div class="card">
+              <div class="panel-title"><span class="panel-icon">▣</span><div><h2>Realizacja zamówienia</h2><div class="muted">{{ order_status_label(o['status']) }}</div></div></div>
+              <div class="order-actions">
+                {% if not finished %}<a class="btn primary" href="{{ url_for('order_packing_list_download_admin', order_id=o['id']) }}">Kontynuuj realizację →</a>{% endif %}
+                {% if o['tracking_no'] %}<a class="btn" target="_blank" href="{{ carrier_tracking_url(o['carrier'], o['tracking_no']) }}">Śledź przesyłkę</a>{% endif %}
+                {% if o['inpost_shipment_id'] %}<a class="btn" href="{{ url_for('order_inpost_label', order_id=o['id'], bundle='1') }}">PDF A4 + A6</a>{% endif %}
+              </div>
+              <div class="line"></div>
+              <div class="shipment-grid">
+                <span class="muted">Kurier</span><b>{{ o['carrier'] or 'Jeszcze niewybrany' }}</b>
+                <span class="muted">Numer przesyłki</span><span>{{ o['tracking_no'] or 'Jeszcze nie nadano' }}</span>
+                <span class="muted">Status zamówienia</span><span class="status-line">{{ order_status_label(o['status']) }}</span>
+                <span class="muted">Powiadomienie klienta</span><span>{% if shipping or finished %}Wysłane po nadaniu{% else %}Oczekuje na nadanie{% endif %}</span>
+              </div>
+            </div>
+            <div class="card">
+              <div class="panel-title"><span class="panel-icon">▤</span><h2>Dokumenty</h2></div>
+              <div class="doc-list">
+                {% if invoice %}<div class="doc-row"><span class="doc-mark">F</span><div><b>Faktura</b><div class="muted">{{ invoice['invoice_no'] }}</div></div><a class="btn" href="{{ url_for('invoice_download_admin', invoice_id=invoice['id']) }}" target="_blank">Pobierz</a></div>{% else %}<div class="doc-row"><span class="doc-mark">F</span><div><b>Faktura</b><div class="muted">Jeszcze niewystawiona</div></div></div>{% endif %}
+                {% if invoice %}<div class="doc-row"><span class="doc-mark">L</span><div><b>Lista pakowa</b><div class="muted">Do faktury {{ invoice['invoice_no'] }}</div></div><a class="btn" href="{{ url_for('invoice_packing_list_download_admin', invoice_id=invoice['id']) }}" target="_blank">Pobierz</a></div>{% endif %}
+                {% if o['inpost_shipment_id'] %}<div class="doc-row"><span class="doc-mark">E</span><div><b>Etykieta kurierska</b><div class="muted">{{ o['carrier'] or 'InPost' }}</div></div><a class="btn" href="{{ url_for('order_inpost_label', order_id=o['id']) }}">Pobierz</a></div>{% endif %}
+              </div>
+            </div>
+          </div>
+
+          <div class="order-bottom">
+            <div class="card">
+              <div class="panel-title"><span class="panel-icon">♙</span><h2>Zamawiający</h2></div>
+              <div><b>{{ o['customer_name'] }}</b></div><div class="muted" style="white-space:pre-line;margin-top:6px;">{{ o['customer_address'] or '-' }}</div>
+              <div class="muted" style="margin-top:8px;">Tel: {{ o['customer_phone'] or '-' }} · Email: {{ o['customer_email'] or '-' }}</div>
+            </div>
+            <div class="card">
+              <div class="panel-title"><span class="panel-icon">✎</span><h2>Notatka</h2></div>
+              <div>{{ o['note'] or '-' }}</div>
+              <div class="hint compact-note" style="margin-top:12px;">Stan magazynowy jest rozliczany przez istniejący proces faktury. Status zamówienia zmienia się zgodnie z jego aktualnym etapem.</div>
+            </div>
+          </div>
+
+          <details class="card more-options">
+            <summary class="btn">Więcej opcji ▾</summary>
+            <div class="manual-panel">
+            <div class="flex">
               <form method="post" action="{{ url_for('order_status_update', order_id=o['id']) }}" class="flex" style="margin-left:10px;">
                 <select name="status" aria-label="Ręczna korekta statusu">
                   {% for status_key in ['new','confirmed','packed','packed_partial','in_delivery','shipped','partially_shipped','issued','completed','cancelled'] %}
@@ -713,7 +802,6 @@ def register_routes(context):
                 <button class="btn" type="submit" onclick="return confirm('Zapisać ręczną korektę statusu? Nie zmieni to stanu magazynowego ani nie wyśle e-maila.')">Zmień status</button>
               </form>
               <div class="right flex">
-                <a class="btn" href="{{ url_for('orders') }}">â† Lista</a>
                 <a class="btn primary" href="{{ url_for('order_packing_list_download_admin', order_id=o['id']) }}">Pakuj</a>
                 {% if (o['currency'] or 'PLN') == 'EUR' %}
                   <a class="btn primary" href="{{ url_for('order_proforma', order_id=o['id']) }}" target="_blank">Proforma EUR</a>
@@ -733,7 +821,6 @@ def register_routes(context):
                   </form>
               </div>
             </div>
-            <div class="muted" style="margin-top:6px;">{{ o['created_at'] }}</div>
             <form method="post" action="{{ url_for('order_mark_shipped', order_id=o['id']) }}" class="flex" style="margin-top:14px;padding:14px;border:1px solid #dbe4f2;border-radius:16px;background:#f8fbff;">
               <div><b>Wysyłka do klienta</b><div class="muted">Wpisz numer przesyłki i oznacz zamówienie jako wysłane.</div></div>
               {% if o['inpost_shipment_id'] %}
@@ -759,30 +846,8 @@ def register_routes(context):
             {% elif request.args.get('confirmation_error') %}
               <div class="hint" style="margin-top:10px; border-color:#fecaca; background:#fff1f2;">Nie udało się wysłać potwierdzenia: {{ request.args.get('confirmation_error') }}</div>
             {% endif %}
-          </div>
-
-          <div class="row">
-            <div class="card">
-              <h2>ZamawiajÄ…cy</h2>
-              <div><b>{{ o['customer_name'] }}</b></div>
-              <div class="muted" style="white-space:pre-line; margin-top:6px;">{{ o['customer_address'] or "-" }}</div>
-              <div class="muted" style="margin-top:6px;">Tel: {{ o['customer_phone'] or "-" }}</div>
-              <div class="muted">Email: {{ o['customer_email'] or "-" }}</div>
-              <div class="line"></div>
-              <div class="muted small">Kod zamĂłwienia do skanowania: <b>{{ canonical_order_no(o['id'], o['created_at'], o['order_no']) }}</b></div>
-              <div class="muted small" style="margin-top:10px;">QR jest uĹĽywany do etykiety 30x50 i skanowania zamĂłwienia.</div>
             </div>
-
-            <div class="card">
-              <h2>Notatka</h2>
-              <div>{{ o['note'] or "-" }}</div>
-              <div class="line"></div>
-              <div class="hint">
-                <b>Wydaj z magazynu</b> odejmie iloĹ›ci z magazynu, ale nie zmieni automatycznie statusu klienta na â€žZrealizowaneâ€ť.<br>
-                JeĹ›li brakuje stanu, pozycja moĹĽe byÄ‡ realizowana z <b>towaru w drodze z Chin</b> (kolumna â€žW dostawieâ€ť poniĹĽej).
-              </div>
-            </div>
-          </div>
+          </details>
 
           {% if not locked %}
           <div class="card">
@@ -877,9 +942,10 @@ def register_routes(context):
               </tbody>
             </table>
           </div>
+          </div>
         {% endblock %}
         """
-        return render_template_string(tpl, title=canonical_order_no(o["id"], o["created_at"], o["order_no"]), base_url=BASE_URL, db_path=DB_PATH, o=o, items=items, order_url=order_url, products=products_rows, locked=(int(o["warehouse_issued"] or 0)==1), order_status_label=order_status_label, order_status_css=order_status_css, canonical_order_no=canonical_order_no)
+        return render_template_string(tpl, title=canonical_order_no(o["id"], o["created_at"], o["order_no"]), base_url=BASE_URL, db_path=DB_PATH, o=o, items=items, invoice=dict(invoice_row) if invoice_row else None, order_url=order_url, products=products_rows, locked=(int(o["warehouse_issued"] or 0)==1), order_status_label=order_status_label, order_status_css=order_status_css, canonical_order_no=canonical_order_no)
 
 
 
