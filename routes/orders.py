@@ -595,6 +595,17 @@ def register_routes(context):
             c.close()
             abort(404)
 
+        shipment_status = ""
+        shipment_status_error = ""
+        if request.args.get("refresh_shipment") == "1" and norm(o["inpost_shipment_id"]):
+            try:
+                shipment = inpost_get_shipment(o["inpost_shipment_id"])
+                shipment_status = norm((shipment or {}).get("status"))
+                if not shipment_status:
+                    shipment_status_error = "InPost nie zwrócił statusu tej przesyłki."
+            except Exception as exc:
+                shipment_status_error = f"Nie udało się pobrać statusu z InPost: {norm(exc)[:180]}"
+
         cur.execute("""
           SELECT oi.*, p.model, p.ean, p.name,
                  COALESCE(s.qty, 0) AS stock_qty,
@@ -763,6 +774,7 @@ def register_routes(context):
                 <span class="muted">Kurier</span><b>{{ o['carrier'] or 'Jeszcze niewybrany' }}</b>
                 <span class="muted">Numer przesyłki</span><span>{{ o['tracking_no'] or 'Jeszcze nie nadano' }}</span>
                 <span class="muted">Status zamówienia</span><span class="status-line">{{ order_status_label(o['status']) }}</span>
+                {% if o['inpost_shipment_id'] %}<span class="muted">Status przesyłki InPost</span><span>{% if shipment_status %}<b>{{ shipment_status|replace('_', ' ')|capitalize }}</b>{% elif shipment_status_error %}<span style="color:#b92d43;">{{ shipment_status_error }}</span>{% else %}<span class="muted">Jeszcze nieodświeżony</span>{% endif %} <a class="btn" style="padding:5px 9px;font-size:11px;margin-left:7px;" href="{{ url_for('order_view', order_id=o['id'], refresh_shipment='1') }}">Odśwież status</a></span>{% endif %}
                 <span class="muted">Powiadomienie klienta</span><span>{% if shipping or finished %}Wysłane po nadaniu{% else %}Oczekuje na nadanie{% endif %}</span>
               </div>
             </div>
@@ -945,7 +957,7 @@ def register_routes(context):
           </div>
         {% endblock %}
         """
-        return render_template_string(tpl, title=canonical_order_no(o["id"], o["created_at"], o["order_no"]), base_url=BASE_URL, db_path=DB_PATH, o=o, items=items, invoice=dict(invoice_row) if invoice_row else None, order_url=order_url, products=products_rows, locked=(int(o["warehouse_issued"] or 0)==1), order_status_label=order_status_label, order_status_css=order_status_css, canonical_order_no=canonical_order_no)
+        return render_template_string(tpl, title=canonical_order_no(o["id"], o["created_at"], o["order_no"]), base_url=BASE_URL, db_path=DB_PATH, o=o, items=items, invoice=dict(invoice_row) if invoice_row else None, shipment_status=shipment_status, shipment_status_error=shipment_status_error, order_url=order_url, products=products_rows, locked=(int(o["warehouse_issued"] or 0)==1), order_status_label=order_status_label, order_status_css=order_status_css, canonical_order_no=canonical_order_no)
 
 
 
