@@ -4315,6 +4315,7 @@ BASE = r"""
     .nav>a:nth-child(6){--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M3%207l9-5%209%205v10l-9%205-9-5ZM3%207l9%205%209-5M12%2012v10%22%2F%3E%3C%2Fsvg%3E")}
     .nav>a:nth-child(7){--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M2%205h12v12H2ZM14%209h4l4%205v3h-8M8%2019a2%202%200%201%201-4%200%202%202%200%201%201%204%200M20%2019a2%202%200%201%201-4%200%202%202%200%201%201%204%200%22%2F%3E%3C%2Fsvg%3E")}
     .nav>a:nth-child(8){--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M8%202H2v6M16%202h6v6M22%2016v6h-6M8%2022H2v-6M6%206h4v4H6ZM14%206h4v4h-4ZM6%2014h4v4H6ZM14%2014h4v4h-4Z%22%2F%3E%3C%2Fsvg%3E")}
+    .nav>a.nav-ai{--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M5%204h14a2%202%200%200%201%202%202v9a2%202%200%200%201-2%202H9l-5%204v-4a2%202%200%200%201-1-2V6a2%202%200%200%201%202-2Z%22%2F%3E%3Cpath%20d%3D%22m12%207%20.7%201.8L15%209.5l-2.3.7L12%2012l-.7-1.8L9%209.5l2.3-.7L12%207Z%22%2F%3E%3C%2Fsvg%3E")}
     .nav-drop-btn{--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M4%206h16M4%2012h16M4%2018h16M8%203v6M16%209v6M10%2015v6%22%2F%3E%3C%2Fsvg%3E")}
     .nav>a:last-child{--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M10%203H4v18h6M9%2012h12m-5-5%205%205-5%205%22%2F%3E%3C%2Fsvg%3E")}
   </style>
@@ -4330,6 +4331,7 @@ BASE = r"""
       <a href="{{ url_for('stock') }}">Stan magazynu</a>
       <a href="{{ url_for('china') }}">Chiny / P/O</a>
       <a href="{{ url_for('order_scan') }}">Skan QR</a>
+      <a class="nav-ai {% if request.endpoint == 'ai_assistant' %}active{% endif %}" href="{{ url_for('ai_assistant') }}">Asystent AI</a>
       <div class="nav-dropdown">
         <button class="nav-drop-btn" type="button">Ustawienia ▾</button>
         <div class="nav-dropdown-menu">
@@ -4391,6 +4393,13 @@ app.jinja_env.globals["carrier_tracking_url"] = carrier_tracking_url
 # =========================
 # PAGES
 # =========================
+@app.get("/ai-assistant")
+@require_permission("inventory.read")
+def ai_assistant():
+    """Minimal internal client for the existing read-only agent runtime."""
+    return render_template("ai_assistant.html", title="Asystent AI")
+
+
 @app.post("/searches/delete-selected")
 def delete_selected_client_searches():
     selected = request.form.getlist("selected_search")
