@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import logging
 import os
 import re
 import time
@@ -26,6 +27,42 @@ _SAFE_TOOL_NAME = re.compile(r"[a-z][a-z0-9_.]{2,127}")
 _STANDALONE_SECRET = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
 _WRITE_INTENT = re.compile(r"(?i)\b(zmień|zmien|ustaw|dodaj|usuń|usun|wyślij|wyslij|utwórz|utworz|anuluj|skoryguj)\b")
 _DATA_INTENT = re.compile(r"(?i)\b(ile|stan|stock|produkt|zamówieni|faktur|ksef|przesył|klient|płatno)\w*")
+_SAFE_API_ERROR_CODE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+logger = logging.getLogger(__name__)
+
+
+def _log_provider_failure(*, exc: Exception, model: str, stage: str, response=None) -> None:
+    """Log bounded provider diagnostics without request content, headers or credentials."""
+    http_status = getattr(response, "status_code", None)
+    api_error_code = ""
+    if response is not None:
+        try:
+            error = response.json().get("error", {})
+            candidate = str(error.get("code") or error.get("type") or "") if isinstance(error, dict) else ""
+            api_error_code = candidate if _SAFE_API_ERROR_CODE.fullmatch(candidate) else ""
+        except Exception:
+            pass
+    if isinstance(exc, requests.Timeout):
+        safe_message = "Przekroczono czas oczekiwania na OpenAI API."
+    elif http_status is not None:
+        safe_message = f"OpenAI API zwróciło błąd HTTP {http_status}."
+    elif stage == "request":
+        safe_message = "Nie udało się połączyć z OpenAI API."
+    elif stage == "response parsing":
+        safe_message = "Nie udało się odczytać odpowiedzi OpenAI API."
+    elif stage == "tool call":
+        safe_message = "Odpowiedź OpenAI zawiera nieprawidłowe wywołanie narzędzia."
+    else:
+        safe_message = "Odpowiedź końcowa OpenAI ma nieprawidłowy format."
+    diagnostic = {
+        "exception_type": type(exc).__name__,
+        "http_status": http_status,
+        "api_error_code": api_error_code or None,
+        "safe_message": safe_message,
+        "model": _safe_text(model, 128),
+        "stage": stage,
+    }
+    logger.error("AI_PROVIDER_FAILURE %s", json.dumps(diagnostic, ensure_ascii=False, sort_keys=True))
 
 
 @dataclass(frozen=True)
@@ -102,25 +139,52 @@ class OpenAIResponsesProvider:
         }
         if previous_response_id:
             payload["previous_response_id"] = previous_response_id
-        response = requests.post(
-            self.endpoint, headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-            json=payload, timeout=timeout_seconds,
-        )
-        response.raise_for_status()
-        body = response.json()
+        response = None
+        try:
+            response = requests.post(
+                self.endpoint, headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+                json=payload, timeout=timeout_seconds,
+            )
+            response.raise_for_status()
+        except Exception as exc:
+            _log_provider_failure(exc=exc, model=self.model, stage="request",
+                                  response=getattr(exc, "response", None) or response)
+            raise
+        try:
+            body = response.json()
+            if not isinstance(body, dict) or not isinstance(body.get("output", []), list):
+                raise ValueError("Malformed provider response")
+        except Exception as exc:
+            _log_provider_failure(exc=exc, model=self.model, stage="response parsing", response=response)
+            raise
         calls, texts = [], []
-        for item in body.get("output", []):
-            if item.get("type") == "function_call":
-                api_name = str(item.get("name") or "")
-                calls.append(ToolCall(str(item.get("call_id") or ""), alias_to_name.get(api_name, api_name), item.get("arguments", "{}")))
-            elif item.get("type") == "message":
-                texts.extend(part.get("text", "") for part in item.get("content", []) if part.get("type") == "output_text")
-        usage = body.get("usage") or {}
-        return ProviderResponse(
-            text="\n".join(filter(None, texts)), tool_calls=tuple(calls), response_id=str(body.get("id") or ""),
-            request_id=str(response.headers.get("x-request-id") or ""), model=str(body.get("model") or self.model),
-            input_tokens=int(usage.get("input_tokens") or 0), output_tokens=int(usage.get("output_tokens") or 0),
-        )
+        try:
+            for item in body.get("output", []):
+                if not isinstance(item, dict):
+                    raise ValueError("Malformed provider output item")
+                if item.get("type") == "function_call":
+                    api_name = str(item.get("name") or "")
+                    calls.append(ToolCall(str(item.get("call_id") or ""), alias_to_name.get(api_name, api_name), item.get("arguments", "{}")))
+        except Exception as exc:
+            _log_provider_failure(exc=exc, model=self.model, stage="tool call", response=response)
+            raise
+        try:
+            for item in body.get("output", []):
+                if item.get("type") == "message":
+                    content = item.get("content", [])
+                    if not isinstance(content, list):
+                        raise ValueError("Malformed provider message content")
+                    texts.extend(str(part.get("text") or "") for part in content
+                                 if isinstance(part, dict) and part.get("type") == "output_text")
+            usage = body.get("usage") or {}
+            return ProviderResponse(
+                text="\n".join(filter(None, texts)), tool_calls=tuple(calls), response_id=str(body.get("id") or ""),
+                request_id=str(response.headers.get("x-request-id") or ""), model=str(body.get("model") or self.model),
+                input_tokens=int(usage.get("input_tokens") or 0), output_tokens=int(usage.get("output_tokens") or 0),
+            )
+        except Exception as exc:
+            _log_provider_failure(exc=exc, model=self.model, stage="final response", response=response)
+            raise
 
 
 def provider_from_env() -> AgentModelProvider:

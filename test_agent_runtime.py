@@ -1,4 +1,5 @@
 import json
+import logging
 import socket
 import urllib.request
 
@@ -165,3 +166,46 @@ def test_real_adapter_uses_env_config_and_safe_responses_contract(monkeypatch):
     assert captured["json"]["store"] is False and captured["json"]["parallel_tool_calls"] is False
     assert captured["json"]["tools"][0]["name"] == "inventory__product__search"
     assert captured["timeout"] == 7 and captured["headers"]["Authorization"] == "Bearer test-key"
+
+
+def test_provider_failure_is_diagnostic_in_log_but_endpoint_response_stays_safe(monkeypatch, caplog):
+    secret = "sk-this-secret-must-never-reach-logs"
+    user_message = "Ile mamy Avery 160? prywatny-marker"
+
+    class ErrorResponse:
+        status_code = 400
+        headers = {"x-request-id": "req-provider-error"}
+
+        def raise_for_status(self):
+            raise runtime.requests.HTTPError("unsafe transport detail", response=self)
+
+        def json(self):
+            return {"error": {"code": "model_not_found", "message": f"{user_message} Authorization: Bearer {secret}"}}
+
+    monkeypatch.setattr(runtime.requests, "post", lambda *_a, **_k: ErrorResponse())
+    backend.AGENT_MODEL_PROVIDER = runtime.OpenAIResponsesProvider(model="configured-test-model", api_key=secret)
+    client = backend.app.test_client()
+    with client.session_transaction() as session:
+        session["admin_authenticated"] = True
+        session["csrf_token"] = "csrf"
+
+    with caplog.at_level(logging.ERROR, logger="agent_runtime"):
+        response = client.post("/api/internal/ai/chat", json={"message": user_message})
+
+    assert response.status_code == 503
+    payload = response.get_json()
+    assert payload["error_code"] == "MODEL_FAILED"
+    assert payload["message"] == "Asystent chwilowo nie może zakończyć odpowiedzi."
+    encoded_response = json.dumps(payload, ensure_ascii=False)
+    assert secret not in encoded_response and user_message not in encoded_response
+
+    log = caplog.text
+    assert "AI_PROVIDER_FAILURE" in log
+    assert '"exception_type": "HTTPError"' in log
+    assert '"http_status": 400' in log
+    assert '"api_error_code": "model_not_found"' in log
+    assert '"model": "configured-test-model"' in log
+    assert '"stage": "request"' in log
+    assert '"safe_message": "OpenAI API zwróciło błąd HTTP 400."' in log
+    assert secret not in log and user_message not in log
+    assert "Authorization" not in log and "unsafe transport detail" not in log
