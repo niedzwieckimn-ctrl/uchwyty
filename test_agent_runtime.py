@@ -28,6 +28,10 @@ def isolated(tmp_path, monkeypatch):
     ):
         db.execute("INSERT INTO products(id,sku,model,name,created_at) VALUES(?,?,?,?,?)", (product_id, sku, model, name, now))
         db.execute("INSERT INTO stock(product_id,qty) VALUES(?,?)", (product_id, qty))
+    db.execute("INSERT INTO customers(id,name,address,phone,email,nip,language,price_list,created_at) VALUES(10,'AM Interiors','Testowa 1','','','', 'pl','pln',?)", (now,))
+    db.execute("INSERT INTO orders(id,order_no,customer_id,customer_name,status,created_at,currency,price_list) VALUES(10,'ZAM-TEST-10',10,'AM Interiors','confirmed',?,'PLN','pln')", (now,))
+    db.execute("INSERT INTO invoices(id,order_id,invoice_no,issue_date,sell_date,payment_type,payment_to,buyer_name,buyer_tax_no,total_net,total_gross,created_at,currency) VALUES(10,10,'FV/TEST/10','2026-09-01','2026-09-01','transfer','2026-09-08','AM Interiors','',100,123,?,'PLN')", (now,))
+    db.execute("INSERT INTO invoice_meta(invoice_id,invoice_items_json,paid,paid_at,updated_at) VALUES(10,'[]',0,NULL,?)", (now,))
     db.commit(); db.close()
     backend.AGENT_MODEL_PROVIDER = None
     yield
@@ -78,13 +82,46 @@ def test_runtime_overdue_result_matches_direct_business_operation():
     def verify_tool_output(kwargs):
         output = json.loads(kwargs["input_items"][-1]["output"])
         assert output == direct.data
-        return runtime.ProviderResponse(text="Nie znaleziono zaległych faktur.")
+        return runtime.ProviderResponse(text="Znaleziono 1 zaległą fakturę.")
 
     provider = runtime.FakeModelProvider([
         tool("invoices.overdue", {}), verify_tool_output,
     ])
     result = runtime.run_agent_turn(owner(), "Czy mam zaległe faktury?", provider)
     assert direct.status == result["status"] == "SUCCESS"
+
+
+@pytest.mark.parametrize(("query", "operation", "arguments", "answer"), [
+    ("Ile mamy Avery 160?", "inventory.product.search", {"query": "Avery 160"},
+     "Na magazynie mamy 24 sztuki Avery 160."),
+    ("Mam niezapłacone faktury?", "invoices.overdue", {},
+     "Znaleziono 1 niezapłaconą fakturę."),
+    ("Znajdź klienta AM Interiors", "customers.search", {"query": "AM Interiors"},
+     "Znaleziono klienta AM Interiors."),
+])
+def test_production_orchestration_reaches_real_business_operation_gate(query, operation, arguments, answer):
+    observed = {}
+
+    def verify_real_result(kwargs):
+        observed["tool_choice_after_result"] = kwargs["tool_choice"]
+        observed["business_result"] = json.loads(kwargs["input_items"][-1]["output"])
+        return runtime.ProviderResponse(text=answer, model="fake-model")
+
+    provider = runtime.FakeModelProvider([tool(operation, arguments), verify_real_result])
+    result = runtime.run_agent_turn(owner(), query, provider)
+
+    assert result["status"] == "SUCCESS"
+    assert provider.calls[0]["tool_choice"] == "required"
+    assert observed["tool_choice_after_result"] == "auto"
+    assert observed["business_result"]["ok"] is True
+    assert observed["business_result"]["count"] >= 1
+    db = backend.conn()
+    execution = db.execute(
+        "SELECT operation,status FROM internal_operation_executions WHERE correlation_id=? ORDER BY started_at DESC LIMIT 1",
+        (result["correlation_id"],),
+    ).fetchone()
+    db.close()
+    assert tuple(execution) == (operation, "SUCCESS")
 
 
 def test_unknown_product_does_not_invent_stock():
@@ -168,6 +205,29 @@ def test_actor_spoof_fields_are_ignored_by_endpoint(monkeypatch):
     assert response.status_code == 200
     db = backend.conn(); actor_id = db.execute("SELECT actor_id FROM internal_operation_executions").fetchone()[0]; db.close()
     assert actor_id == rbac.AI_OWNER_ASSISTANT_ACTOR_ID
+
+
+def test_production_chat_endpoint_uses_runtime_and_real_business_operation_gate():
+    provider = fake_search_answer("Avery 160", "Mamy 24 sztuki Avery 160.")
+    backend.AGENT_MODEL_PROVIDER = provider
+    client = backend.app.test_client()
+    with client.session_transaction() as session:
+        session["admin_authenticated"] = True
+        session["csrf_token"] = "csrf"
+
+    response = client.post("/api/internal/ai/chat", json={"message": "Ile mamy Avery 160?"})
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["status"] == "SUCCESS" and payload["tool_calls"] == 1
+    assert provider.calls[0]["tool_choice"] == "required"
+    db = backend.conn()
+    execution = db.execute(
+        "SELECT operation,status FROM internal_operation_executions WHERE correlation_id=?",
+        (payload["correlation_id"],),
+    ).fetchone()
+    db.close()
+    assert tuple(execution) == ("inventory.product.search", "SUCCESS")
 
 
 def test_read_only_filter_survives_accidental_write_permission(monkeypatch):
@@ -302,9 +362,10 @@ def test_real_adapter_uses_env_config_and_safe_responses_contract(monkeypatch):
     provider = runtime.OpenAIResponsesProvider(model="configured-model", api_key="test-key")
     reply = provider.complete(instructions="safe", input_items=[{"role": "user", "content": "test"}],
                               tools=[{"type": "function", "name": "inventory.product.search", "description": "search", "parameters": {"type": "object"}, "strict": True}],
-                              previous_response_id="", timeout_seconds=7)
+                              previous_response_id="", timeout_seconds=7, tool_choice="required")
     assert reply.tool_calls[0].name == "inventory.product.search"
     assert captured["json"]["store"] is False and captured["json"]["parallel_tool_calls"] is False
+    assert captured["json"]["tool_choice"] == "required"
     assert "previous_response_id" not in captured["json"]
     assert captured["json"]["tools"][0]["name"] == "inventory__product__search"
     assert captured["timeout"] == 7 and captured["headers"]["Authorization"] == "Bearer test-key"
@@ -358,6 +419,7 @@ def test_store_false_tool_flow_replays_output_without_previous_response_id(monke
     assert result["status"] == "SUCCESS" and "24" in result["message"]
     assert len(requests_sent) == 2
     assert all(request["store"] is False for request in requests_sent)
+    assert [request["tool_choice"] for request in requests_sent] == ["required", "auto"]
     assert all("previous_response_id" not in request for request in requests_sent)
     second_input = requests_sent[1]["input"]
     assert second_input[0]["role"] == "user"
