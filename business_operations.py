@@ -37,6 +37,7 @@ EXECUTION_STATUSES = frozenset({
 })
 TERMINAL_STATUSES = frozenset({"SUCCESS", "FAILED", "CONFLICT", "DENIED"})
 SAFE_IDEMPOTENCY_KEY = re.compile(r"[A-Za-z0-9._:-]{1,200}")
+MAX_PRODUCT_SEARCH_RESULTS = 50
 
 
 @dataclass(frozen=True)
@@ -127,7 +128,7 @@ PRODUCT_SEARCH_OUTPUT = {
     "required": ["ok", "query", "candidates", "count", "truncated"],
     "properties": {
         "ok": {"type": "boolean"}, "query": {"type": "string"},
-        "candidates": {"type": "array", "maxItems": 10, "items": _PRODUCT_FIELDS},
+        "candidates": {"type": "array", "maxItems": MAX_PRODUCT_SEARCH_RESULTS, "items": _PRODUCT_FIELDS},
         "count": {"type": "integer"}, "truncated": {"type": "boolean"},
     },
 }
@@ -504,31 +505,52 @@ def _product_get(data, actor, correlation_id, transaction_connection=None):
 
 
 def _product_search(data, actor, correlation_id, transaction_connection=None):
-    query = " ".join(str(data["query"]).strip().lower().split())
-    tokens = [token for token in re.split(r"[^a-z0-9ąćęłńóśźż]+", query) if token][:8]
+    query = " ".join(str(data["query"]).strip().casefold().split())
+    tokens = [token for token in re.split(r"[^\w]+", query, flags=re.UNICODE) if token][:8]
     if not tokens:
         raise ControlledOperationError("INVALID_INPUT", "Fraza wyszukiwania jest pusta", status=DENIED)
-    haystack = "lower(coalesce(p.sku,'') || ' ' || coalesce(p.model,'') || ' ' || coalesce(p.name,'') || ' ' || coalesce(p.ean,''))"
-    where = " AND ".join(f"{haystack} LIKE ?" for _ in tokens)
-    params = [f"%{token}%" for token in tokens]
     db = transaction_connection or _factory()()
     try:
-        found = db.execute(
-            f"""SELECT p.id,p.sku,p.model,p.name,COALESCE(s.qty,0) stock
-                FROM products p LEFT JOIN stock s ON s.product_id=p.id
-                WHERE COALESCE(p.archived,0)=0 AND {where}
-                ORDER BY CASE WHEN lower(coalesce(p.sku,''))=? THEN 0
-                              WHEN lower(coalesce(p.model,''))=? THEN 1 ELSE 2 END,
-                         p.sku,p.id LIMIT 11""",
-            (*params, query, query),
+        catalog = db.execute(
+            """SELECT p.id,p.sku,p.model,p.name,p.ean,COALESCE(s.qty,0) stock
+               FROM products p LEFT JOIN stock s ON s.product_id=p.id
+               WHERE COALESCE(p.archived,0)=0"""
         ).fetchall()
     finally:
         if transaction_connection is None:
             db.close()
+
+    query_compact = re.sub(r"[^\w]+", "", query, flags=re.UNICODE)
+
+    def rank(row):
+        fields = [" ".join(str(row[field] or "").strip().casefold().split())
+                  for field in ("sku", "model", "name", "ean")]
+        combined = " ".join(fields)
+        compact_fields = [re.sub(r"[^\w]+", "", value, flags=re.UNICODE) for value in fields]
+        direct = any(query in value for value in fields)
+        compact = bool(query_compact) and any(query_compact in value for value in compact_fields)
+        token_match = all(token in combined for token in tokens)
+        if not (direct or compact or token_match):
+            return None
+        if query == fields[0]:
+            priority = 0  # exact SKU
+        elif query in fields[1:3]:
+            priority = 1  # exact model or product family/name
+        elif fields[0].startswith(query) or (query_compact and compact_fields[0].startswith(query_compact)):
+            priority = 2  # SKU family, e.g. CH030
+        elif any(value.startswith(query) for value in fields[1:3]):
+            priority = 3
+        else:
+            priority = 4  # model + variant spread across fields
+        return priority, fields[0], int(row["id"])
+
+    found = [(match_rank, row) for row in catalog if (match_rank := rank(row)) is not None]
+    found.sort(key=lambda item: item[0])
+    selected = [row for _, row in found[:MAX_PRODUCT_SEARCH_RESULTS]]
     candidates = [{"id": int(row["id"]), "sku": row["sku"] or "", "model": row["model"],
-                   "name": row["name"], "stock": int(row["stock"])} for row in found[:10]]
+                   "name": row["name"], "stock": int(row["stock"])} for row in selected]
     return {"ok": True, "query": query, "candidates": candidates,
-            "count": len(candidates), "truncated": len(found) > 10}
+            "count": len(candidates), "truncated": len(found) > MAX_PRODUCT_SEARCH_RESULTS}
 
 
 def _pilot_change(data, actor, correlation_id, transaction_connection=None):

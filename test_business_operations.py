@@ -62,6 +62,27 @@ def _product():
         db.close()
 
 
+def _search_products():
+    rows = (
+        (10, "CH030-BB-128148", "CH030", "Victor", 7),
+        (11, "CH034-BB-128160", "CH034", "Avery", 12),
+        (12, "CH034-AB-160192", "CH034", "Avery", 4),
+        (13, "CH034-GM-192224", "CH034", "Avery", 9),
+        (14, "CH101-BLK-160", "CH101", "Andre", 20),
+    )
+    db = backend.conn()
+    try:
+        for product_id, sku, model, name, stock in rows:
+            db.execute(
+                "INSERT INTO products(id,sku,model,name,archived,created_at) VALUES(?,?,?,?,0,?)",
+                (product_id, sku, model, name, backend.now_iso()),
+            )
+            db.execute("INSERT INTO stock(product_id,qty) VALUES(?,?)", (product_id, stock))
+        db.commit()
+    finally:
+        db.close()
+
+
 def _resource():
     return concurrency.create_versioned_resource("business-operation-pilot", {"amount": 0}, actor_context=_owner())
 
@@ -171,6 +192,44 @@ def test_read_operation_owner_success_and_least_privilege_output(isolated):
     assert result.status == "SUCCESS"
     assert result.data == {"ok": True, "id": 1, "sku": "BO-1", "model": "Andre", "ean": "123", "name": "Uchwyt", "stock": 7}
     assert "archived" not in result.data and "created_at" not in result.data
+
+
+@pytest.mark.parametrize(("query", "expected_skus"), [
+    ("CH030-BB-128148", {"CH030-BB-128148"}),
+    ("CH030", {"CH030-BB-128148"}),
+    ("avery", {"CH034-BB-128160", "CH034-AB-160192", "CH034-GM-192224"}),
+    ("  AvErY   160  ", {"CH034-BB-128160", "CH034-AB-160192"}),
+    ("  ch030-bb-128148  ", {"CH030-BB-128148"}),
+])
+def test_product_search_supports_catalog_terms_through_execution_gate(isolated, query, expected_skus):
+    _search_products()
+    result = operations.execute_business_operation(
+        _owner(), "inventory.product.search", {"query": query}
+    )
+    assert result.status == "SUCCESS"
+    assert {item["sku"] for item in result.data["candidates"]} == expected_skus
+    assert result.data["count"] == len(expected_skus)
+    assert result.data["truncated"] is False
+
+
+def test_product_family_search_returns_all_variants_and_does_not_change_stock(isolated):
+    _search_products()
+    db = backend.conn()
+    before = [tuple(row) for row in db.execute("SELECT product_id,qty FROM stock ORDER BY product_id")]
+    db.close()
+
+    result = operations.execute_business_operation(
+        _owner(), "inventory.product.search", {"query": "Avery"}
+    )
+
+    db = backend.conn()
+    after = [tuple(row) for row in db.execute("SELECT product_id,qty FROM stock ORDER BY product_id")]
+    db.close()
+    assert result.status == "SUCCESS"
+    assert [item["sku"] for item in result.data["candidates"]] == [
+        "CH034-AB-160192", "CH034-BB-128160", "CH034-GM-192224"
+    ]
+    assert before == after
 
 
 def test_read_operation_without_permission_is_denied(isolated):
