@@ -108,7 +108,35 @@ def test_china_orders_summary_uses_po_tables_and_ui_active_statuses(data):
     active = run(data, "china.orders.summary", {})
     assert active["scope"] == "active" and active["order_count"] == 1
     assert active["item_units"] == 12 and active["by_status"] == {"ordered": 1}
+    assert active["packages_by_status"] == {"ordered": 1}
+    assert active["pieces_by_status"] == {"ordered": 12}
+    assert sum(active["pieces_by_status"].values()) == active["item_units"]
     assert run(data, "china.orders.summary", {"scope": "all"})["order_count"] == 2
+
+
+def test_china_summary_supports_every_status_and_without_planned(data):
+    db = backend.conn(); now = backend.now_iso()
+    for package_id, status, qty in ((3, "planned", 120), (4, "shipped", 435), (5, "problem", 7)):
+        db.execute("INSERT INTO china_packages(id,package_no,status,created_at) VALUES(?,?,?,?)",
+                   (package_id, f"PO-{package_id}", status, now))
+        db.execute("INSERT INTO china_items(id,package_id,product_id,sku,qty,created_at) VALUES(?,?,?,?,?,?)",
+                   (package_id, package_id, 1, "CH034-BB-128160", qty, now))
+    db.commit(); db.close()
+    result = run(data, "china.orders.summary", {"scope": "active"})
+    assert set(result["packages_by_status"]) == {"planned", "ordered", "shipped", "problem"}
+    assert sum(result["pieces_by_status"].values()) == result["item_units"]
+    without_planned = result["item_units"] - result["pieces_by_status"]["planned"]
+    assert without_planned == 12 + 435 + 7
+    arrived = run(data, "china.orders.summary", {"scope": "arrived"})
+    assert arrived["order_count"] == 1 and arrived["pieces_by_status"] == {"arrived": 5}
+
+
+def test_customer_search_accepts_name_without_spaces(data):
+    db = backend.conn()
+    db.execute("INSERT INTO orders(id,order_no,customer_name,customer_email,status,created_at,currency,price_list) VALUES(3,'ZAM-AM','AM Interiors','am@example.com','confirmed','2026-09-10T10:00:00+02:00','PLN','pln')")
+    db.commit(); db.close()
+    result = run(data, "customers.search", {"query": "aminteriors"})
+    assert any(row["name"] == "AM Interiors" for row in result["results"])
 
 
 def test_unpaid_and_overdue_semantics_include_no_partial_amount_model(data):

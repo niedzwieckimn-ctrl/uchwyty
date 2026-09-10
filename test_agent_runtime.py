@@ -91,6 +91,40 @@ def test_runtime_overdue_result_matches_direct_business_operation():
     assert direct.status == result["status"] == "SUCCESS"
 
 
+def test_runtime_overdue_zero_one_and_multiple_currencies_finish_without_model_failed():
+    db = backend.conn()
+    db.execute("UPDATE invoice_meta SET paid=1 WHERE invoice_id=10")
+    db.commit(); db.close()
+    zero = runtime.run_agent_turn(owner(), "Czy mam zaległe faktury?", runtime.FakeModelProvider([
+        tool("invoices.overdue", {}), runtime.ProviderResponse(text="Nie ma zaległych faktur.")
+    ]))
+    assert zero["status"] == "SUCCESS"
+
+    db = backend.conn(); now = backend.now_iso()
+    db.execute("UPDATE invoice_meta SET paid=0 WHERE invoice_id=10")
+    db.execute("INSERT INTO orders(id,order_no,customer_name,status,created_at,currency,price_list) VALUES(11,'ZAM-EUR','Euro Client','confirmed',?,'EUR','eu_eur')", (now,))
+    db.execute("INSERT INTO invoices(id,order_id,invoice_no,issue_date,sell_date,payment_type,payment_to,buyer_name,buyer_tax_no,total_net,total_gross,created_at,currency) VALUES(11,11,'FV/EUR/11','2026-09-01','2026-09-01','transfer','2026-09-08','Euro Client','',40,50,?,'EUR')", (now,))
+    db.execute("INSERT INTO invoice_meta(invoice_id,invoice_items_json,paid,updated_at) VALUES(11,'[]',0,?)", (now,))
+    db.commit(); db.close()
+
+    observed = {}
+    def inspect_output(kwargs):
+        encoded = kwargs["input_items"][-1]["output"]
+        observed["payload"] = json.loads(encoded)
+        assert len(encoded.encode("utf-8")) < runtime.MAX_TOOL_RESULT_BYTES
+        return runtime.ProviderResponse(text="Są 2 zaległe faktury: 123 PLN i 50 EUR.")
+
+    multiple = runtime.run_agent_turn(owner(), "Ile mam zaległych faktur?", runtime.FakeModelProvider([
+        tool("invoices.overdue", {}), inspect_output,
+    ]))
+    assert multiple["status"] == "SUCCESS" and multiple["error_code"] == ""
+    assert observed["payload"]["count"] == 2
+    assert observed["payload"]["totals_by_currency"] == {
+        "PLN": {"currency": "PLN", "invoice_count": 1, "amount_outstanding": 123.0},
+        "EUR": {"currency": "EUR", "invoice_count": 1, "amount_outstanding": 50.0},
+    }
+
+
 @pytest.mark.parametrize(("query", "operation", "arguments", "answer"), [
     ("Ile mamy Avery 160?", "inventory.product.search", {"query": "Avery 160"},
      "Na magazynie mamy 24 sztuki Avery 160."),

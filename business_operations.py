@@ -167,6 +167,15 @@ _RESULTS_OUTPUT = {
         "count": {"type": "integer"}, "truncated": {"type": "boolean"},
     },
 }
+INVOICE_OVERDUE_OUTPUT = {
+    "type": "object", "additionalProperties": False,
+    "required": ["ok", "results", "count", "truncated", "totals_by_currency"],
+    "properties": {
+        "ok": {"type": "boolean"}, "results": {"type": "array", "maxItems": MAX_BUSINESS_SEARCH_RESULTS},
+        "count": {"type": "integer"}, "truncated": {"type": "boolean"},
+        "totals_by_currency": {"type": "object"},
+    },
+}
 _DETAIL_OUTPUT = {
     "type": "object", "additionalProperties": False, "required": ["ok", "record"],
     "properties": {"ok": {"type": "boolean"}, "record": {"type": "object"}},
@@ -223,11 +232,12 @@ CHINA_SUMMARY_INPUT = {
 }
 CHINA_SUMMARY_OUTPUT = {
     "type": "object", "additionalProperties": False,
-    "required": ["ok", "scope", "order_count", "item_units", "by_status"],
+    "required": ["ok", "scope", "order_count", "item_units", "by_status", "packages_by_status", "pieces_by_status"],
     "properties": {
         "ok": {"type": "boolean"}, "scope": {"type": "string"},
         "order_count": {"type": "integer"}, "item_units": {"type": "integer"},
-        "by_status": {"type": "object"},
+        "by_status": {"type": "object"}, "packages_by_status": {"type": "object"},
+        "pieces_by_status": {"type": "object"},
     },
 }
 PILOT_INPUT = {
@@ -271,7 +281,7 @@ EXTERNAL_TEST_OUTPUT = {
 
 OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
     "inventory.product.search": BusinessOperationDefinition(
-        "inventory.product.search", 1, "Wyszukuje produkty po SKU, modelu lub nazwie i zwraca ograniczony stan.",
+        "inventory.product.search", 1, "Wyszukuje wyłącznie produkty po SKU, modelu, wariancie lub nazwie produktu i zwraca ograniczony stan.",
         "inventory.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "SYSTEM", "AI_AGENT"}),
         PRODUCT_SEARCH_INPUT, PRODUCT_SEARCH_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
@@ -309,10 +319,10 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
     "invoices.overdue": BusinessOperationDefinition(
         "invoices.overdue", 1, "Zwraca wyłącznie zaległe faktury po terminie według tej samej reguły co Cash Flow.",
         "payments.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
-        INVOICE_OVERDUE_INPUT, _RESULTS_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
+        INVOICE_OVERDUE_INPUT, INVOICE_OVERDUE_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
     "customers.search": BusinessOperationDefinition(
-        "customers.search", 1, "Wyszukuje klientów po nazwie, NIP, e-mailu lub telefonie.",
+        "customers.search", 1, "Wyszukuje firmy i klientów po pełnej lub skróconej nazwie, także bez spacji, oraz po NIP, e-mailu lub telefonie.",
         "customers.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
         CUSTOMER_SEARCH_INPUT, _RESULTS_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
@@ -755,8 +765,12 @@ def _date_bounds(data: Mapping[str, Any], *, default_period="all") -> tuple[str 
     return (start.isoformat() if start else None, end.isoformat() if end else None)
 
 
-def _money(value: Any) -> float:
-    return round(float(value or 0), 2)
+def _money(value: Any) -> float | int:
+    rounded = round(float(value or 0), 2)
+    # JSON should carry whole monetary values as 123 rather than 123.0. The
+    # runtime's numeric grounding compares literal number representations and
+    # models naturally omit a redundant decimal zero in final answers.
+    return int(rounded) if rounded.is_integer() else rounded
 
 
 def _limit(data: Mapping[str, Any]) -> int:
@@ -925,10 +939,16 @@ def _invoices_overdue(data, actor, correlation_id, transaction_connection=None):
                        or query in str(r.get("buyer_name") or "").casefold()]
         limit = _limit(data); selected = overdue[:limit]
         results = []
+        totals_by_currency = {}
         for item in selected:
             rows = _invoice_rows(db, "i.id=?", (int(item["id"]),), 1)
             view = _invoice_view(rows[0], True); view["overdue_days"] = int(item["overdue_days"]); results.append(view)
-        return {"ok": True, "results": results, "count": len(results), "truncated": len(overdue) > limit}
+            currency = view["currency"]
+            summary = totals_by_currency.setdefault(currency, {"currency": currency, "invoice_count": 0, "amount_outstanding": 0.0})
+            summary["invoice_count"] += 1
+            summary["amount_outstanding"] = _money(summary["amount_outstanding"] + view["amount_outstanding"])
+        return {"ok": True, "results": results, "count": len(results), "truncated": len(overdue) > limit,
+                "totals_by_currency": totals_by_currency}
     finally:
         if transaction_connection is None: db.close()
 
@@ -955,7 +975,10 @@ def _customers_search(data, actor, correlation_id, transaction_connection=None):
             fields = [" ".join(str(row.get(key) or "").split()).casefold()
                       for key in ("name", "nip", "email", "phone")]
             haystack = " ".join(fields)
-            if not all(token in haystack for token in tokens):
+            compact_haystack = re.sub(r"[^\w]+", "", haystack, flags=re.UNICODE)
+            compact_query = re.sub(r"[^\w]+", "", q, flags=re.UNICODE)
+            if not (all(token in haystack for token in tokens)
+                    or (len(compact_query) >= 3 and compact_query in compact_haystack)):
                 continue
             identity = (("id", int(row["id"])) if row.get("id") is not None
                         else ("identity", fields[0], fields[2]))
@@ -1002,12 +1025,15 @@ def _china_orders_summary(data, actor, correlation_id, transaction_connection=No
                   FROM china_packages cp LEFT JOIN china_items ci ON ci.package_id=cp.id
                  WHERE {' AND '.join(clauses)} GROUP BY cp.id,cp.status""", params,
         ).fetchall()
-        by_status = {}
+        packages_by_status, pieces_by_status = {}, {}
         for row in rows:
             key = str(row["status"] or "unknown")
-            by_status[key] = by_status.get(key, 0) + 1
+            packages_by_status[key] = packages_by_status.get(key, 0) + 1
+            pieces_by_status[key] = pieces_by_status.get(key, 0) + int(row["units"] or 0)
         return {"ok": True, "scope": scope, "order_count": len(rows),
-                "item_units": sum(int(row["units"] or 0) for row in rows), "by_status": by_status}
+                "item_units": sum(int(row["units"] or 0) for row in rows),
+                "by_status": packages_by_status, "packages_by_status": packages_by_status,
+                "pieces_by_status": pieces_by_status}
     finally:
         if transaction_connection is None: db.close()
 
@@ -1225,13 +1251,15 @@ def _safe_diagnostic_args(data: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _diagnostic_result(operation: str, *, status: str, started: float,
-                       output: Any = None, error_code: str = "") -> None:
+                       output: Any = None, error_code: str = "", stage: str = "complete") -> None:
     count = None
     if isinstance(output, Mapping):
         count = output.get("count", output.get("order_count", output.get("product_count")))
+    payload_size = len(json.dumps(sanitize_audit_data(output), ensure_ascii=False, separators=(",", ":")).encode("utf-8")) if output is not None else 0
     logger.info("BUSINESS_OPERATION_RESULT %s", json.dumps({
         "operation": operation, "status": status, "count": count,
-        "error_code": error_code, "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+        "error_code": error_code, "payload_size": payload_size, "stage": stage,
+        "latency_ms": round((time.perf_counter() - started) * 1000, 2),
     }, ensure_ascii=False, sort_keys=True))
 
 
@@ -1347,13 +1375,17 @@ def execute_business_operation(
             "operation": definition.operation_name, "args": _safe_diagnostic_args(data),
         }, ensure_ascii=False, sort_keys=True))
         try:
-            output = validate_output(
-                definition,
-                _HANDLERS[definition.operation_name](data, actor, row["correlation_id"], None),
-            )
+            raw_output = _HANDLERS[definition.operation_name](data, actor, row["correlation_id"], None)
+            try:
+                output = validate_output(definition, raw_output)
+            except Exception:
+                _diagnostic_result(definition.operation_name, status=FAILED, started=handler_started,
+                                   output=raw_output, error_code="INVALID_HANDLER_OUTPUT", stage="output_validation")
+                raise
         except ControlledOperationError as exc:
-            _diagnostic_result(definition.operation_name, status=exc.status, started=handler_started,
-                               error_code=exc.error_code)
+            if exc.error_code != "INVALID_HANDLER_OUTPUT":
+                _diagnostic_result(definition.operation_name, status=exc.status, started=handler_started,
+                                   error_code=exc.error_code, stage="handler")
             event = "business_operation.conflict" if exc.status == CONFLICT else "business_operation.failed"
             audit_result = CONFLICT if exc.status == CONFLICT else FAILED
             terminal = "CONFLICT" if exc.status == CONFLICT else "FAILED"
@@ -1362,7 +1394,7 @@ def execute_business_operation(
             return _result_from_row(row)
         except Exception as exc:
             _diagnostic_result(definition.operation_name, status=FAILED, started=handler_started,
-                               error_code="HANDLER_FAILED")
+                               error_code="HANDLER_FAILED", stage="handler")
             safe_message = sanitize_audit_text(exc)
             row = _transition(execution_id, definition, actor, "FAILED", "business_operation.failed", FAILED,
                               error_code="HANDLER_FAILED", message=safe_message, completed=True)
