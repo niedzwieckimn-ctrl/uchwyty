@@ -121,6 +121,10 @@ OPERATION_DEFINITIONS: dict[str, OperationDefinition] = {
     "agent.tool_result": OperationDefinition("agent.tool_result", 1, None, GREEN, SECURITY),
     "agent.completed": OperationDefinition("agent.completed", 1, None, GREEN, SECURITY),
     "agent.failed": OperationDefinition("agent.failed", 1, None, YELLOW, SECURITY),
+    "agent.conversation.created": OperationDefinition("agent.conversation.created", 1, None, GREEN, SECURITY),
+    "agent.conversation.resumed": OperationDefinition("agent.conversation.resumed", 1, None, GREEN, SECURITY),
+    "agent.conversation.expired": OperationDefinition("agent.conversation.expired", 1, None, GREEN, SECURITY),
+    "agent.conversation.reset": OperationDefinition("agent.conversation.reset", 1, None, GREEN, SECURITY),
 }
 
 
