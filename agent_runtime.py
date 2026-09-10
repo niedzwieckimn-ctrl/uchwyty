@@ -76,6 +76,7 @@ class ToolCall:
 class ProviderResponse:
     text: str = ""
     tool_calls: tuple[ToolCall, ...] = ()
+    output_items: tuple[dict[str, Any], ...] = ()
     response_id: str = ""
     request_id: str = ""
     model: str = ""
@@ -137,8 +138,8 @@ class OpenAIResponsesProvider:
             "tools": api_tools, "tool_choice": "auto", "parallel_tool_calls": False,
             "store": False,
         }
-        if previous_response_id:
-            payload["previous_response_id"] = previous_response_id
+        # With store=False the server-side response cannot be relied on for
+        # continuation. The caller passes response output items explicitly.
         response = None
         try:
             response = requests.post(
@@ -178,7 +179,9 @@ class OpenAIResponsesProvider:
                                  if isinstance(part, dict) and part.get("type") == "output_text")
             usage = body.get("usage") or {}
             return ProviderResponse(
-                text="\n".join(filter(None, texts)), tool_calls=tuple(calls), response_id=str(body.get("id") or ""),
+                text="\n".join(filter(None, texts)), tool_calls=tuple(calls),
+                output_items=tuple(dict(item) for item in body.get("output", [])),
+                response_id=str(body.get("id") or ""),
                 request_id=str(response.headers.get("x-request-id") or ""), model=str(body.get("model") or self.model),
                 input_tokens=int(usage.get("input_tokens") or 0), output_tokens=int(usage.get("output_tokens") or 0),
             )
@@ -256,21 +259,20 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         "Nie wykonuj żądań zmiany danych. Liczby w odpowiedzi muszą dokładnie odpowiadać wynikowi narzędzia."
     )
     input_items = [{"role": "user", "content": [{"type": "input_text", "text": message}]}]
-    previous, tool_count, model_name = "", 0, ""
+    tool_count, model_name = 0, ""
     usage = {"input_tokens": 0, "output_tokens": 0}
     grounded_numbers = set(re.findall(r"\b\d+(?:[.,]\d+)?\b", message))
     started = time.monotonic()
     try:
         while True:
             reply = provider.complete(instructions=instructions, input_items=input_items[-MAX_CONTEXT_MESSAGES:],
-                                      tools=tools, previous_response_id=previous,
+                                      tools=tools, previous_response_id="",
                                       timeout_seconds=MODEL_TIMEOUT_SECONDS)
             if not isinstance(reply, ProviderResponse):
                 raise ValueError("Malformed provider response")
             model_name = reply.model or model_name
             usage["input_tokens"] += max(0, reply.input_tokens)
             usage["output_tokens"] += max(0, reply.output_tokens)
-            previous = reply.response_id or previous
             if reply.tool_calls:
                 if len(reply.tool_calls) != 1:
                     raise ValueError("Dozwolone jest jedno wywołanie narzędzia na krok")
@@ -311,7 +313,13 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 if len(encoded.encode("utf-8")) > MAX_TOOL_RESULT_BYTES:
                     raise RuntimeError("TOOL_RESULT_TOO_LARGE")
                 grounded_numbers.update(re.findall(r"\b\d+(?:[.,]\d+)?\b", encoded))
-                input_items = [{"type": "function_call_output", "call_id": call.call_id, "output": encoded}]
+                response_items = list(reply.output_items)
+                if not response_items:
+                    # Fake/custom providers may expose only the normalized call.
+                    response_items = [{"type": "function_call", "call_id": call.call_id,
+                                       "name": call.name.replace(".", "__"), "arguments": call.arguments}]
+                input_items.extend(response_items)
+                input_items.append({"type": "function_call_output", "call_id": call.call_id, "output": encoded})
                 continue
             if not reply.text:
                 raise ValueError("Malformed provider response")

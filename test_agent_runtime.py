@@ -164,8 +164,67 @@ def test_real_adapter_uses_env_config_and_safe_responses_contract(monkeypatch):
                               previous_response_id="", timeout_seconds=7)
     assert reply.tool_calls[0].name == "inventory.product.search"
     assert captured["json"]["store"] is False and captured["json"]["parallel_tool_calls"] is False
+    assert "previous_response_id" not in captured["json"]
     assert captured["json"]["tools"][0]["name"] == "inventory__product__search"
     assert captured["timeout"] == 7 and captured["headers"]["Authorization"] == "Bearer test-key"
+
+
+def test_store_false_tool_flow_replays_output_without_previous_response_id(monkeypatch):
+    requests_sent = []
+    response_bodies = [
+        {
+            "id": "resp-not-stored",
+            "model": "configured-model",
+            "output": [{
+                "id": "fc-1", "type": "function_call", "status": "completed",
+                "call_id": "call-1", "name": "inventory__product__search",
+                "arguments": '{"query":"Avery 160"}',
+            }],
+            "usage": {"input_tokens": 4, "output_tokens": 2},
+        },
+        {
+            "id": "resp-final",
+            "model": "configured-model",
+            "output": [{
+                "id": "msg-1", "type": "message", "role": "assistant", "status": "completed",
+                "content": [{"type": "output_text", "text": "Na magazynie mamy 24 sztuki Avery 160."}],
+            }],
+            "usage": {"input_tokens": 8, "output_tokens": 6},
+        },
+    ]
+
+    class Response:
+        status_code = 200
+        headers = {"x-request-id": "req-test"}
+
+        def __init__(self, body):
+            self.body = body
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.body
+
+    def post(_url, **kwargs):
+        requests_sent.append(kwargs["json"])
+        return Response(response_bodies.pop(0))
+
+    monkeypatch.setattr(runtime.requests, "post", post)
+    provider = runtime.OpenAIResponsesProvider(model="configured-model", api_key="test-key")
+    result = runtime.run_agent_turn(owner(), "Ile mamy Avery 160?", provider)
+
+    assert result["status"] == "SUCCESS" and "24" in result["message"]
+    assert len(requests_sent) == 2
+    assert all(request["store"] is False for request in requests_sent)
+    assert all("previous_response_id" not in request for request in requests_sent)
+    second_input = requests_sent[1]["input"]
+    assert second_input[0]["role"] == "user"
+    assert second_input[1]["type"] == "function_call"
+    assert second_input[1]["call_id"] == "call-1"
+    assert second_input[2]["type"] == "function_call_output"
+    assert second_input[2]["call_id"] == "call-1"
+    assert '"stock":24' in second_input[2]["output"]
 
 
 def test_provider_failure_is_diagnostic_in_log_but_endpoint_response_stays_safe(monkeypatch, caplog):
