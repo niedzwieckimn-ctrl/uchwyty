@@ -34,6 +34,14 @@ from flask import render_template, render_template_string
 from jinja2 import ChoiceLoader, DictLoader, FileSystemLoader
 from werkzeug.security import check_password_hash
 
+from internal_rbac import (
+    bind_bootstrap_owner_session,
+    configure as configure_internal_rbac,
+    current_actor_context,
+    initialize_schema as initialize_internal_rbac_schema,
+    require_permission,
+)
+
 import qrcode
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import mm
@@ -222,6 +230,8 @@ def conn():
     c = sqlite3.connect(DB_PATH)
     c.row_factory = sqlite3.Row
     return c
+
+configure_internal_rbac(conn)
 
 def init_db():
     c = conn()
@@ -723,6 +733,7 @@ def init_db():
     c.commit()
     from inpost_pickups import initialize as initialize_pickups
     initialize_pickups(c)
+    initialize_internal_rbac_schema(c)
     c.close()
 
 init_db()
