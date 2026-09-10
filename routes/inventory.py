@@ -1266,7 +1266,13 @@ def register_routes(context):
 
 
     @app.get("/api/product/<int:product_id>")
-    @require_permission("inventory.read")
+    @require_permission(
+        "inventory.read",
+        operation="inventory.product.read",
+        audit_success=True,
+        entity_type="product",
+        entity_id_arg="product_id",
+    )
     def api_product(product_id):
         c = conn()
         cur = c.cursor()

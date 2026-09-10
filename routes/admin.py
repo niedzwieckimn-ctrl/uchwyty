@@ -16,6 +16,12 @@ def register_routes(context):
                 session["csrf_token"] = secrets.token_urlsafe(32)
                 session.permanent = True
                 bind_bootstrap_owner_session(session)
+                try_record_audit_event(
+                    "security.login",
+                    result="SUCCESS",
+                    entity_type="internal_actor",
+                    entity_id=session.get("internal_actor_id"),
+                )
                 target = norm(request.args.get("next"))
                 return redirect(target if target.startswith("/") and not target.startswith("//") else url_for("home"))
             else:
