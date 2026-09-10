@@ -57,6 +57,10 @@ from internal_audit_outbox import (
     queue_health as audit_outbox_health,
     start_worker as start_audit_outbox_worker,
 )
+from internal_approval import (
+    configure as configure_internal_approval,
+    initialize_schema as initialize_internal_approval_schema,
+)
 
 import qrcode
 from reportlab.pdfgen import canvas
@@ -251,6 +255,7 @@ configure_internal_rbac(conn)
 configure_internal_audit(conn)
 configure_internal_concurrency(conn)
 configure_internal_audit_outbox(conn)
+configure_internal_approval(conn)
 
 def init_db():
     c = conn()
@@ -756,6 +761,7 @@ def init_db():
     initialize_internal_audit_schema(c)
     initialize_internal_audit_outbox_schema(c)
     initialize_internal_concurrency_schema(c)
+    initialize_internal_approval_schema(c)
     c.close()
 
 init_db()

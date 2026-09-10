@@ -101,6 +101,7 @@ PERMISSIONS = {
     "system.audit_deliver": "Techniczne dostarczanie audytu do centralnej bazy",
     "approvals.review": "Odczyt operacji oczekujących na akceptację",
     "approvals.decide": "Zatwierdzanie lub odrzucanie operacji",
+    "internal.test.change_setting": "Zmiana izolowanego ustawienia testowego",
 }
 
 
@@ -256,7 +257,7 @@ ROLE_PERMISSION_DECISIONS = {
         "invoices.status_read", "ksef.read", "customers.read", "shipping.read",
         "shipping.track", "purchases.read", "payments.read", "reports.read",
         "cashflow.read", "system.audit_read", "approvals.review",
-    }),
+    }, approval={"internal.test.change_setting"}),
     "SYSTEM_KSEF_SCHEDULER": _decisions(
         allow={"invoices.read", "invoices.send_customer", "ksef.read", "ksef.validate"},
         approval={"ksef.send"},

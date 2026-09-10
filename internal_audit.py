@@ -83,6 +83,14 @@ OPERATION_DEFINITIONS: dict[str, OperationDefinition] = {
     "internal.versioned_resource.update": OperationDefinition(
         "internal.versioned_resource.update", 1, "system.audit_read", YELLOW, WRITE
     ),
+    "approval.requested": OperationDefinition("approval.requested", 1, None, YELLOW, SECURITY),
+    "approval.approved": OperationDefinition("approval.approved", 1, "approvals.decide", YELLOW, SECURITY),
+    "approval.rejected": OperationDefinition("approval.rejected", 1, "approvals.decide", YELLOW, SECURITY),
+    "approval.expired": OperationDefinition("approval.expired", 1, None, YELLOW, SECURITY),
+    "approval.cancelled": OperationDefinition("approval.cancelled", 1, None, YELLOW, SECURITY),
+    "approval.consumed": OperationDefinition("approval.consumed", 1, None, YELLOW, SECURITY),
+    "approval.execution_denied": OperationDefinition("approval.execution_denied", 1, None, YELLOW, SECURITY),
+    "approval.stale": OperationDefinition("approval.stale", 1, None, YELLOW, SECURITY),
 }
 
 
@@ -296,6 +304,7 @@ def record_audit_event(
     correlation_id: str = "",
     reason: str = "",
     approval_required: bool = False,
+    approval_id: str = "",
     approved_by: str = "",
     error_code: str = "",
     error_message: str = "",
@@ -312,11 +321,16 @@ def record_audit_event(
     current_version: int | None = None,
     changes_only: bool = True,
     source: str = "",
+    risk_level: str | None = None,
+    transaction_connection: sqlite3.Connection | None = None,
 ) -> str:
     """Append one durable event. Identity, risk and version come from backend state."""
     if _connection_factory is None:
         raise RuntimeError("Audit service nie został skonfigurowany")
     definition = _operation(operation)
+    effective_risk_level = risk_level or definition.risk_level
+    if effective_risk_level not in RISK_LEVELS:
+        raise ValueError(f"Nieznany risk level: {effective_risk_level}")
     if result not in RESULTS:
         raise ValueError(f"Nieznany wynik audytu: {result}")
     if actor_context is None:
@@ -344,10 +358,10 @@ def record_audit_event(
         current_correlation_id(correlation_id),
         getattr(actor_context, "session_id", "") or None,
         getattr(actor_context, "credential_id", "") or None,
-        definition.risk_level,
+        effective_risk_level,
         sanitize_audit_text(reason or getattr(actor_context, "reason", "")) or None,
         int(bool(approval_required)),
-        getattr(actor_context, "approval_id", "") or None,
+        approval_id[:128] or getattr(actor_context, "approval_id", "") or None,
         approved_by[:128] or None,
         result,
         error_code[:128] or None,
@@ -365,7 +379,8 @@ def record_audit_event(
         current_version,
         (source or getattr(actor_context, "source", "") or "internal")[:128],
     )
-    db = _connection_factory()
+    owns_connection = transaction_connection is None
+    db = transaction_connection or _connection_factory()
     try:
         db.execute(
             """INSERT INTO internal_audit_log(
@@ -385,9 +400,15 @@ def record_audit_event(
             ) VALUES(?,'PENDING',0,0,?,0)""",
             (audit_id, _utc_now()),
         )
-        db.commit()
+        if owns_connection:
+            db.commit()
+    except Exception:
+        if owns_connection:
+            db.rollback()
+        raise
     finally:
-        db.close()
+        if owns_connection:
+            db.close()
     return audit_id
 
 
