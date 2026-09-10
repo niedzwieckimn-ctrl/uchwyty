@@ -41,6 +41,15 @@ from internal_rbac import (
     initialize_schema as initialize_internal_rbac_schema,
     require_permission,
 )
+from internal_audit import (
+    configure as configure_internal_audit,
+    initialize_schema as initialize_internal_audit_schema,
+    try_record_audit_event,
+)
+from internal_concurrency import (
+    configure as configure_internal_concurrency,
+    initialize_schema as initialize_internal_concurrency_schema,
+)
 
 import qrcode
 from reportlab.pdfgen import canvas
@@ -232,6 +241,8 @@ def conn():
     return c
 
 configure_internal_rbac(conn)
+configure_internal_audit(conn)
+configure_internal_concurrency(conn)
 
 def init_db():
     c = conn()
@@ -734,6 +745,8 @@ def init_db():
     from inpost_pickups import initialize as initialize_pickups
     initialize_pickups(c)
     initialize_internal_rbac_schema(c)
+    initialize_internal_audit_schema(c)
+    initialize_internal_concurrency_schema(c)
     c.close()
 
 init_db()

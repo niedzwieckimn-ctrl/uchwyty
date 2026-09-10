@@ -546,7 +546,14 @@ def current_actor_context() -> ActorContext | None:
     return context
 
 
-def require_permission(permission: str):
+def require_permission(
+    permission: str,
+    *,
+    operation: str | None = None,
+    audit_success: bool = False,
+    entity_type: str = "",
+    entity_id_arg: str = "",
+):
     """Protect an explicitly migrated endpoint; all other routes stay legacy."""
     if permission not in PERMISSIONS:
         raise ValueError(f"Nieznane permission: {permission}")
@@ -561,6 +568,17 @@ def require_permission(permission: str):
                 abort(401)
             decision = actor.permission_decision(permission)
             if decision != ALLOW:
+                from internal_audit import DENIED, try_record_audit_event
+                try_record_audit_event(
+                    "security.permission.denied",
+                    result=DENIED,
+                    actor_context=actor,
+                    permission=permission,
+                    entity_type="permission",
+                    entity_id=permission,
+                    approval_required=(decision == APPROVAL_REQUIRED),
+                    reason=f"Odmowa dostępu do operacji {operation or func.__name__}",
+                )
                 if request.path.startswith("/api/"):
                     return jsonify(
                         ok=False,
@@ -569,9 +587,27 @@ def require_permission(permission: str):
                         approval_required=(decision == APPROVAL_REQUIRED),
                     ), 403
                 abort(403)
-            return func(*args, **kwargs)
+            response = func(*args, **kwargs)
+            status_code = 200
+            if isinstance(response, tuple) and len(response) > 1 and isinstance(response[1], int):
+                status_code = response[1]
+            elif hasattr(response, "status_code"):
+                status_code = response.status_code
+            if audit_success and operation and 200 <= status_code < 400:
+                from internal_audit import SUCCESS, try_record_audit_event
+                entity_id = kwargs.get(entity_id_arg) if entity_id_arg else None
+                try_record_audit_event(
+                    operation,
+                    result=SUCCESS,
+                    actor_context=actor,
+                    permission=permission,
+                    entity_type=entity_type,
+                    entity_id=entity_id,
+                )
+            return response
 
         wrapped.required_permission = permission
+        wrapped.audit_operation = operation
         return wrapped
 
     return decorator
