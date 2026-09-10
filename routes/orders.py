@@ -603,6 +603,12 @@ def register_routes(context):
                 shipment_status = norm((shipment or {}).get("status"))
                 if not shipment_status:
                     shipment_status_error = "InPost nie zwrócił statusu tej przesyłki."
+                else:
+                    transition = apply_verified_inpost_status(dict(o), shipment)
+                    if not transition.get("ok"):
+                        shipment_status_error = "Status zamówienia zapisano, ale działanie dodatkowe wymaga ponowienia: " + norm(transition.get("error"))[:160]
+                    cur.execute("SELECT * FROM orders WHERE id=?", (order_id,))
+                    o = cur.fetchone()
             except Exception as exc:
                 shipment_status_error = f"Nie udało się pobrać statusu z InPost: {norm(exc)[:180]}"
 
