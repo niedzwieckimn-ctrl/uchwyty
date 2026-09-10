@@ -91,6 +91,7 @@ _configuration_lock = threading.Lock()
 
 
 PILOT_POLICIES = (
+    ("policy-inventory-product-get", "inventory.product.get", 1, "inventory.read", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
     ("policy-internal-test-read", "internal.test.read_status", 1, "system.audit_read", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
     ("policy-internal-test-change", "internal.test.change_setting", 1, "internal.test.change_setting", YELLOW, 1, "approvals.decide", 3600, 0, None, 1),
     ("policy-internal-test-red", "internal.test.red_action", 1, "internal.test.change_setting", RED, 1, "approvals.decide", 1800, 0, None, 1),
@@ -347,6 +348,18 @@ def _request_row(approval_id: str):
         db.close()
 
 
+def get_request_snapshot(approval_id: str) -> dict[str, Any] | None:
+    """Return trusted internal execution metadata; safe_payload is already sanitized."""
+    row = _request_row(approval_id)
+    return dict(row) if row is not None else None
+
+
+def get_request_snapshot(approval_id: str) -> dict[str, Any] | None:
+    """Return a safe internal snapshot for orchestration; it grants no authority."""
+    row = _request_row(approval_id)
+    return dict(row) if row is not None else None
+
+
 def _audit_transition(event: str, row, *, actor, result: str, reason: str = "", error_code: str = "", transaction_connection=None) -> None:
     record_audit_event(
         event, result=result, actor_context=actor, permission=row["permission"],
@@ -503,7 +516,9 @@ def cancel_request(approval_id: str, actor_context: ActorContext, *, reason: str
         raise ApprovalDenied("INVALID_APPROVAL_STATUS", "Approval nie jest PENDING")
 
 
-def _deny(row, actor, code: str, message: str, *, stale: bool = False):
+def _deny(row, actor, code: str, message: str, *, stale: bool = False, transaction_connection=None):
+    if transaction_connection is not None:
+        transaction_connection.rollback()
     _audit_transition("approval.stale" if stale else "approval.execution_denied", row, actor=actor, result=CONFLICT if stale else DENIED, reason=message, error_code=code)
     exc = StaleApproval if stale else ApprovalDenied
     raise exc(code, message)
@@ -517,51 +532,56 @@ def authorize_execution(
     operation_version: int = 1, expected_entity_version: int | None = None,
     current_entity_version: int | None = None,
     claimed_risk_level: str | None = None,
+    transaction_connection: sqlite3.Connection | None = None,
 ) -> None:
     """Revalidate current state and atomically claim one approval for execution."""
     del claimed_risk_level
     actor = _trusted_actor(requesting_actor_context)
+    def deny(code: str, message: str, *, stale: bool = False):
+        _deny(row, actor, code, message, stale=stale, transaction_connection=transaction_connection)
     row = _expire_if_needed(_request_row(approval_id))
     if row is None:
         raise ApprovalDenied("APPROVAL_NOT_FOUND", "Nie znaleziono approval")
     if row["status"] != APPROVED:
-        _deny(row, actor, "INVALID_APPROVAL_STATUS", f"Approval ma status {row['status']}")
+        deny("INVALID_APPROVAL_STATUS", f"Approval ma status {row['status']}")
     if actor.actor_id != row["requesting_actor_id"]:
-        _deny(row, actor, "REQUESTING_ACTOR_CHANGED", "Approval należy do innego aktora", stale=True)
+        deny("REQUESTING_ACTOR_CHANGED", "Approval należy do innego aktora", stale=True)
     try:
         policy = get_policy(operation, operation_version)
     except ApprovalDenied as exc:
-        _deny(row, actor, exc.code, str(exc), stale=True)
+        deny(exc.code, str(exc), stale=True)
     if actor.permission_decision(policy.permission) == PERMISSION_DENY:
-        _deny(row, actor, "PERMISSION_REVOKED", "Permission został odebrany")
+        deny("PERMISSION_REVOKED", "Permission został odebrany")
     if operation != row["operation"] or int(operation_version) != int(row["operation_version"]):
-        _deny(row, actor, "OPERATION_CHANGED", "Operacja lub jej wersja zmieniła się", stale=True)
+        deny("OPERATION_CHANGED", "Operacja lub jej wersja zmieniła się", stale=True)
     if policy.policy_id != row["policy_id"] or policy.permission != row["permission"] or RISK_ORDER[policy.risk_level] > RISK_ORDER[row["risk_level"]] or (policy.requires_approval and not bool(row["approved_by_actor_id"])):
-        _deny(row, actor, "POLICY_CHANGED", "Aktualna polityka jest bardziej restrykcyjna", stale=True)
+        deny("POLICY_CHANGED", "Aktualna polityka jest bardziej restrykcyjna", stale=True)
     current_policy_expiry = _parse_time(row["requested_at"]) + timedelta(seconds=policy.expiry_seconds)
     if current_policy_expiry <= _utc_now_dt():
-        _deny(row, actor, "POLICY_CHANGED", "Aktualna polityka skróciła ważność approval", stale=True)
+        deny("POLICY_CHANGED", "Aktualna polityka skróciła ważność approval", stale=True)
     fingerprint, _ = operation_fingerprint(
         operation=operation, operation_version=operation_version,
         entity_type=entity_type, entity_id=entity_id, payload=payload,
         requesting_actor_id=actor.actor_id, expected_entity_version=expected_entity_version,
     )
     if fingerprint != row["operation_fingerprint"]:
-        _deny(row, actor, "STALE_APPROVAL", "Fingerprint operacji nie jest już aktualny", stale=True)
+        deny("STALE_APPROVAL", "Fingerprint operacji nie jest już aktualny", stale=True)
     if row["expected_entity_version"] is not None and current_entity_version != row["expected_entity_version"]:
-        _deny(row, actor, "ENTITY_VERSION_CONFLICT", "Wersja obiektu zmieniła się", stale=True)
+        deny("ENTITY_VERSION_CONFLICT", "Wersja obiektu zmieniła się", stale=True)
     approved_by = row["approved_by_actor_id"]
     approved_actor = load_actor_context(str(approved_by), source="approval_execution_recheck")
     if approved_actor is None or approved_actor.actor_type != ACTOR_HUMAN:
-        _deny(row, actor, "INVALID_APPROVER", "Approval nie pochodzi od aktywnego HUMAN")
+        deny("INVALID_APPROVER", "Approval nie pochodzi od aktywnego HUMAN")
     if approved_actor.permission_decision(policy.approver_permission) != ALLOW:
-        _deny(row, actor, "APPROVER_PERMISSION_REVOKED", "Approver utracił wymagane permission")
+        deny("APPROVER_PERMISSION_REVOKED", "Approver utracił wymagane permission")
     if approved_actor.actor_id == actor.actor_id and not policy.self_approval_allowed:
-        _deny(row, actor, "SELF_APPROVAL_DENIED", "Aktualna polityka zabrania self approval", stale=True)
+        deny("SELF_APPROVAL_DENIED", "Aktualna polityka zabrania self approval", stale=True)
     now = _iso(_utc_now_dt())
-    db = _factory()()
+    owns_transaction = transaction_connection is None
+    db = transaction_connection or _factory()()
     try:
-        db.execute("BEGIN IMMEDIATE")
+        if owns_transaction:
+            db.execute("BEGIN IMMEDIATE")
         cursor = db.execute(
             """UPDATE internal_approval_requests SET status='CONSUMED',consumed_at=?,updated_at=?
                WHERE approval_id=? AND status='APPROVED' AND expires_at>?""",
@@ -575,17 +595,23 @@ def authorize_execution(
                 "approval.consumed", consumed, actor=actor, result=SUCCESS,
                 reason="Approval atomowo skonsumowany", transaction_connection=db,
             )
-            db.commit()
-        else:
+            if owns_transaction:
+                db.commit()
+        elif owns_transaction:
             db.rollback()
     except Exception:
-        db.rollback()
+        if owns_transaction:
+            db.rollback()
         raise
     finally:
-        db.close()
+        if owns_transaction:
+            db.close()
     if cursor.rowcount != 1:
         latest = _request_row(approval_id)
-        _deny(latest, actor, "ALREADY_CONSUMED", "Approval został już wykorzystany lub wygasł")
+        _deny(
+            latest, actor, "ALREADY_CONSUMED", "Approval został już wykorzystany lub wygasł",
+            transaction_connection=transaction_connection,
+        )
 
 
 consume_approval = authorize_execution

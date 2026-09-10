@@ -91,6 +91,20 @@ OPERATION_DEFINITIONS: dict[str, OperationDefinition] = {
     "approval.consumed": OperationDefinition("approval.consumed", 1, None, YELLOW, SECURITY),
     "approval.execution_denied": OperationDefinition("approval.execution_denied", 1, None, YELLOW, SECURITY),
     "approval.stale": OperationDefinition("approval.stale", 1, None, YELLOW, SECURITY),
+    "business_operation.requested": OperationDefinition("business_operation.requested", 1, None, GREEN, WRITE),
+    "business_operation.denied": OperationDefinition("business_operation.denied", 1, None, YELLOW, SECURITY),
+    "business_operation.pending_approval": OperationDefinition("business_operation.pending_approval", 1, None, YELLOW, WRITE),
+    "business_operation.started": OperationDefinition("business_operation.started", 1, None, YELLOW, WRITE),
+    "business_operation.success": OperationDefinition("business_operation.success", 1, None, GREEN, WRITE),
+    "business_operation.failed": OperationDefinition("business_operation.failed", 1, None, YELLOW, SECURITY),
+    "business_operation.conflict": OperationDefinition("business_operation.conflict", 1, None, YELLOW, SECURITY),
+    "business_operation.requested": OperationDefinition("business_operation.requested", 1, None, GREEN, SECURITY),
+    "business_operation.denied": OperationDefinition("business_operation.denied", 1, None, YELLOW, SECURITY),
+    "business_operation.pending_approval": OperationDefinition("business_operation.pending_approval", 1, None, YELLOW, SECURITY),
+    "business_operation.started": OperationDefinition("business_operation.started", 1, None, YELLOW, SECURITY),
+    "business_operation.success": OperationDefinition("business_operation.success", 1, None, GREEN, SECURITY),
+    "business_operation.failed": OperationDefinition("business_operation.failed", 1, None, YELLOW, SECURITY),
+    "business_operation.conflict": OperationDefinition("business_operation.conflict", 1, None, YELLOW, SECURITY),
 }
 
 
@@ -243,7 +257,7 @@ def sanitize_audit_data(value: Any) -> Any:
 _INLINE_SECRET_PATTERNS = (
     re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+\-/=]+"),
     re.compile(
-        r"(?i)\b(password|passwd|secret|token|api[_-]?key|authorization|cookie)"
+        r"(?i)\b(password|passwd|secret|token|api[_-]?(?:key|token)|access[_-]?token|authorization|cookie)"
         r"\s*[:=]\s*([^\s,;]+)"
     ),
 )

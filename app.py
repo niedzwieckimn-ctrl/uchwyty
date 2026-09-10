@@ -61,6 +61,11 @@ from internal_approval import (
     configure as configure_internal_approval,
     initialize_schema as initialize_internal_approval_schema,
 )
+from business_operations import (
+    configure as configure_business_operations,
+    execute_business_operation,
+    initialize_schema as initialize_business_operations_schema,
+)
 
 import qrcode
 from reportlab.pdfgen import canvas
@@ -256,6 +261,7 @@ configure_internal_audit(conn)
 configure_internal_concurrency(conn)
 configure_internal_audit_outbox(conn)
 configure_internal_approval(conn)
+configure_business_operations(conn)
 
 def init_db():
     c = conn()
@@ -762,6 +768,7 @@ def init_db():
     initialize_internal_audit_outbox_schema(c)
     initialize_internal_concurrency_schema(c)
     initialize_internal_approval_schema(c)
+    initialize_business_operations_schema(c)
     c.close()
 
 init_db()
