@@ -232,12 +232,12 @@ CHINA_SUMMARY_INPUT = {
 }
 CHINA_SUMMARY_OUTPUT = {
     "type": "object", "additionalProperties": False,
-    "required": ["ok", "scope", "order_count", "item_units", "by_status", "packages_by_status", "pieces_by_status"],
+    "required": ["ok", "scope", "order_count", "item_units", "by_status", "packages_by_status", "pieces_by_status", "pieces_excluding_planned"],
     "properties": {
         "ok": {"type": "boolean"}, "scope": {"type": "string"},
         "order_count": {"type": "integer"}, "item_units": {"type": "integer"},
         "by_status": {"type": "object"}, "packages_by_status": {"type": "object"},
-        "pieces_by_status": {"type": "object"},
+        "pieces_by_status": {"type": "object"}, "pieces_excluding_planned": {"type": "integer"},
     },
 }
 PILOT_INPUT = {
@@ -1033,7 +1033,10 @@ def _china_orders_summary(data, actor, correlation_id, transaction_connection=No
         return {"ok": True, "scope": scope, "order_count": len(rows),
                 "item_units": sum(int(row["units"] or 0) for row in rows),
                 "by_status": packages_by_status, "packages_by_status": packages_by_status,
-                "pieces_by_status": pieces_by_status}
+                "pieces_by_status": pieces_by_status,
+                "pieces_excluding_planned": sum(
+                    units for status, units in pieces_by_status.items() if status != "planned"
+                )}
     finally:
         if transaction_connection is None: db.close()
 

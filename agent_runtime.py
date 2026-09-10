@@ -10,6 +10,7 @@ import os
 import re
 import time
 import uuid
+from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Protocol
 
 import requests
@@ -34,6 +35,21 @@ _CLARIFICATION = re.compile(r"(?i)\b(który|która|które|którego|doprecyzuj|po
 _CONTEXT_REFERENCE = re.compile(r"(?i)\b(ten|ta|to|te|tego|tej|tych|jego|jej|nich|drugi|druga|pierwszy|pierwsza)\b")
 _SAFE_API_ERROR_CODE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 logger = logging.getLogger(__name__)
+_NUMERIC_LITERAL = re.compile(r"(?<![\w])(?:\d{1,3}(?:[ \u00a0\u202f]\d{3})+|\d+)(?:[.,]\d+)?(?![\w])")
+
+
+def _normalized_numbers(value: str) -> set[str]:
+    """Canonicalize equivalent Polish/JSON number spellings without doing arithmetic."""
+    normalized = set()
+    for match in _NUMERIC_LITERAL.finditer(str(value or "")):
+        raw = re.sub(r"[ \u00a0\u202f]", "", match.group(0)).replace(",", ".")
+        try:
+            number = Decimal(raw)
+        except InvalidOperation:
+            continue
+        canonical = format(number.normalize(), "f")
+        normalized.add("0" if canonical in {"-0", ""} else canonical)
+    return normalized
 
 
 def _log_provider_failure(*, exc: Exception, model: str, stage: str, response=None) -> None:
@@ -327,9 +343,9 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
     )
     tool_count, model_name = 0, ""
     usage = {"input_tokens": 0, "output_tokens": 0}
-    grounded_numbers = set(re.findall(r"\b\d+(?:[.,]\d+)?\b", message))
+    grounded_numbers = _normalized_numbers(message)
     if conversation_state and _CONTEXT_REFERENCE.search(message) and not _DATA_INTENT.search(message):
-        grounded_numbers.update(re.findall(r"\b\d+(?:[.,]\d+)?\b", context_json))
+        grounded_numbers.update(_normalized_numbers(context_json))
     seen_tool_calls: set[str] = set()
     successful_tools = 0
     tool_latencies_ms: list[int] = []
@@ -454,7 +470,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 encoded = json.dumps(safe_result, ensure_ascii=False, separators=(",", ":"))
                 if len(encoded.encode("utf-8")) > MAX_TOOL_RESULT_BYTES:
                     raise RuntimeError("TOOL_RESULT_TOO_LARGE")
-                grounded_numbers.update(re.findall(r"\b\d+(?:[.,]\d+)?\b", encoded))
+                grounded_numbers.update(_normalized_numbers(encoded))
                 response_items = list(reply.output_items)
                 if not response_items:
                     # Fake/custom providers may expose only the normalized call.
@@ -477,7 +493,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 return _controlled("FAILED", "Nie mam potwierdzonego wyniku narzędzia dla tej informacji.", run_id,
                                    correlation_id, model=model_name, usage=usage,
                                    error_code="TOOL_REQUIRED_FOR_DATA", conversation_id=conversation_id)
-            if not set(re.findall(r"\b\d+(?:[.,]\d+)?\b", answer)) <= grounded_numbers:
+            if not _normalized_numbers(answer) <= grounded_numbers:
                 raise RuntimeError("UNGROUNDED_NUMERIC_DATA")
             metadata = {"model": model_name, "latency_ms": int((time.monotonic() - started) * 1000),
                         "input_tokens": usage["input_tokens"], "output_tokens": usage["output_tokens"],
@@ -490,6 +506,16 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
             return _controlled("SUCCESS", answer, run_id, correlation_id, tools=tool_count,
                                model=model_name, usage=usage, conversation_id=conversation_id)
     except Exception as exc:
+        failure_stage = "grounding" if str(exc) == "UNGROUNDED_NUMERIC_DATA" else "runtime"
+        safe_internal_code = str(exc) if str(exc) in {
+            "TOOL_LIMIT_EXCEEDED", "TOOL_RESULT_TOO_LARGE", "REPEATED_TOOL_CALL",
+            "CONTEXT_LIMIT_EXCEEDED", "UNGROUNDED_NUMERIC_DATA",
+        } else type(exc).__name__
+        logger.error("AI_RUNTIME_FAILURE %s", json.dumps({
+            "agent_run_id": run_id, "conversation_id": conversation_id,
+            "stage": failure_stage, "error_code": safe_internal_code,
+            "tool_calls": tool_count, "successful_tools": successful_tools,
+        }, ensure_ascii=False, sort_keys=True))
         code = str(exc) if str(exc) in {"TOOL_LIMIT_EXCEEDED", "TOOL_RESULT_TOO_LARGE", "REPEATED_TOOL_CALL", "CONTEXT_LIMIT_EXCEEDED"} else "MODEL_FAILED"
         _audit("agent.failed", ai_actor, run_id, correlation_id, FAILED,
                initiated_by=human_actor.actor_id, error=code,
