@@ -91,9 +91,11 @@ _configuration_lock = threading.Lock()
 
 
 PILOT_POLICIES = (
+    ("policy-inventory-product-search", "inventory.product.search", 1, "inventory.read", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
     ("policy-inventory-product-get", "inventory.product.get", 1, "inventory.read", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
     ("policy-internal-test-read", "internal.test.read_status", 1, "system.audit_read", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
     ("policy-internal-test-change", "internal.test.change_setting", 1, "internal.test.change_setting", YELLOW, 1, "approvals.decide", 3600, 0, None, 1),
+    ("policy-internal-test-external", "internal.test.external.execute", 1, "internal.test.change_setting", YELLOW, 1, "approvals.decide", 3600, 0, None, 1),
     ("policy-internal-test-red", "internal.test.red_action", 1, "internal.test.change_setting", RED, 1, "approvals.decide", 1800, 0, None, 1),
 )
 

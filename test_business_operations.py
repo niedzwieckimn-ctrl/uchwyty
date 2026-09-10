@@ -90,7 +90,8 @@ def _execution(execution_id):
 
 def test_registry_is_closed_and_contains_required_contracts(isolated):
     assert set(operations.OPERATION_REGISTRY) == {
-        "inventory.product.get", "internal.test.change_setting"
+        "inventory.product.get", "inventory.product.search",
+        "internal.test.change_setting", "internal.test.external.execute"
     }
     for item in operations.OPERATION_REGISTRY.values():
         assert item.operation_version == 1

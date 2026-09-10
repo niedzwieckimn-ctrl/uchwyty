@@ -105,6 +105,22 @@ OPERATION_DEFINITIONS: dict[str, OperationDefinition] = {
     "business_operation.success": OperationDefinition("business_operation.success", 1, None, GREEN, SECURITY),
     "business_operation.failed": OperationDefinition("business_operation.failed", 1, None, YELLOW, SECURITY),
     "business_operation.conflict": OperationDefinition("business_operation.conflict", 1, None, YELLOW, SECURITY),
+    "external_execution.queued": OperationDefinition("external_execution.queued", 1, None, YELLOW, WRITE),
+    "external_execution.claimed": OperationDefinition("external_execution.claimed", 1, None, YELLOW, SECURITY),
+    "external_execution.started": OperationDefinition("external_execution.started", 1, None, YELLOW, SECURITY),
+    "external_execution.success": OperationDefinition("external_execution.success", 1, None, GREEN, WRITE),
+    "external_execution.retryable_failure": OperationDefinition("external_execution.retryable_failure", 1, None, YELLOW, SECURITY),
+    "external_execution.permanent_failure": OperationDefinition("external_execution.permanent_failure", 1, None, YELLOW, SECURITY),
+    "external_execution.unknown": OperationDefinition("external_execution.unknown", 1, None, YELLOW, SECURITY),
+    "external_execution.reconciliation_started": OperationDefinition("external_execution.reconciliation_started", 1, None, YELLOW, SECURITY),
+    "external_execution.reconciled_success": OperationDefinition("external_execution.reconciled_success", 1, None, GREEN, WRITE),
+    "external_execution.reconciled_failure": OperationDefinition("external_execution.reconciled_failure", 1, None, YELLOW, SECURITY),
+    "external_execution.still_unknown": OperationDefinition("external_execution.still_unknown", 1, None, YELLOW, SECURITY),
+    "agent.requested": OperationDefinition("agent.requested", 1, None, GREEN, SECURITY),
+    "agent.tool_selected": OperationDefinition("agent.tool_selected", 1, None, GREEN, SECURITY),
+    "agent.tool_result": OperationDefinition("agent.tool_result", 1, None, GREEN, SECURITY),
+    "agent.completed": OperationDefinition("agent.completed", 1, None, GREEN, SECURITY),
+    "agent.failed": OperationDefinition("agent.failed", 1, None, YELLOW, SECURITY),
 }
 
 
@@ -221,7 +237,10 @@ def _sanitize(value: Any, *, depth: int = 0) -> Any:
     if isinstance(value, bytes):
         return f"[BINARY {len(value)} bytes]"
     if isinstance(value, str):
-        return value if len(value) <= MAX_TEXT_LENGTH else value[:MAX_TEXT_LENGTH] + TRUNCATED
+        # Free-form values can contain credentials even when their field name is harmless.
+        text = _INLINE_SECRET_PATTERNS[0].sub("Bearer " + REDACTED, value)
+        text = _INLINE_SECRET_PATTERNS[1].sub(lambda match: f"{match.group(1)}={REDACTED}", text)
+        return text if len(text) <= MAX_TEXT_LENGTH else text[:MAX_TEXT_LENGTH] + TRUNCATED
     if isinstance(value, Mapping):
         cleaned: dict[str, Any] = {}
         for index, (key, item) in enumerate(value.items()):

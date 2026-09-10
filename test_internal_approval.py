@@ -259,7 +259,14 @@ def test_risk_spoofing_is_ignored(isolated):
 
 
 def test_ai_may_request_but_may_not_approve(isolated):
-    ai = _create_actor("AI_AGENT", "AI_OWNER_ASSISTANT")
+    # The production AI_OWNER_ASSISTANT is now strictly read-only. Give a
+    # separate AI role the isolated pilot permission only for this engine test.
+    db = backend.conn()
+    db.execute("""INSERT INTO internal_role_permissions(role_key,permission_key,decision)
+                  VALUES('AI_SALES','internal.test.change_setting','APPROVAL_REQUIRED')
+                  ON CONFLICT(role_key,permission_key) DO UPDATE SET decision='APPROVAL_REQUIRED'""")
+    db.commit(); db.close()
+    ai = _create_actor("AI_AGENT", "AI_SALES")
     resource = _resource()
     approval_id = _request(ai, resource)
     assert _row(approval_id)["requesting_actor_type"] == "AI_AGENT"

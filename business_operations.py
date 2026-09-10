@@ -109,6 +109,28 @@ PRODUCT_GET_OUTPUT = {
         "stock": {"type": "integer"},
     },
 }
+PRODUCT_SEARCH_INPUT = {
+    "type": "object", "additionalProperties": False, "required": ["query"],
+    "properties": {"query": {"type": "string", "minLength": 1, "maxLength": 120}},
+}
+_PRODUCT_FIELDS = {
+    "type": "object", "additionalProperties": False,
+    "required": ["id", "sku", "model", "name", "stock"],
+    "properties": {
+        "id": {"type": "integer"}, "sku": {"type": "string"},
+        "model": {"type": ["string", "null"]}, "name": {"type": ["string", "null"]},
+        "stock": {"type": "integer"},
+    },
+}
+PRODUCT_SEARCH_OUTPUT = {
+    "type": "object", "additionalProperties": False,
+    "required": ["ok", "query", "candidates", "count", "truncated"],
+    "properties": {
+        "ok": {"type": "boolean"}, "query": {"type": "string"},
+        "candidates": {"type": "array", "maxItems": 10, "items": _PRODUCT_FIELDS},
+        "count": {"type": "integer"}, "truncated": {"type": "boolean"},
+    },
+}
 PILOT_INPUT = {
     "type": "object",
     "additionalProperties": False,
@@ -127,9 +149,33 @@ PILOT_OUTPUT = {
         "amount": {"type": "integer"},
     },
 }
+EXTERNAL_TEST_INPUT = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["scenario", "value"],
+    "properties": {
+        "scenario": {"type": "string", "maxLength": 64, "enum": [
+            "success", "timeout_before_send", "timeout_after_side_effect", "lost_response",
+            "http_500", "http_400", "rate_limit", "remote_absent",
+            "reconciliation_failure", "still_unknown", "crash_before_send",
+            "crash_after_remote_success", "duplicate", "secret_error",
+        ]},
+        "value": {"type": "string", "maxLength": 200},
+    },
+}
+EXTERNAL_TEST_OUTPUT = {
+    "type": "object",
+    "required": ["queue_status"],
+    "properties": {"queue_status": {"type": "string"}},
+}
 
 
 OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
+    "inventory.product.search": BusinessOperationDefinition(
+        "inventory.product.search", 1, "Wyszukuje produkty po SKU, modelu lub nazwie i zwraca ograniczony stan.",
+        "inventory.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "SYSTEM", "AI_AGENT"}),
+        PRODUCT_SEARCH_INPUT, PRODUCT_SEARCH_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
+    ),
     "inventory.product.get": BusinessOperationDefinition(
         "inventory.product.get", 1, "Pobiera minimalny wewnętrzny widok produktu i stanu.",
         "inventory.read", approvals.GREEN, "NONE",
@@ -141,6 +187,12 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
         "internal.test.change_setting", approvals.YELLOW, "REQUIRED",
         frozenset({"HUMAN", "AI_AGENT"}),
         PILOT_INPUT, PILOT_OUTPUT, IDEMPOTENCY_REQUIRED, "WRITE", False,
+    ),
+    "internal.test.external.execute": BusinessOperationDefinition(
+        "internal.test.external.execute", 1, "Uruchamia wyłącznie izolowany adapter zewnętrzny bez sieci.",
+        "internal.test.change_setting", approvals.YELLOW, "REQUIRED",
+        frozenset({"HUMAN", "AI_AGENT"}),
+        EXTERNAL_TEST_INPUT, EXTERNAL_TEST_OUTPUT, IDEMPOTENCY_REQUIRED, "WRITE", False,
     ),
 }
 
@@ -229,7 +281,7 @@ def _validate_value(name: str, value: Any, rule: Mapping[str, Any]) -> Any:
         if value < rule.get("minimum", value) or value > rule.get("maximum", value):
             raise ControlledOperationError("INVALID_INPUT", f"Pole {name} przekracza dozwolony zakres", status=DENIED)
     elif expected == "string":
-        if not isinstance(value, str) or not value or len(value) > rule.get("maxLength", 2_000):
+        if not isinstance(value, str) or len(value) < rule.get("minLength", 1) or len(value) > rule.get("maxLength", 2_000):
             raise ControlledOperationError("INVALID_INPUT", f"Pole {name} ma nieprawidłową wartość", status=DENIED)
         if rule.get("format") == "uuid":
             try:
@@ -265,9 +317,18 @@ def validate_output(definition: BusinessOperationDefinition, supplied: Any) -> d
     for name, value in supplied.items():
         expected = schema["properties"][name].get("type")
         allowed = set(expected if isinstance(expected, list) else [expected])
-        actual = "null" if value is None else "boolean" if isinstance(value, bool) else "integer" if isinstance(value, int) else "string" if isinstance(value, str) else "other"
+        actual = "null" if value is None else "boolean" if isinstance(value, bool) else "integer" if isinstance(value, int) else "number" if isinstance(value, float) else "string" if isinstance(value, str) else "array" if isinstance(value, list) else "object" if isinstance(value, Mapping) else "other"
         if actual not in allowed:
             raise ControlledOperationError("INVALID_HANDLER_OUTPUT", f"Handler zwrócił zły typ pola {name}")
+        if actual == "array":
+            if len(value) > schema["properties"][name].get("maxItems", 100):
+                raise ControlledOperationError("INVALID_HANDLER_OUTPUT", f"Handler zwrócił za dużo elementów pola {name}")
+            item_schema = schema["properties"][name].get("items", {})
+            for item in value:
+                if not isinstance(item, Mapping):
+                    raise ControlledOperationError("INVALID_HANDLER_OUTPUT", f"Handler zwrócił zły element pola {name}")
+                if set(item_schema.get("required", ())) - set(item) or set(item) - set(item_schema.get("properties", {})):
+                    raise ControlledOperationError("INVALID_HANDLER_OUTPUT", f"Handler zwrócił nieprawidłowe pola {name}")
     return dict(supplied)
 
 
@@ -281,10 +342,14 @@ def _fingerprint(definition: BusinessOperationDefinition, actor: ActorContext, d
 
 
 def _entity(definition: BusinessOperationDefinition, data: Mapping[str, Any]) -> tuple[str, str, int | None]:
+    if definition.operation_name == "inventory.product.search":
+        return "product_search", sanitize_audit_text(data["query"])[:120], None
     if definition.operation_name == "inventory.product.get":
         return "product", str(data["product_id"]), None
     if definition.operation_name == "internal.test.change_setting":
         return "internal_versioned_resource", data["resource_id"], data["expected_version"]
+    if definition.operation_name == "internal.test.external.execute":
+        return "external_test_operation", str(data["value"]), None
     raise ControlledOperationError("REGISTRY_INCONSISTENT", "Brak mapowania obiektu", status=DENIED)
 
 
@@ -438,6 +503,34 @@ def _product_get(data, actor, correlation_id, transaction_connection=None):
             "ean": row["ean"], "name": row["name"], "stock": int(row["stock"])}
 
 
+def _product_search(data, actor, correlation_id, transaction_connection=None):
+    query = " ".join(str(data["query"]).strip().lower().split())
+    tokens = [token for token in re.split(r"[^a-z0-9ąćęłńóśźż]+", query) if token][:8]
+    if not tokens:
+        raise ControlledOperationError("INVALID_INPUT", "Fraza wyszukiwania jest pusta", status=DENIED)
+    haystack = "lower(coalesce(p.sku,'') || ' ' || coalesce(p.model,'') || ' ' || coalesce(p.name,'') || ' ' || coalesce(p.ean,''))"
+    where = " AND ".join(f"{haystack} LIKE ?" for _ in tokens)
+    params = [f"%{token}%" for token in tokens]
+    db = transaction_connection or _factory()()
+    try:
+        found = db.execute(
+            f"""SELECT p.id,p.sku,p.model,p.name,COALESCE(s.qty,0) stock
+                FROM products p LEFT JOIN stock s ON s.product_id=p.id
+                WHERE COALESCE(p.archived,0)=0 AND {where}
+                ORDER BY CASE WHEN lower(coalesce(p.sku,''))=? THEN 0
+                              WHEN lower(coalesce(p.model,''))=? THEN 1 ELSE 2 END,
+                         p.sku,p.id LIMIT 11""",
+            (*params, query, query),
+        ).fetchall()
+    finally:
+        if transaction_connection is None:
+            db.close()
+    candidates = [{"id": int(row["id"]), "sku": row["sku"] or "", "model": row["model"],
+                   "name": row["name"], "stock": int(row["stock"])} for row in found[:10]]
+    return {"ok": True, "query": query, "candidates": candidates,
+            "count": len(candidates), "truncated": len(found) > 10}
+
+
 def _pilot_change(data, actor, correlation_id, transaction_connection=None):
     if transaction_connection is None:
         raise ControlledOperationError("TRANSACTION_REQUIRED", "Pilot wymaga wspólnej transakcji")
@@ -470,8 +563,11 @@ def _pilot_change(data, actor, correlation_id, transaction_connection=None):
 
 
 _HANDLERS: dict[str, Callable[[Mapping[str, Any], ActorContext, str, sqlite3.Connection | None], Any]] = {
+    "inventory.product.search": _product_search,
     "inventory.product.get": _product_get,
     "internal.test.change_setting": _pilot_change,
+    # External operations are queued below and are never called through this map.
+    "internal.test.external.execute": lambda *_args, **_kwargs: None,
 }
 
 
@@ -627,6 +723,10 @@ def execute_business_operation(
                 row = _transition(execution_id, definition, actor, "DENIED", "business_operation.denied", DENIED,
                                   error_code="APPROVAL_NOT_APPROVED", message=f"Approval ma status {snapshot['status']}", completed=True)
                 return _result_from_row(row)
+            if definition.operation_name == "internal.test.external.execute":
+                from external_execution import queue_execution
+                queued = queue_execution(execution_id, actor, data, external_system="test")
+                return _result_from_row(_execution(execution_id))
             claimed = _transition(
                 execution_id, definition, actor, "RUNNING", "business_operation.started", SUCCESS,
                 started=True, expected_statuses=("PENDING_APPROVAL",),

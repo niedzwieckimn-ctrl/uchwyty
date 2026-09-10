@@ -41,6 +41,7 @@ from internal_rbac import (
     initialize_schema as initialize_internal_rbac_schema,
     require_permission,
 )
+from agent_runtime import provider_from_env, run_agent_turn
 from internal_audit import (
     configure as configure_internal_audit,
     initialize_schema as initialize_internal_audit_schema,
@@ -789,6 +790,30 @@ init_db()
 def api_external_execution_health():
     """Minimal protected operational view; contains no payloads or credentials."""
     return jsonify(ok=True, **external_execution_health(current_actor_context()))
+
+
+AGENT_MODEL_PROVIDER = None
+
+
+@app.post("/api/internal/ai/chat")
+@require_permission("inventory.read")
+def api_internal_ai_chat():
+    """Internal text-only, read-only AI runtime. Request identity fields are ignored."""
+    if not _rate_limit("internal_ai_chat", 30, 60):
+        return jsonify(ok=False, status="DENIED", error_code="RATE_LIMITED",
+                       message="Zbyt wiele żądań do asystenta."), 429
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify(ok=False, status="DENIED", error_code="INVALID_REQUEST",
+                       message="Nieprawidłowy format żądania."), 400
+    try:
+        provider = AGENT_MODEL_PROVIDER or provider_from_env()
+    except Exception:
+        return jsonify(ok=False, status="FAILED", error_code="MODEL_NOT_CONFIGURED",
+                       message="Model asystenta nie jest jeszcze skonfigurowany."), 503
+    result = run_agent_turn(current_actor_context(), payload.get("message", ""), provider)
+    status_code = 200 if result["status"] == "SUCCESS" else 403 if result["status"] == "DENIED" else 503
+    return jsonify(result), status_code
 
 
 # =========================

@@ -32,6 +32,7 @@ APPROVAL_REQUIRED = "APPROVAL_REQUIRED"
 DECISIONS = frozenset({ALLOW, DENY, APPROVAL_REQUIRED})
 
 BOOTSTRAP_OWNER_ACTOR_ID = "00000000-0000-4000-8000-000000000001"
+AI_OWNER_ASSISTANT_ACTOR_ID = "20000000-0000-4000-8000-000000000001"
 BOOTSTRAP_OWNER_DISPLAY_NAME = "Bootstrap Owner"
 
 
@@ -257,7 +258,7 @@ ROLE_PERMISSION_DECISIONS = {
         "invoices.status_read", "ksef.read", "customers.read", "shipping.read",
         "shipping.track", "purchases.read", "payments.read", "reports.read",
         "cashflow.read", "system.audit_read", "approvals.review",
-    }, approval={"internal.test.change_setting"}),
+    }),
     "SYSTEM_KSEF_SCHEDULER": _decisions(
         allow={"invoices.read", "invoices.send_customer", "ksef.read", "ksef.validate"},
         approval={"ksef.send"},
@@ -425,6 +426,8 @@ def initialize_schema(db: sqlite3.Connection) -> None:
 
     _upsert_actor(db, BOOTSTRAP_OWNER_ACTOR_ID, ACTOR_HUMAN, BOOTSTRAP_OWNER_DISPLAY_NAME, now)
     _assign_role(db, BOOTSTRAP_OWNER_ACTOR_ID, "OWNER", now)
+    _upsert_actor(db, AI_OWNER_ASSISTANT_ACTOR_ID, ACTOR_AI_AGENT, "AI Owner Assistant", now)
+    _assign_role(db, AI_OWNER_ASSISTANT_ACTOR_ID, "AI_OWNER_ASSISTANT", now)
     for actor_id, role_key in SYSTEM_ACTORS.items():
         _upsert_actor(db, actor_id, ACTOR_SYSTEM, ROLE_DEFINITIONS[role_key][0], now)
         _assign_role(db, actor_id, role_key, now)
