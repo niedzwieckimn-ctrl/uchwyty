@@ -209,7 +209,12 @@ def _tool_descriptors(ai_actor: ActorContext) -> list[dict[str, Any]]:
         safe.append({
             "type": "function", "name": descriptor["name"],
             "description": descriptor["description"], "parameters": descriptor["input_schema"],
-            "strict": True,
+            # Business Operation schemas intentionally contain optional fields.
+            # OpenAI strict mode requires every property to be listed in `required`;
+            # backend validate_input()/execution gate remain the authority here, so
+            # explicit non-strict function calling preserves those optional fields
+            # without weakening server-side validation or read-only enforcement.
+            "strict": False,
         })
     return safe
 
