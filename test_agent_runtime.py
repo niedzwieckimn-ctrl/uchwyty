@@ -230,6 +230,132 @@ def test_production_chat_endpoint_uses_runtime_and_real_business_operation_gate(
     assert tuple(execution) == ("inventory.product.search", "SUCCESS")
 
 
+@pytest.mark.parametrize(("query", "operation", "arguments", "assert_fresh", "answer"), [
+    ("Ile mamy Avery 160?", "inventory.product.search", {"query": "Avery 160"},
+     lambda data: data["count"] >= 1 and data["candidates"][0]["stock"] == 31,
+     "Na magazynie mamy 31 sztuk Avery 160."),
+    ("Mam niezapłacone faktury?", "invoices.overdue", {},
+     lambda data: data["count"] == 1,
+     "Znaleziono 1 niezapłaconą fakturę."),
+    ("Znajdź klienta AM Interiors", "customers.search", {"query": "AM Interiors"},
+     lambda data: data["count"] == 1,
+     "Znaleziono klienta AM Interiors."),
+])
+def test_chat_refreshes_stale_sqlite_before_real_business_operation(
+        monkeypatch, query, operation, arguments, assert_fresh, answer):
+    db = backend.conn()
+    db.execute("UPDATE stock SET qty=0 WHERE product_id=1")
+    db.execute("UPDATE invoice_meta SET paid=1 WHERE invoice_id=10")
+    db.execute("UPDATE customers SET name='Nieaktualny klient' WHERE id=10")
+    db.commit(); db.close()
+    pulls = []
+
+    def mocked_pull(*, force=False, delete_missing=True):
+        pulls.append((force, delete_missing))
+        fresh = backend.conn()
+        fresh.execute("UPDATE stock SET qty=31 WHERE product_id=1")
+        fresh.execute("UPDATE invoice_meta SET paid=0 WHERE invoice_id=10")
+        fresh.execute("UPDATE customers SET name='AM Interiors' WHERE id=10")
+        fresh.commit(); fresh.close()
+        return {"ok": True, "tables": {
+            "stock": {"status": "ok"}, "invoices": {"status": "ok"},
+            "invoice_meta": {"status": "ok"}, "customers": {"status": "ok"},
+        }}
+
+    observed = {}
+    def verify_fresh_output(kwargs):
+        observed["data"] = json.loads(kwargs["input_items"][-1]["output"])
+        return runtime.ProviderResponse(text=answer, model="fake-model")
+
+    monkeypatch.setattr(backend, "supabase_enabled", lambda: True)
+    monkeypatch.setattr(backend, "pull_shared_tables_from_supabase", mocked_pull)
+    backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([
+        tool(operation, arguments), verify_fresh_output,
+    ])
+    client = backend.app.test_client()
+    with client.session_transaction() as session:
+        session["admin_authenticated"] = True
+        session["csrf_token"] = "csrf"
+
+    response = client.post("/api/internal/ai/chat", json={"message": query})
+
+    assert response.status_code == 200
+    assert pulls == [(False, False)]
+    assert observed["data"]["ok"] is True
+    assert assert_fresh(observed["data"])
+
+
+def test_chat_refresh_failure_keeps_sqlite_fallback(monkeypatch, caplog):
+    monkeypatch.setattr(backend, "supabase_enabled", lambda: True)
+    monkeypatch.setattr(
+        backend, "pull_shared_tables_from_supabase",
+        lambda **_kwargs: (_ for _ in ()).throw(TimeoutError("sensitive upstream detail")),
+    )
+    backend.AGENT_MODEL_PROVIDER = fake_search_answer(
+        "Avery 160", "Na magazynie mamy 24 sztuki Avery 160."
+    )
+    client = backend.app.test_client()
+    with client.session_transaction() as session:
+        session["admin_authenticated"] = True
+        session["csrf_token"] = "csrf"
+
+    with caplog.at_level(logging.INFO, logger="app"):
+        response = client.post("/api/internal/ai/chat", json={"message": "Ile mamy Avery 160?"})
+
+    assert response.status_code == 200
+    assert "AI_DATA_REFRESH" in caplog.text
+    assert "TimeoutError" in caplog.text
+    assert "sensitive upstream detail" not in caplog.text
+
+
+def test_chat_without_supabase_skips_refresh_and_does_not_crash(monkeypatch, caplog):
+    monkeypatch.setattr(backend, "supabase_enabled", lambda: False)
+    monkeypatch.setattr(
+        backend, "pull_shared_tables_from_supabase",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("pull must not run")),
+    )
+    backend.AGENT_MODEL_PROVIDER = fake_search_answer(
+        "Avery 160", "Na magazynie mamy 24 sztuki Avery 160."
+    )
+    client = backend.app.test_client()
+    with client.session_transaction() as session:
+        session["admin_authenticated"] = True
+        session["csrf_token"] = "csrf"
+
+    with caplog.at_level(logging.INFO, logger="app"):
+        response = client.post("/api/internal/ai/chat", json={"message": "Ile mamy Avery 160?"})
+
+    assert response.status_code == 200
+    assert "AI_DATA_REFRESH" in caplog.text and "not_configured" in caplog.text
+
+
+def test_chat_refresh_runs_once_for_multi_tool_turn(monkeypatch):
+    pulls = []
+    monkeypatch.setattr(backend, "supabase_enabled", lambda: True)
+    monkeypatch.setattr(
+        backend, "pull_shared_tables_from_supabase",
+        lambda **kwargs: pulls.append(kwargs) or {"ok": True, "tables": {}},
+    )
+    backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([
+        tool("inventory.product.search", {"query": "Avery 160"}, "product"),
+        tool("invoices.overdue", {}, "overdue"),
+        runtime.ProviderResponse(text="Mamy 24 sztuki Avery 160 i 1 zaległą fakturę."),
+    ])
+    client = backend.app.test_client()
+    with client.session_transaction() as session:
+        session["admin_authenticated"] = True
+        session["csrf_token"] = "csrf"
+
+    response = client.post(
+        "/api/internal/ai/chat",
+        json={"message": "Ile mamy Avery 160 i ile jest zaległych faktur?"},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["tool_calls"] == 2
+    assert pulls == [{"force": False, "delete_missing": False}]
+
+
 def test_read_only_filter_survives_accidental_write_permission(monkeypatch):
     db = backend.conn()
     db.execute("INSERT INTO internal_role_permissions(role_key,permission_key,decision) VALUES('AI_OWNER_ASSISTANT','internal.test.change_setting','ALLOW') ON CONFLICT(role_key,permission_key) DO UPDATE SET decision='ALLOW'")

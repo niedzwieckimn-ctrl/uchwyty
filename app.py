@@ -850,6 +850,7 @@ def api_internal_ai_chat():
     except Exception:
         return jsonify(ok=False, status="FAILED", error_code="MODEL_NOT_CONFIGURED",
                        message="Model asystenta nie jest jeszcze skonfigurowany."), 503
+    refresh_ai_data_from_supabase()
     result = run_agent_turn(current_actor_context(), payload.get("message", ""), provider,
                             conversation_id=str(payload.get("conversation_id") or ""))
     status_code = 200 if result["status"] == "SUCCESS" else 403 if result["status"] == "DENIED" else 503
@@ -2122,6 +2123,39 @@ def maybe_pull_shared_from_supabase(force: bool = False):
     except Exception as exc:
         app.logger.warning("Synchronizacja Supabase nie powiodła się: %s", type(exc).__name__)
     return None
+
+
+def refresh_ai_data_from_supabase():
+    """Refresh the local read model once before a read-only AI turn."""
+    started = time.perf_counter()
+    if not supabase_enabled():
+        result = {"ok": False, "status": "skipped", "reason": "not_configured"}
+    else:
+        try:
+            # Serialize with bootstrap/background pulls. The pull's own lock and
+            # force=False retain its existing minimum-interval throttling.
+            with _supabase_full_io_lock:
+                result = pull_shared_tables_from_supabase(force=False, delete_missing=False)
+        except Exception as exc:
+            # The last valid SQLite snapshot remains the read-only fallback.
+            result = {"ok": False, "status": "fallback", "reason": type(exc).__name__}
+
+    table_results = result.get("tables") if isinstance(result, dict) else None
+    table_results = table_results if isinstance(table_results, dict) else {}
+    tables_failed = sum(1 for value in table_results.values()
+                        if isinstance(value, dict) and value.get("status") == "error")
+    safe_summary = {
+        "ok": bool(result.get("ok")) if isinstance(result, dict) else False,
+        "status": str(result.get("status") or ("refreshed" if result.get("ok") else "fallback"))
+        if isinstance(result, dict) else "fallback",
+        "reason": str(result.get("reason") or ("pull_failed" if result.get("error") else ""))
+        if isinstance(result, dict) else "invalid_result",
+        "tables_ok": max(0, len(table_results) - tables_failed),
+        "tables_failed": tables_failed,
+        "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+    }
+    app.logger.info("AI_DATA_REFRESH %s", json.dumps(safe_summary, ensure_ascii=False, sort_keys=True))
+    return result
 
 
 def sync_local_rows_to_supabase(table: str, conflict_col: str, ids: list):
