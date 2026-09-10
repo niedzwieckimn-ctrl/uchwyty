@@ -1,0 +1,127 @@
+{% extends "base.html" %}
+{% block content %}
+<style>
+  .ai-page-head{margin-bottom:18px}.ai-page-head h1{margin-bottom:4px}.ai-page-head p{margin:0;color:var(--muted)}
+  .ai-card{height:min(720px,calc(100vh - 150px));min-height:520px;padding:0;display:flex;flex-direction:column;overflow:hidden}
+  .ai-messages{flex:1;overflow-y:auto;padding:28px;display:flex;flex-direction:column;gap:16px;scroll-behavior:smooth}
+  .ai-empty{margin:auto;max-width:720px;text-align:center;padding:28px}.ai-empty-icon{width:62px;height:62px;margin:0 auto 16px;border-radius:20px;display:grid;place-items:center;background:#eef3ff;color:var(--blue);font-size:28px}.ai-empty h2{font-size:22px;margin-bottom:7px}.ai-examples{display:flex;justify-content:center;flex-wrap:wrap;gap:9px;margin-top:22px}.ai-example{border:1px solid #dfe5f2;background:#fafbff;color:#40506d;border-radius:999px;padding:9px 14px;font:inherit;font-size:13px;cursor:pointer}.ai-example:hover{border-color:#aebdec;background:#f3f6ff}
+  .ai-message{display:flex;gap:10px;max-width:min(780px,88%)}.ai-message.user{align-self:flex-end;flex-direction:row-reverse}.ai-avatar{width:34px;height:34px;flex:0 0 34px;border-radius:12px;display:grid;place-items:center;background:#edf2ff;color:var(--blue);font-weight:800;font-size:12px}.ai-message.user .ai-avatar{background:var(--navy);color:#fff}.ai-bubble{padding:12px 15px;border-radius:17px 17px 17px 5px;background:#f2f5fb;border:1px solid #e6eaf2;white-space:pre-wrap;overflow-wrap:anywhere}.ai-message.user .ai-bubble{border:0;border-radius:17px 17px 5px 17px;background:linear-gradient(135deg,var(--blue),var(--blue2));color:#fff}.ai-message.error .ai-bubble{background:#fff3f4;border-color:#ffd9de;color:#a92d41}.ai-loading .ai-bubble{color:var(--muted)}
+  .ai-compose{padding:17px 20px;border-top:1px solid var(--line);background:#fff}.ai-form{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:end}.ai-input{min-height:48px;max-height:150px;resize:none}.ai-send{height:48px;min-width:112px}.ai-send:disabled,.ai-example:disabled{opacity:.55;cursor:not-allowed;transform:none}.ai-note{margin:8px 3px 0;color:var(--muted);font-size:11px}
+  @media(max-width:680px){.ai-card{height:calc(100vh - 125px);min-height:460px}.ai-messages{padding:18px 14px}.ai-message{max-width:95%}.ai-compose{padding:13px}.ai-form{grid-template-columns:1fr}.ai-send{width:100%}.ai-empty{padding:15px}}
+</style>
+
+<div class="ai-page-head">
+  <h1>Asystent AI</h1>
+  <p>Zapytaj o dane firmy</p>
+</div>
+
+<section class="card ai-card" aria-label="Rozmowa z Asystentem AI">
+  <div id="aiMessages" class="ai-messages" aria-live="polite">
+    <div id="aiEmpty" class="ai-empty">
+      <div class="ai-empty-icon" aria-hidden="true">✦</div>
+      <h2>Co chcesz sprawdzić?</h2>
+      <p class="muted">Asystent może wyszukać produkt i sprawdzić jego dostępny stan.</p>
+      <div class="ai-examples">
+        <button class="ai-example" type="button">Ile mamy Avery 160?</button>
+        <button class="ai-example" type="button">Znajdź CH101-BLK</button>
+        <button class="ai-example" type="button">Ile mamy Andre?</button>
+      </div>
+    </div>
+  </div>
+  <div class="ai-compose">
+    <form id="aiForm" class="ai-form">
+      <textarea id="aiInput" class="ai-input" maxlength="2000" rows="1" placeholder="Wpisz pytanie..." aria-label="Wiadomość do Asystenta AI" required></textarea>
+      <button id="aiSend" class="btn primary ai-send" type="submit">Wyślij</button>
+    </form>
+    <p class="ai-note">Asystent działa w trybie tylko do odczytu i może się pomylić.</p>
+  </div>
+</section>
+
+<script>
+(() => {
+  const form = document.getElementById('aiForm');
+  const input = document.getElementById('aiInput');
+  const send = document.getElementById('aiSend');
+  const messages = document.getElementById('aiMessages');
+  const empty = document.getElementById('aiEmpty');
+  const examples = Array.from(document.querySelectorAll('.ai-example'));
+  let busy = false;
+
+  function addMessage(kind, value, extraClass = '') {
+    if (empty) empty.hidden = true;
+    const row = document.createElement('div');
+    row.className = `ai-message ${kind} ${extraClass}`.trim();
+    const avatar = document.createElement('div');
+    avatar.className = 'ai-avatar';
+    avatar.textContent = kind === 'user' ? 'TY' : 'AI';
+    const bubble = document.createElement('div');
+    bubble.className = 'ai-bubble';
+    bubble.textContent = value;
+    row.append(avatar, bubble);
+    messages.appendChild(row);
+    messages.scrollTop = messages.scrollHeight;
+    return row;
+  }
+
+  function friendlyError(response, data) {
+    if (response.status === 401) return 'Sesja wygasła. Zaloguj się ponownie.';
+    if (response.status === 403 || data?.status === 'DENIED') return data?.message || 'Nie możesz wykonać tej operacji.';
+    if (data?.error_code === 'MODEL_NOT_CONFIGURED') return 'Model AI nie jest jeszcze skonfigurowany.';
+    if (data?.error_code === 'TOOL_REQUIRED_FOR_DATA') return data?.message || 'Do odpowiedzi potrzebne są dane, których teraz nie udało się sprawdzić.';
+    return 'Nie udało się teraz pobrać odpowiedzi. Spróbuj ponownie.';
+  }
+
+  async function submitMessage(text) {
+    const message = text.trim();
+    if (!message || busy) return;
+    busy = true;
+    send.disabled = true;
+    input.disabled = true;
+    examples.forEach(button => button.disabled = true);
+    addMessage('user', message);
+    input.value = '';
+    const loading = addMessage('assistant', 'Asystent sprawdza dane...', 'ai-loading');
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 35000);
+    try {
+      const response = await fetch('/api/internal/ai/chat', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({message: message}),
+        signal: controller.signal
+      });
+      const data = await response.json().catch(() => ({}));
+      loading.remove();
+      if (!response.ok || data.status !== 'SUCCESS') {
+        addMessage('assistant', friendlyError(response, data), 'error');
+      } else {
+        addMessage('assistant', typeof data.message === 'string' ? data.message : 'Nie udało się odczytać odpowiedzi. Spróbuj ponownie.', '');
+      }
+    } catch (_error) {
+      loading.remove();
+      addMessage('assistant', 'Nie udało się teraz pobrać odpowiedzi. Spróbuj ponownie.', 'error');
+    } finally {
+      window.clearTimeout(timer);
+      busy = false;
+      send.disabled = false;
+      input.disabled = false;
+      examples.forEach(button => button.disabled = false);
+      input.focus();
+    }
+  }
+
+  form.addEventListener('submit', event => {
+    event.preventDefault();
+    submitMessage(input.value);
+  });
+  input.addEventListener('keydown', event => {
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault();
+      form.requestSubmit();
+    }
+  });
+  examples.forEach(button => button.addEventListener('click', () => submitMessage(button.textContent || '')));
+})();
+</script>
+{% endblock %}
