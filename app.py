@@ -4059,7 +4059,7 @@ def prepare_invoice_edit_items(edit_items: list[dict], form, invoice_type="domes
 CLIENT_API_PATHS = {
     "/api/client_stock_catalog", "/api/client_search_log", "/api/client/orders",
     "/api/order_lookup", "/api/client_invoices", "/api/client_order_email",
-    "/api/client/profile",
+    "/api/client/profile", "/api/client/search-aliases",
 }
 _rate_lock = threading.Lock()
 _rate_hits = {}
@@ -4221,13 +4221,12 @@ BASE = r"""
     .nav>a,.nav-drop-btn{gap:12px}.nav>a:before,.nav-drop-btn:before{content:""!important;display:block;width:21px;height:21px;flex:0 0 21px;background:currentColor;mask:var(--menu-icon) center/contain no-repeat}
     .nav>a:nth-child(1){--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M3%2010%2012%203%2021%2010M5%209v12h5v-7h4v7h5V9%22%2F%3E%3C%2Fsvg%3E")}
     .nav>a:nth-child(2){--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M5%204h14v18H5ZM9%202h6v4H9ZM9%2011h6M9%2015h6%22%2F%3E%3C%2Fsvg%3E")}
-    .nav>a:nth-child(3){--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M4%203h10l5%205v13H4ZM8%2014h7M11.5%2010.5v7%22%2F%3E%3C%2Fsvg%3E")}
-    .nav>a:nth-child(4){--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M14%202H5v20h14V7ZM14%202v5h5M8%2012h8M8%2016h8%22%2F%3E%3C%2Fsvg%3E")}
-    .nav>a:nth-child(5){--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M4%203h10l4%204v5M4%203v18h8M8%208h5m0%2010%203%203%206-7%22%2F%3E%3C%2Fsvg%3E")}
-    .nav>a:nth-child(6){--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M15%2015l6%206M17%2010a7%207%200%201%201-14%200%207%207%200%201%201%2014%200%22%2F%3E%3C%2Fsvg%3E")}
-    .nav>a:nth-child(7){--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M3%207l9-5%209%205v10l-9%205-9-5ZM3%207l9%205%209-5M12%2012v10%22%2F%3E%3C%2Fsvg%3E")}
-    .nav>a:nth-child(8){--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M2%205h12v12H2ZM14%209h4l4%205v3h-8M8%2019a2%202%200%201%201-4%200%202%202%200%201%201%204%200M20%2019a2%202%200%201%201-4%200%202%202%200%201%201%204%200%22%2F%3E%3C%2Fsvg%3E")}
-    .nav>a:nth-child(9){--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M8%202H2v6M16%202h6v6M22%2016v6h-6M8%2022H2v-6M6%206h4v4H6ZM14%206h4v4h-4ZM6%2014h4v4H6ZM14%2014h4v4h-4Z%22%2F%3E%3C%2Fsvg%3E")}
+    .nav>a:nth-child(3){--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M14%202H5v20h14V7ZM14%202v5h5M8%2012h8M8%2016h8%22%2F%3E%3C%2Fsvg%3E")}
+    .nav>a:nth-child(4){--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M4%203h10l4%204v5M4%203v18h8M8%208h5m0%2010%203%203%206-7%22%2F%3E%3C%2Fsvg%3E")}
+    .nav>a:nth-child(5){--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M15%2015l6%206M17%2010a7%207%200%201%201-14%200%207%207%200%201%201%2014%200%22%2F%3E%3C%2Fsvg%3E")}
+    .nav>a:nth-child(6){--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M3%207l9-5%209%205v10l-9%205-9-5ZM3%207l9%205%209-5M12%2012v10%22%2F%3E%3C%2Fsvg%3E")}
+    .nav>a:nth-child(7){--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M2%205h12v12H2ZM14%209h4l4%205v3h-8M8%2019a2%202%200%201%201-4%200%202%202%200%201%201%204%200M20%2019a2%202%200%201%201-4%200%202%202%200%201%201%204%200%22%2F%3E%3C%2Fsvg%3E")}
+    .nav>a:nth-child(8){--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M8%202H2v6M16%202h6v6M22%2016v6h-6M8%2022H2v-6M6%206h4v4H6ZM14%206h4v4h-4ZM6%2014h4v4H6ZM14%2014h4v4h-4Z%22%2F%3E%3C%2Fsvg%3E")}
     .nav-drop-btn{--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M4%206h16M4%2012h16M4%2018h16M8%203v6M16%209v6M10%2015v6%22%2F%3E%3C%2Fsvg%3E")}
     .nav>a:last-child{--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M10%203H4v18h6M9%2012h12m-5-5%205%205-5%205%22%2F%3E%3C%2Fsvg%3E")}
   </style>
@@ -4237,12 +4236,11 @@ BASE = r"""
     <div class="nav flex">
       <a class="{% if request.endpoint == 'home' %}active{% endif %}" href="{{ url_for('home') }}">Pulpit</a>
       <a class="{% if request.endpoint in ['orders','order_view'] %}active{% endif %}" href="{{ url_for('orders') }}">Zamówienia</a>
-      <a class="{% if request.endpoint == 'order_new' %}active{% endif %}" href="{{ url_for('order_new') }}">Nowe zamówienie</a>
       <a href="{{ url_for('invoices') }}">Faktury</a>
       <a href="{{ url_for('ksef_dashboard') }}">KSeF</a>
-      <a href="{{ url_for('client_searches') }}">Wyszukiwania</a>
+      <a class="{% if request.endpoint == 'client_searches' %}active{% endif %}" href="{{ url_for('client_searches') }}">Wyszukiwania</a>
       <a href="{{ url_for('stock') }}">Stan magazynu</a>
-      <a href="{{ url_for('china') }}">Dostawy (P/O)</a>
+      <a href="{{ url_for('china') }}">Chiny / P/O</a>
       <a href="{{ url_for('order_scan') }}">Skan QR</a>
       <div class="nav-dropdown">
         <button class="nav-drop-btn" type="button">Ustawienia ▾</button>
@@ -4761,7 +4759,7 @@ def auto_sync_after_write(response):
             response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
 
         no_auto_sync_paths = {
-            "/api/client_search_log", "/api/client_order_email", "/api/client/profile"
+            "/api/client_search_log", "/api/client_order_email", "/api/client/profile", "/searches/action"
         }
         if response.status_code < 400 and request.method in ("POST", "PUT", "PATCH", "DELETE") and request.path not in no_auto_sync_paths:
             trigger_background_supabase_sync(reason=f"{request.method} {request.path}")
@@ -7010,6 +7008,10 @@ for _routes_module in (routes_admin, routes_customers, routes_orders, routes_inv
     globals().update(_routes_module.register_routes(globals()))
 if "client_searches_v2" in globals():
     app.view_functions["client_searches"] = client_searches_v2
+
+import search_analytics as _search_analytics
+import sys as _search_sys
+_search_analytics.register(_search_sys.modules[__name__])
 
 _DOMAIN_ROUTE_MODULES = (routes_admin, routes_customers, routes_orders, routes_inventory, routes_shipping, routes_invoices, routes_china)
 
