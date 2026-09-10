@@ -15,6 +15,7 @@ def register_routes(context):
                 session["admin_authenticated"] = True
                 session["csrf_token"] = secrets.token_urlsafe(32)
                 session.permanent = True
+                bind_bootstrap_owner_session(session)
                 target = norm(request.args.get("next"))
                 return redirect(target if target.startswith("/") and not target.startswith("//") else url_for("home"))
             else:

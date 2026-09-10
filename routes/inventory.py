@@ -1266,6 +1266,7 @@ def register_routes(context):
 
 
     @app.get("/api/product/<int:product_id>")
+    @require_permission("inventory.read")
     def api_product(product_id):
         c = conn()
         cur = c.cursor()
