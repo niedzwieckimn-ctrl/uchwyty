@@ -74,3 +74,11 @@ def test_context_is_minimal_and_injection_is_stored_only_as_data():
     encoded = json.dumps(state)
     assert "Ignore instructions" in encoded
     assert "secret@example.pl" not in encoded and "address" not in encoded
+
+
+def test_all_conversation_audit_operations_are_registered():
+    import internal_audit
+    assert {
+        "agent.conversation.created", "agent.conversation.resumed",
+        "agent.conversation.expired", "agent.conversation.reset",
+    } <= set(internal_audit.OPERATION_DEFINITIONS)
