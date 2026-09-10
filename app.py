@@ -21,6 +21,21 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
+
+_STARTUP_STARTED = time.monotonic()
+_startup_logger = logging.getLogger("app.startup")
+
+
+def _startup_step(name: str) -> None:
+    """Emit a flush-safe startup marker without configuration or secret values."""
+    _startup_logger.warning(
+        "STARTUP_STEP %s elapsed_ms=%d", name,
+        int((time.monotonic() - _STARTUP_STARTED) * 1000),
+    )
+
+
+_startup_step("app_import")
+
 try:
     from zoneinfo import ZoneInfo
 except Exception:
@@ -41,7 +56,11 @@ from internal_rbac import (
     initialize_schema as initialize_internal_rbac_schema,
     require_permission,
 )
-from agent_runtime import provider_from_env, run_agent_turn
+from agent_runtime import provider_from_env, reset_agent_conversation, run_agent_turn
+from agent_conversation import (
+    configure as configure_agent_conversation,
+    initialize_schema as initialize_agent_conversation_schema,
+)
 from internal_audit import (
     configure as configure_internal_audit,
     initialize_schema as initialize_internal_audit_schema,
@@ -74,6 +93,7 @@ from external_execution import (
     queue_health as external_execution_health,
     register_adapter as register_external_adapter,
 )
+_startup_step("agent_runtime_init")
 
 import qrcode
 from reportlab.pdfgen import canvas
@@ -106,6 +126,7 @@ from inpost_module import (
     get_label as inpost_get_label,
     get_shipment as inpost_get_shipment,
 )
+_startup_step("application_modules_imported")
 try:
     from ksef_api import ksef_config_summary, send_invoice_to_ksef
 except Exception:
@@ -265,15 +286,22 @@ def conn():
     return c
 
 configure_internal_rbac(conn)
+_startup_step("rbac_configured")
 configure_internal_audit(conn)
 configure_internal_concurrency(conn)
 configure_internal_audit_outbox(conn)
+_startup_step("audit_configured")
 configure_internal_approval(conn)
+_startup_step("approval_configured")
 configure_business_operations(conn)
+configure_agent_conversation(conn)
+_startup_step("business_operations_configured")
 configure_external_execution(conn)
 register_external_adapter("test", IsolatedTestAdapter())
+_startup_step("execution_services_configured")
 
 def init_db():
+    _startup_step("database_init_begin")
     c = conn()
     cur = c.cursor()
 
@@ -765,22 +793,33 @@ def init_db():
     cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_idempotency_key ON orders(idempotency_key) WHERE idempotency_key IS NOT NULL")
 
     c.commit()
+    _startup_step("application_schema_initialized")
     import invoice_jobs, invoice_stock
     invoice_jobs.initialize(c)
     invoice_stock.initialize(c)
+    _startup_step("invoice_schema_initialized")
     import inpost_history
     c.execute(inpost_history.SCHEMA)
     c.commit()
     from inpost_pickups import initialize as initialize_pickups
     initialize_pickups(c)
+    _startup_step("inpost_schema_initialized")
     initialize_internal_rbac_schema(c)
+    _startup_step("rbac_init")
     initialize_internal_audit_schema(c)
     initialize_internal_audit_outbox_schema(c)
     initialize_internal_concurrency_schema(c)
+    _startup_step("audit_init")
     initialize_internal_approval_schema(c)
+    _startup_step("approval_init")
     initialize_business_operations_schema(c)
+    _startup_step("business_operations_init")
+    initialize_agent_conversation_schema(c)
+    _startup_step("agent_conversation_init")
     initialize_external_execution_schema(c)
+    _startup_step("external_execution_init")
     c.close()
+    _startup_step("database_init_complete")
 
 init_db()
 
@@ -811,9 +850,20 @@ def api_internal_ai_chat():
     except Exception:
         return jsonify(ok=False, status="FAILED", error_code="MODEL_NOT_CONFIGURED",
                        message="Model asystenta nie jest jeszcze skonfigurowany."), 503
-    result = run_agent_turn(current_actor_context(), payload.get("message", ""), provider)
+    result = run_agent_turn(current_actor_context(), payload.get("message", ""), provider,
+                            conversation_id=str(payload.get("conversation_id") or ""))
     status_code = 200 if result["status"] == "SUCCESS" else 403 if result["status"] == "DENIED" else 503
     return jsonify(result), status_code
+
+
+@app.post("/api/internal/ai/conversation/reset")
+@require_permission("inventory.read")
+def api_internal_ai_conversation_reset():
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict) or not payload.get("conversation_id"):
+        return jsonify(ok=False, error_code="INVALID_REQUEST"), 400
+    result = reset_agent_conversation(current_actor_context(), str(payload["conversation_id"]))
+    return jsonify(result), 200 if result.get("ok") else 403
 
 
 # =========================
@@ -7276,6 +7326,7 @@ def _send_invoice_to_client(invoice_id: int) -> tuple[int, bool, str]:
 # =========================
 
 # Domain routes are registered after infrastructure and shared helpers exist.
+_startup_step("routes_import_begin")
 from routes import admin as routes_admin, china as routes_china, customers as routes_customers
 from routes import inventory as routes_inventory, invoices as routes_invoices
 from routes import orders as routes_orders, shipping as routes_shipping
@@ -7291,6 +7342,7 @@ if "client_searches_v2" in globals():
 import search_analytics as _search_analytics
 import sys as _search_sys
 _search_analytics.register(_search_sys.modules[__name__])
+_startup_step("routes_init")
 
 _DOMAIN_ROUTE_MODULES = (routes_admin, routes_customers, routes_orders, routes_inventory, routes_shipping, routes_invoices, routes_china)
 
@@ -7310,6 +7362,7 @@ def _refresh_domain_route_context():
 import inpost_pickups as _inpost_pickups
 import sys as _pickup_sys
 _inpost_pickups.start_worker(_pickup_sys.modules[__name__])
+_startup_step("inpost_worker_init")
 
 
 def _send_audit_to_supabase(payload):
@@ -7328,6 +7381,8 @@ def _send_audit_to_supabase(payload):
 if supabase_enabled():
     configure_audit_remote_sender(_send_audit_to_supabase)
     start_audit_outbox_worker()
+_startup_step("audit_worker_init")
+_startup_step("app_ready")
 
 if __name__ == "__main__":
     # debug=True moĹĽesz zostawiÄ‡ na czas budowy
