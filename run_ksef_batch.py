@@ -18,8 +18,14 @@ def candidates(now):
             LEFT JOIN ksef_documents k ON k.invoice_id=i.id LEFT JOIN invoice_meta m ON m.invoice_id=i.id
             WHERE i.publication_state='complete' AND substr(i.created_at,1,10)>=? ORDER BY i.id''',(start,))]
     finally:c.close()
+    # Render cron is scheduled in UTC, while the business cut-off is Warsaw
+    # time. Requiring the exact local hour silently skipped every new invoice
+    # whenever the job reached the process at 18:00/19:00. At and after 17:00
+    # the daily run may safely catch up; KSeF attempt checkpoints prevent a
+    # second submission when an earlier result is uncertain.
+    after_daily_cutoff = now.hour >= 17
     return [x['id'] for x in rows if not (x['ksef_number'] and x['mailed']) and
-            (now.hour==17 or x['ksef_number'] or x['status'] in ('sending','processing','unknown'))]
+            (after_daily_cutoff or x['ksef_number'] or x['status'] in ('sending','processing','unknown'))]
 
 def main():
     now=datetime.now(ZoneInfo('Europe/Warsaw'))

@@ -66,6 +66,13 @@ from business_operations import (
     execute_business_operation,
     initialize_schema as initialize_business_operations_schema,
 )
+from external_execution import (
+    IsolatedTestAdapter,
+    configure as configure_external_execution,
+    initialize_schema as initialize_external_execution_schema,
+    queue_health as external_execution_health,
+    register_adapter as register_external_adapter,
+)
 
 import qrcode
 from reportlab.pdfgen import canvas
@@ -262,6 +269,8 @@ configure_internal_concurrency(conn)
 configure_internal_audit_outbox(conn)
 configure_internal_approval(conn)
 configure_business_operations(conn)
+configure_external_execution(conn)
+register_external_adapter("test", IsolatedTestAdapter())
 
 def init_db():
     c = conn()
@@ -769,9 +778,17 @@ def init_db():
     initialize_internal_concurrency_schema(c)
     initialize_internal_approval_schema(c)
     initialize_business_operations_schema(c)
+    initialize_external_execution_schema(c)
     c.close()
 
 init_db()
+
+
+@app.get("/api/internal/external-executions/health")
+@require_permission("system.audit_read")
+def api_external_execution_health():
+    """Minimal protected operational view; contains no payloads or credentials."""
+    return jsonify(ok=True, **external_execution_health(current_actor_context()))
 
 
 # =========================
@@ -4952,6 +4969,188 @@ def _packed_package_orders(cur, order):
     )
     rows = [dict(row) for row in cur.fetchall()]
     return rows or [order]
+
+
+_INPOST_COLLECTED_OR_LATER = frozenset({
+    "collected_from_sender", "taken_by_courier_from_pok", "collected_by_courier",
+    "taken_by_courier", "adopted_at_source_branch", "sent_from_source_branch",
+    "adopted_at_sorting_center", "sent_from_sorting_center", "adopted_at_target_branch",
+    "out_for_delivery_to_address", "out_for_delivery", "ready_to_pickup",
+    "pickup_reminder_sent", "delivered", "returned_to_sender",
+})
+
+
+def normalize_inpost_status(status) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", norm(status).lower()).strip("_")
+
+
+def inpost_status_is_collected(status) -> bool:
+    """True from the first physical courier scan through later transport states."""
+    return normalize_inpost_status(status) in _INPOST_COLLECTED_OR_LATER
+
+
+def invoice_packing_list_email_attachment_for_orders(orders: list[dict]) -> dict:
+    """Load/rebuild the packing list for exactly the orders in one shipment.
+
+    A consumed packing batch is the relationship between the shipment's packed
+    orders and its invoice.  This avoids rebuilding a consolidated document
+    from the root order after a local file has disappeared.
+    """
+    package_orders = [dict(item) for item in (orders or []) if item]
+    package_ids = sorted({to_int(item.get("id"), 0) for item in package_orders if to_int(item.get("id"), 0) > 0})
+    if not package_ids:
+        raise ValueError("brak zamówień należących do przesyłki")
+    placeholders = ",".join("?" for _ in package_ids)
+    c = conn()
+    try:
+        cur = c.cursor()
+        candidates = cur.execute(
+            f"""SELECT DISTINCT pb.id,pb.invoice_id
+                FROM packing_batches pb
+                JOIN packing_allocations pa ON pa.batch_id=pb.id
+                WHERE pb.invoice_id IS NOT NULL AND pa.order_id IN ({placeholders})
+                ORDER BY pb.id DESC""", tuple(package_ids),
+        ).fetchall()
+        invoice_id = 0
+        for candidate in candidates:
+            member_ids = {int(row[0]) for row in cur.execute(
+                "SELECT DISTINCT order_id FROM packing_allocations WHERE batch_id=?", (candidate["id"],)
+            ).fetchall()}
+            if member_ids == set(package_ids):
+                invoice_id = int(candidate["invoice_id"] or 0)
+                break
+        # Starsze faktury zbiorcze mogą nie mieć zachowanego packing_batch,
+        # ale invoice_allocations nadal przechowuje dokładny, trwały zakres.
+        if not invoice_id:
+            allocation_candidates = cur.execute(
+                f"""SELECT DISTINCT invoice_id FROM invoice_allocations
+                    WHERE order_id IN ({placeholders}) ORDER BY invoice_id DESC""",
+                tuple(package_ids),
+            ).fetchall()
+            for candidate in allocation_candidates:
+                candidate_invoice_id = int(candidate[0] or 0)
+                member_ids = {int(row[0]) for row in cur.execute(
+                    "SELECT DISTINCT order_id FROM invoice_allocations WHERE invoice_id=?",
+                    (candidate_invoice_id,),
+                ).fetchall()}
+                if member_ids == set(package_ids):
+                    invoice_id = candidate_invoice_id
+                    break
+        if not invoice_id:
+            if len(package_ids) == 1:
+                return _order_packing_list_email_attachment(package_orders[0])
+            raise ValueError("brak faktury o zakresie zgodnym z zamówieniami przesyłki")
+        invoice = cur.execute("SELECT * FROM invoices WHERE id=?", (invoice_id,)).fetchone()
+        meta_row = cur.execute("SELECT * FROM invoice_meta WHERE invoice_id=?", (invoice_id,)).fetchone()
+        if not invoice:
+            return _order_packing_list_email_attachment(package_orders[0])
+        invoice, invoice_meta = dict(invoice), dict(meta_row) if meta_row else {}
+        order_row = cur.execute("SELECT * FROM orders WHERE id=?", (invoice["order_id"],)).fetchone()
+    finally:
+        c.close()
+
+    invoice_no = norm(invoice.get("invoice_no")) or f"FV_{invoice_id}"
+    pdf_path = norm(invoice_meta.get("pdf_path"))
+    if pdf_path and not parse_supabase_storage_ref(pdf_path):
+        local_invoice = pdf_path if os.path.isabs(pdf_path) else invoice_pdf_abspath(pdf_path)
+        local_packing = packing_list_pdf_path_for_invoice(local_invoice, invoice_no)
+        if os.path.exists(local_packing):
+            with open(local_packing, "rb") as pdf_file:
+                content = pdf_file.read()
+            if content:
+                return {"filename": f"{safe_filename(invoice_no)}_lista_pakowania.pdf", "content": content}
+
+    if supabase_enabled():
+        try:
+            storage_ref = supabase_storage_ref(invoice_packing_storage_object_path(invoice_id, invoice_no))
+            content, _name = supabase_storage_download_bytes(storage_ref)
+            if content:
+                return {"filename": f"{safe_filename(invoice_no)}_lista_pakowania.pdf", "content": content}
+        except Exception as exc:
+            app.logger.warning("Nie udało się pobrać zbiorczej listy pakowania faktury %s: %s", invoice_id, type(exc).__name__)
+
+    items = invoice_items_from_saved_json(invoice_id)
+    if not items:
+        raise ValueError("faktura nie ma zapisanego zakresu pozycji listy pakowania")
+    expected_ids = set(_invoice_json_order_ids(json.dumps(items, ensure_ascii=False)))
+    if expected_ids and expected_ids != set(package_ids):
+        raise ValueError("zakres faktury nie odpowiada zamówieniom należącym do przesyłki")
+    generated = generate_invoice_packing_list_pdf(
+        order_row, items, invoice_meta_payload({**invoice, **invoice_meta}),
+    )
+    with open(generated, "rb") as pdf_file:
+        content = pdf_file.read()
+    if not content:
+        raise ValueError("wygenerowana zbiorcza lista pakowania jest pusta")
+    return {"filename": f"{safe_filename(invoice_no)}_lista_pakowania.pdf", "content": content}
+
+
+def apply_verified_inpost_status(order: dict, shipment: dict) -> dict:
+    """Apply an authenticated InPost status to all and only shipment members."""
+    remote_status = norm((shipment or {}).get("status"))
+    if not inpost_status_is_collected(remote_status):
+        return {"ok": True, "ignored": "not_collected", "status": remote_status, "orders": []}
+    shipment_id = norm(order.get("inpost_shipment_id"))
+    remote_tracking = re.sub(r"\s+", "", norm((shipment or {}).get("tracking_number"))) or re.sub(
+        r"\s+", "", norm(order.get("tracking_no"))
+    )
+    c = conn()
+    try:
+        cur = c.cursor()
+        package_rows = cur.execute(
+            "SELECT * FROM orders WHERE inpost_shipment_id=? ORDER BY id", (shipment_id,)
+        ).fetchall() if shipment_id else []
+        package_orders = [dict(item) for item in package_rows] or [dict(order)]
+        package_ids = [to_int(item.get("id"), 0) for item in package_orders]
+        placeholders = ",".join("?" for _ in package_ids)
+        shipped_at = now_iso()
+        cur.execute(
+            f"""UPDATE orders SET
+                status=CASE
+                  WHEN LOWER(COALESCE(status,'')) IN ('issued','completed','cancelled') THEN status
+                  WHEN LOWER(COALESCE(status,'')) IN ('packed_partial','partially_shipped') THEN 'partially_shipped'
+                  ELSE 'shipped'
+                END,
+                tracking_no=CASE WHEN ?<>'' THEN ? ELSE tracking_no END,
+                carrier='inpost',
+                shipped_at=CASE WHEN TRIM(COALESCE(shipped_at,''))='' THEN ? ELSE shipped_at END
+                WHERE id IN ({placeholders})""",
+            (remote_tracking, remote_tracking, shipped_at, *package_ids),
+        )
+        c.commit()
+        package_orders = [dict(item) for item in cur.execute(
+            f"SELECT * FROM orders WHERE id IN ({placeholders}) ORDER BY id", tuple(package_ids)
+        ).fetchall()]
+    finally:
+        c.close()
+
+    if supabase_enabled():
+        try:
+            for package_order in package_orders:
+                supabase_update_rows("orders", {
+                    "status": package_order.get("status"), "tracking_no": remote_tracking,
+                    "carrier": "inpost", "shipped_at": package_order.get("shipped_at"),
+                    "warehouse_issued": int(package_order.get("warehouse_issued") or 0),
+                }, {"id": int(package_order["id"])})
+        except Exception as exc:
+            app.logger.exception("InPost: błąd synchronizacji statusu zamówień: %s", exc)
+            return {"ok": False, "error": "supabase_sync_failed", "status": remote_status, "orders": package_ids}
+
+    tracking_hash = hashlib.sha256(remote_tracking.encode("utf-8")).hexdigest()[:16]
+    event_keys = [f"order_shipped:{order_id}:inpost:{tracking_hash}" for order_id in package_ids]
+    if event_keys and all(_email_event_already_ok(key) for key in event_keys):
+        return {"ok": True, "duplicate": True, "status": remote_status, "orders": package_ids}
+    try:
+        packing_attachment = invoice_packing_list_email_attachment_for_orders(package_orders)
+        email_result = _send_orders_shipped_email(package_orders, remote_tracking, "inpost", packing_attachment)
+    except Exception as exc:
+        app.logger.exception("InPost: nie udało się wysłać powiadomienia z listą pakowania")
+        email_result = {"ok": False, "error": str(exc)}
+    for package_order, event_key in zip(package_orders, event_keys):
+        _record_email_event(event_key, "order_shipped", package_order.get("id"), package_order.get("customer_email"), email_result)
+    if not email_result.get("ok"):
+        return {"ok": False, "error": (norm(email_result.get("error")) or "email_failed")[:300], "status": remote_status, "orders": package_ids}
+    return {"ok": True, "shipped": True, "status": remote_status, "orders": package_ids}
 
 
 def enqueue_automatic_inpost_pickup(shipment_id):
