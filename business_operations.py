@@ -14,10 +14,12 @@ import re
 import sqlite3
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Mapping
+from zoneinfo import ZoneInfo
 
 import internal_approval as approvals
+from cash_flow_module import cash_flow_overdue_invoices
 from internal_audit import (
     CONFLICT, DENIED, FAILED, NOOP, PENDING_APPROVAL, SUCCESS,
     current_correlation_id, record_audit_event, sanitize_audit_data,
@@ -38,6 +40,8 @@ EXECUTION_STATUSES = frozenset({
 TERMINAL_STATUSES = frozenset({"SUCCESS", "FAILED", "CONFLICT", "DENIED"})
 SAFE_IDEMPOTENCY_KEY = re.compile(r"[A-Za-z0-9._:-]{1,200}")
 MAX_PRODUCT_SEARCH_RESULTS = 50
+MAX_BUSINESS_SEARCH_RESULTS = 50
+WARSAW_TZ = ZoneInfo("Europe/Warsaw")
 
 
 @dataclass(frozen=True)
@@ -132,6 +136,73 @@ PRODUCT_SEARCH_OUTPUT = {
         "count": {"type": "integer"}, "truncated": {"type": "boolean"},
     },
 }
+
+_LIMIT = {"type": "integer", "minimum": 1, "maximum": MAX_BUSINESS_SEARCH_RESULTS}
+_QUERY = {"type": "string", "minLength": 1, "maxLength": 160}
+_DATE = {"type": "string", "minLength": 10, "maxLength": 10}
+_PERIOD = {"type": "string", "enum": [
+    "all", "today", "yesterday", "this_week", "this_month", "previous_month", "custom",
+]}
+_SEARCH_INPUT = {
+    "type": "object", "additionalProperties": False, "properties": {
+        "query": _QUERY, "status": {"type": "string", "minLength": 1, "maxLength": 64},
+        "period": _PERIOD, "date_from": _DATE, "date_to": _DATE, "limit": _LIMIT,
+    },
+}
+_GET_INPUT = {
+    "type": "object", "additionalProperties": False, "properties": {
+        "id": {"type": "integer", "minimum": 1, "maximum": 9_223_372_036_854_775_807},
+        "number": _QUERY,
+    },
+}
+_RESULTS_OUTPUT = {
+    "type": "object", "additionalProperties": False,
+    "required": ["ok", "results", "count", "truncated"],
+    "properties": {
+        "ok": {"type": "boolean"}, "results": {"type": "array", "maxItems": MAX_BUSINESS_SEARCH_RESULTS},
+        "count": {"type": "integer"}, "truncated": {"type": "boolean"},
+    },
+}
+_DETAIL_OUTPUT = {
+    "type": "object", "additionalProperties": False, "required": ["ok", "record"],
+    "properties": {"ok": {"type": "boolean"}, "record": {"type": "object"}},
+}
+INVOICE_SEARCH_INPUT = {
+    "type": "object", "additionalProperties": False, "properties": {
+        "query": _QUERY,
+        "payment_status": {"type": "string", "enum": ["all", "paid", "unpaid", "overdue"]},
+        "date_field": {"type": "string", "enum": ["issue_date", "due_date"]},
+        "period": _PERIOD, "date_from": _DATE, "date_to": _DATE, "limit": _LIMIT,
+    },
+}
+INVOICE_OVERDUE_INPUT = {
+    "type": "object", "additionalProperties": False, "properties": {
+        "query": _QUERY, "as_of": _DATE, "limit": _LIMIT,
+    },
+}
+CUSTOMER_SEARCH_INPUT = {
+    "type": "object", "additionalProperties": False, "required": ["query"],
+    "properties": {"query": _QUERY, "limit": _LIMIT},
+}
+CUSTOMER_GET_INPUT = {
+    "type": "object", "additionalProperties": False, "required": ["customer_id"],
+    "properties": {"customer_id": {"type": "integer", "minimum": 1, "maximum": 9_223_372_036_854_775_807}},
+}
+SALES_SUMMARY_INPUT = {
+    "type": "object", "additionalProperties": False, "properties": {
+        "period": _PERIOD, "date_from": _DATE, "date_to": _DATE,
+    },
+}
+SALES_SUMMARY_OUTPUT = {
+    "type": "object", "additionalProperties": False,
+    "required": ["ok", "date_from", "date_to", "order_count", "invoice_count", "by_currency", "top_customers"],
+    "properties": {
+        "ok": {"type": "boolean"}, "date_from": {"type": ["string", "null"]},
+        "date_to": {"type": ["string", "null"]}, "order_count": {"type": "integer"},
+        "invoice_count": {"type": "integer"}, "by_currency": {"type": "array", "maxItems": 20},
+        "top_customers": {"type": "array", "maxItems": 20},
+    },
+}
 PILOT_INPUT = {
     "type": "object",
     "additionalProperties": False,
@@ -182,6 +253,46 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
         "inventory.read", approvals.GREEN, "NONE",
         frozenset({"HUMAN", "SYSTEM", "AI_AGENT"}),
         PRODUCT_GET_INPUT, PRODUCT_GET_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
+    ),
+    "orders.search": BusinessOperationDefinition(
+        "orders.search", 1, "Wyszukuje zamówienia po numerze, kliencie, statusie i okresie.",
+        "orders.read_full", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
+        _SEARCH_INPUT, _RESULTS_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
+    ),
+    "orders.get": BusinessOperationDefinition(
+        "orders.get", 1, "Pobiera zamówienie wraz z pozycjami i podsumowaniem kwot.",
+        "orders.read_full", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
+        _GET_INPUT, _DETAIL_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
+    ),
+    "invoices.search": BusinessOperationDefinition(
+        "invoices.search", 1, "Wyszukuje faktury po numerze, kliencie, płatności i okresie wystawienia.",
+        "invoices.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
+        INVOICE_SEARCH_INPUT, _RESULTS_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
+    ),
+    "invoices.get": BusinessOperationDefinition(
+        "invoices.get", 1, "Pobiera fakturę, status płatności i zapisane pozycje.",
+        "invoices.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
+        _GET_INPUT, _DETAIL_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
+    ),
+    "invoices.overdue": BusinessOperationDefinition(
+        "invoices.overdue", 1, "Zwraca zaległe faktury według tej samej reguły co Cash Flow.",
+        "payments.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
+        INVOICE_OVERDUE_INPUT, _RESULTS_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
+    ),
+    "customers.search": BusinessOperationDefinition(
+        "customers.search", 1, "Wyszukuje klientów po nazwie, NIP, e-mailu lub telefonie.",
+        "customers.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
+        CUSTOMER_SEARCH_INPUT, _RESULTS_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
+    ),
+    "customers.get": BusinessOperationDefinition(
+        "customers.get", 1, "Pobiera dane klienta oraz zagregowaną historię zamówień i faktur.",
+        "customers.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
+        CUSTOMER_GET_INPUT, _DETAIL_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
+    ),
+    "business.sales.summary": BusinessOperationDefinition(
+        "business.sales.summary", 1, "Zwraca podsumowanie sprzedaży za kontrolowany okres, osobno dla każdej waluty.",
+        "reports.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
+        SALES_SUMMARY_INPUT, SALES_SUMMARY_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
     "internal.test.change_setting": BusinessOperationDefinition(
         "internal.test.change_setting", 1, "Zmienia wyłącznie izolowany zasób testowy.",
@@ -328,7 +439,7 @@ def validate_output(definition: BusinessOperationDefinition, supplied: Any) -> d
             for item in value:
                 if not isinstance(item, Mapping):
                     raise ControlledOperationError("INVALID_HANDLER_OUTPUT", f"Handler zwrócił zły element pola {name}")
-                if set(item_schema.get("required", ())) - set(item) or set(item) - set(item_schema.get("properties", {})):
+                if item_schema.get("properties") and (set(item_schema.get("required", ())) - set(item) or set(item) - set(item_schema["properties"])):
                     raise ControlledOperationError("INVALID_HANDLER_OUTPUT", f"Handler zwrócił nieprawidłowe pola {name}")
     return dict(supplied)
 
@@ -347,6 +458,14 @@ def _entity(definition: BusinessOperationDefinition, data: Mapping[str, Any]) ->
         return "product_search", sanitize_audit_text(data["query"])[:120], None
     if definition.operation_name == "inventory.product.get":
         return "product", str(data["product_id"]), None
+    if definition.operation_name in {"orders.search", "invoices.search", "invoices.overdue", "customers.search"}:
+        return definition.operation_name.replace(".", "_"), sanitize_audit_text(data.get("query", "all"))[:160], None
+    if definition.operation_name in {"orders.get", "invoices.get"}:
+        return definition.operation_name.split(".")[0][:-1], str(data.get("id") or data.get("number") or ""), None
+    if definition.operation_name == "customers.get":
+        return "customer", str(data["customer_id"]), None
+    if definition.operation_name == "business.sales.summary":
+        return "sales_summary", str(data.get("period") or "this_month"), None
     if definition.operation_name == "internal.test.change_setting":
         return "internal_versioned_resource", data["resource_id"], data["expected_version"]
     if definition.operation_name == "internal.test.external.execute":
@@ -553,6 +672,322 @@ def _product_search(data, actor, correlation_id, transaction_connection=None):
             "count": len(candidates), "truncated": len(found) > MAX_PRODUCT_SEARCH_RESULTS}
 
 
+def _business_now() -> datetime:
+    return datetime.now(WARSAW_TZ)
+
+
+def _iso_date(value: str, field: str) -> date:
+    try:
+        return date.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        raise ControlledOperationError("INVALID_DATE", f"Pole {field} musi mieć format RRRR-MM-DD", status=DENIED)
+
+
+def _date_bounds(data: Mapping[str, Any], *, default_period="all") -> tuple[str | None, str | None]:
+    period = data.get("period") or default_period
+    today = _business_now().date()
+    if period == "all":
+        start = end = None
+    elif period == "today":
+        start = end = today
+    elif period == "yesterday":
+        start = end = today - timedelta(days=1)
+    elif period == "this_week":
+        start, end = today - timedelta(days=today.weekday()), today
+    elif period == "this_month":
+        start, end = today.replace(day=1), today
+    elif period == "previous_month":
+        end = today.replace(day=1) - timedelta(days=1)
+        start = end.replace(day=1)
+    elif period == "custom":
+        if not data.get("date_from") or not data.get("date_to"):
+            raise ControlledOperationError("DATE_RANGE_REQUIRED", "Okres custom wymaga date_from i date_to", status=DENIED)
+        start, end = _iso_date(data["date_from"], "date_from"), _iso_date(data["date_to"], "date_to")
+    else:
+        raise ControlledOperationError("INVALID_PERIOD", "Nieprawidłowy okres", status=DENIED)
+    if data.get("date_from") and period != "custom":
+        start = _iso_date(data["date_from"], "date_from")
+    if data.get("date_to") and period != "custom":
+        end = _iso_date(data["date_to"], "date_to")
+    if start and end and start > end:
+        raise ControlledOperationError("INVALID_DATE_RANGE", "Początek okresu jest po końcu", status=DENIED)
+    return (start.isoformat() if start else None, end.isoformat() if end else None)
+
+
+def _money(value: Any) -> float:
+    return round(float(value or 0), 2)
+
+
+def _limit(data: Mapping[str, Any]) -> int:
+    return int(data.get("limit") or 20)
+
+
+def _order_totals(db: sqlite3.Connection, order_id: int) -> dict[str, dict[str, float]]:
+    rows = db.execute(
+        """SELECT UPPER(COALESCE(NULLIF(TRIM(oi.currency),''),NULLIF(TRIM(o.currency),''),'PLN')) currency,
+                  SUM(oi.qty * COALESCE(oi.unit_net_price,0)) net,
+                  SUM(oi.qty * COALESCE(oi.unit_gross_price,oi.unit_net_price,0)) gross
+           FROM orders o LEFT JOIN order_items oi ON oi.order_id=o.id WHERE o.id=? GROUP BY 1""", (order_id,),
+    ).fetchall()
+    return {str(row["currency"]): {"net": _money(row["net"]), "gross": _money(row["gross"])} for row in rows if row["currency"]}
+
+
+def _orders_search(data, actor, correlation_id, transaction_connection=None):
+    db = transaction_connection or _factory()()
+    try:
+        start, end = _date_bounds(data)
+        clauses, params = ["1=1"], []
+        query = " ".join(str(data.get("query") or "").split()).casefold()
+        if query:
+            clauses.append("(LOWER(o.order_no) LIKE ? OR LOWER(o.customer_name) LIKE ? OR LOWER(COALESCE(o.customer_email,'')) LIKE ?)")
+            params.extend([f"%{query}%"] * 3)
+        status = str(data.get("status") or "").strip().casefold()
+        if status == "not_shipped":
+            clauses.append("LOWER(o.status) NOT IN ('shipped','completed','cancelled')")
+        elif status == "in_progress":
+            clauses.append("LOWER(o.status) IN ('confirmed','issued','packed','packed_partial','in_delivery','partially_shipped')")
+        elif status:
+            clauses.append("LOWER(o.status)=?"); params.append(status)
+        if start:
+            clauses.append("SUBSTR(TRIM(o.created_at),1,10)>=?"); params.append(start)
+        if end:
+            clauses.append("SUBSTR(TRIM(o.created_at),1,10)<=?"); params.append(end)
+        limit = _limit(data)
+        rows = db.execute(
+            f"""SELECT o.*, COUNT(oi.id) item_lines, COALESCE(SUM(oi.qty),0) item_qty
+                 FROM orders o LEFT JOIN order_items oi ON oi.order_id=o.id
+                 WHERE {' AND '.join(clauses)} GROUP BY o.id ORDER BY o.created_at DESC,o.id DESC LIMIT ?""",
+            (*params, limit + 1),
+        ).fetchall()
+        selected = rows[:limit]
+        results = [{
+            "id": int(r["id"]), "order_number": r["order_no"], "customer_id": r["customer_id"],
+            "customer_name": r["customer_name"], "status": r["status"], "created_at": r["created_at"],
+            "currency": str(r["currency"] or "PLN").upper(), "item_lines": int(r["item_lines"]),
+            "item_qty": int(r["item_qty"]), "totals": _order_totals(db, int(r["id"])),
+        } for r in selected]
+        return {"ok": True, "results": results, "count": len(results), "truncated": len(rows) > limit}
+    finally:
+        if transaction_connection is None: db.close()
+
+
+def _resolve_by_id_or_number(db, table: str, data, number_column: str):
+    if bool(data.get("id")) == bool(str(data.get("number") or "").strip()):
+        raise ControlledOperationError("IDENTIFIER_REQUIRED", "Podaj dokładnie jedno: id albo number", status=DENIED)
+    if data.get("id"):
+        return db.execute(f"SELECT * FROM {table} WHERE id=?", (data["id"],)).fetchone()
+    return db.execute(f"SELECT * FROM {table} WHERE LOWER({number_column})=LOWER(?)", (str(data["number"]).strip(),)).fetchone()
+
+
+def _orders_get(data, actor, correlation_id, transaction_connection=None):
+    db = transaction_connection or _factory()()
+    try:
+        row = _resolve_by_id_or_number(db, "orders", data, "order_no")
+        if row is None: raise ControlledOperationError("ORDER_NOT_FOUND", "Nie znaleziono zamówienia", status=NOOP)
+        record = {"id": int(row["id"]), "order_number": row["order_no"], "customer_id": row["customer_id"],
+                  "customer_name": row["customer_name"], "status": row["status"], "note": row["note"],
+                  "created_at": row["created_at"], "currency": str(row["currency"] or "PLN").upper(),
+                  "tracking_number": row["tracking_no"], "carrier": row["carrier"],
+                  "packed_at": row["packed_at"], "shipped_at": row["shipped_at"]}
+        items = db.execute("""SELECT oi.id,oi.product_id,oi.sku,oi.qty,oi.unit_net_price,oi.unit_gross_price,
+                                      UPPER(COALESCE(NULLIF(TRIM(oi.currency),''),NULLIF(TRIM(?),''),'PLN')) currency,
+                                      p.model,p.name
+                               FROM order_items oi LEFT JOIN products p ON p.id=oi.product_id
+                               WHERE oi.order_id=? ORDER BY oi.id LIMIT 100""", (record.get("currency"), record["id"])).fetchall()
+        record["items"] = [{**dict(i), "qty": int(i["qty"]), "unit_net_price": _money(i["unit_net_price"]),
+                            "unit_gross_price": _money(i["unit_gross_price"])} for i in items]
+        record["totals"] = _order_totals(db, record["id"])
+        return {"ok": True, "record": record}
+    finally:
+        if transaction_connection is None: db.close()
+
+
+def _overdue_ids(db, now=None) -> set[int]:
+    return {int(row["id"]) for row in cash_flow_overdue_invoices(db, current_time=now or _business_now())}
+
+
+def _invoice_view(row, overdue: bool) -> dict[str, Any]:
+    currency = str(row["currency"] or row["order_currency"] or "PLN").upper()
+    paid = bool(row["paid"])
+    return {"id": int(row["id"]), "invoice_number": row["invoice_no"], "order_id": int(row["order_id"]),
+            "buyer_name": row["buyer_name"], "issue_date": row["issue_date"], "due_date": row["payment_to"],
+            "currency": currency, "total_net": _money(row["total_net"]), "total_gross": _money(row["total_gross"]),
+            "paid": paid, "paid_at": row["paid_at"] or None,
+            "amount_outstanding": 0.0 if paid else _money(row["total_gross"]),
+            "payment_status": "paid" if paid else "overdue" if overdue else "unpaid"}
+
+
+def _invoice_rows(db, where="1=1", params=(), limit=51):
+    return db.execute(f"""SELECT i.*,COALESCE(m.paid,0) paid,m.paid_at,m.invoice_items_json,
+                                  COALESCE(i.currency,o.currency,'PLN') currency,
+                                  COALESCE(o.currency,'PLN') order_currency
+                           FROM invoices i LEFT JOIN invoice_meta m ON m.invoice_id=i.id
+                           LEFT JOIN orders o ON o.id=i.order_id WHERE {where}
+                           ORDER BY i.issue_date DESC,i.id DESC LIMIT ?""", (*params, limit)).fetchall()
+
+
+def _invoices_search(data, actor, correlation_id, transaction_connection=None):
+    db = transaction_connection or _factory()()
+    try:
+        start, end = _date_bounds(data)
+        clauses, params = ["1=1"], []
+        query = " ".join(str(data.get("query") or "").split()).casefold()
+        if query:
+            clauses.append("(LOWER(i.invoice_no) LIKE ? OR LOWER(COALESCE(i.buyer_name,'')) LIKE ? OR LOWER(COALESCE(i.buyer_tax_no,'')) LIKE ?)")
+            params.extend([f"%{query}%"] * 3)
+        date_column = "i.payment_to" if data.get("date_field") == "due_date" else "i.issue_date"
+        if start: clauses.append(f"SUBSTR(TRIM({date_column}),1,10)>=?"); params.append(start)
+        if end: clauses.append(f"SUBSTR(TRIM({date_column}),1,10)<=?"); params.append(end)
+        status = data.get("payment_status") or "all"
+        if status == "paid": clauses.append("COALESCE(m.paid,0)=1")
+        elif status in {"unpaid", "overdue"}: clauses.append("COALESCE(m.paid,0)=0")
+        limit = _limit(data); overdue_ids = _overdue_ids(db)
+        rows = _invoice_rows(db, " AND ".join(clauses), params, limit=1001 if status == "overdue" else limit + 1)
+        if status == "overdue": rows = [row for row in rows if int(row["id"]) in overdue_ids]
+        selected = rows[:limit]
+        return {"ok": True, "results": [_invoice_view(r, int(r["id"]) in overdue_ids) for r in selected],
+                "count": len(selected), "truncated": len(rows) > limit}
+    finally:
+        if transaction_connection is None: db.close()
+
+
+def _invoices_get(data, actor, correlation_id, transaction_connection=None):
+    db = transaction_connection or _factory()()
+    try:
+        base = _resolve_by_id_or_number(db, "invoices", data, "invoice_no")
+        if base is None: raise ControlledOperationError("INVOICE_NOT_FOUND", "Nie znaleziono faktury", status=NOOP)
+        rows = _invoice_rows(db, "i.id=?", (int(base["id"]),), 1)
+        row = rows[0]; record = _invoice_view(row, int(row["id"]) in _overdue_ids(db))
+        try:
+            items = json.loads(row["invoice_items_json"] or "[]")
+            if not isinstance(items, list): items = []
+        except Exception: items = []
+        record["items"] = sanitize_audit_data(items[:100])
+        record["buyer_tax_no"] = row["buyer_tax_no"]
+        record["payment_type"] = row["payment_type"]
+        return {"ok": True, "record": record}
+    finally:
+        if transaction_connection is None: db.close()
+
+
+def _invoices_overdue(data, actor, correlation_id, transaction_connection=None):
+    db = transaction_connection or _factory()()
+    try:
+        now = _business_now()
+        if data.get("as_of"):
+            requested = _iso_date(data["as_of"], "as_of")
+            now = datetime.combine(requested, datetime.min.time(), tzinfo=WARSAW_TZ).replace(hour=12)
+        query = " ".join(str(data.get("query") or "").split()).casefold()
+        overdue = cash_flow_overdue_invoices(db, current_time=now)
+        if query:
+            overdue = [r for r in overdue if query in str(r.get("invoice_no") or "").casefold()
+                       or query in str(r.get("buyer_name") or "").casefold()]
+        limit = _limit(data); selected = overdue[:limit]
+        results = []
+        for item in selected:
+            rows = _invoice_rows(db, "i.id=?", (int(item["id"]),), 1)
+            view = _invoice_view(rows[0], True); view["overdue_days"] = int(item["overdue_days"]); results.append(view)
+        return {"ok": True, "results": results, "count": len(results), "truncated": len(overdue) > limit}
+    finally:
+        if transaction_connection is None: db.close()
+
+
+def _customers_search(data, actor, correlation_id, transaction_connection=None):
+    db = transaction_connection or _factory()()
+    try:
+        q = " ".join(str(data["query"]).split()).casefold(); limit = _limit(data)
+        pattern = f"%{q}%"
+        rows = db.execute("""SELECT id,name,nip,email,phone,address,language,price_list FROM customers
+                             WHERE LOWER(name) LIKE ? OR LOWER(COALESCE(nip,'')) LIKE ?
+                                OR LOWER(COALESCE(email,'')) LIKE ? OR LOWER(COALESCE(phone,'')) LIKE ?
+                             ORDER BY name,id LIMIT ?""", (pattern, pattern, pattern, pattern, limit + 1)).fetchall()
+        selected = rows[:limit]
+        results = [{"id": int(r["id"]), "name": r["name"], "nip": r["nip"]} for r in selected]
+        return {"ok": True, "results": results, "count": len(selected), "truncated": len(rows) > limit}
+    finally:
+        if transaction_connection is None: db.close()
+
+
+def _customers_get(data, actor, correlation_id, transaction_connection=None):
+    db = transaction_connection or _factory()()
+    try:
+        row = db.execute("SELECT * FROM customers WHERE id=?", (data["customer_id"],)).fetchone()
+        if row is None: raise ControlledOperationError("CUSTOMER_NOT_FOUND", "Nie znaleziono klienta", status=NOOP)
+        record = {"id": int(row["id"]), "name": row["name"], "nip": row["nip"],
+                  "language": row["language"], "price_list": row["price_list"]}
+        record["order_count"] = int(db.execute("SELECT COUNT(*) FROM orders WHERE customer_id=?", (row["id"],)).fetchone()[0])
+        last_order = db.execute("SELECT id,order_no,status,created_at,currency FROM orders WHERE customer_id=? ORDER BY created_at DESC,id DESC LIMIT 1", (row["id"],)).fetchone()
+        record["last_order"] = ({"id": int(last_order["id"]), "order_number": last_order["order_no"],
+                                 "status": last_order["status"], "created_at": last_order["created_at"],
+                                 "currency": str(last_order["currency"] or "PLN").upper(),
+                                 "totals": _order_totals(db, int(last_order["id"]))} if last_order else None)
+        sums = db.execute("""SELECT UPPER(COALESCE(i.currency,o.currency,'PLN')) currency,COUNT(*) invoice_count,
+                                    SUM(i.total_net) total_net,SUM(i.total_gross) total_gross,
+                                    SUM(CASE WHEN COALESCE(m.paid,0)=1 THEN i.total_gross ELSE 0 END) paid_gross
+                             FROM invoices i LEFT JOIN orders o ON o.id=i.order_id
+                             LEFT JOIN invoice_meta m ON m.invoice_id=i.id
+                             WHERE o.customer_id=? GROUP BY 1 ORDER BY 1""", (row["id"],)).fetchall()
+        record["invoice_totals"] = [{"currency": r["currency"], "invoice_count": int(r["invoice_count"]),
+                                     "total_net": _money(r["total_net"]), "total_gross": _money(r["total_gross"]),
+                                     "paid_gross": _money(r["paid_gross"])} for r in sums]
+        return {"ok": True, "record": record}
+    finally:
+        if transaction_connection is None: db.close()
+
+
+def _sales_summary(data, actor, correlation_id, transaction_connection=None):
+    db = transaction_connection or _factory()()
+    try:
+        start, end = _date_bounds(data, default_period="this_month")
+        order_where, order_params = ["1=1"], []
+        invoice_where, invoice_params = ["1=1"], []
+        if start:
+            order_where.append("SUBSTR(TRIM(o.created_at),1,10)>=?"); order_params.append(start)
+            invoice_where.append("SUBSTR(TRIM(i.issue_date),1,10)>=?"); invoice_params.append(start)
+        if end:
+            order_where.append("SUBSTR(TRIM(o.created_at),1,10)<=?"); order_params.append(end)
+            invoice_where.append("SUBSTR(TRIM(i.issue_date),1,10)<=?"); invoice_params.append(end)
+        order_count = int(db.execute(f"SELECT COUNT(*) FROM orders o WHERE {' AND '.join(order_where)}", order_params).fetchone()[0])
+        invoice_count = int(db.execute(f"SELECT COUNT(*) FROM invoices i WHERE {' AND '.join(invoice_where)}", invoice_params).fetchone()[0])
+        rows = db.execute(f"""SELECT UPPER(COALESCE(i.currency,o.currency,'PLN')) currency,
+                                      SUM(i.total_net) invoice_net,SUM(i.total_gross) invoice_gross,
+                                      SUM(CASE WHEN COALESCE(m.paid,0)=1 THEN i.total_gross ELSE 0 END) paid_gross
+                               FROM invoices i LEFT JOIN orders o ON o.id=i.order_id
+                               LEFT JOIN invoice_meta m ON m.invoice_id=i.id
+                               WHERE {' AND '.join(invoice_where)} GROUP BY 1 ORDER BY 1""", invoice_params).fetchall()
+        currency_map = {r["currency"]: {"currency": r["currency"], "order_count": 0, "order_net": 0.0,
+                        "order_gross": 0.0, "average_order_gross": 0.0,
+                        "invoice_net": _money(r["invoice_net"]), "invoice_gross": _money(r["invoice_gross"]),
+                        "paid_gross": _money(r["paid_gross"])} for r in rows}
+        order_rows = db.execute(f"""SELECT currency,COUNT(*) order_count,SUM(order_net) order_net,SUM(order_gross) order_gross
+            FROM (SELECT o.id,UPPER(COALESCE(NULLIF(TRIM(oi.currency),''),NULLIF(TRIM(o.currency),''),'PLN')) currency,
+                         SUM(oi.qty*COALESCE(oi.unit_net_price,0)) order_net,
+                         SUM(oi.qty*COALESCE(oi.unit_gross_price,oi.unit_net_price,0)) order_gross
+                  FROM orders o LEFT JOIN order_items oi ON oi.order_id=o.id
+                  WHERE {' AND '.join(order_where)} GROUP BY o.id,2) grouped GROUP BY currency ORDER BY currency""", order_params).fetchall()
+        for r in order_rows:
+            entry = currency_map.setdefault(r["currency"], {"currency": r["currency"], "invoice_net": 0.0,
+                "invoice_gross": 0.0, "paid_gross": 0.0})
+            entry.update({"order_count": int(r["order_count"]), "order_net": _money(r["order_net"]),
+                          "order_gross": _money(r["order_gross"]),
+                          "average_order_gross": _money(float(r["order_gross"] or 0) / max(1, int(r["order_count"])))})
+        for entry in currency_map.values():
+            entry.setdefault("order_count", 0); entry.setdefault("order_net", 0.0)
+            entry.setdefault("order_gross", 0.0); entry.setdefault("average_order_gross", 0.0)
+        by_currency = [currency_map[key] for key in sorted(currency_map)]
+        top = db.execute(f"""SELECT COALESCE(NULLIF(TRIM(i.buyer_name),''),o.customer_name,'-') customer,
+                                    UPPER(COALESCE(i.currency,o.currency,'PLN')) currency,
+                                    COUNT(*) invoice_count,SUM(i.total_net) invoice_net
+                             FROM invoices i LEFT JOIN orders o ON o.id=i.order_id
+                             WHERE {' AND '.join(invoice_where)} GROUP BY 1,2 ORDER BY invoice_net DESC LIMIT 20""", invoice_params).fetchall()
+        top_customers = [{"customer": r["customer"], "currency": r["currency"],
+                          "invoice_count": int(r["invoice_count"]), "invoice_net": _money(r["invoice_net"])} for r in top]
+        return {"ok": True, "date_from": start, "date_to": end, "order_count": order_count,
+                "invoice_count": invoice_count, "by_currency": by_currency, "top_customers": top_customers}
+    finally:
+        if transaction_connection is None: db.close()
+
+
 def _pilot_change(data, actor, correlation_id, transaction_connection=None):
     if transaction_connection is None:
         raise ControlledOperationError("TRANSACTION_REQUIRED", "Pilot wymaga wspólnej transakcji")
@@ -587,6 +1022,14 @@ def _pilot_change(data, actor, correlation_id, transaction_connection=None):
 _HANDLERS: dict[str, Callable[[Mapping[str, Any], ActorContext, str, sqlite3.Connection | None], Any]] = {
     "inventory.product.search": _product_search,
     "inventory.product.get": _product_get,
+    "orders.search": _orders_search,
+    "orders.get": _orders_get,
+    "invoices.search": _invoices_search,
+    "invoices.get": _invoices_get,
+    "invoices.overdue": _invoices_overdue,
+    "customers.search": _customers_search,
+    "customers.get": _customers_get,
+    "business.sales.summary": _sales_summary,
     "internal.test.change_setting": _pilot_change,
     # External operations are queued below and are never called through this map.
     "internal.test.external.execute": lambda *_args, **_kwargs: None,

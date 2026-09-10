@@ -25,8 +25,8 @@ MAX_CONTEXT_MESSAGES = 8
 MODEL_TIMEOUT_SECONDS = 30
 _SAFE_TOOL_NAME = re.compile(r"[a-z][a-z0-9_.]{2,127}")
 _STANDALONE_SECRET = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
-_WRITE_INTENT = re.compile(r"(?i)\b(zmień|zmien|ustaw|dodaj|usuń|usun|wyślij|wyslij|utwórz|utworz|anuluj|skoryguj)\b")
-_DATA_INTENT = re.compile(r"(?i)\b(ile|stan|stock|produkt|zamówieni|faktur|ksef|przesył|klient|płatno)\w*")
+_WRITE_INTENT = re.compile(r"(?i)\b(zmień|zmien|ustaw|oznacz|dodaj|usuń|usun|wyślij|wyslij|utwórz|utworz|anuluj|skoryguj)\b")
+_DATA_INTENT = re.compile(r"(?i)\b(ile|stan|stock|produkt|zamówieni|faktur|ksef|przesył|klient|płatno|zaleg|sprzeda|obrót)\w*")
 _SAFE_API_ERROR_CODE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 logger = logging.getLogger(__name__)
 
