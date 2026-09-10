@@ -50,6 +50,13 @@ from internal_concurrency import (
     configure as configure_internal_concurrency,
     initialize_schema as initialize_internal_concurrency_schema,
 )
+from internal_audit_outbox import (
+    configure as configure_internal_audit_outbox,
+    configure_remote_sender as configure_audit_remote_sender,
+    initialize_schema as initialize_internal_audit_outbox_schema,
+    queue_health as audit_outbox_health,
+    start_worker as start_audit_outbox_worker,
+)
 
 import qrcode
 from reportlab.pdfgen import canvas
@@ -243,6 +250,7 @@ def conn():
 configure_internal_rbac(conn)
 configure_internal_audit(conn)
 configure_internal_concurrency(conn)
+configure_internal_audit_outbox(conn)
 
 def init_db():
     c = conn()
@@ -746,6 +754,7 @@ def init_db():
     initialize_pickups(c)
     initialize_internal_rbac_schema(c)
     initialize_internal_audit_schema(c)
+    initialize_internal_audit_outbox_schema(c)
     initialize_internal_concurrency_schema(c)
     c.close()
 
@@ -7055,6 +7064,24 @@ def _refresh_domain_route_context():
 import inpost_pickups as _inpost_pickups
 import sys as _pickup_sys
 _inpost_pickups.start_worker(_pickup_sys.modules[__name__])
+
+
+def _send_audit_to_supabase(payload):
+    # audit_id is immutable and is the remote idempotency key. A retry after an
+    # uncertain response can only observe the existing row, never create a copy.
+    return supabase_request(
+        "/rest/v1/internal_audit_log",
+        method="POST",
+        params={"on_conflict": "audit_id"},
+        payload=payload,
+        prefer="resolution=ignore-duplicates,return=minimal",
+        timeout=20,
+    )
+
+
+if supabase_enabled():
+    configure_audit_remote_sender(_send_audit_to_supabase)
+    start_audit_outbox_worker()
 
 if __name__ == "__main__":
     # debug=True moĹĽesz zostawiÄ‡ na czas budowy

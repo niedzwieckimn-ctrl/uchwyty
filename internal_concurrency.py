@@ -197,6 +197,8 @@ def update_versioned_resource(
             after_state=normalized_payload,
             entity_version_before=current_version,
             entity_version_after=None,
+            expected_version=expected_version,
+            current_version=current_version,
         )
         raise OptimisticConcurrencyConflict(resource_id, expected_version, current_version)
 

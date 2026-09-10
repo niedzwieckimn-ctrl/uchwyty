@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from flask import Flask
@@ -256,7 +257,8 @@ def test_optimistic_concurrency_detects_conflict_and_preserves_newer_state(isola
     assert updated.version == 2
     with pytest.raises(concurrency.OptimisticConcurrencyConflict) as exc:
         concurrency.update_versioned_resource(
-            resource.resource_id, 1, {"value": "stale"}, actor_context=actor
+            resource.resource_id, 1, {"value": "stale"}, actor_context=actor,
+            correlation_id="version-process",
         )
     assert exc.value.current_version == 2
     final = concurrency.get_versioned_resource(resource.resource_id)
@@ -272,6 +274,45 @@ def test_optimistic_concurrency_detects_conflict_and_preserves_newer_state(isola
     assert conflict["error_code"] == "VERSION_CONFLICT"
     assert conflict["entity_version_before"] == 2
     assert conflict["entity_version_after"] is None
+    assert conflict["expected_version"] == 1
+    assert conflict["current_version"] == 2
+    assert conflict["actor_id"] == rbac.BOOTSTRAP_OWNER_ACTOR_ID
+    assert conflict["request_id"] == "request-version"
+    assert conflict["correlation_id"] == "version-process"
+
+
+def test_two_parallel_versioned_updates_cannot_both_win(isolated):
+    actor = _owner("parallel-version")
+    resource = concurrency.create_versioned_resource(
+        "pilot", {"value": "initial"}, actor_context=actor, resource_id=str(uuid.uuid4())
+    )
+
+    def update(value):
+        try:
+            result = concurrency.update_versioned_resource(
+                resource.resource_id, 1, {"value": value}, actor_context=actor
+            )
+            return "SUCCESS", result.version
+        except concurrency.OptimisticConcurrencyConflict as exc:
+            return "CONFLICT", exc.current_version
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(update, ("first", "second")))
+    assert sorted(result for result, _version in outcomes) == ["CONFLICT", "SUCCESS"]
+    final = concurrency.get_versioned_resource(resource.resource_id)
+    assert final.version == 2
+    assert final.payload["value"] in {"first", "second"}
+
+
+def test_versioned_write_cannot_omit_expected_version(isolated):
+    actor = _owner()
+    resource = concurrency.create_versioned_resource(
+        "pilot", {"value": "initial"}, actor_context=actor, resource_id=str(uuid.uuid4())
+    )
+    with pytest.raises(TypeError):
+        concurrency.update_versioned_resource(
+            resource.resource_id, payload={"value": "bypass"}, actor_context=actor
+        )
 
 
 def test_audit_read_service_requires_system_audit_permission(isolated):

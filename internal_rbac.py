@@ -98,6 +98,7 @@ PERMISSIONS = {
     "system.jobs": "Uruchamianie zadań systemowych",
     "system.users_manage": "Zarządzanie użytkownikami wewnętrznymi",
     "system.audit_read": "Odczyt centralnego audytu",
+    "system.audit_deliver": "Techniczne dostarczanie audytu do centralnej bazy",
     "approvals.review": "Odczyt operacji oczekujących na akceptację",
     "approvals.decide": "Zatwierdzanie lub odrzucanie operacji",
 }
@@ -123,6 +124,7 @@ ROLE_DEFINITIONS = {
     "SYSTEM_17TRACK_WEBHOOK": ("System 17TRACK webhook", "SYSTEM"),
     "SYSTEM_ORDER_EMAIL_RETRY": ("System order e-mail retry", "SYSTEM"),
     "SYSTEM_DATA_SYNC": ("System data sync", "SYSTEM"),
+    "SYSTEM_AUDIT_DELIVERY": ("System audit delivery", "SYSTEM"),
 }
 
 
@@ -139,7 +141,7 @@ ROLE_PERMISSION_DECISIONS = {
             "inventory.pricing_manage", "invoices.publish", "invoices.modify",
             "invoices.reverse", "ksef.send", "ksef.override_status",
             "customers.delete", "purchases.receive", "purchases.delete",
-            "payments.set_status", "system.company_manage",
+            "payments.set_status", "system.company_manage", "system.audit_deliver",
         },
         approval={
             "orders.delete", "orders.stock_repair", "inventory.adjust",
@@ -275,6 +277,7 @@ ROLE_PERMISSION_DECISIONS = {
         allow={"orders.read_full", "orders.send_confirmation"}
     ),
     "SYSTEM_DATA_SYNC": _decisions(allow={"system.sync"}),
+    "SYSTEM_AUDIT_DELIVERY": _decisions(allow={"system.audit_deliver"}),
 }
 
 
@@ -286,6 +289,7 @@ SYSTEM_ACTORS = {
     "10000000-0000-4000-8000-000000000005": "SYSTEM_17TRACK_WEBHOOK",
     "10000000-0000-4000-8000-000000000006": "SYSTEM_ORDER_EMAIL_RETRY",
     "10000000-0000-4000-8000-000000000007": "SYSTEM_DATA_SYNC",
+    "10000000-0000-4000-8000-000000000008": "SYSTEM_AUDIT_DELIVERY",
 }
 
 

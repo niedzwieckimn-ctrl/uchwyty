@@ -74,6 +74,9 @@ OPERATION_DEFINITIONS: dict[str, OperationDefinition] = {
     "inventory.product.read": OperationDefinition(
         "inventory.product.read", 1, "inventory.read", GREEN, READ_STANDARD
     ),
+    "internal.audit_outbox.status": OperationDefinition(
+        "internal.audit_outbox.status", 1, "system.audit_read", GREEN, READ_SENSITIVE
+    ),
     "internal.versioned_resource.create": OperationDefinition(
         "internal.versioned_resource.create", 1, "system.audit_read", GREEN, WRITE
     ),
@@ -137,6 +140,8 @@ def initialize_schema(db: sqlite3.Connection) -> None:
             after_state TEXT,
             entity_version_before INTEGER,
             entity_version_after INTEGER,
+            expected_version INTEGER,
+            current_version INTEGER,
             source TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_internal_audit_actor_time
@@ -161,6 +166,12 @@ def initialize_schema(db: sqlite3.Connection) -> None:
         END;
         """
     )
+    existing_columns = {
+        row[1] for row in db.execute("PRAGMA table_info(internal_audit_log)").fetchall()
+    }
+    for column in ("expected_version", "current_version"):
+        if column not in existing_columns:
+            db.execute(f"ALTER TABLE internal_audit_log ADD COLUMN {column} INTEGER")
     db.commit()
 
 
@@ -297,6 +308,8 @@ def record_audit_event(
     after_state: Any = None,
     entity_version_before: int | None = None,
     entity_version_after: int | None = None,
+    expected_version: int | None = None,
+    current_version: int | None = None,
     changes_only: bool = True,
     source: str = "",
 ) -> str:
@@ -348,6 +361,8 @@ def record_audit_event(
         _json_state(after_state),
         entity_version_before,
         entity_version_after,
+        expected_version,
+        current_version,
         (source or getattr(actor_context, "source", "") or "internal")[:128],
     )
     db = _connection_factory()
@@ -360,9 +375,15 @@ def record_audit_event(
                 approval_required,approval_id,approved_by,result,error_code,error_message,
                 external_integration,external_request_id,external_result,idempotency_key,
                 is_replay,before_state,after_state,entity_version_before,
-                entity_version_after,source
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                entity_version_after,expected_version,current_version,source
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             values,
+        )
+        db.execute(
+            """INSERT INTO internal_audit_outbox(
+                audit_id,status,attempt_count,next_attempt_at,created_at,lease_until
+            ) VALUES(?,'PENDING',0,0,?,0)""",
+            (audit_id, _utc_now()),
         )
         db.commit()
     finally:
