@@ -486,7 +486,13 @@ def register_routes(context):
         return render_template_string(tpl, title="Zaległości", base_url=BASE_URL, db_path=DB_PATH, rows=rows, total_gross=total_gross)
 
 
+    @app.get("/api/internal/audit-outbox/status")
+    @require_permission("system.audit_read", operation="internal.audit_outbox.status")
+    def internal_audit_outbox_status():
+        return jsonify(ok=True, outbox=audit_outbox_health())
 
-    exported = {'login': login, 'logout': logout, 'home': home, 'company': company, 'company_save': company_save, 'retry_failed_order_confirmations': retry_failed_order_confirmations, 'email_test': email_test, 'overdue_payments': overdue_payments}
+
+
+    exported = {'login': login, 'logout': logout, 'home': home, 'company': company, 'company_save': company_save, 'retry_failed_order_confirmations': retry_failed_order_confirmations, 'email_test': email_test, 'overdue_payments': overdue_payments, 'internal_audit_outbox_status': internal_audit_outbox_status}
     globals().update(exported)
     return exported
