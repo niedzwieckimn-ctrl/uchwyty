@@ -1,4 +1,5 @@
 from datetime import datetime
+import logging
 
 import pytest
 
@@ -17,6 +18,7 @@ def data(tmp_path, monkeypatch):
     db.execute("INSERT INTO customers(id,name,address,phone,email,nip,language,price_list,created_at) VALUES(1,'Firma Avery','Warszawa','500600700','avery@example.pl','1234567890','pl','pln',?)", (now,))
     db.execute("INSERT INTO customers(id,name,address,phone,email,nip,language,price_list,created_at) VALUES(2,'Euro Client','Berlin','111','euro@example.de','DE123','de','eu_eur',?)", (now,))
     db.execute("INSERT INTO products(id,sku,model,name,archived,created_at) VALUES(1,'CH034-BB-128160','CH034','Avery',0,?)", (now,))
+    db.execute("INSERT INTO stock(product_id,qty) VALUES(1,40)")
     db.execute("INSERT INTO orders(id,order_no,customer_id,customer_name,status,created_at,currency,price_list) VALUES(1,'ZAM-2609101',1,'Firma Avery','confirmed','2026-09-10T08:00:00+02:00','PLN','pln')")
     db.execute("INSERT INTO orders(id,order_no,customer_id,customer_name,status,created_at,currency,price_list) VALUES(2,'ZAM-2608311',2,'Euro Client','completed','2026-08-31T08:00:00+02:00','EUR','eu_eur')")
     db.execute("INSERT INTO order_items(id,order_id,product_id,sku,qty,unit_net_price,unit_gross_price,currency,created_at) VALUES(1,1,1,'CH034-BB-128160',2,100,123,'PLN',?)", (now,))
@@ -25,6 +27,10 @@ def data(tmp_path, monkeypatch):
     db.execute("INSERT INTO invoices(id,order_id,invoice_no,issue_date,sell_date,payment_type,payment_to,buyer_name,buyer_tax_no,total_net,total_gross,created_at,currency) VALUES(2,2,'FV/2/09/2026','2026-09-09','2026-09-09','transfer','2026-09-20','Euro Client','DE123',50,50,?,'EUR')", (now,))
     db.execute("INSERT INTO invoice_meta(invoice_id,invoice_items_json,paid,paid_at,updated_at) VALUES(1,'[{\"sku\":\"CH034-BB-128160\",\"qty\":2,\"currency\":\"PLN\"}]',0,NULL,?)", (now,))
     db.execute("INSERT INTO invoice_meta(invoice_id,invoice_items_json,paid,paid_at,updated_at) VALUES(2,'[{\"sku\":\"CH034-BB-128160\",\"qty\":1,\"currency\":\"EUR\"}]',1,'2026-09-10',?)", (now,))
+    db.execute("INSERT INTO china_packages(id,package_no,status,created_at) VALUES(1,'PO-1','ordered',?)", (now,))
+    db.execute("INSERT INTO china_packages(id,package_no,status,created_at) VALUES(2,'PO-2','arrived',?)", (now,))
+    db.execute("INSERT INTO china_items(id,package_id,product_id,sku,qty,created_at) VALUES(1,1,1,'CH034-BB-128160',12,?)", (now,))
+    db.execute("INSERT INTO china_items(id,package_id,product_id,sku,qty,created_at) VALUES(2,2,1,'CH034-BB-128160',5,?)", (now,))
     db.commit(); db.close()
     return rbac.load_actor_context(rbac.AI_OWNER_ASSISTANT_ACTOR_ID, request_id="prompt9")
 
@@ -76,6 +82,54 @@ def test_customer_search_and_get(data):
     assert "email" not in detail and "phone" not in detail and "address" not in detail
 
 
+@pytest.mark.parametrize("query", ["AM Interiors", "am interiors", "AM", "Interiors", "  AM   Interiors  "])
+def test_customer_search_matches_order_identity_casefold_contains_and_spaces(data, query):
+    db = backend.conn()
+    db.execute("INSERT INTO orders(id,order_no,customer_name,customer_email,status,created_at,currency,price_list) VALUES(3,'ZAM-AM','AM Interiors','am@example.com','confirmed','2026-09-10T10:00:00+02:00','PLN','pln')")
+    db.commit(); db.close()
+    found = run(data, "customers.search", {"query": query})
+    assert any(row["name"] == "AM Interiors" for row in found["results"])
+
+
+def test_inventory_summary_matches_inventory_analysis(data):
+    from inventory_analytics import build_replenishment_analysis
+    rows = build_replenishment_analysis(backend.conn, today=datetime.fromisoformat("2026-09-10").date())
+    result = run(data, "inventory.summary", {})
+    assert result == {
+        "ok": True, "product_count": len(rows),
+        "stock_units": sum(row["stock_qty"] for row in rows),
+        "available_units": sum(row["available_qty"] for row in rows),
+        "reserved_units": sum(row["reserved_qty"] for row in rows),
+        "incoming_units": sum(row["incoming_qty"] for row in rows),
+    }
+
+
+def test_china_orders_summary_uses_po_tables_and_ui_active_statuses(data):
+    active = run(data, "china.orders.summary", {})
+    assert active["scope"] == "active" and active["order_count"] == 1
+    assert active["item_units"] == 12 and active["by_status"] == {"ordered": 1}
+    assert run(data, "china.orders.summary", {"scope": "all"})["order_count"] == 2
+
+
+def test_unpaid_and_overdue_semantics_include_no_partial_amount_model(data):
+    # invoice_meta stores a paid boolean, exactly as the Faktury and Cash Flow UI.
+    # There is no persisted partial-payment amount; paid=0 therefore remains fully open.
+    unpaid = run(data, "invoices.search", {"payment_status": "unpaid"})
+    invoice = next(row for row in unpaid["results"] if row["invoice_number"] == "FV/1/09/2026")
+    assert invoice["amount_outstanding"] == invoice["total_gross"] == 246.0
+    assert run(data, "invoices.overdue", {"as_of": "2026-09-10"})["count"] == 1
+
+
+def test_business_operation_diagnostics_are_bounded(data, caplog):
+    with caplog.at_level(logging.INFO, logger="business_operations"):
+        run(data, "customers.search", {"query": "AM Interiors"})
+    assert "BUSINESS_OPERATION_INPUT" in caplog.text
+    assert "BUSINESS_OPERATION_RESULT" in caplog.text
+    assert '"operation": "customers.search"' in caplog.text
+    assert '"status": "SUCCESS"' in caplog.text
+    assert "AM Interiors" not in caplog.text
+
+
 def test_ambiguous_customer_returns_candidates(data):
     db = backend.conn(); now = backend.now_iso()
     db.execute("INSERT INTO customers(name,nip,language,price_list,created_at) VALUES('Firma Avery Druga','999','pl','pln',?)", (now,)); db.commit(); db.close()
@@ -104,12 +158,13 @@ def test_search_limit_is_enforced(data):
 
 
 def test_read_operations_do_not_mutate_business_tables(data):
-    tables = ("orders", "order_items", "customers", "invoices", "invoice_meta", "invoice_allocations")
+    tables = ("orders", "order_items", "customers", "invoices", "invoice_meta", "invoice_allocations", "products", "stock", "china_packages", "china_items")
     db = backend.conn(); before = {t: [tuple(r) for r in db.execute(f"SELECT * FROM {t} ORDER BY 1")] for t in tables}; db.close()
     for name, payload in (
         ("orders.search", {}), ("orders.get", {"id": 1}), ("invoices.search", {}),
         ("invoices.get", {"id": 1}), ("invoices.overdue", {}),
         ("customers.search", {"query": "Firma"}), ("customers.get", {"customer_id": 1}),
+        ("inventory.summary", {}), ("china.orders.summary", {}),
         ("business.sales.summary", {"period": "this_month"}),
     ):
         run(data, name, payload)

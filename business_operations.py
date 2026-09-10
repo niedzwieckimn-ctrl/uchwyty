@@ -10,9 +10,11 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import logging
 import re
 import sqlite3
 import threading
+import time
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Mapping
@@ -20,6 +22,7 @@ from zoneinfo import ZoneInfo
 
 import internal_approval as approvals
 from cash_flow_module import cash_flow_overdue_invoices
+from inventory_analytics import build_replenishment_analysis
 from internal_audit import (
     CONFLICT, DENIED, FAILED, NOOP, PENDING_APPROVAL, SUCCESS,
     current_correlation_id, record_audit_event, sanitize_audit_data,
@@ -42,6 +45,7 @@ SAFE_IDEMPOTENCY_KEY = re.compile(r"[A-Za-z0-9._:-]{1,200}")
 MAX_PRODUCT_SEARCH_RESULTS = 50
 MAX_BUSINESS_SEARCH_RESULTS = 50
 WARSAW_TZ = ZoneInfo("Europe/Warsaw")
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -203,6 +207,29 @@ SALES_SUMMARY_OUTPUT = {
         "top_customers": {"type": "array", "maxItems": 20},
     },
 }
+INVENTORY_SUMMARY_INPUT = {"type": "object", "additionalProperties": False, "properties": {}}
+INVENTORY_SUMMARY_OUTPUT = {
+    "type": "object", "additionalProperties": False,
+    "required": ["ok", "product_count", "stock_units", "available_units", "reserved_units", "incoming_units"],
+    "properties": {
+        "ok": {"type": "boolean"}, "product_count": {"type": "integer"},
+        "stock_units": {"type": "integer"}, "available_units": {"type": "integer"},
+        "reserved_units": {"type": "integer"}, "incoming_units": {"type": "integer"},
+    },
+}
+CHINA_SUMMARY_INPUT = {
+    "type": "object", "additionalProperties": False,
+    "properties": {"scope": {"type": "string", "enum": ["active", "all", "arrived"]}},
+}
+CHINA_SUMMARY_OUTPUT = {
+    "type": "object", "additionalProperties": False,
+    "required": ["ok", "scope", "order_count", "item_units", "by_status"],
+    "properties": {
+        "ok": {"type": "boolean"}, "scope": {"type": "string"},
+        "order_count": {"type": "integer"}, "item_units": {"type": "integer"},
+        "by_status": {"type": "object"},
+    },
+}
 PILOT_INPUT = {
     "type": "object",
     "additionalProperties": False,
@@ -254,6 +281,11 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
         frozenset({"HUMAN", "SYSTEM", "AI_AGENT"}),
         PRODUCT_GET_INPUT, PRODUCT_GET_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
+    "inventory.summary": BusinessOperationDefinition(
+        "inventory.summary", 1, "Podsumowuje cały magazyn: fizyczny stan, dostępność, rezerwacje i dostawy w drodze.",
+        "inventory.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "SYSTEM", "AI_AGENT"}),
+        INVENTORY_SUMMARY_INPUT, INVENTORY_SUMMARY_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
+    ),
     "orders.search": BusinessOperationDefinition(
         "orders.search", 1, "Wyszukuje zamówienia po numerze, kliencie, statusie i okresie.",
         "orders.read_full", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
@@ -265,7 +297,7 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
         _GET_INPUT, _DETAIL_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
     "invoices.search": BusinessOperationDefinition(
-        "invoices.search", 1, "Wyszukuje faktury po numerze, kliencie, płatności i okresie wystawienia.",
+        "invoices.search", 1, "Wyszukuje faktury, w tym wszystkie nieopłacone przez payment_status=unpaid; po terminie obsługuje invoices.overdue.",
         "invoices.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
         INVOICE_SEARCH_INPUT, _RESULTS_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
@@ -275,7 +307,7 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
         _GET_INPUT, _DETAIL_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
     "invoices.overdue": BusinessOperationDefinition(
-        "invoices.overdue", 1, "Zwraca zaległe faktury według tej samej reguły co Cash Flow.",
+        "invoices.overdue", 1, "Zwraca wyłącznie zaległe faktury po terminie według tej samej reguły co Cash Flow.",
         "payments.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
         INVOICE_OVERDUE_INPUT, _RESULTS_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
@@ -288,6 +320,11 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
         "customers.get", 1, "Pobiera dane klienta oraz zagregowaną historię zamówień i faktur.",
         "customers.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
         CUSTOMER_GET_INPUT, _DETAIL_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
+    ),
+    "china.orders.summary": BusinessOperationDefinition(
+        "china.orders.summary", 1, "Liczy zamówienia zakupowe Chiny/P/O z tabel dostaw, domyślnie aktywne.",
+        "purchases.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
+        CHINA_SUMMARY_INPUT, CHINA_SUMMARY_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
     "business.sales.summary": BusinessOperationDefinition(
         "business.sales.summary", 1, "Zwraca podsumowanie sprzedaży za kontrolowany okres, osobno dla każdej waluty.",
@@ -458,12 +495,16 @@ def _entity(definition: BusinessOperationDefinition, data: Mapping[str, Any]) ->
         return "product_search", sanitize_audit_text(data["query"])[:120], None
     if definition.operation_name == "inventory.product.get":
         return "product", str(data["product_id"]), None
+    if definition.operation_name == "inventory.summary":
+        return "inventory_summary", "all", None
     if definition.operation_name in {"orders.search", "invoices.search", "invoices.overdue", "customers.search"}:
         return definition.operation_name.replace(".", "_"), sanitize_audit_text(data.get("query", "all"))[:160], None
     if definition.operation_name in {"orders.get", "invoices.get"}:
         return definition.operation_name.split(".")[0][:-1], str(data.get("id") or data.get("number") or ""), None
     if definition.operation_name == "customers.get":
         return "customer", str(data["customer_id"]), None
+    if definition.operation_name == "china.orders.summary":
+        return "china_orders_summary", str(data.get("scope") or "active"), None
     if definition.operation_name == "business.sales.summary":
         return "sales_summary", str(data.get("period") or "this_month"), None
     if definition.operation_name == "internal.test.change_setting":
@@ -896,14 +937,77 @@ def _customers_search(data, actor, correlation_id, transaction_connection=None):
     db = transaction_connection or _factory()()
     try:
         q = " ".join(str(data["query"]).split()).casefold(); limit = _limit(data)
-        pattern = f"%{q}%"
-        rows = db.execute("""SELECT id,name,nip,email,phone,address,language,price_list FROM customers
-                             WHERE LOWER(name) LIKE ? OR LOWER(COALESCE(nip,'')) LIKE ?
-                                OR LOWER(COALESCE(email,'')) LIKE ? OR LOWER(COALESCE(phone,'')) LIKE ?
-                             ORDER BY name,id LIMIT ?""", (pattern, pattern, pattern, pattern, limit + 1)).fetchall()
-        selected = rows[:limit]
-        results = [{"id": int(r["id"]), "name": r["name"], "nip": r["nip"]} for r in selected]
-        return {"ok": True, "results": results, "count": len(selected), "truncated": len(rows) > limit}
+        tokens = q.split()
+        registered = [dict(row) for row in db.execute(
+            "SELECT id,name,nip,email,phone FROM customers ORDER BY name,id"
+        ).fetchall()]
+        # The Wyszukiwania screen also resolves identities from order e-mail/name.
+        # Include those identities when the CRM row is missing from the local copy.
+        order_identities = [dict(row) for row in db.execute(
+            """SELECT customer_id AS id,customer_name AS name,'' AS nip,
+                      customer_email AS email,customer_phone AS phone
+                 FROM orders
+                WHERE TRIM(COALESCE(customer_name,''))<>'' OR TRIM(COALESCE(customer_email,''))<>''
+                ORDER BY created_at DESC,id DESC"""
+        ).fetchall()]
+        matches, seen = [], set()
+        for row in registered + order_identities:
+            fields = [" ".join(str(row.get(key) or "").split()).casefold()
+                      for key in ("name", "nip", "email", "phone")]
+            haystack = " ".join(fields)
+            if not all(token in haystack for token in tokens):
+                continue
+            identity = (("id", int(row["id"])) if row.get("id") is not None
+                        else ("identity", fields[0], fields[2]))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            matches.append({"id": int(row["id"]) if row.get("id") is not None else None,
+                            "name": row.get("name") or row.get("email") or "", "nip": row.get("nip") or ""})
+        selected = matches[:limit]
+        return {"ok": True, "results": selected, "count": len(selected), "truncated": len(matches) > limit}
+    finally:
+        if transaction_connection is None: db.close()
+
+
+def _inventory_summary(data, actor, correlation_id, transaction_connection=None):
+    del data, actor, correlation_id
+    if transaction_connection is not None:
+        rows = build_replenishment_analysis(lambda: transaction_connection, today=_business_now().date())
+    else:
+        rows = build_replenishment_analysis(_factory(), today=_business_now().date())
+    return {
+        "ok": True,
+        "product_count": len(rows),
+        "stock_units": sum(int(row.get("stock_qty") or 0) for row in rows),
+        "available_units": sum(int(row.get("available_qty") or 0) for row in rows),
+        "reserved_units": sum(int(row.get("reserved_qty") or 0) for row in rows),
+        "incoming_units": sum(int(row.get("incoming_qty") or 0) for row in rows),
+    }
+
+
+def _china_orders_summary(data, actor, correlation_id, transaction_connection=None):
+    del actor, correlation_id
+    db = transaction_connection or _factory()()
+    try:
+        scope = str(data.get("scope") or "active")
+        active = ("planned", "ordered", "shipped", "problem")
+        clauses, params = ["1=1"], []
+        if scope == "active":
+            clauses.append("LOWER(COALESCE(cp.status,'')) IN (?,?,?,?)"); params.extend(active)
+        elif scope == "arrived":
+            clauses.append("LOWER(COALESCE(cp.status,''))='arrived'")
+        rows = db.execute(
+            f"""SELECT cp.id,LOWER(COALESCE(cp.status,'')) status,COALESCE(SUM(ci.qty),0) units
+                  FROM china_packages cp LEFT JOIN china_items ci ON ci.package_id=cp.id
+                 WHERE {' AND '.join(clauses)} GROUP BY cp.id,cp.status""", params,
+        ).fetchall()
+        by_status = {}
+        for row in rows:
+            key = str(row["status"] or "unknown")
+            by_status[key] = by_status.get(key, 0) + 1
+        return {"ok": True, "scope": scope, "order_count": len(rows),
+                "item_units": sum(int(row["units"] or 0) for row in rows), "by_status": by_status}
     finally:
         if transaction_connection is None: db.close()
 
@@ -1022,6 +1126,7 @@ def _pilot_change(data, actor, correlation_id, transaction_connection=None):
 _HANDLERS: dict[str, Callable[[Mapping[str, Any], ActorContext, str, sqlite3.Connection | None], Any]] = {
     "inventory.product.search": _product_search,
     "inventory.product.get": _product_get,
+    "inventory.summary": _inventory_summary,
     "orders.search": _orders_search,
     "orders.get": _orders_get,
     "invoices.search": _invoices_search,
@@ -1029,6 +1134,7 @@ _HANDLERS: dict[str, Callable[[Mapping[str, Any], ActorContext, str, sqlite3.Con
     "invoices.overdue": _invoices_overdue,
     "customers.search": _customers_search,
     "customers.get": _customers_get,
+    "china.orders.summary": _china_orders_summary,
     "business.sales.summary": _sales_summary,
     "internal.test.change_setting": _pilot_change,
     # External operations are queued below and are never called through this map.
@@ -1106,6 +1212,27 @@ def _safe_denial(operation: str, version: int, execution_id: str, actor, correla
         correlation_id=correlation, error_code=code,
         safe_error_message=sanitize_audit_text(message),
     )
+
+
+def _safe_diagnostic_args(data: Mapping[str, Any]) -> dict[str, Any]:
+    safe = {"keys": sorted(str(key) for key in data)}
+    if "query" in data:
+        safe["query_length"] = len(str(data.get("query") or ""))
+    for key in ("status", "payment_status", "period", "date_field", "as_of", "scope", "limit"):
+        if key in data:
+            safe[key] = data[key]
+    return safe
+
+
+def _diagnostic_result(operation: str, *, status: str, started: float,
+                       output: Any = None, error_code: str = "") -> None:
+    count = None
+    if isinstance(output, Mapping):
+        count = output.get("count", output.get("order_count", output.get("product_count")))
+    logger.info("BUSINESS_OPERATION_RESULT %s", json.dumps({
+        "operation": operation, "status": status, "count": count,
+        "error_code": error_code, "latency_ms": round((time.perf_counter() - started) * 1000, 2),
+    }, ensure_ascii=False, sort_keys=True))
 
 
 def execute_business_operation(
@@ -1215,12 +1342,18 @@ def execute_business_operation(
                                   started=True, expected_statuses=("CREATED",))
             if claimed is None:
                 return _result_from_row(_execution(execution_id), status=NOOP)
+        handler_started = time.perf_counter()
+        logger.info("BUSINESS_OPERATION_INPUT %s", json.dumps({
+            "operation": definition.operation_name, "args": _safe_diagnostic_args(data),
+        }, ensure_ascii=False, sort_keys=True))
         try:
             output = validate_output(
                 definition,
                 _HANDLERS[definition.operation_name](data, actor, row["correlation_id"], None),
             )
         except ControlledOperationError as exc:
+            _diagnostic_result(definition.operation_name, status=exc.status, started=handler_started,
+                               error_code=exc.error_code)
             event = "business_operation.conflict" if exc.status == CONFLICT else "business_operation.failed"
             audit_result = CONFLICT if exc.status == CONFLICT else FAILED
             terminal = "CONFLICT" if exc.status == CONFLICT else "FAILED"
@@ -1228,10 +1361,13 @@ def execute_business_operation(
                               error_code=exc.error_code, message=exc.safe_message, completed=True)
             return _result_from_row(row)
         except Exception as exc:
+            _diagnostic_result(definition.operation_name, status=FAILED, started=handler_started,
+                               error_code="HANDLER_FAILED")
             safe_message = sanitize_audit_text(exc)
             row = _transition(execution_id, definition, actor, "FAILED", "business_operation.failed", FAILED,
                               error_code="HANDLER_FAILED", message=safe_message, completed=True)
             return _result_from_row(row)
+        _diagnostic_result(definition.operation_name, status=SUCCESS, started=handler_started, output=output)
         row = _transition(execution_id, definition, actor, "SUCCESS", "business_operation.success", SUCCESS,
                           data=output, completed=True, expected_statuses=("RUNNING",))
         return _result_from_row(row)

@@ -155,9 +155,9 @@ def test_prompt_injection_cannot_expose_write_tool():
     assert all(not permission.endswith((".adjust", ".send", ".manage", ".create")) for permission in ai.effective_permissions)
     names = {item["name"] for item in runtime._tool_descriptors(ai)}
     assert names == {
-        "inventory.product.get", "inventory.product.search", "orders.search", "orders.get",
+        "inventory.product.get", "inventory.product.search", "inventory.summary", "orders.search", "orders.get",
         "invoices.search", "invoices.get", "invoices.overdue", "customers.search",
-        "customers.get", "business.sales.summary",
+        "customers.get", "china.orders.summary", "business.sales.summary",
     }
     assert all(item["parameters"] and "permission" not in item for item in runtime._tool_descriptors(ai))
     assert all(item["strict"] is False for item in runtime._tool_descriptors(ai))
