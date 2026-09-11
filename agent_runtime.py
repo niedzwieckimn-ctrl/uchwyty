@@ -10,6 +10,7 @@ import os
 import re
 import time
 import uuid
+from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Protocol
 
@@ -32,21 +33,140 @@ _STANDALONE_SECRET = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
 _SAFE_API_ERROR_CODE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 logger = logging.getLogger(__name__)
 _NUMERIC_LITERAL = re.compile(r"(?<![\w])(?:\d{1,3}(?:[ \u00a0\u202f]\d{3})+|\d+)(?:[.,]\d+)?(?![\w])")
+_DATE_LITERAL = re.compile(
+    r"(?<!\d)(?P<iso>\d{4}-(?:0?[1-9]|1[0-2])-(?:0?[1-9]|[12]\d|3[01]))(?!\d)"
+    r"|(?<!\d)(?P<dmy>(?:0?[1-9]|[12]\d|3[01])[./](?:0?[1-9]|1[0-2])[./]\d{4})(?!\d)"
+)
+_IDENTIFIER_LITERAL = re.compile(
+    r"(?i)(?<![\w])(?:FVAT|FV)\s+[A-Z0-9]+(?:\s*[/\-]\s*[A-Z0-9]+)+"
+    r"|(?<![\w])(?:ID)\s*[:#]?\s*\d+"
+    r"|(?<![\w])(?=[A-Z0-9/\-]*[A-Z])(?=[A-Z0-9/\-]*\d)[A-Z0-9]+(?:[/\-][A-Z0-9]+)+(?![\w])"
+    r"|(?<![\w])(?=[A-Z0-9]*[A-Z])(?=[A-Z0-9]*\d)[A-Z0-9]{3,}(?![\w])"
+)
+_IDENTIFIER_KEYS = re.compile(
+    r"(?i)(?:^id$|_id$|^sku$|(?:invoice|order|document|tracking|package|shipment|po)_(?:no|number)$|number$)"
+)
+_DATE_KEYS = re.compile(r"(?i)(?:^date$|_date$|_at$|^as_of$|^due$|^deadline$)")
 ORCHESTRATION_TOOLS = frozenset({"assistant.respond", "assistant.clarify"})
 
 
-def _normalized_numbers(value: str) -> set[str]:
-    """Canonicalize equivalent Polish/JSON number spellings without doing arithmetic."""
-    normalized = set()
-    for match in _NUMERIC_LITERAL.finditer(str(value or "")):
+@dataclass
+class GroundingFacts:
+    numeric_values: set[str] = field(default_factory=set)
+    identifiers: set[str] = field(default_factory=set)
+    dates: set[str] = field(default_factory=set)
+
+    def merge(self, other: "GroundingFacts", *, identifiers_only: bool = False) -> None:
+        self.identifiers.update(other.identifiers)
+        if not identifiers_only:
+            self.numeric_values.update(other.numeric_values)
+            self.dates.update(other.dates)
+
+
+def _canonical_number(raw: Any) -> str | None:
+    raw = re.sub(r"[ \u00a0\u202f]", "", str(raw)).replace(",", ".")
+    try:
+        number = Decimal(raw)
+    except InvalidOperation:
+        return None
+    canonical = format(number.normalize(), "f")
+    return "0" if canonical in {"-0", ""} else canonical
+
+
+def _canonical_identifier(raw: Any) -> str:
+    value = re.sub(r"\s*([/\-])\s*", r"\1", str(raw or "").strip().casefold())
+    value = re.sub(r"\s+", " ", value)
+    labelled = re.fullmatch(r"id\s*[:#]?\s*(\d+)", value)
+    return labelled.group(1) if labelled else value
+
+
+def _canonical_date(raw: str) -> str | None:
+    value = str(raw or "").strip()
+    try:
+        if re.fullmatch(r"\d{4}-\d{1,2}-\d{1,2}", value):
+            year, month, day = map(int, value.split("-"))
+        elif re.fullmatch(r"\d{1,2}[./]\d{1,2}[./]\d{4}", value):
+            day, month, year = map(int, re.split(r"[./]", value))
+        else:
+            return None
+        return date(year, month, day).isoformat()
+    except ValueError:
+        return None
+
+
+def _text_grounding_facts(value: Any) -> GroundingFacts:
+    """Classify text tokens before extracting business numbers; never derive arithmetic."""
+    text = str(value or "")
+    facts = GroundingFacts()
+    masked = list(text)
+    for match in _IDENTIFIER_LITERAL.finditer(text):
+        facts.identifiers.add(_canonical_identifier(match.group(0)))
+        masked[match.start():match.end()] = " " * (match.end() - match.start())
+    remaining = "".join(masked)
+    for match in _DATE_LITERAL.finditer(remaining):
+        canonical = _canonical_date(match.group(0))
+        if canonical:
+            facts.dates.add(canonical)
+            masked[match.start():match.end()] = " " * (match.end() - match.start())
+    remaining = "".join(masked)
+    for match in _NUMERIC_LITERAL.finditer(remaining):
         raw = re.sub(r"[ \u00a0\u202f]", "", match.group(0)).replace(",", ".")
-        try:
-            number = Decimal(raw)
-        except InvalidOperation:
-            continue
-        canonical = format(number.normalize(), "f")
-        normalized.add("0" if canonical in {"-0", ""} else canonical)
-    return normalized
+        canonical = _canonical_number(raw)
+        if canonical is not None:
+            facts.numeric_values.add(canonical)
+    return facts
+
+
+def _payload_grounding_facts(value: Any, key: str = "") -> GroundingFacts:
+    facts = GroundingFacts()
+    if isinstance(value, Mapping):
+        for child_key, child_value in value.items():
+            facts.merge(_payload_grounding_facts(child_value, str(child_key)))
+        return facts
+    if isinstance(value, (list, tuple)):
+        for child in value:
+            facts.merge(_payload_grounding_facts(child, key))
+        return facts
+    if value is None or isinstance(value, bool):
+        return facts
+    if _IDENTIFIER_KEYS.search(key):
+        facts.identifiers.add(_canonical_identifier(value))
+        return facts
+    if _DATE_KEYS.search(key):
+        canonical = _canonical_date(str(value))
+        if canonical:
+            facts.dates.add(canonical)
+        else:
+            facts.merge(_text_grounding_facts(value))
+        return facts
+    if isinstance(value, (int, float, Decimal)):
+        canonical = _canonical_number(value)
+        if canonical is not None:
+            facts.numeric_values.add(canonical)
+        return facts
+    facts.merge(_text_grounding_facts(value))
+    return facts
+
+
+def _normalized_numbers(value: str) -> set[str]:
+    """Compatibility helper: return only business numeric values from text."""
+    return _text_grounding_facts(value).numeric_values
+
+
+def _missing_grounding(answer: str, allowed: GroundingFacts) -> tuple[GroundingFacts, GroundingFacts]:
+    observed = _text_grounding_facts(answer)
+    missing = GroundingFacts(
+        numeric_values=observed.numeric_values - allowed.numeric_values,
+        identifiers=observed.identifiers - allowed.identifiers,
+        dates=observed.dates - allowed.dates,
+    )
+    return observed, missing
+
+
+def _identifier_diagnostics(values: set[str]) -> list[dict[str, Any]]:
+    return [{"type": "identifier", "length": len(value),
+             "sha256_prefix": hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]}
+            for value in sorted(values)]
 
 
 def _log_provider_failure(*, exc: Exception, model: str, stage: str, response=None) -> None:
@@ -386,7 +506,10 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
     # a real result, return to auto so the model can finish or select another tool.
     tool_count, model_name = 0, ""
     usage = {"input_tokens": 0, "output_tokens": 0}
-    grounded_numbers = _normalized_numbers(message)
+    grounded_facts = _text_grounding_facts(message)
+    # Conversation context may repeat structural identifiers only. It must never
+    # ground stale amounts, quantities, counters or dates.
+    grounded_facts.merge(_payload_grounding_facts(model_context), identifiers_only=True)
     seen_tool_calls: set[str] = set()
     successful_tools = 0
     tool_latencies_ms: list[int] = []
@@ -448,7 +571,21 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 }, ensure_ascii=False, sort_keys=True))
                 if call.name in ORCHESTRATION_TOOLS:
                     answer = _validate_orchestration_arguments(call.name, arguments)
-                    if not _normalized_numbers(answer) <= grounded_numbers:
+                    answer_facts, missing_facts = _missing_grounding(answer, grounded_facts)
+                    if (missing_facts.numeric_values or missing_facts.identifiers or missing_facts.dates):
+                        logger.error("AI_GROUNDING_REJECTED %s", json.dumps({
+                            "agent_run_id": run_id,
+                            "conversation_id": conversation_id,
+                            "answer_numeric_values": sorted(answer_facts.numeric_values),
+                            "allowed_numeric_values": sorted(grounded_facts.numeric_values),
+                            "missing_numeric_values": sorted(missing_facts.numeric_values),
+                            "answer_dates": sorted(answer_facts.dates),
+                            "allowed_dates": sorted(grounded_facts.dates),
+                            "missing_dates": sorted(missing_facts.dates),
+                            "answer_identifiers_count": len(answer_facts.identifiers),
+                            "missing_identifiers_count": len(missing_facts.identifiers),
+                            "missing_identifier_metadata": _identifier_diagnostics(missing_facts.identifiers),
+                        }, ensure_ascii=False, sort_keys=True))
                         raise RuntimeError("UNGROUNDED_NUMERIC_DATA")
                     logger.info("AI_FINAL_RESPONSE %s", json.dumps({
                         "agent_run_id": run_id, "conversation_id": conversation_id,
@@ -528,7 +665,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 encoded = json.dumps(safe_result, ensure_ascii=False, separators=(",", ":"))
                 if len(encoded.encode("utf-8")) > MAX_TOOL_RESULT_BYTES:
                     raise RuntimeError("TOOL_RESULT_TOO_LARGE")
-                grounded_numbers.update(_normalized_numbers(encoded))
+                grounded_facts.merge(_payload_grounding_facts(safe_result))
                 response_items = list(reply.output_items)
                 if not response_items:
                     # Fake/custom providers may expose only the normalized call.
