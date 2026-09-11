@@ -50,11 +50,12 @@ def test_internal_page_has_expected_navigation_and_conversation_controls(client)
     assert "event.key === 'Enter' && !event.shiftKey" in html
 
 
-def test_browser_request_contains_only_message_and_renders_only_safe_message(client):
+def test_browser_request_contains_only_message_conversation_and_renders_only_safe_message(client):
     login(client)
     html = client.get("/ai-assistant").get_data(as_text=True)
     assert "fetch('/api/internal/ai/chat'" in html
-    assert "JSON.stringify({message: message})" in html
+    assert "JSON.stringify({message: message, conversation_id: conversationId})" in html
+    assert "Nowa rozmowa" in html
     forbidden_request_fields = ("actor_id", "actor_type", "roles", "permissions", "risk_level", "AI_OWNER_ACTOR_ID")
     assert all(value not in html for value in forbidden_request_fields)
     forbidden_output_fields = ("execution_id", "correlation_id", "tool_calls", "raw JSON", "stacktrace", "system prompt")
@@ -73,7 +74,11 @@ def test_fake_provider_smoke_returns_grounded_answer(client):
     db.close()
     backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([
         runtime.ProviderResponse(tool_calls=(runtime.ToolCall("call-1", "inventory.product.search", json.dumps({"query": "Avery 160"})),), model="fake-model"),
-        runtime.ProviderResponse(text="Na magazynie mamy 24 sztuki Avery 160.", model="fake-model"),
+        runtime.ProviderResponse(tool_calls=(runtime.ToolCall(
+            "call-final", "assistant.respond",
+            json.dumps({"message": "Na magazynie mamy 24 sztuki Avery 160.",
+                        "numeric_claims": [{"kind": "stock", "value": 24}]}),
+        ),), model="fake-model"),
     ])
     login(client)
     response = client.post("/api/internal/ai/chat", json={"message": "Ile mamy Avery 160?"})

@@ -48,9 +48,15 @@ def tool(name, args, call_id="call-1"):
     return runtime.ProviderResponse(tool_calls=(runtime.ToolCall(call_id, name, json.dumps(args)),), model="fake-model")
 
 
-def respond(text, model="fake-model", input_tokens=0, output_tokens=0):
+def respond(text, model="fake-model", input_tokens=0, output_tokens=0, numeric_claims=None):
+    if numeric_claims is None:
+        numeric_claims = [{"kind": "other_business_numeric", "value": mention["value"],
+                           **({"currency": mention["currency"]} if mention["currency"] else {})}
+                          for mention in runtime._business_numeric_mentions(text)]
     return runtime.ProviderResponse(
-        tool_calls=(runtime.ToolCall("assistant-response", "assistant.respond", json.dumps({"message": text})),),
+        tool_calls=(runtime.ToolCall("assistant-response", "assistant.respond", json.dumps({
+            "message": text, "numeric_claims": numeric_claims,
+        })),),
         model=model, input_tokens=input_tokens, output_tokens=output_tokens,
     )
 
@@ -108,12 +114,44 @@ def test_ungrounded_business_number_is_rejected_with_safe_diagnostics(caplog):
     with caplog.at_level(logging.INFO):
         result = runtime.run_agent_turn(owner(), "Ile mamy Avery 160?", provider)
     assert result["status"] == "FAILED" and result["error_code"] == "MODEL_FAILED"
-    record = next(item.message for item in caplog.records if item.message.startswith("AI_GROUNDING_REJECTED "))
+    record = next(item.message for item in caplog.records if item.message.startswith("AI_NUMERIC_CLAIMS_REJECTED "))
     diagnostic = json.loads(record.split(" ", 1)[1])
-    assert diagnostic["missing_numeric_values"] == ["47"]
-    assert diagnostic["answer_identifiers_count"] == 1
+    assert diagnostic["rejected_claims"] == [{
+        "currency": "", "kind": "other_business_numeric", "normalized_value": "47",
+    }]
+    assert diagnostic["reason"] == "UNGROUNDED_NUMERIC_DATA"
     assert "CH101-BLK-160" not in record
-    assert diagnostic["missing_identifier_metadata"] == []
+
+
+def test_business_number_in_message_without_structured_claim_is_controlled_mismatch(caplog):
+    provider = runtime.FakeModelProvider([
+        tool("inventory.product.search", {"query": "Avery 160"}),
+        respond("Na stanie jest 24 szt.", numeric_claims=[]),
+    ])
+    with caplog.at_level(logging.INFO):
+        result = runtime.run_agent_turn(owner(), "Ile mamy Avery 160?", provider)
+    assert result["status"] == "FAILED"
+    assert result["error_code"] == "NUMERIC_CLAIM_DECLARATION_MISMATCH"
+    record = next(item.message for item in caplog.records if item.message.startswith("AI_NUMERIC_CLAIMS_REJECTED "))
+    diagnostic = json.loads(record.split(" ", 1)[1])
+    assert diagnostic == {
+        "agent_run_id": result["agent_run_id"], "conversation_id": result["conversation_id"],
+        "claims_count": 0, "rejected_claims": [], "reason": "NUMERIC_CLAIM_DECLARATION_MISMATCH",
+    }
+
+
+def test_orders_summary_total_passes_grounding_and_different_total_is_blocked():
+    db = backend.conn()
+    db.execute("INSERT INTO order_items(order_id,product_id,sku,qty,unit_net_price,unit_gross_price,currency,created_at) VALUES(10,1,'CH101-BLK-160',2,100,123,'PLN',?)", (backend.now_iso(),))
+    db.commit(); db.close()
+    good = runtime.run_agent_turn(owner(), "Jaka jest łączna kwota zamówień?", runtime.FakeModelProvider([
+        tool("orders.summary", {"period": "all"}), respond("Łączna kwota brutto to 246 PLN."),
+    ]))
+    assert good["status"] == "SUCCESS"
+    bad = runtime.run_agent_turn(owner(), "Jaka jest łączna kwota zamówień?", runtime.FakeModelProvider([
+        tool("orders.summary", {"period": "all"}), respond("Łączna kwota brutto to 999 PLN."),
+    ]))
+    assert bad["status"] == "FAILED" and bad["error_code"] == "MODEL_FAILED"
 
 
 def test_runtime_product_result_matches_direct_business_operation():
@@ -322,7 +360,7 @@ def test_prompt_injection_cannot_expose_write_tool():
     assert all(not permission.endswith((".adjust", ".send", ".manage", ".create")) for permission in ai.effective_permissions)
     names = {item["name"] for item in runtime._tool_descriptors(ai)}
     assert names == {
-        "inventory.product.get", "inventory.product.search", "inventory.summary", "orders.search", "orders.get",
+        "inventory.product.get", "inventory.product.search", "inventory.summary", "orders.search", "orders.get", "orders.summary",
             "invoices.search", "invoices.get", "invoices.overdue", "customers.search",
             "customers.get", "china.orders.summary", "business.sales.summary",
             "assistant.respond", "assistant.clarify",
@@ -335,7 +373,9 @@ def test_prompt_injection_cannot_expose_write_tool():
 
 def test_existing_context_cannot_replace_fresh_tool_for_new_data_question():
     first = runtime.run_agent_turn(owner(), "Pokaż Avery", fake_search_answer("Avery", "Znalazłem Avery."))
-    provider = runtime.FakeModelProvider([respond(text="Masz 0 zaległych faktur.")])
+    provider = runtime.FakeModelProvider([respond(
+        text="Masz 0 zaległych faktur.", numeric_claims=[{"kind": "count", "value": 0}],
+    )])
     second = runtime.run_agent_turn(owner(), "Ile mam zaległych faktur?", provider,
                                     conversation_id=first["conversation_id"])
     assert second["status"] == "FAILED"
@@ -346,7 +386,7 @@ def test_old_context_number_cannot_ground_unrelated_current_answer():
     first = runtime.run_agent_turn(owner(), "Pokaż Avery", fake_search_answer("Avery", "Znalazłem Avery."))
     provider = runtime.FakeModelProvider([
         tool("invoices.overdue", {}, "overdue"),
-        respond(text="Masz 24 zaległe faktury."),
+        respond(text="Masz 24 zaległe faktury.", numeric_claims=[{"kind": "count", "value": 24}]),
     ])
     second = runtime.run_agent_turn(owner(), "Ile mam zaległych faktur?", provider,
                                     conversation_id=first["conversation_id"])
@@ -833,7 +873,7 @@ def test_store_false_tool_flow_replays_output_without_previous_response_id(monke
             "output": [{
                 "id": "fc-final", "type": "function_call", "status": "completed",
                 "call_id": "call-final", "name": "assistant__respond",
-                "arguments": '{"message":"Na magazynie mamy 24 sztuki Avery 160."}',
+                    "arguments": '{"message":"Na magazynie mamy 24 sztuki Avery 160.","numeric_claims":[{"kind":"stock","value":24}]}',
             }],
             "usage": {"input_tokens": 8, "output_tokens": 6},
         },
