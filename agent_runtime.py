@@ -98,16 +98,20 @@ def _text_grounding_facts(value: Any) -> GroundingFacts:
     """Classify text tokens before extracting business numbers; never derive arithmetic."""
     text = str(value or "")
     facts = GroundingFacts()
-    masked = list(text)
+    excluded_spans: list[tuple[int, int]] = []
     for match in _IDENTIFIER_LITERAL.finditer(text):
         facts.identifiers.add(_canonical_identifier(match.group(0)))
-        masked[match.start():match.end()] = " " * (match.end() - match.start())
-    remaining = "".join(masked)
-    for match in _DATE_LITERAL.finditer(remaining):
+        excluded_spans.append(match.span())
+    # Dates are recognized on the original text as their spans may be nested in
+    # a full document identifier such as "FVAT 1/09/2026".
+    for match in _DATE_LITERAL.finditer(text):
         canonical = _canonical_date(match.group(0))
         if canonical:
             facts.dates.add(canonical)
-            masked[match.start():match.end()] = " " * (match.end() - match.start())
+            excluded_spans.append(match.span())
+    masked = list(text)
+    for start, end in excluded_spans:
+        masked[start:end] = " " * (end - start)
     remaining = "".join(masked)
     for match in _NUMERIC_LITERAL.finditer(remaining):
         raw = re.sub(r"[ \u00a0\u202f]", "", match.group(0)).replace(",", ".")
@@ -130,6 +134,9 @@ def _payload_grounding_facts(value: Any, key: str = "") -> GroundingFacts:
     if value is None or isinstance(value, bool):
         return facts
     if _IDENTIFIER_KEYS.search(key):
+        classified = _text_grounding_facts(value)
+        facts.identifiers.update(classified.identifiers)
+        facts.dates.update(classified.dates)
         facts.identifiers.add(_canonical_identifier(value))
         return facts
     if _DATE_KEYS.search(key):

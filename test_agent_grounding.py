@@ -71,6 +71,45 @@ def test_i_two_invoices_and_naturally_formatted_amounts_pass():
     )
 
 
+@pytest.mark.parametrize(("answer", "tool", "expected_numbers"), [
+    ("FVAT 1/09/2026 — 2 040,91 PLN", {"invoice_number": "FVAT 1/09/2026", "amount": 2040.91}, {"2040.91"}),
+    ("FVAT 2/09/2026 — 757,78 PLN", {"invoice_number": "FVAT 2/09/2026", "amount": 757.78}, {"757.78"}),
+    ("CH034-BB-128160 — 17 szt.", {"sku": "CH034-BB-128160", "stock": 17}, {"17"}),
+    ("ORD-1234 — 4 pozycje", {"order_number": "ORD-1234", "item_count": 4}, {"4"}),
+])
+def test_10_7_1_identifier_spans_do_not_leak_internal_digits(answer, tool, expected_numbers):
+    facts = allowed(tool=tool)
+    observed, missing = runtime._missing_grounding(answer, facts)
+    assert observed.numeric_values == expected_numbers
+    assert missing.numeric_values == missing.identifiers == missing.dates == set()
+
+
+def test_10_7_1_number_after_invoice_identifier_remains_grounded():
+    invoice_only = allowed(tool={"invoice_number": "FVAT 1/09/2026"})
+    observed, missing = runtime._missing_grounding("FVAT 1/09/2026 — 2 dni po terminie", invoice_only)
+    assert observed.numeric_values == {"2"}
+    assert missing.numeric_values == {"2"}
+    with_overdue_days = allowed(tool={"invoice_number": "FVAT 1/09/2026", "overdue_days": 2})
+    assert_grounded("FVAT 1/09/2026 — 2 dni po terminie", with_overdue_days)
+
+
+def test_10_7_1_production_case_has_no_missing_identifier_date_or_internal_number():
+    facts = allowed(tool={"invoices": [
+        {"invoice_number": "FVAT 1/09/2026", "amount": 2040.91},
+        {"invoice_number": "FVAT 2/09/2026", "amount": 757.78},
+    ]})
+    _observed, missing = runtime._missing_grounding(
+        "FVAT 1/09/2026 — 2 040,91 PLN\nFVAT 2/09/2026 — 757,78 PLN", facts,
+    )
+    assert missing.identifiers == set()
+    assert missing.dates == set()
+    assert missing.numeric_values == set()
+
+
+def test_10_7_1_real_stock_hallucination_is_still_rejected():
+    assert_rejected("stan 18 szt.", allowed(tool={"stock": 17}), missing_number="18")
+
+
 def test_j_hallucinated_sum_fails_unless_tool_returns_exact_total():
     assert_rejected("Łącznie 3000 PLN", allowed(tool=invoice_results()), missing_number="3000")
     with_total = invoice_results()
@@ -94,4 +133,3 @@ def test_runtime_rejection_logs_safe_structured_diagnostics(monkeypatch, caplog)
     assert metadata[0]["length"] == len("FVAT SECRET/123")
     assert len(metadata[0]["sha256_prefix"]) == 12
     assert "FVAT" not in str(metadata)
-
