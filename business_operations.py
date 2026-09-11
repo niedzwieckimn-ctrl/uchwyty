@@ -159,6 +159,12 @@ _GET_INPUT = {
         "number": _QUERY,
     },
 }
+INVOICE_GET_INPUT = {
+    "type": "object", "additionalProperties": False, "properties": {
+        "id": {"type": "integer", "minimum": 1, "maximum": 9_223_372_036_854_775_807},
+        "number": _QUERY, "latest": {"type": "boolean"},
+    },
+}
 _RESULTS_OUTPUT = {
     "type": "object", "additionalProperties": False,
     "required": ["ok", "results", "count", "truncated"],
@@ -169,11 +175,12 @@ _RESULTS_OUTPUT = {
 }
 INVOICE_OVERDUE_OUTPUT = {
     "type": "object", "additionalProperties": False,
-    "required": ["ok", "results", "count", "truncated", "totals_by_currency"],
+    "required": ["ok", "results", "count", "truncated", "totals_by_currency", "customer_count", "customers"],
     "properties": {
         "ok": {"type": "boolean"}, "results": {"type": "array", "maxItems": MAX_BUSINESS_SEARCH_RESULTS},
         "count": {"type": "integer"}, "truncated": {"type": "boolean"},
         "totals_by_currency": {"type": "object"},
+        "customer_count": {"type": "integer"}, "customers": {"type": "array", "maxItems": MAX_BUSINESS_SEARCH_RESULTS},
     },
 }
 _DETAIL_OUTPUT = {
@@ -312,9 +319,9 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
         INVOICE_SEARCH_INPUT, _RESULTS_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
     "invoices.get": BusinessOperationDefinition(
-        "invoices.get", 1, "Pobiera fakturę, status płatności i zapisane pozycje.",
+        "invoices.get", 1, "Pobiera fakturę po id lub numerze; latest=true zwraca ostatnio wystawioną fakturę wraz z zapisanymi pozycjami.",
         "invoices.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
-        _GET_INPUT, _DETAIL_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
+        INVOICE_GET_INPUT, _DETAIL_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
     "invoices.overdue": BusinessOperationDefinition(
         "invoices.overdue", 1, "Zwraca wyłącznie zaległe faktury po terminie według tej samej reguły co Cash Flow.",
@@ -510,7 +517,7 @@ def _entity(definition: BusinessOperationDefinition, data: Mapping[str, Any]) ->
     if definition.operation_name in {"orders.search", "invoices.search", "invoices.overdue", "customers.search"}:
         return definition.operation_name.replace(".", "_"), sanitize_audit_text(data.get("query", "all"))[:160], None
     if definition.operation_name in {"orders.get", "invoices.get"}:
-        return definition.operation_name.split(".")[0][:-1], str(data.get("id") or data.get("number") or ""), None
+        return definition.operation_name.split(".")[0][:-1], str(data.get("id") or data.get("number") or ("latest" if data.get("latest") else "")), None
     if definition.operation_name == "customers.get":
         return "customer", str(data["customer_id"]), None
     if definition.operation_name == "china.orders.summary":
@@ -888,8 +895,9 @@ def _invoices_search(data, actor, correlation_id, transaction_connection=None):
         clauses, params = ["1=1"], []
         query = " ".join(str(data.get("query") or "").split()).casefold()
         if query:
-            clauses.append("(LOWER(i.invoice_no) LIKE ? OR LOWER(COALESCE(i.buyer_name,'')) LIKE ? OR LOWER(COALESCE(i.buyer_tax_no,'')) LIKE ?)")
-            params.extend([f"%{query}%"] * 3)
+            compact_query = re.sub(r"\s+", "", query)
+            clauses.append("(LOWER(i.invoice_no) LIKE ? OR REPLACE(LOWER(i.invoice_no),' ','') LIKE ? OR LOWER(COALESCE(i.buyer_name,'')) LIKE ? OR LOWER(COALESCE(i.buyer_tax_no,'')) LIKE ?)")
+            params.extend([f"%{query}%", f"%{compact_query}%", f"%{query}%", f"%{query}%"])
         date_column = "i.payment_to" if data.get("date_field") == "due_date" else "i.issue_date"
         if start: clauses.append(f"SUBSTR(TRIM({date_column}),1,10)>=?"); params.append(start)
         if end: clauses.append(f"SUBSTR(TRIM({date_column}),1,10)<=?"); params.append(end)
@@ -909,7 +917,22 @@ def _invoices_search(data, actor, correlation_id, transaction_connection=None):
 def _invoices_get(data, actor, correlation_id, transaction_connection=None):
     db = transaction_connection or _factory()()
     try:
-        base = _resolve_by_id_or_number(db, "invoices", data, "invoice_no")
+        identifiers = int(bool(data.get("id"))) + int(bool(str(data.get("number") or "").strip())) + int(data.get("latest") is True)
+        if identifiers != 1:
+            raise ControlledOperationError("IDENTIFIER_REQUIRED", "Podaj dokładnie jedno: id, number albo latest=true", status=DENIED)
+        if data.get("latest") is True:
+            # created_at is written at the moment the invoice record is issued;
+            # id resolves ties without interpreting the human invoice number.
+            base = db.execute(
+                """SELECT * FROM invoices
+                   ORDER BY COALESCE(NULLIF(TRIM(created_at),''),issue_date) DESC,id DESC LIMIT 1"""
+            ).fetchone()
+        elif data.get("id"):
+            base = db.execute("SELECT * FROM invoices WHERE id=?", (data["id"],)).fetchone()
+        else:
+            wanted = re.sub(r"\s+", "", str(data["number"])).casefold()
+            base = next((row for row in db.execute("SELECT * FROM invoices ORDER BY id DESC").fetchall()
+                         if re.sub(r"\s+", "", str(row["invoice_no"] or "")).casefold() == wanted), None)
         if base is None: raise ControlledOperationError("INVOICE_NOT_FOUND", "Nie znaleziono faktury", status=NOOP)
         rows = _invoice_rows(db, "i.id=?", (int(base["id"]),), 1)
         row = rows[0]; record = _invoice_view(row, int(row["id"]) in _overdue_ids(db))
@@ -940,6 +963,7 @@ def _invoices_overdue(data, actor, correlation_id, transaction_connection=None):
         limit = _limit(data); selected = overdue[:limit]
         results = []
         totals_by_currency = {}
+        customers_by_name = {}
         for item in selected:
             rows = _invoice_rows(db, "i.id=?", (int(item["id"]),), 1)
             view = _invoice_view(rows[0], True); view["overdue_days"] = int(item["overdue_days"]); results.append(view)
@@ -947,8 +971,19 @@ def _invoices_overdue(data, actor, correlation_id, transaction_connection=None):
             summary = totals_by_currency.setdefault(currency, {"currency": currency, "invoice_count": 0, "amount_outstanding": 0.0})
             summary["invoice_count"] += 1
             summary["amount_outstanding"] = _money(summary["amount_outstanding"] + view["amount_outstanding"])
+            customer_name = str(view.get("buyer_name") or "Bez klienta")
+            customer = customers_by_name.setdefault(customer_name.casefold(), {
+                "buyer_name": customer_name, "invoice_count": 0, "oldest_overdue_days": 0,
+                "totals_by_currency": {},
+            })
+            customer["invoice_count"] += 1
+            customer["oldest_overdue_days"] = max(customer["oldest_overdue_days"], view["overdue_days"])
+            customer["totals_by_currency"][currency] = _money(
+                customer["totals_by_currency"].get(currency, 0) + view["amount_outstanding"]
+            )
+        customers = sorted(customers_by_name.values(), key=lambda value: (-value["oldest_overdue_days"], value["buyer_name"].casefold()))
         return {"ok": True, "results": results, "count": len(results), "truncated": len(overdue) > limit,
-                "totals_by_currency": totals_by_currency}
+                "totals_by_currency": totals_by_currency, "customer_count": len(customers), "customers": customers}
     finally:
         if transaction_connection is None: db.close()
 
