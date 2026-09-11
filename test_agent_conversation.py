@@ -34,9 +34,47 @@ def test_create_resume_and_storage_reopen():
     conversations.update_context(conversation_id, "inventory.product.search", {"query": "Avery"},
                                  {"candidates": [{"id": 1, "sku": "CH034-BLK-160", "name": "Avery", "stock": 7}]})
     resumed_id, resumed, status = conversations.open_conversation(human, ai, conversation_id)
-    assert resumed_id == conversation_id and status == "resumed" and resumed["products"][0]["stock"] == 7
+    assert resumed_id == conversation_id and status == "resumed"
+    assert resumed["active_product"] == {"id": 1, "sku": "CH034-BLK-160", "name": "Avery"}
+    assert "stock" not in json.dumps(resumed)
     conversations.configure(backend.conn)
-    assert conversations.open_conversation(human, ai, conversation_id)[1]["products"][0]["id"] == 1
+    assert conversations.open_conversation(human, ai, conversation_id)[1]["active_product"]["id"] == 1
+
+
+def test_structured_context_natural_customer_invoice_order_followups():
+    human, ai = actors(); cid = conversations.open_conversation(human, ai)[0]
+    state = conversations.update_context(cid, "customers.search", {"query": "Magmar"},
+        {"results": [{"id": 7, "name": "Magmar", "nip": "7"}]})
+    assert conversations.resolve_reference(state, "ile ma zrealizowanych zamówień?")["entity"]["id"] == 7
+    state = conversations.update_context(cid, "orders.get", {"id": 31},
+        {"record": {"id": 31, "order_number": "ZAM-31", "customer_id": 7, "status": "done", "item_qty": 99}})
+    assert conversations.resolve_reference(state, "co było w tym zamówieniu?")["entity"]["id"] == 31
+    assert "item_qty" not in json.dumps(state)
+    state = conversations.update_context(cid, "invoices.get", {"id": 12},
+        {"record": {"id": 12, "invoice_number": "FV/12", "customer_id": 7, "amount_outstanding": 100}})
+    assert conversations.resolve_reference(state, "co było na niej?")["entity"]["id"] == 12
+    assert conversations.resolve_reference(state, "czy ten klient ma zaległości?")["entity"]["id"] == 7
+
+
+def test_ordinal_product_selection_and_no_implicit_active_candidate():
+    human, ai = actors(); cid = conversations.open_conversation(human, ai)[0]
+    state = conversations.update_context(cid, "inventory.product.search", {"query": "Avery 160"}, {"candidates": [
+        {"id": 4, "sku": "A-160-A", "model": "Avery", "stock": 5},
+        {"id": 9, "sku": "A-160-B", "model": "Avery", "stock": 8},
+    ]})
+    assert "active_product" not in state
+    resolved = conversations.resolve_reference(state, "ten drugi")
+    assert resolved == {"resolved": True, "entity_type": "product",
+                        "entity": {"id": 9, "sku": "A-160-B", "model": "Avery"}, "ordinal": 2}
+
+
+def test_china_summary_reference_keeps_selector_not_counts():
+    human, ai = actors(); cid = conversations.open_conversation(human, ai)[0]
+    state = conversations.update_context(cid, "china.orders.summary", {"scope": "active"},
+        {"ok": True, "scope": "active", "order_count": 4, "item_units": 500})
+    resolved = conversations.resolve_reference(state, "a ile tam jest sztuk?")
+    assert resolved["entity_type"] == "china_order" and resolved["entity"] == {"scope": "active"}
+    assert "500" not in json.dumps(state)
 
 
 def test_other_human_cannot_take_conversation():

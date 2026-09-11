@@ -6,6 +6,7 @@ import urllib.request
 import pytest
 
 import app as backend
+import agent_conversation as conversations
 import agent_runtime as runtime
 import business_operations as operations
 import internal_rbac as rbac
@@ -30,8 +31,8 @@ def isolated(tmp_path, monkeypatch):
         db.execute("INSERT INTO stock(product_id,qty) VALUES(?,?)", (product_id, qty))
     db.execute("INSERT INTO customers(id,name,address,phone,email,nip,language,price_list,created_at) VALUES(10,'AM Interiors','Testowa 1','','','', 'pl','pln',?)", (now,))
     db.execute("INSERT INTO orders(id,order_no,customer_id,customer_name,status,created_at,currency,price_list) VALUES(10,'ZAM-TEST-10',10,'AM Interiors','confirmed',?,'PLN','pln')", (now,))
-    db.execute("INSERT INTO invoices(id,order_id,invoice_no,issue_date,sell_date,payment_type,payment_to,buyer_name,buyer_tax_no,total_net,total_gross,created_at,currency) VALUES(10,10,'FV/TEST/10','2026-09-01','2026-09-01','transfer','2026-09-08','AM Interiors','',100,123,?,'PLN')", (now,))
-    db.execute("INSERT INTO invoice_meta(invoice_id,invoice_items_json,paid,paid_at,updated_at) VALUES(10,'[]',0,NULL,?)", (now,))
+    db.execute("INSERT INTO invoices(id,order_id,invoice_no,issue_date,sell_date,payment_type,payment_to,buyer_name,buyer_tax_no,total_net,total_gross,created_at,currency) VALUES(10,10,'FVAT 8/09/2026','2026-09-01','2026-09-01','transfer','2026-09-08','AM Interiors','',100,123,?,'PLN')", (now,))
+    db.execute("INSERT INTO invoice_meta(invoice_id,invoice_items_json,paid,paid_at,updated_at) VALUES(10,'[{\"sku\":\"CH101-BLK-160\",\"model\":\"Avery 160\",\"name\":\"Avery czarny 160\",\"qty\":2,\"unit_net_price\":100}]',0,NULL,?)", (now,))
     db.commit(); db.close()
     backend.AGENT_MODEL_PROVIDER = None
     yield
@@ -123,6 +124,82 @@ def test_runtime_overdue_zero_one_and_multiple_currencies_finish_without_model_f
         "PLN": {"currency": "PLN", "invoice_count": 1, "amount_outstanding": 123.0},
         "EUR": {"currency": "EUR", "invoice_count": 1, "amount_outstanding": 50.0},
     }
+
+
+@pytest.mark.parametrize(("query", "operation", "arguments", "answer"), [
+    ("Jakie mam zaległe faktury?", "invoices.overdue", {"as_of": "2026-09-11"},
+     "Masz 1 zaległą fakturę na 123 PLN, opóźnioną o 3 dni."),
+    ("czy jakiś klient zalega z płatnością?", "invoices.overdue", {"as_of": "2026-09-11"},
+     "1 klient zalega z 1 fakturą na 123 PLN, a najstarsza zaległość ma 3 dni."),
+    ("jaka była ostatnia faktura?", "invoices.get", {"latest": True},
+     "Ostatnia faktura to FVAT 8/09/2026 z 2026-09-01 na 123 PLN."),
+    ("jaka jest pozycja ostatnio wystawionej faktury?", "invoices.get", {"latest": True},
+     "Pozycja to Avery 160, SKU CH101-BLK-160, 2 sztuki po 100 PLN netto."),
+    ("sprawdź fakturę FVAT 8/09/2026", "invoices.get", {"number": "FVAT 8/09/2026"},
+     "Faktura FVAT 8/09/2026 ma wartość 123 PLN."),
+    ("ile mam uchwytów w paczkach z Chin oprócz zaplanowanych", "china.orders.summary", {"scope": "active"},
+     "W paczkach innych niż zaplanowane masz 935 sztuk."),
+])
+def test_production_questions_complete_endpoint_tool_grounding_and_final_response(
+        monkeypatch, caplog, query, operation, arguments, answer):
+    if operation == "china.orders.summary":
+        db = backend.conn(); now = backend.now_iso()
+        for package_id, status, qty in ((1, "planned", 120), (2, "ordered", 500), (3, "shipped", 435)):
+            db.execute("INSERT INTO china_packages(id,package_no,status,created_at) VALUES(?,?,?,?)",
+                       (package_id, f"PO-{package_id}", status, now))
+            db.execute("INSERT INTO china_items(id,package_id,product_id,sku,qty,created_at) VALUES(?,?,?,?,?,?)",
+                       (package_id, package_id, 1, "CH101-BLK-160", qty, now))
+        db.commit(); db.close()
+    backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([
+        tool(operation, arguments), runtime.ProviderResponse(text=answer, model="fake-model"),
+    ])
+    client = backend.app.test_client()
+    with client.session_transaction() as session:
+        session["admin_authenticated"] = True
+        session["csrf_token"] = "csrf"
+    with caplog.at_level(logging.INFO):
+        response = client.post("/api/internal/ai/chat", json={"message": query})
+    payload = response.get_json()
+    assert response.status_code == 200
+    assert payload["status"] == "SUCCESS" and payload["error_code"] == ""
+    assert "AI_TOOL_EXECUTION_END" in caplog.text
+    assert "AI_FINAL_RESPONSE" in caplog.text
+    assert "AI_RUNTIME_FAILURE" not in caplog.text
+    db = backend.conn()
+    execution = db.execute(
+        "SELECT status,result_summary FROM internal_operation_executions WHERE operation=? ORDER BY created_at DESC LIMIT 1",
+        (operation,),
+    ).fetchone(); db.close()
+    assert execution["status"] == "SUCCESS"
+    result = json.loads(execution["result_summary"])
+    if operation == "china.orders.summary":
+        assert result["pieces_excluding_planned"] == 935
+    if operation == "invoices.get":
+        assert result["record"]["invoice_number"] == "FVAT 8/09/2026"
+        assert result["record"]["items"][0]["sku"] == "CH101-BLK-160"
+
+
+@pytest.mark.parametrize(("query", "operation", "arguments", "answer"), [
+    ("mam jakieś zaległe faktury?", "invoices.overdue", {}, "Masz 1 zaległą fakturę na 123 PLN."),
+    ("kto mi zalega?", "invoices.overdue", {}, "AM Interiors zalega z 1 fakturą na 123 PLN."),
+    ("pokaż przeterminowane faktury", "invoices.overdue", {}, "Masz 1 przeterminowaną fakturę."),
+    ("która faktura była ostatnia?", "invoices.get", {"latest": True}, "Ostatnia to FVAT 8/09/2026."),
+    ("pokaż ostatnią fakturę", "invoices.get", {"latest": True}, "Ostatnia to FVAT 8/09/2026 na 123 PLN."),
+    ("co było na ostatniej fakturze?", "invoices.get", {"latest": True}, "Były 2 sztuki Avery 160."),
+    ("jakie pozycje miała ostatnia faktura?", "invoices.get", {"latest": True}, "Pozycja: 2 sztuki Avery 160."),
+    ("znajdź FVAT8/09/2026", "invoices.get", {"number": "FVAT8/09/2026"}, "Znaleziono FVAT 8/09/2026."),
+])
+def test_invoice_language_variants_use_semantic_operations(query, operation, arguments, answer):
+    backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([
+        tool(operation, arguments), runtime.ProviderResponse(text=answer, model="fake-model"),
+    ])
+    client = backend.app.test_client()
+    with client.session_transaction() as session:
+        session["admin_authenticated"] = True
+        session["csrf_token"] = "csrf"
+    response = client.post("/api/internal/ai/chat", json={"message": query})
+    assert response.status_code == 200
+    assert response.get_json()["status"] == "SUCCESS"
 
 
 @pytest.mark.parametrize(("query", "operation", "arguments", "answer"), [
@@ -429,6 +506,49 @@ def test_context_resolves_followup_to_candidate_id():
     second_provider = runtime.FakeModelProvider([verify_context, runtime.ProviderResponse(text="Ten wariant ma 24 sztuki.")])
     second = runtime.run_agent_turn(owner(), "A 160?", second_provider, conversation_id=first["conversation_id"])
     assert second["status"] == "SUCCESS" and "24" in second["message"]
+
+
+def test_natural_customer_followup_injects_id_through_real_execution_gate(monkeypatch):
+    human = owner()
+    ai = rbac.load_actor_context(rbac.AI_OWNER_ASSISTANT_ACTOR_ID, request_id="ai")
+    cid = conversations.open_conversation(human, ai)[0]
+    conversations.update_context(cid, "customers.search", {"query": "Firma"},
+                                 {"results": [{"id": 17, "name": "Firma"}]})
+    captured = {}
+    original = operations._HANDLERS["orders.search"]
+    def handler(data, *args, **kwargs):
+        captured.update(data)
+        return {"ok": True, "results": [], "count": 0, "truncated": False}
+    monkeypatch.setitem(operations._HANDLERS, "orders.search", handler)
+    provider = runtime.FakeModelProvider([
+        tool("orders.search", {}, "customer-orders"),
+        runtime.ProviderResponse(text="Nie ma takich zamówień."),
+    ])
+    result = runtime.run_agent_turn(human, "ile ma zrealizowanych zamówień?", provider, conversation_id=cid)
+    monkeypatch.setitem(operations._HANDLERS, "orders.search", original)
+    assert result["status"] == "SUCCESS" and captured["customer_id"] == 17
+    assert provider.calls[0]["tool_choice"] == "required"
+
+
+def test_ordinal_followup_injects_selected_product_id_through_gate(monkeypatch):
+    human = owner()
+    ai = rbac.load_actor_context(rbac.AI_OWNER_ASSISTANT_ACTOR_ID, request_id="ai")
+    cid = conversations.open_conversation(human, ai)[0]
+    conversations.update_context(cid, "inventory.product.search", {"query": "Avery"}, {"candidates": [
+        {"id": 3, "sku": "A-1", "model": "Avery"}, {"id": 8, "sku": "A-2", "model": "Avery"},
+    ]})
+    captured = {}
+    original = operations._HANDLERS["inventory.product.get"]
+    def handler(data, *args, **kwargs):
+        captured.update(data)
+        return {"ok": True, "id": 8, "sku": "A-2", "model": "Avery", "ean": None, "name": "Avery", "stock": 6}
+    monkeypatch.setitem(operations._HANDLERS, "inventory.product.get", handler)
+    result = runtime.run_agent_turn(human, "ten drugi", runtime.FakeModelProvider([
+        tool("inventory.product.get", {}, "second-product"),
+        runtime.ProviderResponse(text="Wybrany wariant ma 6 sztuk."),
+    ]), conversation_id=cid)
+    monkeypatch.setitem(operations._HANDLERS, "inventory.product.get", original)
+    assert result["status"] == "SUCCESS" and captured["product_id"] == 8
 
 
 def test_missing_referent_returns_clarification_without_tool():

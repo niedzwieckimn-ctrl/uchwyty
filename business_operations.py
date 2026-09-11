@@ -151,6 +151,7 @@ _SEARCH_INPUT = {
     "type": "object", "additionalProperties": False, "properties": {
         "query": _QUERY, "status": {"type": "string", "minLength": 1, "maxLength": 64},
         "period": _PERIOD, "date_from": _DATE, "date_to": _DATE, "limit": _LIMIT,
+        "customer_id": {"type": "integer", "minimum": 1, "maximum": 9_223_372_036_854_775_807},
     },
 }
 _GET_INPUT = {
@@ -193,11 +194,13 @@ INVOICE_SEARCH_INPUT = {
         "payment_status": {"type": "string", "enum": ["all", "paid", "unpaid", "overdue"]},
         "date_field": {"type": "string", "enum": ["issue_date", "due_date"]},
         "period": _PERIOD, "date_from": _DATE, "date_to": _DATE, "limit": _LIMIT,
+        "customer_id": {"type": "integer", "minimum": 1, "maximum": 9_223_372_036_854_775_807},
     },
 }
 INVOICE_OVERDUE_INPUT = {
     "type": "object", "additionalProperties": False, "properties": {
         "query": _QUERY, "as_of": _DATE, "limit": _LIMIT,
+        "customer_id": {"type": "integer", "minimum": 1, "maximum": 9_223_372_036_854_775_807},
     },
 }
 CUSTOMER_SEARCH_INPUT = {
@@ -800,6 +803,8 @@ def _orders_search(data, actor, correlation_id, transaction_connection=None):
         start, end = _date_bounds(data)
         clauses, params = ["1=1"], []
         query = " ".join(str(data.get("query") or "").split()).casefold()
+        if data.get("customer_id"):
+            clauses.append("o.customer_id=?"); params.append(int(data["customer_id"]))
         if query:
             clauses.append("(LOWER(o.order_no) LIKE ? OR LOWER(o.customer_name) LIKE ? OR LOWER(COALESCE(o.customer_email,'')) LIKE ?)")
             params.extend([f"%{query}%"] * 3)
@@ -872,6 +877,7 @@ def _invoice_view(row, overdue: bool) -> dict[str, Any]:
     currency = str(row["currency"] or row["order_currency"] or "PLN").upper()
     paid = bool(row["paid"])
     return {"id": int(row["id"]), "invoice_number": row["invoice_no"], "order_id": int(row["order_id"]),
+            "customer_id": row["customer_id"],
             "buyer_name": row["buyer_name"], "issue_date": row["issue_date"], "due_date": row["payment_to"],
             "currency": currency, "total_net": _money(row["total_net"]), "total_gross": _money(row["total_gross"]),
             "paid": paid, "paid_at": row["paid_at"] or None,
@@ -882,7 +888,7 @@ def _invoice_view(row, overdue: bool) -> dict[str, Any]:
 def _invoice_rows(db, where="1=1", params=(), limit=51):
     return db.execute(f"""SELECT i.*,COALESCE(m.paid,0) paid,m.paid_at,m.invoice_items_json,
                                   COALESCE(i.currency,o.currency,'PLN') currency,
-                                  COALESCE(o.currency,'PLN') order_currency
+                                  COALESCE(o.currency,'PLN') order_currency,o.customer_id
                            FROM invoices i LEFT JOIN invoice_meta m ON m.invoice_id=i.id
                            LEFT JOIN orders o ON o.id=i.order_id WHERE {where}
                            ORDER BY i.issue_date DESC,i.id DESC LIMIT ?""", (*params, limit)).fetchall()
@@ -894,6 +900,8 @@ def _invoices_search(data, actor, correlation_id, transaction_connection=None):
         start, end = _date_bounds(data)
         clauses, params = ["1=1"], []
         query = " ".join(str(data.get("query") or "").split()).casefold()
+        if data.get("customer_id"):
+            clauses.append("o.customer_id=?"); params.append(int(data["customer_id"]))
         if query:
             compact_query = re.sub(r"\s+", "", query)
             clauses.append("(LOWER(i.invoice_no) LIKE ? OR REPLACE(LOWER(i.invoice_no),' ','') LIKE ? OR LOWER(COALESCE(i.buyer_name,'')) LIKE ? OR LOWER(COALESCE(i.buyer_tax_no,'')) LIKE ?)")
@@ -957,6 +965,15 @@ def _invoices_overdue(data, actor, correlation_id, transaction_connection=None):
             now = datetime.combine(requested, datetime.min.time(), tzinfo=WARSAW_TZ).replace(hour=12)
         query = " ".join(str(data.get("query") or "").split()).casefold()
         overdue = cash_flow_overdue_invoices(db, current_time=now)
+        if data.get("customer_id"):
+            customer_id = int(data["customer_id"])
+            filtered = []
+            for item in overdue:
+                invoice = db.execute("SELECT order_id FROM invoices WHERE id=?", (int(item["id"]),)).fetchone()
+                order = db.execute("SELECT customer_id FROM orders WHERE id=?", (invoice["order_id"],)).fetchone() if invoice else None
+                if order and int(order["customer_id"] or 0) == customer_id:
+                    filtered.append(item)
+            overdue = filtered
         if query:
             overdue = [r for r in overdue if query in str(r.get("invoice_no") or "").casefold()
                        or query in str(r.get("buyer_name") or "").casefold()]

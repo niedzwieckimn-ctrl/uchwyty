@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import json
+import re
 import sqlite3
 import threading
 import uuid
@@ -130,6 +131,79 @@ def _pick(item: Mapping[str, Any], names) -> dict[str, Any]:
     return {name: item.get(name) for name in names if item.get(name) not in (None, "")}
 
 
+_ENTITY_FIELDS = {
+    "customer": ("id", "name", "nip"),
+    "invoice": ("id", "invoice_number", "customer_id", "order_id"),
+    "order": ("id", "order_number", "customer_id"),
+    "product": ("id", "sku", "model", "name"),
+    "china_order": ("id", "order_number", "po_number", "package_number", "status", "scope"),
+}
+_OPERATION_ENTITY = {
+    "customers": "customer", "invoices": "invoice", "orders": "order",
+    "inventory": "product", "china": "china_order",
+}
+_ORDINALS = {"pierwszy": 0, "pierwsza": 0, "pierwsze": 0,
+             "drugi": 1, "druga": 1, "drugie": 1,
+             "trzeci": 2, "trzecia": 2, "trzecie": 2}
+
+
+def _entity_type(operation: str) -> str:
+    return _OPERATION_ENTITY.get(operation.split(".", 1)[0], "")
+
+
+def _minimal(entity_type: str, item: Mapping[str, Any]) -> dict[str, Any]:
+    return _pick(item, _ENTITY_FIELDS.get(entity_type, ("id",)))
+
+
+def context_for_model(state: Mapping[str, Any], message: str = "") -> dict[str, Any]:
+    """Expose identifiers for reference resolution, never cached business facts."""
+    result = {key: value for key, value in state.items()
+              if key.startswith("active_") or key in {"selection_candidates", "last_operation", "last_period"}}
+    resolved = resolve_reference(state, message)
+    if resolved.get("resolved"):
+        result["resolved_reference"] = resolved
+    return sanitize_audit_data(result)
+
+
+def resolve_reference(state: Mapping[str, Any], message: str) -> dict[str, Any]:
+    text = " ".join(str(message or "").casefold().split())
+    ordinal = next((index for word, index in _ORDINALS.items() if re.search(rf"\b{word}\b", text)), None)
+    candidates = state.get("selection_candidates") or {}
+    if ordinal is not None and isinstance(candidates, Mapping):
+        items = candidates.get("items") or []
+        if ordinal < len(items):
+            return {"resolved": True, "entity_type": candidates.get("entity_type"),
+                    "entity": items[ordinal], "ordinal": ordinal + 1}
+        return {"resolved": False, "reason": "ordinal_out_of_range", "ordinal": ordinal + 1}
+
+    if re.search(r"\b(jego|jej|ten klient|ta firma)\b", text) and state.get("active_customer"):
+        return {"resolved": True, "entity_type": "customer", "entity": state["active_customer"]}
+    if re.search(r"\b(ma|miał|miala|miał[aoy]?)\b", text) and state.get("active_customer"):
+        return {"resolved": True, "entity_type": "customer", "entity": state["active_customer"]}
+    if re.search(r"\b(ostatnie|ostatnia|ostatniej)\b", text):
+        preferred = "invoice" if "faktur" in text else "order" if "zamów" in text or "zamow" in text else ""
+        if not preferred:
+            last = str(state.get("last_operation") or "")
+            preferred = _entity_type(last)
+        if preferred and state.get("active_" + preferred):
+            return {"resolved": True, "entity_type": preferred, "entity": state["active_" + preferred]}
+        if preferred == "order" and state.get("active_customer"):
+            return {"resolved": True, "entity_type": "customer", "entity": state["active_customer"]}
+
+    patterns = (
+        ("invoice", r"\b(faktur\w*|niej|ją|ostatni(?:a|ej)?)\b"),
+        ("order", r"\b(zamówieni\w*|zamowieni\w*|tym zamówieniu|tym zamowieniu|tamto)\b"),
+        ("product", r"\b(produkt\w*|model\w*|uchwyt\w*|go)\b"),
+        ("china_order", r"\b(paczk\w*|chin\w*|zaplanowan\w*|wysłan\w*|wyslan\w*|tam)\b"),
+        ("customer", r"\b(klient\w*|firm\w*|jego|on)\b"),
+    )
+    for entity_type, pattern in patterns:
+        entity = state.get("active_" + entity_type)
+        if entity and re.search(pattern, text):
+            return {"resolved": True, "entity_type": entity_type, "entity": entity}
+    return {"resolved": False, "reason": "no_unambiguous_reference"}
+
+
 def update_context(conversation_id: str, operation: str, arguments: Mapping[str, Any], result: Mapping[str, Any]) -> dict[str, Any]:
     db = _factory()()
     try:
@@ -141,26 +215,27 @@ def update_context(conversation_id: str, operation: str, arguments: Mapping[str,
         state["last_operation"] = operation
         if arguments.get("period") or arguments.get("date_from") or arguments.get("date_to") or arguments.get("as_of"):
             state["last_period"] = _pick(arguments, ("period", "date_from", "date_to", "date_field", "as_of"))
+        entity_type = _entity_type(operation)
         records = result.get("candidates") if operation.startswith("inventory.product") else result.get("results")
-        if operation == "inventory.product.get": records = [result]
+        if operation == "inventory.product.get": records = [result.get("product") or result.get("record") or result]
         if operation == "orders.get": records = [result.get("record") or {}]
         if operation == "invoices.get": records = [result.get("record") or {}]
         if operation == "customers.get": records = [result.get("record") or {}]
-        if isinstance(records, list):
-            if operation.startswith("inventory.product"):
-                fields, key = ("id", "sku", "model", "name", "stock"), "products"
-            elif operation.startswith("orders."):
-                fields, key = ("id", "order_number", "customer_id", "customer_name", "status"), "orders"
-            elif operation.startswith("invoices."):
-                fields, key = ("id", "invoice_number", "order_id", "buyer_name", "due_date", "currency", "amount_outstanding", "overdue_days"), "invoices"
-            else:
-                fields, key = ("id", "name", "nip"), "customers"
-            state[key] = [_pick(item, fields) for item in records[:MAX_CANDIDATES] if isinstance(item, Mapping)]
-        if operation == "customers.get" and isinstance(result.get("record"), Mapping):
-            customer = result["record"]
-            state["customer_detail"] = _pick(customer, ("id", "name", "nip", "order_count", "last_order", "invoice_totals"))
-        if operation == "business.sales.summary":
-            state["sales_summary"] = _pick(result, ("date_from", "date_to", "order_count", "invoice_count", "by_currency", "top_customers"))
+        if isinstance(records, list) and entity_type:
+            minimal = [_minimal(entity_type, item) for item in records[:MAX_CANDIDATES]
+                       if isinstance(item, Mapping)]
+            minimal = [item for item in minimal if item]
+            if len(minimal) == 1:
+                state["active_" + entity_type] = minimal[0]
+                state.pop("selection_candidates", None)
+            elif len(minimal) > 1:
+                state["selection_candidates"] = {"entity_type": entity_type, "items": minimal}
+        if operation == "china.orders.summary":
+            state["active_china_order"] = {"scope": str(result.get("scope") or arguments.get("scope") or "active")}
+        # Detail rows can establish the related customer without caching balances/statuses.
+        active = state.get("active_" + entity_type, {}) if entity_type else {}
+        if entity_type in {"invoice", "order"} and active.get("customer_id"):
+            state["active_customer"] = {"id": active["customer_id"]}
         state = sanitize_audit_data(state)
         encoded = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
         if len(encoded.encode("utf-8")) > MAX_STORED_CONTEXT_BYTES:
