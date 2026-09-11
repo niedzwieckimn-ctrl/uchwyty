@@ -96,6 +96,7 @@ PILOT_POLICIES = (
     ("policy-inventory-summary", "inventory.summary", 1, "inventory.read", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
     ("policy-orders-search", "orders.search", 1, "orders.read_full", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
     ("policy-orders-get", "orders.get", 1, "orders.read_full", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
+    ("policy-orders-summary", "orders.summary", 1, "orders.read_full", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
     ("policy-invoices-search", "invoices.search", 1, "invoices.read", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
     ("policy-invoices-get", "invoices.get", 1, "invoices.read", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
     ("policy-invoices-overdue", "invoices.overdue", 1, "payments.read", GREEN, 0, "approvals.decide", 3600, 1, None, 1),

@@ -17,6 +17,7 @@ import threading
 import time
 import uuid
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
@@ -147,6 +148,10 @@ _DATE = {"type": "string", "minLength": 10, "maxLength": 10}
 _PERIOD = {"type": "string", "enum": [
     "all", "today", "yesterday", "this_week", "this_month", "previous_month", "custom",
 ]}
+_ORDER_SUMMARY_PERIOD = {"type": "string", "enum": [
+    "all", "today", "yesterday", "this_week", "this_month", "previous_month",
+    "last_7_days", "last_30_days", "custom",
+]}
 _SEARCH_INPUT = {
     "type": "object", "additionalProperties": False, "properties": {
         "query": _QUERY, "status": {"type": "string", "minLength": 1, "maxLength": 64},
@@ -165,6 +170,40 @@ ORDER_GET_INPUT = {
         "id": {"type": "integer", "minimum": 1, "maximum": 9_223_372_036_854_775_807},
         "number": _QUERY, "latest": {"type": "boolean"},
         "customer_id": {"type": "integer", "minimum": 1, "maximum": 9_223_372_036_854_775_807},
+    },
+}
+ORDER_SUMMARY_INPUT = {
+    "type": "object", "additionalProperties": False, "properties": {
+        "customer_id": {"type": "integer", "minimum": 1, "maximum": 9_223_372_036_854_775_807},
+        "period": _ORDER_SUMMARY_PERIOD, "date_from": _DATE, "date_to": _DATE,
+        "status": {"type": "string", "minLength": 1, "maxLength": 64},
+    },
+}
+_ORDER_CURRENCY_SUMMARY = {
+    "type": "object", "additionalProperties": False,
+    "required": ["currency", "total_net", "total_gross"],
+    "properties": {
+        "currency": {"type": "string"}, "total_net": {"type": ["integer", "number"]},
+        "total_gross": {"type": ["integer", "number"]},
+    },
+}
+_ORDER_STATUS_SUMMARY = {
+    "type": "object", "additionalProperties": False,
+    "required": ["status", "order_count", "total_units"],
+    "properties": {
+        "status": {"type": "string"}, "order_count": {"type": "integer"},
+        "total_units": {"type": "integer"},
+    },
+}
+ORDER_SUMMARY_OUTPUT = {
+    "type": "object", "additionalProperties": False,
+    "required": ["ok", "date_from", "date_to", "order_count", "total_units", "by_currency", "statuses"],
+    "properties": {
+        "ok": {"type": "boolean"}, "date_from": {"type": ["string", "null"]},
+        "date_to": {"type": ["string", "null"]}, "order_count": {"type": "integer"},
+        "total_units": {"type": "integer"},
+        "by_currency": {"type": "array", "maxItems": 20, "items": _ORDER_CURRENCY_SUMMARY},
+        "statuses": {"type": "array", "maxItems": 100, "items": _ORDER_STATUS_SUMMARY},
     },
 }
 INVOICE_GET_INPUT = {
@@ -322,6 +361,12 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
         "orders.get", 1, "Pobiera zamówienie z pozycjami po id/number albo najnowsze przez latest=true, opcjonalnie dla customer_id.",
         "orders.read_full", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
         ORDER_GET_INPUT, _DETAIL_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
+    ),
+    "orders.summary": BusinessOperationDefinition(
+        "orders.summary", 1,
+        "Podsumowuje zamówienia w zadanym okresie i opcjonalnie dla konkretnego klienta. Używaj do pytań o łączną wartość, liczbę zamówień, liczbę sztuk lub podsumowanie statusów. Nie używaj do wyświetlania pojedynczego zamówienia.",
+        "orders.read_full", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
+        ORDER_SUMMARY_INPUT, ORDER_SUMMARY_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
     "invoices.search": BusinessOperationDefinition(
         "invoices.search", 1, "Wyszukuje faktury, opcjonalnie dla customer_id; payment_status=unpaid oznacza nieopłacone, a zaległe obsługuje invoices.overdue.",
@@ -526,6 +571,8 @@ def _entity(definition: BusinessOperationDefinition, data: Mapping[str, Any]) ->
         return "inventory_summary", "all", None
     if definition.operation_name in {"orders.search", "invoices.search", "invoices.overdue", "customers.search"}:
         return definition.operation_name.replace(".", "_"), sanitize_audit_text(data.get("query", "all"))[:160], None
+    if definition.operation_name == "orders.summary":
+        return "orders_summary", str(data.get("customer_id") or data.get("period") or "all"), None
     if definition.operation_name in {"orders.get", "invoices.get"}:
         return definition.operation_name.split(".")[0][:-1], str(data.get("id") or data.get("number") or ("latest" if data.get("latest") else "")), None
     if definition.operation_name == "customers.get":
@@ -767,6 +814,10 @@ def _date_bounds(data: Mapping[str, Any], *, default_period="all") -> tuple[str 
     elif period == "previous_month":
         end = today.replace(day=1) - timedelta(days=1)
         start = end.replace(day=1)
+    elif period == "last_7_days":
+        start, end = today - timedelta(days=6), today
+    elif period == "last_30_days":
+        start, end = today - timedelta(days=29), today
     elif period == "custom":
         if not data.get("date_from") or not data.get("date_to"):
             raise ControlledOperationError("DATE_RANGE_REQUIRED", "Okres custom wymaga date_from i date_to", status=DENIED)
@@ -804,28 +855,34 @@ def _order_totals(db: sqlite3.Connection, order_id: int) -> dict[str, dict[str, 
     return {str(row["currency"]): {"net": _money(row["net"]), "gross": _money(row["gross"])} for row in rows if row["currency"]}
 
 
+def _order_filter(data: Mapping[str, Any]) -> tuple[str | None, str | None, list[str], list[Any]]:
+    """Build the same date and status predicates for order reads and aggregates."""
+    start, end = _date_bounds(data)
+    clauses, params = ["1=1"], []
+    if data.get("customer_id"):
+        clauses.append("o.customer_id=?"); params.append(int(data["customer_id"]))
+    status = str(data.get("status") or "").strip().casefold()
+    if status == "not_shipped":
+        clauses.append("LOWER(o.status) NOT IN ('shipped','completed','cancelled')")
+    elif status == "in_progress":
+        clauses.append("LOWER(o.status) IN ('confirmed','issued','packed','packed_partial','in_delivery','partially_shipped')")
+    elif status:
+        clauses.append("LOWER(o.status)=?"); params.append(status)
+    if start:
+        clauses.append("SUBSTR(TRIM(o.created_at),1,10)>=?"); params.append(start)
+    if end:
+        clauses.append("SUBSTR(TRIM(o.created_at),1,10)<=?"); params.append(end)
+    return start, end, clauses, params
+
+
 def _orders_search(data, actor, correlation_id, transaction_connection=None):
     db = transaction_connection or _factory()()
     try:
-        start, end = _date_bounds(data)
-        clauses, params = ["1=1"], []
+        _start, _end, clauses, params = _order_filter(data)
         query = " ".join(str(data.get("query") or "").split()).casefold()
-        if data.get("customer_id"):
-            clauses.append("o.customer_id=?"); params.append(int(data["customer_id"]))
         if query:
             clauses.append("(LOWER(o.order_no) LIKE ? OR LOWER(o.customer_name) LIKE ? OR LOWER(COALESCE(o.customer_email,'')) LIKE ?)")
             params.extend([f"%{query}%"] * 3)
-        status = str(data.get("status") or "").strip().casefold()
-        if status == "not_shipped":
-            clauses.append("LOWER(o.status) NOT IN ('shipped','completed','cancelled')")
-        elif status == "in_progress":
-            clauses.append("LOWER(o.status) IN ('confirmed','issued','packed','packed_partial','in_delivery','partially_shipped')")
-        elif status:
-            clauses.append("LOWER(o.status)=?"); params.append(status)
-        if start:
-            clauses.append("SUBSTR(TRIM(o.created_at),1,10)>=?"); params.append(start)
-        if end:
-            clauses.append("SUBSTR(TRIM(o.created_at),1,10)<=?"); params.append(end)
         limit = _limit(data)
         rows = db.execute(
             f"""SELECT o.*, COUNT(oi.id) item_lines, COALESCE(SUM(oi.qty),0) item_qty
@@ -841,6 +898,56 @@ def _orders_search(data, actor, correlation_id, transaction_connection=None):
             "item_qty": int(r["item_qty"]), "totals": _order_totals(db, int(r["id"])),
         } for r in selected]
         return {"ok": True, "results": results, "count": len(results), "truncated": len(rows) > limit}
+    finally:
+        if transaction_connection is None: db.close()
+
+
+def _orders_summary(data, actor, correlation_id, transaction_connection=None):
+    db = transaction_connection or _factory()()
+    try:
+        start, end, clauses, params = _order_filter(data)
+        orders = db.execute(
+            f"SELECT o.id,o.status,UPPER(COALESCE(NULLIF(TRIM(o.currency),''),'PLN')) currency "
+            f"FROM orders o WHERE {' AND '.join(clauses)} ORDER BY o.id",
+            params,
+        ).fetchall()
+        if not orders:
+            return {"ok": True, "date_from": start, "date_to": end, "order_count": 0,
+                    "total_units": 0, "by_currency": [], "statuses": []}
+        order_ids = [int(row["id"]) for row in orders]
+        items = db.execute(
+            f"""SELECT oi.order_id,oi.qty,oi.unit_net_price,oi.unit_gross_price,
+                       UPPER(COALESCE(NULLIF(TRIM(oi.currency),''),NULLIF(TRIM(o.currency),''),'PLN')) currency
+                FROM order_items oi JOIN orders o ON o.id=oi.order_id
+                WHERE oi.order_id IN ({','.join('?' for _ in order_ids)})""",
+            order_ids,
+        ).fetchall()
+        units_by_order = {order_id: 0 for order_id in order_ids}
+        currency_totals: dict[str, dict[str, Decimal]] = {}
+        for order in orders:
+            currency_totals.setdefault(str(order["currency"]), {"net": Decimal("0"), "gross": Decimal("0")})
+        for item in items:
+            qty = int(item["qty"] or 0)
+            units_by_order[int(item["order_id"])] += qty
+            totals = currency_totals.setdefault(str(item["currency"]), {"net": Decimal("0"), "gross": Decimal("0")})
+            net = Decimal(str(item["unit_net_price"] or 0))
+            gross = Decimal(str(item["unit_gross_price"] if item["unit_gross_price"] is not None else item["unit_net_price"] or 0))
+            totals["net"] += Decimal(qty) * net
+            totals["gross"] += Decimal(qty) * gross
+        status_totals: dict[str, dict[str, int]] = {}
+        for order in orders:
+            status = str(order["status"] or "")
+            bucket = status_totals.setdefault(status, {"order_count": 0, "total_units": 0})
+            bucket["order_count"] += 1
+            bucket["total_units"] += units_by_order[int(order["id"])]
+        return {
+            "ok": True, "date_from": start, "date_to": end,
+            "order_count": len(orders), "total_units": sum(units_by_order.values()),
+            "by_currency": [{"currency": currency, "total_net": _money(values["net"]),
+                             "total_gross": _money(values["gross"])}
+                            for currency, values in sorted(currency_totals.items())],
+            "statuses": [{"status": status, **values} for status, values in sorted(status_totals.items())],
+        }
     finally:
         if transaction_connection is None: db.close()
 
@@ -1227,6 +1334,7 @@ _HANDLERS: dict[str, Callable[[Mapping[str, Any], ActorContext, str, sqlite3.Con
     "inventory.summary": _inventory_summary,
     "orders.search": _orders_search,
     "orders.get": _orders_get,
+    "orders.summary": _orders_summary,
     "invoices.search": _invoices_search,
     "invoices.get": _invoices_get,
     "invoices.overdue": _invoices_overdue,
