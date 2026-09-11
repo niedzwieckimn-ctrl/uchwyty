@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import json
-import re
 import sqlite3
 import threading
 import uuid
@@ -142,12 +141,6 @@ _OPERATION_ENTITY = {
     "customers": "customer", "invoices": "invoice", "orders": "order",
     "inventory": "product", "china": "china_order",
 }
-_ORDINALS = {"pierwszy": 0, "pierwsza": 0, "pierwsze": 0,
-             "drugi": 1, "druga": 1, "drugie": 1,
-             "trzeci": 2, "trzecia": 2, "trzecie": 2}
-_INVOICE_NUMBER = re.compile(r"(?i)\b(?:FVAT|FV)\s*[A-Z0-9]+(?:\s*[/\-]\s*[A-Z0-9]+)+")
-
-
 def _entity_type(operation: str) -> str:
     return _OPERATION_ENTITY.get(operation.split(".", 1)[0], "")
 
@@ -156,65 +149,12 @@ def _minimal(entity_type: str, item: Mapping[str, Any]) -> dict[str, Any]:
     return _pick(item, _ENTITY_FIELDS.get(entity_type, ("id",)))
 
 
-def context_for_model(state: Mapping[str, Any], message: str = "") -> dict[str, Any]:
-    """Expose identifiers for reference resolution, never cached business facts."""
-    result = {key: value for key, value in state.items()
-              if key.startswith("active_") or key in {"selection_candidates", "last_operation", "last_period"}}
-    resolved = resolve_reference(state, message)
-    if resolved.get("resolved"):
-        result["resolved_reference"] = resolved
-    return sanitize_audit_data(result)
-
-
-def resolve_reference(state: Mapping[str, Any], message: str) -> dict[str, Any]:
-    text = " ".join(str(message or "").casefold().split())
-    explicit_invoice = _INVOICE_NUMBER.search(str(message or ""))
-    if explicit_invoice:
-        number = re.sub(r"\s*([/-])\s*", r"\1", explicit_invoice.group(0).strip())
-        return {"resolved": True, "entity_type": "invoice", "selector": {"number": number},
-                "source": "explicit"}
-    if re.search(r"\bostatni\w*\s+faktur\w*|\bfaktur\w*\s+ostatni\w*", text):
-        return {"resolved": True, "entity_type": "invoice", "selector": {"latest": True},
-                "source": "explicit"}
-    if re.search(r"\bostatni\w*\s+zam[oó]wieni\w*|\bzam[oó]wieni\w*\s+ostatni\w*", text):
-        customer = state.get("active_customer") if isinstance(state.get("active_customer"), Mapping) else {}
-        return {"resolved": True, "entity_type": "customer" if customer else "order",
-                "entity": customer, "selector": {"latest": True}, "source": "explicit"}
-    ordinal = next((index for word, index in _ORDINALS.items() if re.search(rf"\b{word}\b", text)), None)
-    candidates = state.get("selection_candidates") or {}
-    if ordinal is not None and isinstance(candidates, Mapping):
-        items = candidates.get("items") or []
-        if ordinal < len(items):
-            return {"resolved": True, "entity_type": candidates.get("entity_type"),
-                    "entity": items[ordinal], "ordinal": ordinal + 1}
-        return {"resolved": False, "reason": "ordinal_out_of_range", "ordinal": ordinal + 1}
-
-    if re.search(r"\b(jego|jej|ten klient|ta firma)\b", text) and state.get("active_customer"):
-        return {"resolved": True, "entity_type": "customer", "entity": state["active_customer"]}
-    if re.search(r"\b(ma|miał|miala|miał[aoy]?)\b", text) and state.get("active_customer"):
-        return {"resolved": True, "entity_type": "customer", "entity": state["active_customer"]}
-    if re.search(r"\b(ostatnie|ostatnia|ostatniej)\b", text):
-        preferred = "invoice" if "faktur" in text else "order" if "zamów" in text or "zamow" in text else ""
-        if not preferred:
-            last = str(state.get("last_operation") or "")
-            preferred = _entity_type(last)
-        if preferred and state.get("active_" + preferred):
-            return {"resolved": True, "entity_type": preferred, "entity": state["active_" + preferred]}
-        if preferred == "order" and state.get("active_customer"):
-            return {"resolved": True, "entity_type": "customer", "entity": state["active_customer"]}
-
-    patterns = (
-        ("invoice", r"\b(faktur\w*|niej|ją|ostatni(?:a|ej)?)\b"),
-        ("order", r"\b(zamówieni\w*|zamowieni\w*|tym zamówieniu|tym zamowieniu|tamto)\b"),
-        ("product", r"\b(produkt\w*|model\w*|uchwyt\w*|go)\b"),
-        ("china_order", r"\b(paczk\w*|chin\w*|zaplanowan\w*|wysłan\w*|wyslan\w*|tam)\b"),
-        ("customer", r"\b(klient\w*|firm\w*|jego|on)\b"),
-    )
-    for entity_type, pattern in patterns:
-        entity = state.get("active_" + entity_type)
-        if entity and re.search(pattern, text):
-            return {"resolved": True, "entity_type": entity_type, "entity": entity}
-    return {"resolved": False, "reason": "no_unambiguous_reference"}
+def context_for_model(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Expose only structural identifiers; semantic resolution belongs to the model."""
+    return sanitize_audit_data({
+        key: value for key, value in state.items()
+        if key.startswith("active_") or key in {"selection_candidates", "last_operation", "last_period"}
+    })
 
 
 def update_context(conversation_id: str, operation: str, arguments: Mapping[str, Any], result: Mapping[str, Any]) -> dict[str, Any]:

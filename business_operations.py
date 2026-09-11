@@ -314,27 +314,27 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
         INVENTORY_SUMMARY_INPUT, INVENTORY_SUMMARY_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
     "orders.search": BusinessOperationDefinition(
-        "orders.search", 1, "Wyszukuje zamówienia po numerze, kliencie, statusie i okresie.",
+        "orders.search", 1, "Wyszukuje zamówienia po numerze, customer_id, statusie i okresie; limit=1 zwraca najnowszy pasujący rekord.",
         "orders.read_full", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
         _SEARCH_INPUT, _RESULTS_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
     "orders.get": BusinessOperationDefinition(
-        "orders.get", 1, "Pobiera zamówienie wraz z pozycjami i podsumowaniem kwot.",
+        "orders.get", 1, "Pobiera zamówienie z pozycjami po id/number albo najnowsze przez latest=true, opcjonalnie dla customer_id.",
         "orders.read_full", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
         ORDER_GET_INPUT, _DETAIL_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
     "invoices.search": BusinessOperationDefinition(
-        "invoices.search", 1, "Wyszukuje faktury, w tym wszystkie nieopłacone przez payment_status=unpaid; po terminie obsługuje invoices.overdue.",
+        "invoices.search", 1, "Wyszukuje faktury, opcjonalnie dla customer_id; payment_status=unpaid oznacza nieopłacone, a zaległe obsługuje invoices.overdue.",
         "invoices.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
         INVOICE_SEARCH_INPUT, _RESULTS_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
     "invoices.get": BusinessOperationDefinition(
-        "invoices.get", 1, "Pobiera fakturę po id lub numerze; latest=true zwraca ostatnio wystawioną fakturę wraz z zapisanymi pozycjami.",
+        "invoices.get", 1, "Pobiera jedną fakturę po dokładnym id lub number; latest=true zwraca globalnie ostatnio wystawioną wraz z pozycjami.",
         "invoices.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
         INVOICE_GET_INPUT, _DETAIL_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
     "invoices.overdue": BusinessOperationDefinition(
-        "invoices.overdue", 1, "Zwraca wyłącznie zaległe faktury po terminie według tej samej reguły co Cash Flow.",
+        "invoices.overdue", 1, "Zwraca zaległe faktury po terminie według Cash Flow, opcjonalnie ograniczone przez customer_id.",
         "payments.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
         INVOICE_OVERDUE_INPUT, INVOICE_OVERDUE_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
