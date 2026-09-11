@@ -272,7 +272,21 @@ def _apply_resolved_reference(tool_name: str, arguments: Any, resolution: Mappin
     data = dict(arguments) if isinstance(arguments, Mapping) else {}
     entity_type = resolution.get("entity_type") if resolution.get("resolved") else ""
     entity = resolution.get("entity") if isinstance(resolution.get("entity"), Mapping) else {}
+    selector = resolution.get("selector") if isinstance(resolution.get("selector"), Mapping) else {}
     entity_id = entity.get("id")
+    # A selector explicitly present in the current message has precedence over
+    # both model-supplied stale arguments and conversation context.
+    if tool_name == "invoices.get" and selector.get("number"):
+        return {"number": selector["number"]}
+    if tool_name == "invoices.get" and selector.get("latest"):
+        return {"latest": True}
+    if tool_name == "orders.get" and selector.get("latest"):
+        data = {"latest": True}
+        if entity_type == "customer" and entity_id:
+            data["customer_id"] = entity_id
+        return data
+    if tool_name == "orders.search" and selector.get("latest"):
+        data["limit"] = 1
     if entity_type == "customer" and entity_id and tool_name in {
         "orders.search", "invoices.search", "invoices.overdue"
     }:
@@ -360,6 +374,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         "agent_run_id": run_id, "conversation_id": conversation_id,
         "resolved": bool(resolution.get("resolved")),
         "entity_type": resolution.get("entity_type"), "ordinal": resolution.get("ordinal"),
+        "source": resolution.get("source"),
         "entity_id": (resolution.get("entity") or {}).get("id") if isinstance(resolution.get("entity"), Mapping) else None,
     }, ensure_ascii=False, sort_keys=True))
     input_items = []

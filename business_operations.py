@@ -160,6 +160,13 @@ _GET_INPUT = {
         "number": _QUERY,
     },
 }
+ORDER_GET_INPUT = {
+    "type": "object", "additionalProperties": False, "properties": {
+        "id": {"type": "integer", "minimum": 1, "maximum": 9_223_372_036_854_775_807},
+        "number": _QUERY, "latest": {"type": "boolean"},
+        "customer_id": {"type": "integer", "minimum": 1, "maximum": 9_223_372_036_854_775_807},
+    },
+}
 INVOICE_GET_INPUT = {
     "type": "object", "additionalProperties": False, "properties": {
         "id": {"type": "integer", "minimum": 1, "maximum": 9_223_372_036_854_775_807},
@@ -314,7 +321,7 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
     "orders.get": BusinessOperationDefinition(
         "orders.get", 1, "Pobiera zamówienie wraz z pozycjami i podsumowaniem kwot.",
         "orders.read_full", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
-        _GET_INPUT, _DETAIL_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
+        ORDER_GET_INPUT, _DETAIL_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
     "invoices.search": BusinessOperationDefinition(
         "invoices.search", 1, "Wyszukuje faktury, w tym wszystkie nieopłacone przez payment_status=unpaid; po terminie obsługuje invoices.overdue.",
@@ -849,7 +856,17 @@ def _resolve_by_id_or_number(db, table: str, data, number_column: str):
 def _orders_get(data, actor, correlation_id, transaction_connection=None):
     db = transaction_connection or _factory()()
     try:
-        row = _resolve_by_id_or_number(db, "orders", data, "order_no")
+        identifiers = int(bool(data.get("id"))) + int(bool(str(data.get("number") or "").strip())) + int(data.get("latest") is True)
+        if identifiers != 1:
+            raise ControlledOperationError("IDENTIFIER_REQUIRED", "Podaj dokładnie jedno: id, number albo latest=true", status=DENIED)
+        if data.get("latest") is True:
+            if data.get("customer_id"):
+                row = db.execute("SELECT * FROM orders WHERE customer_id=? ORDER BY created_at DESC,id DESC LIMIT 1",
+                                 (int(data["customer_id"]),)).fetchone()
+            else:
+                row = db.execute("SELECT * FROM orders ORDER BY created_at DESC,id DESC LIMIT 1").fetchone()
+        else:
+            row = _resolve_by_id_or_number(db, "orders", data, "order_no")
         if row is None: raise ControlledOperationError("ORDER_NOT_FOUND", "Nie znaleziono zamówienia", status=NOOP)
         record = {"id": int(row["id"]), "order_number": row["order_no"], "customer_id": row["customer_id"],
                   "customer_name": row["customer_name"], "status": row["status"], "note": row["note"],

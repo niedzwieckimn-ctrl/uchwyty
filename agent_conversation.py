@@ -145,6 +145,7 @@ _OPERATION_ENTITY = {
 _ORDINALS = {"pierwszy": 0, "pierwsza": 0, "pierwsze": 0,
              "drugi": 1, "druga": 1, "drugie": 1,
              "trzeci": 2, "trzecia": 2, "trzecie": 2}
+_INVOICE_NUMBER = re.compile(r"(?i)\b(?:FVAT|FV)\s*[A-Z0-9]+(?:\s*[/\-]\s*[A-Z0-9]+)+")
 
 
 def _entity_type(operation: str) -> str:
@@ -167,6 +168,18 @@ def context_for_model(state: Mapping[str, Any], message: str = "") -> dict[str, 
 
 def resolve_reference(state: Mapping[str, Any], message: str) -> dict[str, Any]:
     text = " ".join(str(message or "").casefold().split())
+    explicit_invoice = _INVOICE_NUMBER.search(str(message or ""))
+    if explicit_invoice:
+        number = re.sub(r"\s*([/-])\s*", r"\1", explicit_invoice.group(0).strip())
+        return {"resolved": True, "entity_type": "invoice", "selector": {"number": number},
+                "source": "explicit"}
+    if re.search(r"\bostatni\w*\s+faktur\w*|\bfaktur\w*\s+ostatni\w*", text):
+        return {"resolved": True, "entity_type": "invoice", "selector": {"latest": True},
+                "source": "explicit"}
+    if re.search(r"\bostatni\w*\s+zam[oó]wieni\w*|\bzam[oó]wieni\w*\s+ostatni\w*", text):
+        customer = state.get("active_customer") if isinstance(state.get("active_customer"), Mapping) else {}
+        return {"resolved": True, "entity_type": "customer" if customer else "order",
+                "entity": customer, "selector": {"latest": True}, "source": "explicit"}
     ordinal = next((index for word, index in _ORDINALS.items() if re.search(rf"\b{word}\b", text)), None)
     candidates = state.get("selection_candidates") or {}
     if ordinal is not None and isinstance(candidates, Mapping):
