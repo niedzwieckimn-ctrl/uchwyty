@@ -55,6 +55,7 @@ logger = logging.getLogger(__name__)
 # Data access stays outside operation handlers. The application injects a
 # per-operation freshness provider; this module never imports the Flask app.
 _freshness_provider: Callable[[str], Mapping[str, Any]] | None = None
+_write_success_observer: Callable[[str, Mapping[str, Any]], None] | None = None
 
 FRESHNESS_GROUP_BY_OPERATION = {
     "inventory.product.search": "inventory", "inventory.product.get": "inventory", "inventory.summary": "inventory",
@@ -71,6 +72,14 @@ def configure_freshness(provider: Callable[[str], Mapping[str, Any]] | None) -> 
     """Install the application-owned source-of-truth freshness boundary."""
     global _freshness_provider
     _freshness_provider = provider
+
+
+def configure_write_success_observer(
+    observer: Callable[[str, Mapping[str, Any]], None] | None,
+) -> None:
+    """Notify the application after a local WRITE transaction has committed."""
+    global _write_success_observer
+    _write_success_observer = observer
 
 
 @dataclass(frozen=True)
@@ -1686,8 +1695,21 @@ def _execute_local_approved(
             "SELECT * FROM internal_operation_executions WHERE execution_id=?", (execution_id,)
         ).fetchone()
         _audit("business_operation.success", definition, actor, row, SUCCESS, transaction_connection=db)
+        result = _result_from_row(row)
         db.commit()
-        return _result_from_row(row)
+        if _write_success_observer and definition.operation_name in ORDER_WRITES:
+            try:
+                _write_success_observer(definition.operation_name, output)
+            except Exception as exc:
+                logger.error(
+                    "BUSINESS_OPERATION_POST_WRITE_CONSISTENCY %s",
+                    json.dumps({
+                        "operation": definition.operation_name,
+                        "status": "FAILED",
+                        "exception_type": type(exc).__name__,
+                    }, sort_keys=True),
+                )
+        return result
     except approvals.StaleApproval as exc:
         db.rollback()
         row = _transition(execution_id, definition, actor, "CONFLICT", "business_operation.conflict", CONFLICT,

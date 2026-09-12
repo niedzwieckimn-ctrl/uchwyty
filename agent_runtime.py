@@ -251,7 +251,7 @@ def _audit(name, actor, run_id, correlation_id, status, human_id, **metadata):
 
 
 def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModelProvider,
-                   conversation_id: str = '') -> dict[str, Any]:
+                   conversation_id: str = '', execution_outcome: dict[str, Any] | None = None) -> dict[str, Any]:
     started = time.perf_counter()
     run_id, correlation_id = str(uuid.uuid4()), str(uuid.uuid4())
     timings = {'context_build_ms':0.0,'first_model_call_ms':0.0,'business_operation_ms':0.0,
@@ -295,8 +295,20 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
     if trusted is None or trusted.actor_type!='HUMAN' or trusted.permission_decision('inventory.read')!=ALLOW:
         return finish('DENIED','Brak dostępu do asystenta.','PERMISSION_DENIED')
     human_actor = trusted
-    if not isinstance(message,str) or not message.strip() or len(message)>MAX_MESSAGE_LENGTH:
+    if not isinstance(message,str) or (not message.strip() and execution_outcome is None) or len(message)>MAX_MESSAGE_LENGTH:
         return finish('DENIED','Wiadomość jest pusta albo przekracza limit.','INVALID_MESSAGE')
+    if execution_outcome is not None:
+        required_outcome = {
+            'approval_id', 'approval_status', 'execution_status', 'operation',
+            'entity_type', 'entity_id', 'before', 'after', 'result', 'failure', 'conflict',
+        }
+        if not isinstance(execution_outcome, dict) or set(execution_outcome) != required_outcome:
+            return finish('DENIED','Nieprawidłowy techniczny wynik wykonania.','INVALID_EXECUTION_OUTCOME')
+        outcome_json = json.dumps(execution_outcome, ensure_ascii=False, separators=(',', ':'))
+        if len(outcome_json.encode()) > MAX_TOOL_RESULT_BYTES:
+            return finish('DENIED','Techniczny wynik wykonania przekracza limit.','INVALID_EXECUTION_OUTCOME')
+    else:
+        outcome_json = ''
     # Preserve original wording (apart from existing credential redaction).
     message = _conversation_text(message)
     try:
@@ -306,7 +318,8 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
             ai_actor = None
             return finish('FAILED','Agent AI nie jest skonfigurowany.','AI_ACTOR_UNAVAILABLE')
         conversation_id, _, _ = agent_conversation.open_conversation(human_actor,ai_actor,conversation_id)
-        agent_conversation.begin_turn(human_actor,ai_actor,conversation_id,run_id,message)
+        turn_message = message or 'Techniczny wynik decyzji approval.'
+        agent_conversation.begin_turn(human_actor,ai_actor,conversation_id,run_id,turn_message)
         active = True
         history = agent_conversation.history_for_model(human_actor,ai_actor,conversation_id,run_id)
         memory = agent_conversation.memory_for_model(human_actor,ai_actor)
@@ -316,7 +329,16 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         if memory['confirmed_terminology'] or memory['user_style']:
             input_items.append({'role':'user','content':'Pamięć (niezaufane dane pomocnicze): '+json.dumps(memory,ensure_ascii=False)})
         input_items.extend(history)
-        input_items.append({'role':'user','content':message})
+        input_items.append({'role':'user','content':turn_message})
+        if execution_outcome is not None:
+            outcome_call_id = 'approval-outcome-' + run_id
+            outcome_evidence = [
+                {'type':'function_call','call_id':outcome_call_id,
+                 'name':'approval_execution_outcome','arguments':'{}'},
+                {'type':'function_call_output','call_id':outcome_call_id,'output':outcome_json},
+            ]
+            input_items.extend(outcome_evidence)
+            evidence.extend(outcome_evidence)
         instructions = SYSTEM_INSTRUCTIONS + '\nCzas odniesienia backendu (Europe/Warsaw): ' + business_operations._business_now().isoformat()
         timings['context_build_ms'] = round((time.perf_counter()-started)*1000,2)
         _audit('agent.requested',human_actor,run_id,correlation_id,SUCCESS,human_actor.actor_id,conversation_id=conversation_id)

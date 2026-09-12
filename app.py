@@ -85,6 +85,7 @@ from business_operations import (
     ControlledOperationError,
     configure as configure_business_operations,
     configure_freshness as configure_business_operations_freshness,
+    configure_write_success_observer,
     execute_business_operation,
     initialize_schema as initialize_business_operations_schema,
 )
@@ -297,6 +298,7 @@ configure_internal_approval(conn)
 _startup_step("approval_configured")
 configure_business_operations(conn)
 configure_business_operations_freshness(lambda operation_name: ensure_business_operation_freshness(operation_name))
+configure_write_success_observer(lambda operation_name, result: reconcile_business_freshness_after_write(operation_name, result))
 configure_agent_conversation(conn)
 _startup_step("business_operations_configured")
 configure_external_execution(conn)
@@ -837,6 +839,70 @@ def api_external_execution_health():
 AGENT_MODEL_PROVIDER = None
 
 
+def _json_object(value):
+    if not value:
+        return None
+    try:
+        decoded = json.loads(value)
+        return decoded if isinstance(decoded, dict) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _approval_execution_outcome(approval_id: str) -> dict:
+    """Build model evidence from trusted execution, approval and audit rows."""
+    db = conn()
+    try:
+        approval_row = db.execute(
+            'SELECT * FROM internal_approval_requests WHERE approval_id=?', (approval_id,)
+        ).fetchone()
+        execution = db.execute(
+            'SELECT * FROM internal_operation_executions WHERE approval_id=?', (approval_id,)
+        ).fetchone()
+        audit_row = None
+        if execution and execution['status'] == 'SUCCESS':
+            audit_row = db.execute(
+                '''SELECT before_state,after_state,result,error_code,error_message
+                     FROM internal_audit_log
+                    WHERE correlation_id=? AND operation=? AND entity_type=? AND entity_id=?
+                    ORDER BY rowid DESC LIMIT 1''',
+                (execution['correlation_id'], execution['operation'],
+                 execution['entity_type'], execution['entity_id']),
+            ).fetchone()
+    finally:
+        db.close()
+    if approval_row is None or execution is None:
+        raise LookupError('Approval execution not found')
+    execution_status = execution['status']
+    approval_status = approval_row['status']
+    logical_result = 'REJECTED' if approval_status == 'REJECTED' else execution_status
+    error = None
+    if execution['error_code'] or execution['safe_error_message']:
+        error = {
+            'code': execution['error_code'] or '',
+            'message': execution['safe_error_message'] or '',
+        }
+    entity_id = execution['entity_id']
+    if isinstance(entity_id, str) and entity_id.isdigit():
+        entity_id = int(entity_id)
+    return {
+        'approval_id': approval_id,
+        'approval_status': approval_status,
+        'execution_status': execution_status,
+        'operation': execution['operation'],
+        'entity_type': execution['entity_type'],
+        'entity_id': entity_id,
+        'before': _json_object(audit_row['before_state']) if audit_row else None,
+        'after': _json_object(audit_row['after_state']) if audit_row else None,
+        'result': {
+            'status': logical_result,
+            'data': _json_object(execution['result_summary']),
+        },
+        'failure': error if execution_status in {'FAILED', 'DENIED'} else None,
+        'conflict': error if execution_status == 'CONFLICT' else None,
+    }
+
+
 @app.post('/api/internal/ai/approvals/<approval_id>/<decision>')
 @require_permission('approvals.decide')
 def api_ai_approval_decide(approval_id, decision):
@@ -844,6 +910,8 @@ def api_ai_approval_decide(approval_id, decision):
     import internal_approval
     from internal_rbac import load_actor_context
     human = current_actor_context()
+    payload = request.get_json(silent=True) or {}
+    conversation_id = str(payload.get('conversation_id') or '') if isinstance(payload, dict) else ''
     if human.actor_type != 'HUMAN' or decision not in {'approve', 'reject'}:
         return jsonify(status='DENIED'), 403
     snapshot = internal_approval.get_request_snapshot(approval_id)
@@ -863,14 +931,31 @@ def api_ai_approval_decide(approval_id, decision):
     try:
         if decision == 'reject':
             internal_approval.reject_request(approval_id, human)
-            return jsonify(status='REJECTED')
-        if snapshot['status'] == 'PENDING':
+        elif snapshot['status'] == 'PENDING':
             internal_approval.approve_request(approval_id, human)
         requester = load_actor_context(snapshot['requesting_actor_id'],
             delegated_by_actor_id=binding['human_id'], source='approval_execution')
         result = business_operations.execute_business_operation(requester, snapshot['operation'],
             json.loads(snapshot['safe_payload']), idempotency_key=execution['idempotency_key'], approval_id=approval_id)
-        return jsonify(result.to_dict())
+        outcome = _approval_execution_outcome(approval_id)
+        response = {
+            'status': outcome['result']['status'],
+            'execution_outcome': outcome,
+            'conversation_id': conversation_id,
+        }
+        if conversation_id:
+            try:
+                provider = AGENT_MODEL_PROVIDER or provider_from_env()
+                model_result = run_agent_turn(
+                    human, '', provider, conversation_id=conversation_id,
+                    execution_outcome=outcome,
+                )
+                response['model_status'] = model_result['status']
+                response['message'] = model_result['message']
+                response['conversation_id'] = model_result['conversation_id']
+            except Exception:
+                response['model_status'] = 'FAILED'
+        return jsonify(response)
     except internal_approval.ApprovalDenied as exc:
         return jsonify(status='DENIED', error_code=exc.code), 409
 
@@ -2048,6 +2133,14 @@ def _mark_business_freshness(group: str, completed_at: float) -> None:
         c.commit()
     finally:
         c.close()
+
+
+def reconcile_business_freshness_after_write(operation_name: str, _result: dict) -> None:
+    """Keep only snapshots affected by the committed local order state current."""
+    if operation_name == "orders.status.transition":
+        completed_at = time.time()
+        for group in ('orders', 'inventory', 'fulfillment', 'customers'):
+            _mark_business_freshness(group, completed_at)
 
 
 def _business_snapshot_age(group: str, now_ts: float) -> float | None:
