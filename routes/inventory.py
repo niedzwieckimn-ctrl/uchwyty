@@ -1107,9 +1107,10 @@ def register_routes(context):
                     abort(404)
             response = send_file(io.BytesIO(image_bytes), download_name=filename, mimetype=served_mimetype, conditional=True, max_age=604800)
         else:
-            if not os.path.isfile(row["stored_path"]):
+            local_path = existing_product_image_local_path(row["stored_path"])
+            if not local_path:
                 abort(404)
-            response = send_file(row["stored_path"], mimetype=mimetype, conditional=True, max_age=604800)
+            response = send_file(local_path, mimetype=mimetype, conditional=True, max_age=604800)
         if extension == ".svg":
             response.headers["Content-Security-Policy"] = "default-src 'none'; style-src 'unsafe-inline'; sandbox"
         response.headers["X-Content-Type-Options"] = "nosniff"
