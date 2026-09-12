@@ -99,9 +99,9 @@
       if (artifact.type === 'document_link') {
         if (!safeInternalUrl(artifact.url)) continue;
         card.classList.add('ai-document');
-        const title = document.createElement('h3'); title.textContent = artifact.name || 'Dokument';
+        const title = document.createElement('h3'); title.textContent = artifact.label || artifact.name || 'Dokument';
         const link = document.createElement('a'); link.className = 'btn'; link.href = artifact.url;
-        link.target = '_blank'; link.rel = 'noopener'; link.textContent = artifact.document_type === 'invoice_pdf' ? 'Otwórz PDF' : 'Otwórz dokument';
+        link.target = '_blank'; link.rel = 'noopener'; link.textContent = artifact.document_type === 'invoice_pdf' ? 'Otwórz PDF' : artifact.document_type === 'packing_list' ? 'Otwórz listę pakową' : 'Otwórz dokument';
         card.append(title, link); wrap.appendChild(card); continue;
       }
       const title = document.createElement('h3'); title.textContent = titles[artifact.type] || 'Szczegóły'; card.appendChild(title);
