@@ -89,3 +89,21 @@ def test_inventory_does_not_pull_invoice_tables(freshness):
     actor, calls, _rows = freshness
     _run(actor, "inventory.product.search", {"query": "CH034"})
     assert "invoices" not in calls and "invoice_meta" not in calls
+
+
+def test_new_read_only_operations_use_narrow_freshness_groups(freshness):
+    actor, calls, _rows = freshness
+    readiness = _run(actor, "orders.fulfillment.readiness", {})
+    assert readiness["ready_count"] == 1
+    assert set(calls) == {"products", "stock", "orders", "order_items", "invoice_allocations"}
+    calls.clear()
+    china = _run(actor, "china.orders.get", {"id": 1})["record"]
+    assert china["po_number"] == "PO-1" and china["items"][0]["quantity"] == 20
+    assert set(calls) == {"products", "china_packages", "china_items"}
+
+
+def test_new_readiness_preserves_data_unavailable_on_cold_failure(freshness, monkeypatch):
+    actor, _calls, _rows = freshness
+    monkeypatch.setattr(backend, "supabase_select_rows", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("offline")))
+    result = operations.execute_business_operation(actor, "orders.fulfillment.readiness", {})
+    assert result.status == "FAILED" and result.error_code == "DATA_UNAVAILABLE"

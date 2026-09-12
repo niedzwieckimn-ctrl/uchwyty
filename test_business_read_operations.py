@@ -207,3 +207,79 @@ def test_rbac_blocks_role_without_order_permission(data):
     limited = rbac.load_actor_context("ai-limited", request_id="limited")
     result = operations.execute_business_operation(limited, "orders.search", {})
     assert result.status == "DENIED" and result.error_code == "PERMISSION_DENIED"
+
+
+def test_fulfillment_readiness_reports_ready_and_shortage_without_double_use(data):
+    db = backend.conn(); now = backend.now_iso()
+    db.execute("INSERT INTO products(id,sku,model,name,archived,created_at) VALUES(2,'SHORT-1','Short','Short product',0,?)", (now,))
+    db.execute("INSERT INTO stock(product_id,qty) VALUES(2,7)")
+    # Oldest complete order consumes five. The next order sees only two and is short by three.
+    for order_id, qty in ((10, 5), (11, 5)):
+        db.execute("INSERT INTO orders(id,order_no,customer_name,status,created_at,currency,price_list) VALUES(?,?,?,'confirmed',?,'PLN','pln')",
+                   (order_id, f'READY-{order_id}', 'Test', f'2026-09-10T0{order_id-9}:00:00+02:00'))
+        db.execute("INSERT INTO order_items(id,order_id,product_id,sku,qty,created_at) VALUES(?,?,?,?,?,?)",
+                   (order_id, order_id, 2, 'SHORT-1', qty, now))
+    db.commit(); db.close()
+    result = run(data, "orders.fulfillment.readiness", {})
+    by_id = {row["order_id"]: row for row in result["results"]}
+    assert by_id[10]["ready"] is True
+    assert by_id[11]["ready"] is False
+    assert by_id[11]["shortages"][0] == {
+        "product_id": 2, "sku": "SHORT-1", "model": "Short", "name": "Short product",
+        "required_quantity": 5, "available_quantity": 2, "shortage_quantity": 3,
+    }
+    assert by_id[11]["missing_items"] == by_id[11]["shortages"]
+
+
+def test_fulfillment_readiness_deducts_invoice_allocations(data):
+    db = backend.conn(); now = backend.now_iso()
+    db.execute("UPDATE stock SET qty=1 WHERE product_id=1")
+    db.execute("INSERT INTO invoice_allocations(id,invoice_id,order_id,order_item_id,qty,created_at) VALUES(10,1,1,1,1,?)", (now,))
+    db.commit(); db.close()
+    row = run(data, "orders.fulfillment.readiness", {"order_id": 1})["results"][0]
+    assert row["ready"] is True and row["total_units"] == 1
+
+
+def test_fulfillment_readiness_reports_ten_required_seven_available(data):
+    db = backend.conn(); now = backend.now_iso()
+    db.execute("INSERT INTO products(id,sku,name,archived,created_at) VALUES(3,'TEN-SEVEN','Ten seven',0,?)", (now,))
+    db.execute("INSERT INTO stock(product_id,qty) VALUES(3,7)")
+    db.execute("INSERT INTO orders(id,order_no,customer_name,status,created_at,currency,price_list) VALUES(12,'TEN-ORDER','Test','confirmed',?,'PLN','pln')", (now,))
+    db.execute("INSERT INTO order_items(id,order_id,product_id,sku,qty,created_at) VALUES(12,12,3,'TEN-SEVEN',10,?)", (now,))
+    db.commit(); db.close()
+    shortage = run(data, "orders.fulfillment.readiness", {"order_id": 12})["results"][0]["shortages"][0]
+    assert shortage["required_quantity"] == 10
+    assert shortage["available_quantity"] == 7
+    assert shortage["shortage_quantity"] == 3
+
+
+def test_dashboard_and_operation_share_fulfillment_calculator(data, monkeypatch):
+    import fulfillment_readiness
+    calls = []
+    original = fulfillment_readiness.calculate_fulfillment_readiness
+    monkeypatch.setattr(fulfillment_readiness, "calculate_fulfillment_readiness", lambda db: calls.append(True) or original(db))
+    backend.app.secret_key = "readiness-test"
+    client = backend.app.test_client()
+    with client.session_transaction() as session:
+        session["admin_authenticated"] = True
+        session["csrf_token"] = "test"
+        session["internal_actor_id"] = rbac.BOOTSTRAP_OWNER_ACTOR_ID
+    response = client.get("/")
+    assert response.status_code == 200 and calls
+
+
+def test_china_search_keeps_order_status_and_delivery_stage_separate(data):
+    db = backend.conn()
+    db.execute("UPDATE china_packages SET supplier='Nurlin',tracking='TRACK-1',tracking_status='OutForDelivery',tracking_substatus='Courier',tracking_eta='2026-09-12',tracking_carrier='FedEx',shipping_method='AIR',ordered_at='2026-09-01' WHERE id=1")
+    db.commit(); db.close()
+    result = run(data, "china.orders.search", {"status": "ordered", "delivery_stage": "OutForDelivery", "supplier": "Nurlin"})
+    assert result["count"] == 1
+    row = result["results"][0]
+    assert row["order_status"] == "ordered" and row["delivery_stage"] == "OutForDelivery"
+    assert row["tracking_eta"] == "2026-09-12" and row["total_units"] == 12
+
+
+def test_china_get_returns_structured_items(data):
+    detail = run(data, "china.orders.get", {"number": "PO-1"})["record"]
+    assert detail["po_number"] == "PO-1" and detail["order_status"] == "ordered"
+    assert detail["items"][0]["sku"] == "CH034-BB-128160" and detail["items"][0]["quantity"] == 12

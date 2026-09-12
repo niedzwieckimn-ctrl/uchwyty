@@ -113,8 +113,8 @@ def test_registry_is_closed_and_contains_required_contracts(isolated):
     assert set(operations.OPERATION_REGISTRY) == {
         "orders.summary", "agent.terminology.search", "agent.terminology.remember",
         "inventory.product.get", "inventory.product.search", "inventory.summary",
-        "orders.search", "orders.get", "invoices.search", "invoices.get", "invoices.overdue",
-        "customers.search", "customers.get", "china.orders.summary", "business.sales.summary",
+        "orders.search", "orders.get", "orders.fulfillment.readiness", "invoices.search", "invoices.get", "invoices.overdue",
+        "customers.search", "customers.get", "china.orders.summary", "china.orders.search", "china.orders.get", "business.sales.summary",
         "internal.test.change_setting", "internal.test.external.execute"
     }
     for item in operations.OPERATION_REGISTRY.values():

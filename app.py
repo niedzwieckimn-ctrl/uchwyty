@@ -1964,19 +1964,23 @@ BUSINESS_FRESHNESS_GROUPS = {
                   ("order_items", "id"), ("invoice_allocations", "id"),
                   ("china_packages", "id"), ("china_items", "id")],
     "orders": [("customers", "id"), ("products", "id"), ("orders", "id"), ("order_items", "id")],
+    "fulfillment": [("products", "id"), ("stock", "product_id"), ("orders", "id"),
+                    ("order_items", "id"), ("invoice_allocations", "id")],
     "customers": [("customers", "id"), ("orders", "id"), ("order_items", "id"),
                   ("invoices", "id"), ("invoice_meta", "invoice_id")],
     "invoices": [("orders", "id"), ("invoices", "id"), ("invoice_meta", "invoice_id"),
                  ("cash_flow_settings", "key")],
-    "china": [("china_packages", "id"), ("china_items", "id")],
+    "china": [("products", "id"), ("china_packages", "id"), ("china_items", "id")],
     "sales": [("orders", "id"), ("order_items", "id"), ("invoices", "id"), ("invoice_meta", "invoice_id")],
 }
 BUSINESS_FRESHNESS_OPERATION_GROUP = {
     "inventory.product.search": "inventory", "inventory.product.get": "inventory", "inventory.summary": "inventory",
     "orders.search": "orders", "orders.get": "orders", "orders.summary": "orders",
+    "orders.fulfillment.readiness": "fulfillment",
     "customers.search": "customers", "customers.get": "customers",
     "invoices.search": "invoices", "invoices.get": "invoices", "invoices.overdue": "invoices",
-    "china.orders.summary": "china", "business.sales.summary": "sales",
+    "china.orders.summary": "china", "china.orders.search": "china", "china.orders.get": "china",
+    "business.sales.summary": "sales",
 }
 _business_freshness_locks = {group: threading.Lock() for group in BUSINESS_FRESHNESS_GROUPS}
 

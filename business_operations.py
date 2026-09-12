@@ -25,6 +25,7 @@ import agent_conversation
 import internal_approval as approvals
 from cash_flow_module import cash_flow_overdue_invoices
 from inventory_analytics import build_replenishment_analysis
+from fulfillment_readiness import calculate_fulfillment_readiness
 from internal_audit import (
     CONFLICT, DENIED, FAILED, NOOP, PENDING_APPROVAL, SUCCESS,
     current_correlation_id, record_audit_event, sanitize_audit_data,
@@ -56,9 +57,11 @@ _freshness_provider: Callable[[str], Mapping[str, Any]] | None = None
 FRESHNESS_GROUP_BY_OPERATION = {
     "inventory.product.search": "inventory", "inventory.product.get": "inventory", "inventory.summary": "inventory",
     "orders.search": "orders", "orders.get": "orders", "orders.summary": "orders",
+    "orders.fulfillment.readiness": "fulfillment",
     "customers.search": "customers", "customers.get": "customers",
     "invoices.search": "invoices", "invoices.get": "invoices", "invoices.overdue": "invoices",
-    "china.orders.summary": "china", "business.sales.summary": "sales",
+    "china.orders.summary": "china", "china.orders.search": "china", "china.orders.get": "china",
+    "business.sales.summary": "sales",
 }
 
 
@@ -316,6 +319,36 @@ CHINA_SUMMARY_OUTPUT = {
         "pieces_by_status": {"type": "object"}, "pieces_excluding_planned": {"type": "integer"},
     },
 }
+FULFILLMENT_READINESS_INPUT = {
+    "type": "object", "additionalProperties": False,
+    "properties": {"order_id": {"type": "integer", "minimum": 1, "maximum": 9_223_372_036_854_775_807}, "limit": _LIMIT},
+}
+FULFILLMENT_READINESS_OUTPUT = {
+    "type": "object", "additionalProperties": False,
+    "required": ["ok", "results", "count", "ready_count", "truncated"],
+    "properties": {"ok": {"type": "boolean"}, "results": {"type": "array", "maxItems": MAX_BUSINESS_SEARCH_RESULTS},
+                   "count": {"type": "integer"}, "ready_count": {"type": "integer"}, "truncated": {"type": "boolean"}},
+}
+CHINA_SEARCH_INPUT = {
+    "type": "object", "additionalProperties": False,
+    "properties": {
+        "query": _QUERY, "status": {"type": "string", "enum": ["planned", "ordered", "shipped", "arrived", "problem"]},
+        "supplier": {"type": "string", "minLength": 1, "maxLength": 160}, "date_from": _DATE, "date_to": _DATE,
+        "active_only": {"type": "boolean"}, "delivery_stage": {"type": "string", "minLength": 1, "maxLength": 120}, "limit": _LIMIT,
+    },
+}
+CHINA_SEARCH_OUTPUT = {
+    "type": "object", "additionalProperties": False, "required": ["ok", "results", "count", "truncated"],
+    "properties": {"ok": {"type": "boolean"}, "results": {"type": "array", "maxItems": MAX_BUSINESS_SEARCH_RESULTS},
+                   "count": {"type": "integer"}, "truncated": {"type": "boolean"}},
+}
+CHINA_GET_INPUT = {
+    "type": "object", "additionalProperties": False,
+    "properties": {"id": {"type": "integer", "minimum": 1, "maximum": 9_223_372_036_854_775_807},
+                   "number": {"type": "string", "minLength": 1, "maxLength": 160}},
+}
+CHINA_GET_OUTPUT = {"type": "object", "additionalProperties": False, "required": ["ok", "record"],
+                    "properties": {"ok": {"type": "boolean"}, "record": {"type": "object"}}}
 PILOT_INPUT = {
     "type": "object",
     "additionalProperties": False,
@@ -407,6 +440,12 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
         "orders.read_full", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
         ORDER_SUMMARY_INPUT, ORDER_SUMMARY_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
+    "orders.fulfillment.readiness": BusinessOperationDefinition(
+        "orders.fulfillment.readiness", 1,
+        "Deterministically checks whether order items can be fully fulfilled from currently available inventory and reports shortages.",
+        "orders.read_full", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
+        FULFILLMENT_READINESS_INPUT, FULFILLMENT_READINESS_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
+    ),
     "invoices.search": BusinessOperationDefinition(
         "invoices.search", 1, "Wyszukuje faktury, opcjonalnie dla customer_id; payment_status=unpaid oznacza nieopłacone, a zaległe obsługuje invoices.overdue.",
         "invoices.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
@@ -436,6 +475,16 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
         "china.orders.summary", 1, "Liczy zamówienia zakupowe Chiny/P/O z tabel dostaw, domyślnie aktywne.",
         "purchases.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
         CHINA_SUMMARY_INPUT, CHINA_SUMMARY_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
+    ),
+    "china.orders.search": BusinessOperationDefinition(
+        "china.orders.search", 1, "Searches and lists China purchase/shipping orders using structured filters.",
+        "purchases.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
+        CHINA_SEARCH_INPUT, CHINA_SEARCH_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
+    ),
+    "china.orders.get": BusinessOperationDefinition(
+        "china.orders.get", 1, "Returns details and items for one China purchase/shipping order.",
+        "purchases.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
+        CHINA_GET_INPUT, CHINA_GET_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
     "business.sales.summary": BusinessOperationDefinition(
         "business.sales.summary", 1, "Zwraca podsumowanie sprzedaży za kontrolowany okres, osobno dla każdej waluty.",
@@ -616,12 +665,18 @@ def _entity(definition: BusinessOperationDefinition, data: Mapping[str, Any]) ->
         return definition.operation_name.replace(".", "_"), sanitize_audit_text(data.get("query", "all"))[:160], None
     if definition.operation_name == "orders.summary":
         return "orders_summary", str(data.get("customer_id") or data.get("period") or "all"), None
+    if definition.operation_name == "orders.fulfillment.readiness":
+        return "order_fulfillment_readiness", str(data.get("order_id") or "all"), None
     if definition.operation_name in {"orders.get", "invoices.get"}:
         return definition.operation_name.split(".")[0][:-1], str(data.get("id") or data.get("number") or ("latest" if data.get("latest") else "")), None
     if definition.operation_name == "customers.get":
         return "customer", str(data["customer_id"]), None
     if definition.operation_name == "china.orders.summary":
         return "china_orders_summary", str(data.get("scope") or "active"), None
+    if definition.operation_name == "china.orders.search":
+        return "china_order_search", str(data.get("status") or data.get("supplier") or "all"), None
+    if definition.operation_name == "china.orders.get":
+        return "china_order", str(data.get("id") or data.get("number") or ""), None
     if definition.operation_name == "business.sales.summary":
         return "sales_summary", str(data.get("period") or "this_month"), None
     if definition.operation_name == "internal.test.change_setting":
@@ -1231,6 +1286,94 @@ def _inventory_summary(data, actor, correlation_id, transaction_connection=None)
     }
 
 
+def _orders_fulfillment_readiness(data, actor, correlation_id, transaction_connection=None):
+    del actor, correlation_id
+    db = transaction_connection or _factory()()
+    try:
+        rows = calculate_fulfillment_readiness(db)
+        if data.get("order_id"):
+            rows = [row for row in rows if row["order_id"] == int(data["order_id"])]
+        limit = _limit(data)
+        selected = rows[:limit]
+        return {"ok": True, "results": selected, "count": len(selected),
+                "ready_count": sum(1 for row in selected if row["ready"]), "truncated": len(rows) > limit}
+    finally:
+        if transaction_connection is None:
+            db.close()
+
+
+def _china_order_view(row, *, item_count=0, total_units=0):
+    return {
+        "id": int(row["id"]), "po_number": row["package_no"], "supplier": row["supplier"] or "",
+        "order_status": row["status"] or "", "delivery_stage": row["tracking_status"] or "",
+        "delivery_substatus": row["tracking_substatus"] or "", "tracking_eta": row["tracking_eta"] or "",
+        "tracking_number": row["tracking"] or "", "carrier": row["tracking_carrier"] or "",
+        "shipping_method": row["shipping_method"] or "", "ordered_at": row["ordered_at"] or "",
+        "shipped_at": row["shipped_at"] or "", "arrived_at": row["arrived_at"] or "",
+        "created_at": row["created_at"] or "", "item_count": int(item_count), "total_units": int(total_units),
+    }
+
+
+def _china_orders_search(data, actor, correlation_id, transaction_connection=None):
+    del actor, correlation_id
+    db = transaction_connection or _factory()()
+    try:
+        clauses, params = ["1=1"], []
+        if data.get("status"):
+            clauses.append("LOWER(COALESCE(cp.status,''))=?"); params.append(data["status"])
+        if data.get("supplier"):
+            clauses.append("LOWER(COALESCE(cp.supplier,''))=LOWER(?)"); params.append(data["supplier"].strip())
+        if data.get("active_only") is True:
+            clauses.append("LOWER(COALESCE(cp.status,'')) IN ('planned','ordered','shipped','problem')")
+        if data.get("delivery_stage"):
+            clauses.append("LOWER(COALESCE(cp.tracking_status,''))=LOWER(?)"); params.append(data["delivery_stage"].strip())
+        if data.get("date_from"):
+            clauses.append("SUBSTR(COALESCE(NULLIF(TRIM(cp.ordered_at),''),cp.created_at),1,10)>=?"); params.append(data["date_from"])
+        if data.get("date_to"):
+            clauses.append("SUBSTR(COALESCE(NULLIF(TRIM(cp.ordered_at),''),cp.created_at),1,10)<=?"); params.append(data["date_to"])
+        query = str(data.get("query") or "").strip()
+        if query:
+            clauses.append("(LOWER(cp.package_no) LIKE LOWER(?) OR LOWER(COALESCE(cp.tracking,'')) LIKE LOWER(?))")
+            params.extend([f"%{query}%", f"%{query}%"])
+        limit = _limit(data)
+        rows = db.execute(f"""SELECT cp.*,COUNT(ci.id) item_count,COALESCE(SUM(ci.qty),0) total_units
+                              FROM china_packages cp LEFT JOIN china_items ci ON ci.package_id=cp.id
+                              WHERE {' AND '.join(clauses)} GROUP BY cp.id
+                              ORDER BY COALESCE(NULLIF(TRIM(cp.ordered_at),''),cp.created_at) DESC,cp.id DESC LIMIT ?""",
+                          (*params, limit + 1)).fetchall()
+        selected = rows[:limit]
+        return {"ok": True, "results": [_china_order_view(row, item_count=row["item_count"], total_units=row["total_units"]) for row in selected],
+                "count": len(selected), "truncated": len(rows) > limit}
+    finally:
+        if transaction_connection is None:
+            db.close()
+
+
+def _china_orders_get(data, actor, correlation_id, transaction_connection=None):
+    del actor, correlation_id
+    db = transaction_connection or _factory()()
+    try:
+        if bool(data.get("id")) == bool(str(data.get("number") or "").strip()):
+            raise ControlledOperationError("IDENTIFIER_REQUIRED", "Podaj dokładnie jedno: id albo number", status=DENIED)
+        if data.get("id"):
+            row = db.execute("SELECT * FROM china_packages WHERE id=?", (data["id"],)).fetchone()
+        else:
+            row = db.execute("SELECT * FROM china_packages WHERE LOWER(package_no)=LOWER(?)", (data["number"].strip(),)).fetchone()
+        if row is None:
+            raise ControlledOperationError("CHINA_ORDER_NOT_FOUND", "Nie znaleziono China P/O", status=NOOP)
+        items = db.execute("""SELECT ci.id,ci.product_id,ci.sku,ci.qty,p.model,p.name,ci.created_at
+                              FROM china_items ci LEFT JOIN products p ON p.id=ci.product_id
+                              WHERE ci.package_id=? ORDER BY ci.id""", (row["id"],)).fetchall()
+        record = _china_order_view(row, item_count=len(items), total_units=sum(int(item["qty"] or 0) for item in items))
+        record["items"] = [{"id": int(item["id"]), "product_id": int(item["product_id"]),
+                            "sku": item["sku"], "model": item["model"], "name": item["name"],
+                            "quantity": int(item["qty"] or 0), "created_at": item["created_at"] or ""} for item in items]
+        return {"ok": True, "record": record}
+    finally:
+        if transaction_connection is None:
+            db.close()
+
+
 def _china_orders_summary(data, actor, correlation_id, transaction_connection=None):
     del actor, correlation_id
     db = transaction_connection or _factory()()
@@ -1383,12 +1526,15 @@ _HANDLERS: dict[str, Callable[[Mapping[str, Any], ActorContext, str, sqlite3.Con
     "orders.search": _orders_search,
     "orders.get": _orders_get,
     "orders.summary": _orders_summary,
+    "orders.fulfillment.readiness": _orders_fulfillment_readiness,
     "invoices.search": _invoices_search,
     "invoices.get": _invoices_get,
     "invoices.overdue": _invoices_overdue,
     "customers.search": _customers_search,
     "customers.get": _customers_get,
     "china.orders.summary": _china_orders_summary,
+    "china.orders.search": _china_orders_search,
+    "china.orders.get": _china_orders_get,
     "business.sales.summary": _sales_summary,
     "internal.test.change_setting": _pilot_change,
     # External operations are queued below and are never called through this map.
