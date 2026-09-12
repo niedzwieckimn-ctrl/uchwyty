@@ -74,11 +74,7 @@ def test_fake_provider_smoke_returns_grounded_answer(client):
     db.close()
     backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([
         runtime.ProviderResponse(tool_calls=(runtime.ToolCall("call-1", "inventory.product.search", json.dumps({"query": "Avery 160"})),), model="fake-model"),
-        runtime.ProviderResponse(tool_calls=(runtime.ToolCall(
-            "call-final", "assistant.respond",
-            json.dumps({"message": "Na magazynie mamy 24 sztuki Avery 160.",
-                        "numeric_claims": [{"kind": "stock", "value": 24}]}),
-        ),), model="fake-model"),
+        runtime.ProviderResponse(text="Na magazynie mamy 24 sztuki Avery 160.", model="fake-model"),
     ])
     login(client)
     response = client.post("/api/internal/ai/chat", json={"message": "Ile mamy Avery 160?"})

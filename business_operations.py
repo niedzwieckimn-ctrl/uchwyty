@@ -21,6 +21,7 @@ from decimal import Decimal
 from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
+import agent_conversation
 import internal_approval as approvals
 from cash_flow_module import cash_flow_overdue_invoices
 from inventory_analytics import build_replenishment_analysis
@@ -154,6 +155,7 @@ _ORDER_SUMMARY_PERIOD = {"type": "string", "enum": [
 ]}
 _SEARCH_INPUT = {
     "type": "object", "additionalProperties": False, "properties": {
+        "product_id": {"type": "integer", "minimum": 1, "maximum": 9223372036854775807},
         "query": _QUERY, "status": {"type": "string", "minLength": 1, "maxLength": 64},
         "period": _PERIOD, "date_from": _DATE, "date_to": _DATE, "limit": _LIMIT,
         "customer_id": {"type": "integer", "minimum": 1, "maximum": 9_223_372_036_854_775_807},
@@ -336,6 +338,25 @@ EXTERNAL_TEST_OUTPUT = {
 
 
 OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
+    "agent.terminology.search": BusinessOperationDefinition(
+        "agent.terminology.search", 1, "Odczytuje zapisane znaczenie terminu firmy i wersję. Query jest fragmentem nazwy terminu, nie zdaniem do interpretacji.",
+        "inventory.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
+        {"type":"object","additionalProperties":False,"required":["query"],"properties":{"query":{"type":"string","minLength":1,"maxLength":80}}},
+        {"type":"object","required":["ok","results"],"properties":{"ok":{"type":"boolean"},"results":{"type":"array"}}},
+        IDEMPOTENCY_NONE, "READ_STANDARD", True,
+    ),
+    "agent.terminology.remember": BusinessOperationDefinition(
+        "agent.terminology.remember", 1, "Zapisuje wyłącznie potwierdzoną przez użytkownika terminologię firmy. Nie zapisuj przypuszczeń; przy niepewności najpierw dopytaj. expected_version=0 tworzy termin; zmiana wymaga aktualnej wersji z agent.terminology.search.",
+        "agent.terminology.remember", approvals.GREEN, "NONE", frozenset({"AI_AGENT"}),
+        {"type":"object","additionalProperties":False,"required":["term","meaning","confirmed_by_user","expected_version","source_run_id"],
+         "properties":{"term":{"type":"string","minLength":1,"maxLength":80},
+                       "meaning":{"type":"string","minLength":1,"maxLength":500},
+                       "confirmed_by_user":{"type":"boolean"},
+                       "expected_version":{"type":"integer","minimum":0,"maximum":2147483647},
+                       "source_run_id":{"type":"string","format":"uuid","maxLength":36}}},
+        {"type":"object","required":["ok","term","version"],"properties":{"ok":{"type":"boolean"},"term":{"type":"string"},"version":{"type":"integer"}}},
+        IDEMPOTENCY_REQUIRED, "WRITE", False,
+    ),
     "inventory.product.search": BusinessOperationDefinition(
         "inventory.product.search", 1, "Wyszukuje wyłącznie produkty po SKU, modelu, wariancie lub nazwie produktu i zwraca ograniczony stan.",
         "inventory.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "SYSTEM", "AI_AGENT"}),
@@ -353,7 +374,7 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
         INVENTORY_SUMMARY_INPUT, INVENTORY_SUMMARY_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
     "orders.search": BusinessOperationDefinition(
-        "orders.search", 1, "Wyszukuje zamówienia po numerze, customer_id, statusie i okresie; limit=1 zwraca najnowszy pasujący rekord.",
+        "orders.search", 1, "Wyszukuje zamówienia po numerze lub nazwie klienta (query), customer_id, product_id, statusie i okresie; limit=1 zwraca najnowszy pasujący rekord z customer_id. product_id pozwala ustalić ostatniego nabywcę produktu.",
         "orders.read_full", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
         _SEARCH_INPUT, _RESULTS_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
@@ -563,6 +584,10 @@ def _fingerprint(definition: BusinessOperationDefinition, actor: ActorContext, d
 
 
 def _entity(definition: BusinessOperationDefinition, data: Mapping[str, Any]) -> tuple[str, str, int | None]:
+    if definition.operation_name == "agent.terminology.search":
+        return "agent_terminology_search", data["query"], None
+    if definition.operation_name == "agent.terminology.remember":
+        return "agent_terminology", data["term"], data["expected_version"]
     if definition.operation_name == "inventory.product.search":
         return "product_search", sanitize_audit_text(data["query"])[:120], None
     if definition.operation_name == "inventory.product.get":
@@ -879,6 +904,9 @@ def _orders_search(data, actor, correlation_id, transaction_connection=None):
     db = transaction_connection or _factory()()
     try:
         _start, _end, clauses, params = _order_filter(data)
+        if data.get("product_id"):
+            clauses.append("EXISTS (SELECT 1 FROM order_items matched WHERE matched.order_id=o.id AND matched.product_id=?)")
+            params.append(data["product_id"])
         query = " ".join(str(data.get("query") or "").split()).casefold()
         if query:
             clauses.append("(LOWER(o.order_no) LIKE ? OR LOWER(o.customer_name) LIKE ? OR LOWER(COALESCE(o.customer_email,'')) LIKE ?)")
@@ -1329,6 +1357,8 @@ def _pilot_change(data, actor, correlation_id, transaction_connection=None):
 
 
 _HANDLERS: dict[str, Callable[[Mapping[str, Any], ActorContext, str, sqlite3.Connection | None], Any]] = {
+    "agent.terminology.search": agent_conversation.search_terminology,
+    "agent.terminology.remember": agent_conversation.remember_terminology,
     "inventory.product.search": _product_search,
     "inventory.product.get": _product_get,
     "inventory.summary": _inventory_summary,

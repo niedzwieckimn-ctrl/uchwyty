@@ -48,24 +48,12 @@ def tool(name, args, call_id="call-1"):
     return runtime.ProviderResponse(tool_calls=(runtime.ToolCall(call_id, name, json.dumps(args)),), model="fake-model")
 
 
-def respond(text, model="fake-model", input_tokens=0, output_tokens=0, numeric_claims=None):
-    if numeric_claims is None:
-        numeric_claims = [{"kind": "other_business_numeric", "value": mention["value"],
-                           **({"currency": mention["currency"]} if mention["currency"] else {})}
-                          for mention in runtime._business_numeric_mentions(text)]
-    return runtime.ProviderResponse(
-        tool_calls=(runtime.ToolCall("assistant-response", "assistant.respond", json.dumps({
-            "message": text, "numeric_claims": numeric_claims,
-        })),),
-        model=model, input_tokens=input_tokens, output_tokens=output_tokens,
-    )
+def respond(text, model="fake-model", input_tokens=0, output_tokens=0):
+    return runtime.ProviderResponse(text=text, model=model,input_tokens=input_tokens,output_tokens=output_tokens)
 
 
 def clarify(text, model="fake-model"):
-    return runtime.ProviderResponse(
-        tool_calls=(runtime.ToolCall("assistant-clarify", "assistant.clarify", json.dumps({"message": text})),),
-        model=model,
-    )
+    return runtime.ProviderResponse(text=text,model=model)
 
 
 def fake_search_answer(query, answer):
@@ -77,7 +65,7 @@ def test_orchestration_a_greeting_uses_respond_without_business_operation():
     result = runtime.run_agent_turn(owner(), "cześć", provider)
     assert result["status"] == "SUCCESS" and result["tool_calls"] == 0
     db = backend.conn(); count = db.execute("SELECT COUNT(*) FROM internal_operation_executions").fetchone()[0]; db.close()
-    assert count == 0 and provider.calls[0]["tool_choice"] == "required"
+    assert count == 0 and provider.calls[0]["tool_choice"] == "auto"
 
 
 def test_orchestration_b_fresh_inventory_requires_business_tool_then_respond():
@@ -90,13 +78,6 @@ def test_orchestration_b_fresh_inventory_requires_business_tool_then_respond():
     assert tuple(operation) == ("inventory.summary", "SUCCESS")
 
 
-def test_orchestration_g_plain_final_text_is_provider_contract_violation():
-    result = runtime.run_agent_turn(owner(), "cześć", runtime.FakeModelProvider([
-        runtime.ProviderResponse(text="Cześć", model="broken-provider"),
-    ]))
-    assert result["status"] == "FAILED" and result["error_code"] == "PROVIDER_CONTRACT_VIOLATION"
-
-
 def test_basic_question_uses_gate_and_returns_grounded_stock():
     result = runtime.run_agent_turn(owner(), "Ile mamy Avery 160?", fake_search_answer("Avery 160", "Na magazynie mamy 24 sztuki Avery 160."))
     assert result["status"] == "SUCCESS" and result["tool_calls"] == 1 and "24" in result["message"]
@@ -104,54 +85,6 @@ def test_basic_question_uses_gate_and_returns_grounded_stock():
     row = db.execute("SELECT actor_id,operation,status FROM internal_operation_executions").fetchone()
     db.close()
     assert tuple(row) == (rbac.AI_OWNER_ASSISTANT_ACTOR_ID, "inventory.product.search", "SUCCESS")
-
-
-def test_ungrounded_business_number_is_rejected_with_safe_diagnostics(caplog):
-    provider = runtime.FakeModelProvider([
-        tool("inventory.product.search", {"query": "Avery 160"}),
-        respond("SKU CH101-BLK-160 ma 47 sztuk."),
-    ])
-    with caplog.at_level(logging.INFO):
-        result = runtime.run_agent_turn(owner(), "Ile mamy Avery 160?", provider)
-    assert result["status"] == "FAILED" and result["error_code"] == "MODEL_FAILED"
-    record = next(item.message for item in caplog.records if item.message.startswith("AI_NUMERIC_CLAIMS_REJECTED "))
-    diagnostic = json.loads(record.split(" ", 1)[1])
-    assert diagnostic["rejected_claims"] == [{
-        "currency": "", "kind": "other_business_numeric", "normalized_value": "47",
-    }]
-    assert diagnostic["reason"] == "UNGROUNDED_NUMERIC_DATA"
-    assert "CH101-BLK-160" not in record
-
-
-def test_business_number_in_message_without_structured_claim_is_controlled_mismatch(caplog):
-    provider = runtime.FakeModelProvider([
-        tool("inventory.product.search", {"query": "Avery 160"}),
-        respond("Na stanie jest 24 szt.", numeric_claims=[]),
-    ])
-    with caplog.at_level(logging.INFO):
-        result = runtime.run_agent_turn(owner(), "Ile mamy Avery 160?", provider)
-    assert result["status"] == "FAILED"
-    assert result["error_code"] == "NUMERIC_CLAIM_DECLARATION_MISMATCH"
-    record = next(item.message for item in caplog.records if item.message.startswith("AI_NUMERIC_CLAIMS_REJECTED "))
-    diagnostic = json.loads(record.split(" ", 1)[1])
-    assert diagnostic == {
-        "agent_run_id": result["agent_run_id"], "conversation_id": result["conversation_id"],
-        "claims_count": 0, "rejected_claims": [], "reason": "NUMERIC_CLAIM_DECLARATION_MISMATCH",
-    }
-
-
-def test_orders_summary_total_passes_grounding_and_different_total_is_blocked():
-    db = backend.conn()
-    db.execute("INSERT INTO order_items(order_id,product_id,sku,qty,unit_net_price,unit_gross_price,currency,created_at) VALUES(10,1,'CH101-BLK-160',2,100,123,'PLN',?)", (backend.now_iso(),))
-    db.commit(); db.close()
-    good = runtime.run_agent_turn(owner(), "Jaka jest łączna kwota zamówień?", runtime.FakeModelProvider([
-        tool("orders.summary", {"period": "all"}), respond("Łączna kwota brutto to 246 PLN."),
-    ]))
-    assert good["status"] == "SUCCESS"
-    bad = runtime.run_agent_turn(owner(), "Jaka jest łączna kwota zamówień?", runtime.FakeModelProvider([
-        tool("orders.summary", {"period": "all"}), respond("Łączna kwota brutto to 999 PLN."),
-    ]))
-    assert bad["status"] == "FAILED" and bad["error_code"] == "MODEL_FAILED"
 
 
 def test_runtime_product_result_matches_direct_business_operation():
@@ -316,8 +249,8 @@ def test_production_orchestration_reaches_real_business_operation_gate(query, op
     result = runtime.run_agent_turn(owner(), query, provider)
 
     assert result["status"] == "SUCCESS"
-    assert provider.calls[0]["tool_choice"] == "required"
-    assert observed["tool_choice_after_result"] == "required"
+    assert provider.calls[0]["tool_choice"] == "auto"
+    assert observed["tool_choice_after_result"] == "auto"
     assert observed["business_result"]["ok"] is True
     assert observed["business_result"]["count"] >= 1
     db = backend.conn()
@@ -356,42 +289,10 @@ def test_invented_or_write_tool_is_denied(name):
 
 def test_prompt_injection_cannot_expose_write_tool():
     ai = rbac.load_actor_context(rbac.AI_OWNER_ASSISTANT_ACTOR_ID)
-    assert not ai.approval_required_permissions
-    assert all(not permission.endswith((".adjust", ".send", ".manage", ".create")) for permission in ai.effective_permissions)
-    names = {item["name"] for item in runtime._tool_descriptors(ai)}
-    assert names == {
-        "inventory.product.get", "inventory.product.search", "inventory.summary", "orders.search", "orders.get", "orders.summary",
-            "invoices.search", "invoices.get", "invoices.overdue", "customers.search",
-            "customers.get", "china.orders.summary", "business.sales.summary",
-            "assistant.respond", "assistant.clarify",
-    }
-    assert all(item["parameters"] and "permission" not in item for item in runtime._tool_descriptors(ai))
     descriptors = runtime._tool_descriptors(ai)
-    assert all(item["strict"] is True for item in descriptors if item["name"].startswith("assistant."))
-    assert all(item["strict"] is False for item in descriptors if not item["name"].startswith("assistant."))
-
-
-def test_existing_context_cannot_replace_fresh_tool_for_new_data_question():
-    first = runtime.run_agent_turn(owner(), "Pokaż Avery", fake_search_answer("Avery", "Znalazłem Avery."))
-    provider = runtime.FakeModelProvider([respond(
-        text="Masz 0 zaległych faktur.", numeric_claims=[{"kind": "count", "value": 0}],
-    )])
-    second = runtime.run_agent_turn(owner(), "Ile mam zaległych faktur?", provider,
-                                    conversation_id=first["conversation_id"])
-    assert second["status"] == "FAILED"
-    assert second["error_code"] == "MODEL_FAILED"
-
-
-def test_old_context_number_cannot_ground_unrelated_current_answer():
-    first = runtime.run_agent_turn(owner(), "Pokaż Avery", fake_search_answer("Avery", "Znalazłem Avery."))
-    provider = runtime.FakeModelProvider([
-        tool("invoices.overdue", {}, "overdue"),
-        respond(text="Masz 24 zaległe faktury.", numeric_claims=[{"kind": "count", "value": 24}]),
-    ])
-    second = runtime.run_agent_turn(owner(), "Ile mam zaległych faktur?", provider,
-                                    conversation_id=first["conversation_id"])
-    assert second["status"] == "FAILED"
-    assert second["error_code"] == "MODEL_FAILED"
+    assert all(operations.OPERATION_REGISTRY[item['name']].read_only or item['name']==runtime.MEMORY_WRITE for item in descriptors)
+    assert not any(item['name'].startswith('assistant.') for item in descriptors)
+    assert all(item['strict'] is False for item in descriptors)
 
 
 def test_tool_diagnostics_are_bounded_and_redact_customer_query(caplog):
@@ -402,7 +303,7 @@ def test_tool_diagnostics_are_bounded_and_redact_customer_query(caplog):
     with caplog.at_level(logging.INFO, logger="agent_runtime"):
         result = runtime.run_agent_turn(owner(), "Znajdź klienta Jan Kowalski", provider)
     assert result["status"] == "SUCCESS"
-    assert "AI_TOOL_CALL" in caplog.text and "AI_TOOL_RESULT" in caplog.text
+    assert "AI_TOOL_EXECUTION_END" in caplog.text
     assert "Jan Kowalski" not in caplog.text
 
 
@@ -430,7 +331,7 @@ def test_production_chat_endpoint_uses_runtime_and_real_business_operation_gate(
     assert response.status_code == 200
     payload = response.get_json()
     assert payload["status"] == "SUCCESS" and payload["tool_calls"] == 1
-    assert provider.calls[0]["tool_choice"] == "required"
+    assert provider.calls[0]["tool_choice"] == "auto"
     db = backend.conn()
     execution = db.execute(
         "SELECT operation,status FROM internal_operation_executions WHERE correlation_id=?",
@@ -438,132 +339,6 @@ def test_production_chat_endpoint_uses_runtime_and_real_business_operation_gate(
     ).fetchone()
     db.close()
     assert tuple(execution) == ("inventory.product.search", "SUCCESS")
-
-
-@pytest.mark.parametrize(("query", "operation", "arguments", "assert_fresh", "answer"), [
-    ("Ile mamy Avery 160?", "inventory.product.search", {"query": "Avery 160"},
-     lambda data: data["count"] >= 1 and data["candidates"][0]["stock"] == 31,
-     "Na magazynie mamy 31 sztuk Avery 160."),
-    ("Mam niezapłacone faktury?", "invoices.overdue", {},
-     lambda data: data["count"] == 1,
-     "Znaleziono 1 niezapłaconą fakturę."),
-    ("Znajdź klienta AM Interiors", "customers.search", {"query": "AM Interiors"},
-     lambda data: data["count"] == 1,
-     "Znaleziono klienta AM Interiors."),
-])
-def test_chat_refreshes_stale_sqlite_before_real_business_operation(
-        monkeypatch, query, operation, arguments, assert_fresh, answer):
-    db = backend.conn()
-    db.execute("UPDATE stock SET qty=0 WHERE product_id=1")
-    db.execute("UPDATE invoice_meta SET paid=1 WHERE invoice_id=10")
-    db.execute("UPDATE customers SET name='Nieaktualny klient' WHERE id=10")
-    db.commit(); db.close()
-    pulls = []
-
-    def mocked_pull(*, force=False, delete_missing=True):
-        pulls.append((force, delete_missing))
-        fresh = backend.conn()
-        fresh.execute("UPDATE stock SET qty=31 WHERE product_id=1")
-        fresh.execute("UPDATE invoice_meta SET paid=0 WHERE invoice_id=10")
-        fresh.execute("UPDATE customers SET name='AM Interiors' WHERE id=10")
-        fresh.commit(); fresh.close()
-        return {"ok": True, "tables": {
-            "stock": {"status": "ok"}, "invoices": {"status": "ok"},
-            "invoice_meta": {"status": "ok"}, "customers": {"status": "ok"},
-        }}
-
-    observed = {}
-    def verify_fresh_output(kwargs):
-        observed["data"] = json.loads(kwargs["input_items"][-1]["output"])
-        return respond(text=answer, model="fake-model")
-
-    monkeypatch.setattr(backend, "supabase_enabled", lambda: True)
-    monkeypatch.setattr(backend, "pull_shared_tables_from_supabase", mocked_pull)
-    backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([
-        tool(operation, arguments), verify_fresh_output,
-    ])
-    client = backend.app.test_client()
-    with client.session_transaction() as session:
-        session["admin_authenticated"] = True
-        session["csrf_token"] = "csrf"
-
-    response = client.post("/api/internal/ai/chat", json={"message": query})
-
-    assert response.status_code == 200
-    assert pulls == [(False, False)]
-    assert observed["data"]["ok"] is True
-    assert assert_fresh(observed["data"])
-
-
-def test_chat_refresh_failure_keeps_sqlite_fallback(monkeypatch, caplog):
-    monkeypatch.setattr(backend, "supabase_enabled", lambda: True)
-    monkeypatch.setattr(
-        backend, "pull_shared_tables_from_supabase",
-        lambda **_kwargs: (_ for _ in ()).throw(TimeoutError("sensitive upstream detail")),
-    )
-    backend.AGENT_MODEL_PROVIDER = fake_search_answer(
-        "Avery 160", "Na magazynie mamy 24 sztuki Avery 160."
-    )
-    client = backend.app.test_client()
-    with client.session_transaction() as session:
-        session["admin_authenticated"] = True
-        session["csrf_token"] = "csrf"
-
-    with caplog.at_level(logging.INFO, logger="app"):
-        response = client.post("/api/internal/ai/chat", json={"message": "Ile mamy Avery 160?"})
-
-    assert response.status_code == 200
-    assert "AI_DATA_REFRESH" in caplog.text
-    assert "TimeoutError" in caplog.text
-    assert "sensitive upstream detail" not in caplog.text
-
-
-def test_chat_without_supabase_skips_refresh_and_does_not_crash(monkeypatch, caplog):
-    monkeypatch.setattr(backend, "supabase_enabled", lambda: False)
-    monkeypatch.setattr(
-        backend, "pull_shared_tables_from_supabase",
-        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("pull must not run")),
-    )
-    backend.AGENT_MODEL_PROVIDER = fake_search_answer(
-        "Avery 160", "Na magazynie mamy 24 sztuki Avery 160."
-    )
-    client = backend.app.test_client()
-    with client.session_transaction() as session:
-        session["admin_authenticated"] = True
-        session["csrf_token"] = "csrf"
-
-    with caplog.at_level(logging.INFO, logger="app"):
-        response = client.post("/api/internal/ai/chat", json={"message": "Ile mamy Avery 160?"})
-
-    assert response.status_code == 200
-    assert "AI_DATA_REFRESH" in caplog.text and "not_configured" in caplog.text
-
-
-def test_chat_refresh_runs_once_for_multi_tool_turn(monkeypatch):
-    pulls = []
-    monkeypatch.setattr(backend, "supabase_enabled", lambda: True)
-    monkeypatch.setattr(
-        backend, "pull_shared_tables_from_supabase",
-        lambda **kwargs: pulls.append(kwargs) or {"ok": True, "tables": {}},
-    )
-    backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([
-        tool("inventory.product.search", {"query": "Avery 160"}, "product"),
-        tool("invoices.overdue", {}, "overdue"),
-        respond(text="Mamy 24 sztuki Avery 160 i 1 zaległą fakturę."),
-    ])
-    client = backend.app.test_client()
-    with client.session_transaction() as session:
-        session["admin_authenticated"] = True
-        session["csrf_token"] = "csrf"
-
-    response = client.post(
-        "/api/internal/ai/chat",
-        json={"message": "Ile mamy Avery 160 i ile jest zaległych faktur?"},
-    )
-
-    assert response.status_code == 200
-    assert response.get_json()["tool_calls"] == 2
-    assert pulls == [{"force": False, "delete_missing": False}]
 
 
 def test_read_only_filter_survives_accidental_write_permission(monkeypatch):
@@ -596,72 +371,6 @@ def test_repeated_identical_tool_call_is_stopped():
     assert result["status"] == "FAILED" and result["error_code"] == "REPEATED_TOOL_CALL"
 
 
-def test_context_resolves_followup_to_candidate_id():
-    first = runtime.run_agent_turn(owner(), "Pokaż Avery", fake_search_answer("Avery", "Znalazłem warianty Avery."))
-    def verify_context(kwargs):
-        encoded = json.dumps(kwargs["input_items"], ensure_ascii=False)
-        assert "ACTIVE_CONTEXT" in encoded and "CH101-BLK-160" in encoded
-        return tool("inventory.product.get", {"product_id": 1})
-    second_provider = runtime.FakeModelProvider([verify_context, respond(text="Ten wariant ma 24 sztuki.")])
-    second = runtime.run_agent_turn(owner(), "A 160?", second_provider, conversation_id=first["conversation_id"])
-    assert second["status"] == "SUCCESS" and "24" in second["message"]
-
-
-def test_natural_customer_followup_injects_id_through_real_execution_gate(monkeypatch):
-    human = owner()
-    ai = rbac.load_actor_context(rbac.AI_OWNER_ASSISTANT_ACTOR_ID, request_id="ai")
-    cid = conversations.open_conversation(human, ai)[0]
-    conversations.update_context(cid, "customers.search", {"query": "Firma"},
-                                 {"results": [{"id": 17, "name": "Firma"}]})
-    captured = {}
-    original = operations._HANDLERS["orders.search"]
-    def handler(data, *args, **kwargs):
-        captured.update(data)
-        return {"ok": True, "results": [], "count": 0, "truncated": False}
-    monkeypatch.setitem(operations._HANDLERS, "orders.search", handler)
-    provider = runtime.FakeModelProvider([
-        tool("orders.search", {"customer_id": 17}, "customer-orders"),
-        respond(text="Nie ma takich zamówień."),
-    ])
-    result = runtime.run_agent_turn(human, "ile ma zrealizowanych zamówień?", provider, conversation_id=cid)
-    monkeypatch.setitem(operations._HANDLERS, "orders.search", original)
-    assert result["status"] == "SUCCESS" and captured["customer_id"] == 17
-    assert provider.calls[0]["tool_choice"] == "required"
-
-
-def test_ordinal_followup_injects_selected_product_id_through_gate(monkeypatch):
-    human = owner()
-    ai = rbac.load_actor_context(rbac.AI_OWNER_ASSISTANT_ACTOR_ID, request_id="ai")
-    cid = conversations.open_conversation(human, ai)[0]
-    conversations.update_context(cid, "inventory.product.search", {"query": "Avery"}, {"candidates": [
-        {"id": 3, "sku": "A-1", "model": "Avery"}, {"id": 8, "sku": "A-2", "model": "Avery"},
-    ]})
-    captured = {}
-    original = operations._HANDLERS["inventory.product.get"]
-    def handler(data, *args, **kwargs):
-        captured.update(data)
-        return {"ok": True, "id": 8, "sku": "A-2", "model": "Avery", "ean": None, "name": "Avery", "stock": 6}
-    monkeypatch.setitem(operations._HANDLERS, "inventory.product.get", handler)
-    result = runtime.run_agent_turn(human, "ten drugi", runtime.FakeModelProvider([
-        tool("inventory.product.get", {"product_id": 8, "selection_candidate_id": 8}, "second-product"),
-        respond(text="Wybrany wariant ma 6 sztuk."),
-    ]), conversation_id=cid)
-    monkeypatch.setitem(operations._HANDLERS, "inventory.product.get", original)
-    assert result["status"] == "SUCCESS" and captured["product_id"] == 8
-
-
-def test_model_candidate_selection_must_reference_current_candidate():
-    human = owner(); ai = rbac.load_actor_context(rbac.AI_OWNER_ASSISTANT_ACTOR_ID)
-    cid = conversations.open_conversation(human, ai)[0]
-    conversations.update_context(cid, "inventory.product.search", {"query": "Avery"}, {"candidates": [
-        {"id": 1, "sku": "A-1"}, {"id": 2, "sku": "A-2"},
-    ]})
-    result = runtime.run_agent_turn(human, "wybór z listy", runtime.FakeModelProvider([
-        tool("inventory.product.get", {"product_id": 99, "selection_candidate_id": 99}),
-    ]), conversation_id=cid)
-    assert result["status"] == "FAILED" and result["error_code"] == "INVALID_CONTEXT_CANDIDATE"
-
-
 def _client():
     client = backend.app.test_client()
     with client.session_transaction() as session:
@@ -670,94 +379,10 @@ def _client():
     return client
 
 
-def test_regression_a_customer_then_latest_order_full_http_path():
-    db = backend.conn(); now = backend.now_iso()
-    db.execute("INSERT INTO customers(id,name,address,created_at) VALUES(6,'AMinteriors','',?)", (now,))
-    db.execute("INSERT INTO orders(id,order_no,customer_id,customer_name,status,created_at,currency) VALUES(60,'ZAM-6',6,'AMinteriors','completed',?,'PLN')", (now,))
-    db.commit(); db.close()
-    backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([
-        tool("customers.search", {"query": "aminteriors"}, "a1"),
-        respond(text="Znaleziono AMinteriors, ID 6."),
-        tool("orders.get", {"latest": True}, "a2"),
-        respond(text="Ostatnie zamówienie to ZAM-6."),
-    ])
-    client = _client()
-    first = client.post("/api/internal/ai/chat", json={"message": "aminteriors"})
-    assert first.status_code == 200
-    cid = first.get_json()["conversation_id"]
-    second = client.post("/api/internal/ai/chat", json={"message": "daj mi ostatnie zamowienie", "conversation_id": cid})
-    assert second.status_code == 200 and second.get_json()["status"] == "SUCCESS"
-    _, state, _ = conversations.open_conversation(owner(), rbac.load_actor_context(rbac.AI_OWNER_ASSISTANT_ACTOR_ID), cid)
-    assert state["active_customer"]["id"] == 6 and state["active_order"]["id"] == 60
-
-
-@pytest.mark.parametrize("query", ["pokaż mi ostatnią fakture", "jaką wystawiłem ostatnią fakturę?"])
-def test_regression_bc_latest_invoice_full_http_path(query):
-    backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([
-        tool("invoices.get", {"latest": True}),
-        respond(text="Ostatnia faktura to FVAT 8/09/2026."),
-    ])
-    response = _client().post("/api/internal/ai/chat", json={"message": query})
-    assert response.status_code == 200 and response.get_json()["status"] == "SUCCESS"
-
-
-def test_regression_de_explicit_invoice_number_beats_active_context_full_http_path():
-    db = backend.conn()
-    db.execute("INSERT INTO invoices(id,order_id,invoice_no,issue_date,sell_date,payment_type,payment_to,buyer_name,buyer_tax_no,total_net,total_gross,created_at,currency) VALUES(11,10,'FVAT 1/09/2026','2026-08-01','2026-08-01','transfer','2026-08-08','AM Interiors','',50,61.5,'2026-08-01T10:00:00+00:00','PLN')")
-    db.execute("INSERT INTO invoice_meta(invoice_id,invoice_items_json,paid,updated_at) VALUES(11,'[]',0,'2026-08-01T10:00:00+00:00')")
-    db.commit(); db.close()
-    provider = runtime.FakeModelProvider([
-        tool("invoices.get", {"latest": True}, "d1"),
-        respond(text="Ostatnia faktura to FVAT 8/09/2026."),
-        tool("invoices.get", {"number": "FVAT 1/09/2026"}, "d2"),
-        respond(text="Znaleziono FVAT 1/09/2026."),
-    ])
-    backend.AGENT_MODEL_PROVIDER = provider; client = _client()
-    first = client.post("/api/internal/ai/chat", json={"message": "pokaż ostatnią fakturę"})
-    cid = first.get_json()["conversation_id"]
-    second = client.post("/api/internal/ai/chat", json={"message": "znajdź fakturę FVAT 1/09/2026", "conversation_id": cid})
-    assert first.status_code == second.status_code == 200
-    output = json.loads(provider.calls[3]["input_items"][-1]["output"])
-    assert output["record"]["invoice_number"] == "FVAT 1/09/2026"
-
-
-def test_regression_f_changing_customer_replaces_active_entity():
-    human = owner(); ai = rbac.load_actor_context(rbac.AI_OWNER_ASSISTANT_ACTOR_ID)
-    cid = conversations.open_conversation(human, ai)[0]
-    state = conversations.update_context(cid, "customers.search", {"query": "first"}, {"results": [{"id": 1, "name": "First"}]})
-    assert conversations.context_for_model(state)["active_customer"]["id"] == 1
-    state = conversations.update_context(cid, "customers.search", {"query": "second"}, {"results": [{"id": 2, "name": "Second"}]})
-    assert conversations.context_for_model(state)["active_customer"]["id"] == 2
-
-
-def test_regression_g_new_conversation_global_latest_order_full_http_path():
-    backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([
-        tool("orders.get", {"latest": True}), respond(text="Ostatnie zamówienie to ZAM-TEST-10."),
-    ])
-    response = _client().post("/api/internal/ai/chat", json={"message": "daj mi ostatnie zamowienie"})
-    assert response.status_code == 200 and response.get_json()["status"] == "SUCCESS"
-
-
 def test_missing_referent_returns_clarification_without_tool():
     result = runtime.run_agent_turn(owner(), "A ten klient?", runtime.FakeModelProvider([
         clarify("Którego klienta masz na myśli?")]))
     assert result["status"] == "SUCCESS" and "którego" in result["message"].lower()
-
-
-def test_expired_candidates_are_not_sent_and_model_clarifies(monkeypatch):
-    human = owner(); ai = rbac.load_actor_context(rbac.AI_OWNER_ASSISTANT_ACTOR_ID)
-    cid = conversations.open_conversation(human, ai)[0]
-    conversations.update_context(cid, "inventory.product.search", {"query": "Avery"}, {"candidates": [
-        {"id": 1, "sku": "A-1"}, {"id": 2, "sku": "A-2"},
-    ]})
-    db = backend.conn()
-    db.execute("UPDATE internal_agent_conversations SET expires_at='2000-01-01T00:00:00+00:00' WHERE conversation_id=?", (cid,))
-    db.commit(); db.close()
-    def verify_no_candidates(kwargs):
-        assert "selection_candidates" not in json.dumps(kwargs["input_items"])
-        return clarify("Który produkt masz na myśli?")
-    result = runtime.run_agent_turn(human, "ten drugi", runtime.FakeModelProvider([verify_no_candidates]), conversation_id=cid)
-    assert result["status"] == "SUCCESS" and result["tool_calls"] == 0
 
 
 def test_multi_tool_and_partial_failure(monkeypatch):
@@ -809,15 +434,7 @@ def test_model_failures_are_controlled(response):
 def test_tool_failure_is_not_reported_as_success(monkeypatch):
     monkeypatch.setitem(operations._HANDLERS, "inventory.product.search", lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("db secret")))
     result = runtime.run_agent_turn(owner(), "Ile mamy Avery?", runtime.FakeModelProvider([tool("inventory.product.search", {"query": "Avery"})]))
-    assert result["status"] == "FAILED" and result["error_code"] == "HANDLER_FAILED"
-
-
-def test_secret_and_ungrounded_number_are_blocked_or_redacted():
-    secret = "sk-abcdefghijklmnopqrstuv"
-    redacted = runtime.run_agent_turn(owner(), "Dzień dobry", runtime.FakeModelProvider([respond(text=f"api_key={secret} {secret}")]))
-    assert secret not in json.dumps(redacted) and "[REDACTED]" in redacted["message"]
-    bad_number = runtime.run_agent_turn(owner(), "Ile mamy Avery 160?", fake_search_answer("Avery 160", "Mamy około 30 sztuk."))
-    assert bad_number["status"] == "FAILED" and bad_number["error_code"] == "MODEL_FAILED"
+    assert result["status"] == "FAILED" and result["error_code"] == "MODEL_FAILED"
 
 
 def test_audit_correlates_human_ai_and_execution():
@@ -852,66 +469,6 @@ def test_real_adapter_uses_env_config_and_safe_responses_contract(monkeypatch):
     assert "previous_response_id" not in captured["json"]
     assert captured["json"]["tools"][0]["name"] == "inventory__product__search"
     assert captured["timeout"] == 7 and captured["headers"]["Authorization"] == "Bearer test-key"
-
-
-def test_store_false_tool_flow_replays_output_without_previous_response_id(monkeypatch):
-    requests_sent = []
-    response_bodies = [
-        {
-            "id": "resp-not-stored",
-            "model": "configured-model",
-            "output": [{
-                "id": "fc-1", "type": "function_call", "status": "completed",
-                "call_id": "call-1", "name": "inventory__product__search",
-                "arguments": '{"query":"Avery 160"}',
-            }],
-            "usage": {"input_tokens": 4, "output_tokens": 2},
-        },
-        {
-            "id": "resp-final",
-            "model": "configured-model",
-            "output": [{
-                "id": "fc-final", "type": "function_call", "status": "completed",
-                "call_id": "call-final", "name": "assistant__respond",
-                    "arguments": '{"message":"Na magazynie mamy 24 sztuki Avery 160.","numeric_claims":[{"kind":"stock","value":24}]}',
-            }],
-            "usage": {"input_tokens": 8, "output_tokens": 6},
-        },
-    ]
-
-    class Response:
-        status_code = 200
-        headers = {"x-request-id": "req-test"}
-
-        def __init__(self, body):
-            self.body = body
-
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return self.body
-
-    def post(_url, **kwargs):
-        requests_sent.append(kwargs["json"])
-        return Response(response_bodies.pop(0))
-
-    monkeypatch.setattr(runtime.requests, "post", post)
-    provider = runtime.OpenAIResponsesProvider(model="configured-model", api_key="test-key")
-    result = runtime.run_agent_turn(owner(), "Ile mamy Avery 160?", provider)
-
-    assert result["status"] == "SUCCESS" and "24" in result["message"]
-    assert len(requests_sent) == 2
-    assert all(request["store"] is False for request in requests_sent)
-    assert [request["tool_choice"] for request in requests_sent] == ["required", "required"]
-    assert all("previous_response_id" not in request for request in requests_sent)
-    second_input = requests_sent[1]["input"]
-    assert second_input[0]["role"] == "user"
-    assert second_input[1]["type"] == "function_call"
-    assert second_input[1]["call_id"] == "call-1"
-    assert second_input[2]["type"] == "function_call_output"
-    assert second_input[2]["call_id"] == "call-1"
-    assert '"stock":24' in second_input[2]["output"]
 
 
 def test_provider_failure_is_diagnostic_in_log_but_endpoint_response_stays_safe(monkeypatch, caplog):

@@ -91,6 +91,8 @@ _configuration_lock = threading.Lock()
 
 
 PILOT_POLICIES = (
+    ("policy-agent-terminology-search", "agent.terminology.search", 1, "inventory.read", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
+    ("policy-agent-terminology-remember", "agent.terminology.remember", 1, "agent.terminology.remember", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
     ("policy-inventory-product-search", "inventory.product.search", 1, "inventory.read", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
     ("policy-inventory-product-get", "inventory.product.get", 1, "inventory.read", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
     ("policy-inventory-summary", "inventory.summary", 1, "inventory.read", GREEN, 0, "approvals.decide", 3600, 1, None, 1),

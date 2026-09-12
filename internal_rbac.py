@@ -37,6 +37,7 @@ BOOTSTRAP_OWNER_DISPLAY_NAME = "Bootstrap Owner"
 
 
 PERMISSIONS = {
+    "agent.terminology.remember": "Zapis potwierdzonej terminologii firmy",
     "orders.read_full": "Pełny odczyt zamówień",
     "orders.fulfillment_read": "Ograniczony odczyt do realizacji",
     "orders.create": "Tworzenie zamówień",
@@ -253,6 +254,7 @@ ROLE_PERMISSION_DECISIONS = {
         approval={"purchases.manage", "purchases.costs"},
     ),
     "AI_OWNER_ASSISTANT": _decisions(allow={
+        "agent.terminology.remember",
         "orders.read_full", "orders.fulfillment_read", "orders.stock_audit",
         "inventory.read", "inventory.replenishment_read", "invoices.read",
         "invoices.status_read", "ksef.read", "customers.read", "shipping.read",
