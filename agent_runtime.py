@@ -22,6 +22,13 @@ MODEL_TIMEOUT_SECONDS = 30
 _SAFE_API_ERROR_CODE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _STANDALONE_SECRET = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
 logger = logging.getLogger(__name__)
+_artifact_builder = None
+
+
+def configure_artifact_builder(builder) -> None:
+    """Install the backend-owned presentation mapper; it grants no capabilities."""
+    global _artifact_builder
+    _artifact_builder = builder
 
 def _log_provider_failure(*, exc: Exception, model: str, stage: str, response=None) -> None:
     """Log bounded provider diagnostics without request content, headers or credentials."""
@@ -260,6 +267,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
     model_name, evidence, active = '', [], False
     ai_actor = None
     pending_approvals = []
+    artifacts = []
 
     def finish(status, answer, code=''):
         nonlocal active
@@ -287,7 +295,9 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         logger.info('AI_TURN_TIMING %s',json.dumps({'agent_run_id':run_id,**timings}))
         return {'ok':status=='SUCCESS','status':status,'message':answer,'agent_run_id':run_id,
                 'correlation_id':correlation_id,'conversation_id':conversation_id,'tool_calls':timings['tool_calls_count'],
-                'model':model_name,'usage':usage,'error_code':code,'timings':dict(timings), 'pending_approvals':pending_approvals}
+                'model':model_name,'usage':usage,'error_code':code,'timings':dict(timings),
+                'artifacts':artifacts, 'approvals':pending_approvals,
+                'pending_approvals':pending_approvals}
 
     if not isinstance(human_actor,ActorContext) or human_actor.actor_type!='HUMAN':
         return finish('DENIED','Dostęp wymaga tożsamości pracownika.','HUMAN_REQUIRED')
@@ -417,6 +427,19 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                     pending_approvals.append({'approval_id': result.approval_id,
                         'order_id': arguments['order_id'], 'target_status': arguments['target_status'],
                         'expected_version': arguments['expected_version']})
+                if result.status == 'SUCCESS' and _artifact_builder and len(artifacts) < 6:
+                    try:
+                        candidates = _artifact_builder(call.name, result.data)
+                        if isinstance(candidates, list):
+                            for candidate in candidates:
+                                if isinstance(candidate, dict) and len(artifacts) < 6:
+                                    key = (candidate.get('type'), candidate.get('id'), candidate.get('url'))
+                                    if not any((item.get('type'), item.get('id'), item.get('url')) == key for item in artifacts):
+                                        artifacts.append(candidate)
+                    except Exception as exc:
+                        logger.error('AI_ARTIFACT_BUILD_FAILED %s', json.dumps({
+                            'operation': call.name, 'exception_type': type(exc).__name__,
+                        }, sort_keys=True))
                 data = result.data if result.status=='SUCCESS' else {'ok':False,'status':result.status,
                     'error_code':result.error_code,'error':result.safe_error_message}
                 if result.status != 'SUCCESS' and call.name in business_operations.ORDER_WRITES:

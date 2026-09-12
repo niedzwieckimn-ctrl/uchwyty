@@ -56,7 +56,8 @@ from internal_rbac import (
     initialize_schema as initialize_internal_rbac_schema,
     require_permission,
 )
-from agent_runtime import provider_from_env, reset_agent_conversation, run_agent_turn
+from agent_runtime import configure_artifact_builder, provider_from_env, reset_agent_conversation, run_agent_turn
+from agent_artifacts import build_artifacts
 from agent_conversation import (
     configure as configure_agent_conversation,
     initialize_schema as initialize_agent_conversation_schema,
@@ -299,6 +300,7 @@ _startup_step("approval_configured")
 configure_business_operations(conn)
 configure_business_operations_freshness(lambda operation_name: ensure_business_operation_freshness(operation_name))
 configure_write_success_observer(lambda operation_name, result: reconcile_business_freshness_after_write(operation_name, result))
+configure_artifact_builder(lambda operation_name, result: build_business_artifacts(operation_name, result))
 configure_agent_conversation(conn)
 _startup_step("business_operations_configured")
 configure_external_execution(conn)
@@ -837,6 +839,49 @@ def api_external_execution_health():
 
 
 AGENT_MODEL_PROVIDER = None
+
+
+def _artifact_links(operation_name: str, record: dict) -> dict:
+    """Resolve only whitelisted internal routes for IDs returned by READ operations."""
+    try:
+        entity_id = int(record.get('id') or 0)
+    except (TypeError, ValueError):
+        return {}
+    if entity_id <= 0:
+        return {}
+    if operation_name in {'orders.get', 'orders.search'}:
+        return {'detail_url': f'/orders/{entity_id}'}
+    if operation_name in {'china.orders.get', 'china.orders.search'}:
+        return {'detail_url': f'/china/{entity_id}'}
+    if operation_name in {'invoices.get', 'invoices.search'}:
+        invoice = load_invoice_with_meta(entity_id)
+        if not invoice or int(invoice.get('id') or 0) != entity_id:
+            return {}
+        pdf_path = invoice.get('pdf_path', '')
+        stored = bool(parse_supabase_storage_ref(pdf_path))
+        local = invoice_pdf_exists(pdf_path, invoice.get('invoice_no', ''))[0]
+        return {'document_url': f'/invoices/{entity_id}/download'} if stored or local else {}
+    if operation_name in {'inventory.product.get', 'inventory.product.search'}:
+        db = conn()
+        try:
+            row = db.execute(
+                '''SELECT i.id,i.stored_path
+                     FROM product_image_assignments a
+                     JOIN product_images i ON i.id=a.image_id
+                    WHERE a.product_id=? ORDER BY i.id LIMIT 1''',
+                (entity_id,),
+            ).fetchone()
+        finally:
+            db.close()
+        if not row:
+            return {}
+        exists = bool(parse_supabase_storage_ref(row['stored_path'])) or os.path.isfile(row['stored_path'])
+        return {'image_url': f"/stock/images/{int(row['id'])}"} if exists else {}
+    return {}
+
+
+def build_business_artifacts(operation_name: str, result: dict) -> list[dict]:
+    return build_artifacts(operation_name, result, _artifact_links)
 
 
 def _json_object(value):
