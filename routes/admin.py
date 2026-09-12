@@ -121,45 +121,13 @@ def register_routes(context):
             AND date(issued.issued_at)=date('now','localtime')
         """)
         n_issued_today = int(cur.fetchone()["n"] or 0)
-        # Zamowienia, ktore mozna wydac z obecnego stanu. Stan jest rezerwowany
-        # od najstarszego zamowienia, aby ta sama sztuka nie byla liczona dwa razy.
-        issuable_statuses = {
-            "new", "pending", "unconfirmed", "confirmed", "packed",
-            "packed_partial", "partially_shipped",
-        }
-        status_ph = ",".join(["?"] * len(issuable_statuses))
-        cur.execute(f"""
-          SELECT o.id, o.order_no, o.created_at, o.note, oi.product_id,
-                 SUM(MAX(0, oi.qty - COALESCE((
-                   SELECT SUM(ia.qty) FROM invoice_allocations ia
-                   WHERE ia.order_item_id=oi.id
-                 ),0))) AS required_qty
-          FROM orders o
-          JOIN order_items oi ON oi.order_id=o.id
-          WHERE LOWER(COALESCE(o.status,'')) IN ({status_ph})
-            AND COALESCE(o.warehouse_issued,0)=0
-          GROUP BY o.id, oi.product_id
-          HAVING required_qty > 0
-          ORDER BY o.created_at, o.id, oi.product_id
-        """, tuple(sorted(issuable_statuses)))
-        issue_rows = [dict(r) for r in cur.fetchall()]
-        cur.execute("SELECT product_id, MAX(0, COALESCE(qty,0)) AS qty FROM stock")
-        issue_stock_pool = {int(r["product_id"]): int(r["qty"] or 0) for r in cur.fetchall()}
-        issue_orders = {}
-        for row in issue_rows:
-            order_id = int(row["id"])
-            issue_orders.setdefault(order_id, {"order": row, "needs": []})["needs"].append(
-                (int(row["product_id"]), int(row["required_qty"] or 0))
-            )
-        issuable_orders = []
-        for candidate in issue_orders.values():
-            if candidate["needs"] and all(issue_stock_pool.get(pid, 0) >= qty for pid, qty in candidate["needs"]):
-                issuable_orders.append(candidate["order"])
-                for pid, qty in candidate["needs"]:
-                    issue_stock_pool[pid] = issue_stock_pool.get(pid, 0) - qty
+        # The dashboard and AI share the same deterministic allocation rule.
+        from fulfillment_readiness import calculate_fulfillment_readiness
+        readiness = calculate_fulfillment_readiness(c)
+        issuable_orders = [row for row in readiness if row["ready"]]
         n_issuable_today = len(issuable_orders)
         issuable_order_labels = [
-            order_display_no(r["id"], r.get("created_at"), r.get("order_no"), r.get("note") or "")
+            order_display_no(r["order_id"], r.get("created_at"), r.get("order_number"), r.get("note") or "")
             for r in issuable_orders[:3]
         ]
         reorder_horizon_days = 60
