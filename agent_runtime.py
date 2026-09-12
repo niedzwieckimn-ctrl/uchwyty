@@ -10,6 +10,7 @@ import uuid
 from typing import Any, Protocol
 import requests
 import agent_conversation
+from agent_artifacts import build_artifact_sources
 import business_operations
 from internal_audit import SUCCESS, FAILED, record_audit_event, sanitize_audit_text
 from internal_rbac import AI_OWNER_ASSISTANT_ACTOR_ID, ActorContext, load_actor_context, ALLOW
@@ -211,6 +212,9 @@ Jeżeli nie ma danych lub odpowiedniej operacji, powiedz czego nie możesz bezpi
 Nie wykonuj niepewnych obliczeń, jeśli istnieje odpowiednia operacja agregująca.
 Starsze turny lub duże wyniki mogą zostać pominięte w ograniczonym oknie historii; nie odtwarzaj ich z domysłów.
 Gdy odniesienie jest jednoznaczne w historii, użyj właściwych identyfikatorów; gdy nie jest, naturalnie dopytaj.
+Gdy użytkownik wybiera konkretny obiekt z trusted_artifact_evidence, wywołaj jego istniejącą operację get
+z zapisanym entity_id. To ponownie sprawdza uprawnienia i świeżość, a backend dołączy warstwę prezentacji.
+Nie twórz entity_id z tekstu odpowiedzi ani z danych innych niż function_call_output bieżącej rozmowy.
 Odpowiadaj normalnym tekstem, zwięźle, w języku użytkownika. Wspominaj identyfikatory omawianych rekordów.
 Ogranicz liczbę wywołań: proste pytanie zwykle wymaga jednej operacji i odpowiedzi po jej wyniku.
 Możesz dodać notatkę wewnętrzną; zmiana statusu wymaga zatwierdzenia przez człowieka. Nigdy nie twierdź, że zapis lub wysyłka się odbyły bez wyniku sukcesu.
@@ -268,6 +272,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
     ai_actor = None
     pending_approvals = []
     artifacts = []
+    artifact_sources = []
 
     def finish(status, answer, code=''):
         nonlocal active
@@ -276,6 +281,14 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         if active:
             active = False
             try:
+                if artifact_sources:
+                    source_call_id = 'trusted-artifacts-' + run_id
+                    evidence[0:0] = [
+                        {'type':'function_call','call_id':source_call_id,
+                         'name':'trusted_artifact_evidence','arguments':'{}'},
+                        {'type':'function_call_output','call_id':source_call_id,
+                         'output':json.dumps(artifact_sources,ensure_ascii=False,separators=(',',':'))},
+                    ]
                 agent_conversation.finish_turn(human_actor,ai_actor,conversation_id,run_id,answer,evidence)
             except Exception:
                 status, code = 'FAILED', 'HISTORY_SAVE_FAILED'
@@ -440,6 +453,16 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                         logger.error('AI_ARTIFACT_BUILD_FAILED %s', json.dumps({
                             'operation': call.name, 'exception_type': type(exc).__name__,
                         }, sort_keys=True))
+                if result.status == 'SUCCESS':
+                    for source in build_artifact_sources(
+                        call.name, result.data, conversation_id, run_id,
+                    ):
+                        key = (source['operation'], source['entity_type'], source['entity_id'])
+                        if len(artifact_sources) < 10 and not any(
+                            (item['operation'], item['entity_type'], item['entity_id']) == key
+                            for item in artifact_sources
+                        ):
+                            artifact_sources.append(source)
                 data = result.data if result.status=='SUCCESS' else {'ok':False,'status':result.status,
                     'error_code':result.error_code,'error':result.safe_error_message}
                 if result.status != 'SUCCESS' and call.name in business_operations.ORDER_WRITES:

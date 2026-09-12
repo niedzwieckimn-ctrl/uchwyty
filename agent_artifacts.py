@@ -34,11 +34,66 @@ def _record(operation: str, result: Mapping[str, Any]) -> Mapping[str, Any] | No
     record = result.get('record')
     if isinstance(record, Mapping):
         return record
-    results = result.get('results')
+    results = result.get('candidates') if operation == 'inventory.product.search' else result.get('results')
     if operation.endswith('.search') and result.get('count') == 1 and isinstance(results, list):
         candidate = results[0] if results else None
         return candidate if isinstance(candidate, Mapping) else None
     return None
+
+
+def build_artifact_sources(
+    operation: str,
+    result: Mapping[str, Any],
+    conversation_id: str,
+    source_turn_id: str,
+) -> list[dict[str, Any]]:
+    """Build bounded evidence that a later model turn may select and re-read."""
+    if not isinstance(result, Mapping) or result.get('ok') is not True:
+        return []
+    entity_types = {
+        'inventory.product.get': 'product', 'inventory.product.search': 'product',
+        'orders.get': 'order', 'orders.search': 'order',
+        'invoices.get': 'invoice', 'invoices.search': 'invoice',
+        'china.orders.get': 'china_order', 'china.orders.search': 'china_order',
+    }
+    entity_type = entity_types.get(operation)
+    if not entity_type:
+        return []
+    if operation == 'inventory.product.get':
+        records = [result]
+    elif operation == 'inventory.product.search':
+        records = result.get('candidates')
+    elif isinstance(result.get('record'), Mapping):
+        records = [result['record']]
+    else:
+        records = result.get('results')
+    if not isinstance(records, list):
+        return []
+    allowed = {
+        'product': ('id', 'sku', 'model', 'name', 'stock'),
+        'order': ('id', 'order_number', 'customer_name', 'created_at', 'status'),
+        'invoice': ('id', 'invoice_number', 'buyer_name', 'issue_date'),
+        'china_order': ('id', 'po_number', 'supplier', 'order_status', 'delivery_stage'),
+    }[entity_type]
+    sources = []
+    for record in records[:10]:
+        if not isinstance(record, Mapping):
+            continue
+        try:
+            entity_id = int(record.get('id') or 0)
+        except (TypeError, ValueError):
+            continue
+        if entity_id <= 0:
+            continue
+        sources.append({
+            'operation': operation,
+            'entity_type': entity_type,
+            'entity_id': entity_id,
+            'trusted_result_subset': _fields(record, allowed),
+            'conversation_id': conversation_id,
+            'source_turn_id': source_turn_id,
+        })
+    return sources
 
 
 def _safe_url(value: Any, prefixes: tuple[str, ...]) -> str:
@@ -98,6 +153,17 @@ def build_artifacts(
         if detail_url:
             card['detail_url'] = detail_url
         artifacts.append(card)
+        packing_url = _safe_url(
+            links.get('packing_list_url'),
+            ('/api/internal/ai/documents/packing-lists/',),
+        )
+        if packing_url:
+            artifacts.append({
+                'type': 'document_link', 'document_type': 'packing_list',
+                'label': 'Lista pakowa', 'url': packing_url,
+                'order_id': record.get('id'),
+                'invoice_id': links.get('packing_invoice_id'),
+            })
 
     elif operation in {'inventory.product.get', 'inventory.product.search'}:
         card = {'type': 'product_card', **_fields(record, (

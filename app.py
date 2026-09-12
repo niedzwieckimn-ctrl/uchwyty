@@ -841,6 +841,88 @@ def api_external_execution_health():
 AGENT_MODEL_PROVIDER = None
 
 
+def existing_product_image_local_path(stored_path: str) -> str:
+    """Resolve legacy relative image paths exactly within known application roots."""
+    raw = norm(stored_path)
+    if not raw or parse_supabase_storage_ref(raw):
+        return ''
+    candidates = [raw] if os.path.isabs(raw) else [
+        os.path.join(os.path.dirname(DB_PATH), raw),
+        os.path.join(os.path.dirname(DB_PATH), 'product_images', raw),
+        os.path.join(os.path.dirname(__file__), raw),
+    ]
+    for candidate in candidates:
+        resolved = os.path.realpath(candidate)
+        if os.path.isfile(resolved):
+            return resolved
+    return ''
+
+
+def _product_image_available(stored_path: str) -> bool:
+    storage_ref = parse_supabase_storage_ref(stored_path)
+    path = storage_ref[1] if storage_ref else norm(stored_path)
+    if os.path.splitext(path)[1].lower() not in {'.svg', '.png', '.jpg', '.jpeg'}:
+        return False
+    return bool(storage_ref) or bool(existing_product_image_local_path(stored_path))
+
+
+def _packing_invoice_id_for_order(order_id: int) -> int:
+    db = conn()
+    try:
+        row = db.execute(
+            '''SELECT DISTINCT i.id
+                 FROM invoices i
+                 LEFT JOIN invoice_allocations a ON a.invoice_id=i.id
+                WHERE i.order_id=? OR a.order_id=?
+                ORDER BY i.id DESC LIMIT 1''',
+            (order_id, order_id),
+        ).fetchone()
+        return int(row['id']) if row else 0
+    finally:
+        db.close()
+
+
+def _existing_packing_list_source(invoice_id: int, include_content: bool = False) -> dict | None:
+    """Locate an already-created packing list without generating or changing data."""
+    invoice = load_invoice_with_meta(invoice_id)
+    if not invoice:
+        return None
+    invoice_no = norm(invoice.get('invoice_no')) or f'FV_{invoice_id}'
+    raw_pdf = norm(invoice.get('pdf_path'))
+    local_candidates = []
+    if raw_pdf and not parse_supabase_storage_ref(raw_pdf):
+        invoice_path = raw_pdf if os.path.isabs(raw_pdf) else invoice_pdf_abspath(raw_pdf)
+        local_candidates.append(packing_list_pdf_path_for_invoice(invoice_path, invoice_no))
+    target_name = f'{safe_filename(invoice_no)}_lista_pakowania.pdf'
+    packing_root = os.path.join(DATA_DIR, 'faktury')
+    if os.path.isdir(packing_root):
+        for directory, _subdirs, filenames in os.walk(packing_root):
+            if target_name in filenames:
+                local_candidates.append(os.path.join(directory, target_name))
+    for candidate in local_candidates:
+        if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
+            return {
+                'kind': 'local', 'path': candidate, 'filename': target_name,
+                'invoice_id': int(invoice_id), 'order_id': int(invoice.get('order_id') or 0),
+            }
+    if supabase_enabled():
+        storage_ref = supabase_storage_ref(invoice_packing_storage_object_path(invoice_id, invoice_no))
+        try:
+            content, filename = supabase_storage_download_bytes(storage_ref)
+        except Exception:
+            return None
+        if content:
+            source = {
+                'kind': 'storage', 'storage_ref': storage_ref,
+                'filename': filename or target_name, 'invoice_id': int(invoice_id),
+                'order_id': int(invoice.get('order_id') or 0),
+            }
+            if include_content:
+                source['content'] = content
+            return source
+    return None
+
+
 def _artifact_links(operation_name: str, record: dict) -> dict:
     """Resolve only whitelisted internal routes for IDs returned by READ operations."""
     try:
@@ -850,7 +932,14 @@ def _artifact_links(operation_name: str, record: dict) -> dict:
     if entity_id <= 0:
         return {}
     if operation_name in {'orders.get', 'orders.search'}:
-        return {'detail_url': f'/orders/{entity_id}'}
+        links = {'detail_url': f'/orders/{entity_id}'}
+        invoice_id = _packing_invoice_id_for_order(entity_id)
+        if invoice_id and _existing_packing_list_source(invoice_id):
+            links.update({
+                'packing_list_url': f'/api/internal/ai/documents/packing-lists/{invoice_id}',
+                'packing_invoice_id': invoice_id,
+            })
+        return links
     if operation_name in {'china.orders.get', 'china.orders.search'}:
         return {'detail_url': f'/china/{entity_id}'}
     if operation_name in {'invoices.get', 'invoices.search'}:
@@ -875,13 +964,30 @@ def _artifact_links(operation_name: str, record: dict) -> dict:
             db.close()
         if not row:
             return {}
-        exists = bool(parse_supabase_storage_ref(row['stored_path'])) or os.path.isfile(row['stored_path'])
+        exists = _product_image_available(row['stored_path'])
         return {'image_url': f"/stock/images/{int(row['id'])}"} if exists else {}
     return {}
 
 
 def build_business_artifacts(operation_name: str, result: dict) -> list[dict]:
     return build_artifacts(operation_name, result, _artifact_links)
+
+
+@app.get('/api/internal/ai/documents/packing-lists/<int:invoice_id>')
+@require_permission('orders.read_full')
+def api_internal_ai_packing_list(invoice_id):
+    source = _existing_packing_list_source(invoice_id, include_content=True)
+    if not source:
+        abort(404)
+    if source['kind'] == 'local':
+        return send_file(
+            source['path'], mimetype='application/pdf', as_attachment=True,
+            download_name=source['filename'], conditional=True,
+        )
+    return send_file(
+        io.BytesIO(source['content']), mimetype='application/pdf', as_attachment=True,
+        download_name=source['filename'], conditional=True,
+    )
 
 
 def _json_object(value):
