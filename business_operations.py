@@ -49,6 +49,24 @@ MAX_BUSINESS_SEARCH_RESULTS = 50
 WARSAW_TZ = ZoneInfo("Europe/Warsaw")
 logger = logging.getLogger(__name__)
 
+# Data access stays outside operation handlers. The application injects a
+# per-operation freshness provider; this module never imports the Flask app.
+_freshness_provider: Callable[[str], Mapping[str, Any]] | None = None
+
+FRESHNESS_GROUP_BY_OPERATION = {
+    "inventory.product.search": "inventory", "inventory.product.get": "inventory", "inventory.summary": "inventory",
+    "orders.search": "orders", "orders.get": "orders", "orders.summary": "orders",
+    "customers.search": "customers", "customers.get": "customers",
+    "invoices.search": "invoices", "invoices.get": "invoices", "invoices.overdue": "invoices",
+    "china.orders.summary": "china", "business.sales.summary": "sales",
+}
+
+
+def configure_freshness(provider: Callable[[str], Mapping[str, Any]] | None) -> None:
+    """Install the application-owned source-of-truth freshness boundary."""
+    global _freshness_provider
+    _freshness_provider = provider
+
 
 @dataclass(frozen=True)
 class BusinessOperationDefinition:
@@ -1461,16 +1479,22 @@ def _safe_diagnostic_args(data: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _diagnostic_result(operation: str, *, status: str, started: float,
-                       output: Any = None, error_code: str = "", stage: str = "complete") -> None:
+                       output: Any = None, error_code: str = "", stage: str = "complete",
+                       freshness: Mapping[str, Any] | None = None) -> None:
     count = None
     if isinstance(output, Mapping):
         count = output.get("count", output.get("order_count", output.get("product_count")))
     payload_size = len(json.dumps(sanitize_audit_data(output), ensure_ascii=False, separators=(",", ":")).encode("utf-8")) if output is not None else 0
-    logger.info("BUSINESS_OPERATION_RESULT %s", json.dumps({
+    payload = {
         "operation": operation, "status": status, "count": count,
         "error_code": error_code, "payload_size": payload_size, "stage": stage,
-        "latency_ms": round((time.perf_counter() - started) * 1000, 2),
-    }, ensure_ascii=False, sort_keys=True))
+        "operation_ms": round((time.perf_counter() - started) * 1000, 2),
+    }
+    if freshness:
+        payload.update({key: freshness[key] for key in (
+            "freshness_group", "freshness_check_ms", "sync_ms", "cache_hit", "snapshot_age_seconds",
+        ) if key in freshness})
+    logger.info("BUSINESS_OPERATION_RESULT %s", json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
 
 def execute_business_operation(
@@ -1581,21 +1605,25 @@ def execute_business_operation(
             if claimed is None:
                 return _result_from_row(_execution(execution_id), status=NOOP)
         handler_started = time.perf_counter()
+        freshness: Mapping[str, Any] = {}
         logger.info("BUSINESS_OPERATION_INPUT %s", json.dumps({
             "operation": definition.operation_name, "args": _safe_diagnostic_args(data),
         }, ensure_ascii=False, sort_keys=True))
         try:
+            if _freshness_provider and definition.operation_name in FRESHNESS_GROUP_BY_OPERATION:
+                freshness = _freshness_provider(definition.operation_name) or {}
             raw_output = _HANDLERS[definition.operation_name](data, actor, row["correlation_id"], None)
             try:
                 output = validate_output(definition, raw_output)
             except Exception:
                 _diagnostic_result(definition.operation_name, status=FAILED, started=handler_started,
-                                   output=raw_output, error_code="INVALID_HANDLER_OUTPUT", stage="output_validation")
+                                   output=raw_output, error_code="INVALID_HANDLER_OUTPUT", stage="output_validation",
+                                   freshness=freshness)
                 raise
         except ControlledOperationError as exc:
             if exc.error_code != "INVALID_HANDLER_OUTPUT":
                 _diagnostic_result(definition.operation_name, status=exc.status, started=handler_started,
-                                   error_code=exc.error_code, stage="handler")
+                                   error_code=exc.error_code, stage="handler", freshness=freshness)
             event = "business_operation.conflict" if exc.status == CONFLICT else "business_operation.failed"
             audit_result = CONFLICT if exc.status == CONFLICT else FAILED
             terminal = "CONFLICT" if exc.status == CONFLICT else "FAILED"
@@ -1604,12 +1632,13 @@ def execute_business_operation(
             return _result_from_row(row)
         except Exception as exc:
             _diagnostic_result(definition.operation_name, status=FAILED, started=handler_started,
-                               error_code="HANDLER_FAILED", stage="handler")
+                               error_code="HANDLER_FAILED", stage="handler", freshness=freshness)
             safe_message = sanitize_audit_text(exc)
             row = _transition(execution_id, definition, actor, "FAILED", "business_operation.failed", FAILED,
                               error_code="HANDLER_FAILED", message=safe_message, completed=True)
             return _result_from_row(row)
-        _diagnostic_result(definition.operation_name, status=SUCCESS, started=handler_started, output=output)
+        _diagnostic_result(definition.operation_name, status=SUCCESS, started=handler_started, output=output,
+                           freshness=freshness)
         row = _transition(execution_id, definition, actor, "SUCCESS", "business_operation.success", SUCCESS,
                           data=output, completed=True, expected_statuses=("RUNNING",))
         return _result_from_row(row)

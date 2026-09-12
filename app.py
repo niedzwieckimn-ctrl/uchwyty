@@ -82,7 +82,9 @@ from internal_approval import (
     initialize_schema as initialize_internal_approval_schema,
 )
 from business_operations import (
+    ControlledOperationError,
     configure as configure_business_operations,
+    configure_freshness as configure_business_operations_freshness,
     execute_business_operation,
     initialize_schema as initialize_business_operations_schema,
 )
@@ -294,6 +296,7 @@ _startup_step("audit_configured")
 configure_internal_approval(conn)
 _startup_step("approval_configured")
 configure_business_operations(conn)
+configure_business_operations_freshness(lambda operation_name: ensure_business_operation_freshness(operation_name))
 configure_agent_conversation(conn)
 _startup_step("business_operations_configured")
 configure_external_execution(conn)
@@ -1949,6 +1952,127 @@ def sqlite_delete_missing_rows(table: str, conflict_col: str, remote_keys: list)
     c.commit()
     c.close()
     return deleted
+
+
+# Business reads deliberately use narrow source groups.  A marker records a
+# completed group snapshot, including the valid case where Supabase returned no
+# rows.  It prevents an empty SQLite database after a restart from looking like
+# an empty company.
+BUSINESS_FRESHNESS_TTL_SECONDS = float(os.environ.get("BUSINESS_FRESHNESS_TTL_SECONDS", "45"))
+BUSINESS_FRESHNESS_GROUPS = {
+    "inventory": [("products", "id"), ("stock", "product_id"), ("orders", "id"),
+                  ("order_items", "id"), ("invoice_allocations", "id"),
+                  ("china_packages", "id"), ("china_items", "id")],
+    "orders": [("customers", "id"), ("products", "id"), ("orders", "id"), ("order_items", "id")],
+    "customers": [("customers", "id"), ("orders", "id"), ("order_items", "id"),
+                  ("invoices", "id"), ("invoice_meta", "invoice_id")],
+    "invoices": [("orders", "id"), ("invoices", "id"), ("invoice_meta", "invoice_id"),
+                 ("cash_flow_settings", "key")],
+    "china": [("china_packages", "id"), ("china_items", "id")],
+    "sales": [("orders", "id"), ("order_items", "id"), ("invoices", "id"), ("invoice_meta", "invoice_id")],
+}
+BUSINESS_FRESHNESS_OPERATION_GROUP = {
+    "inventory.product.search": "inventory", "inventory.product.get": "inventory", "inventory.summary": "inventory",
+    "orders.search": "orders", "orders.get": "orders", "orders.summary": "orders",
+    "customers.search": "customers", "customers.get": "customers",
+    "invoices.search": "invoices", "invoices.get": "invoices", "invoices.overdue": "invoices",
+    "china.orders.summary": "china", "business.sales.summary": "sales",
+}
+_business_freshness_locks = {group: threading.Lock() for group in BUSINESS_FRESHNESS_GROUPS}
+
+
+def _business_freshness_marker(group: str) -> float | None:
+    c = conn()
+    try:
+        c.execute("CREATE TABLE IF NOT EXISTS local_sync_state(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at TEXT NOT NULL)")
+        row = c.execute("SELECT value FROM local_sync_state WHERE key=?", (f"business_freshness:{group}",)).fetchone()
+        c.commit()
+        try:
+            return float(row["value"]) if row else None
+        except (TypeError, ValueError):
+            return None
+    finally:
+        c.close()
+
+
+def _mark_business_freshness(group: str, completed_at: float) -> None:
+    c = conn()
+    try:
+        c.execute("CREATE TABLE IF NOT EXISTS local_sync_state(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at TEXT NOT NULL)")
+        c.execute("""INSERT INTO local_sync_state(key,value,updated_at) VALUES(?,?,?)
+                     ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at""",
+                  (f"business_freshness:{group}", str(completed_at), now_iso()))
+        c.commit()
+    finally:
+        c.close()
+
+
+def _business_snapshot_age(group: str, now_ts: float) -> float | None:
+    marker = _business_freshness_marker(group)
+    return max(0.0, now_ts - marker) if marker is not None else None
+
+
+def _pull_business_freshness_group(group: str) -> dict:
+    specs = BUSINESS_FRESHNESS_GROUPS[group]
+    fetched = {(table, conflict): supabase_select_rows(table, order_by=conflict) for table, conflict in specs}
+    # Reuse the established pull helpers and only alter tables in this group.
+    with _supabase_full_io_lock:
+        for table, conflict in specs:
+            sqlite_upsert_rows(table, fetched[(table, conflict)], conflict)
+        for table, conflict in reversed(specs):
+            keys = [row.get(conflict) for row in fetched[(table, conflict)] if row.get(conflict) is not None]
+            sqlite_delete_missing_rows(table, conflict, keys)
+    completed_at = time.time()
+    _mark_business_freshness(group, completed_at)
+    return {"rows": {table: len(fetched[(table, conflict)]) for table, conflict in specs}, "completed_at": completed_at}
+
+
+def ensure_business_operation_freshness(operation_name: str) -> dict:
+    """Synchronously establish a recent, group-scoped SQLite snapshot for one read."""
+    group = BUSINESS_FRESHNESS_OPERATION_GROUP.get(operation_name)
+    if not group:
+        return {}
+    started = time.perf_counter()
+    now_ts = time.time()
+    age = _business_snapshot_age(group, now_ts)
+    base = {"freshness_group": group, "freshness_check_ms": 0.0, "sync_ms": 0.0, "cache_hit": False}
+    if age is not None and age < BUSINESS_FRESHNESS_TTL_SECONDS:
+        base.update({"cache_hit": True, "snapshot_age_seconds": round(age, 2),
+                     "freshness_check_ms": round((time.perf_counter() - started) * 1000, 2)})
+        return base
+
+    # Local development/test SQLite is authoritative when Supabase is not
+    # configured.  A configured but unreachable Supabase remains a controlled
+    # failure unless a previously completed group snapshot exists.
+    if not supabase_enabled():
+        base.update({"cache_hit": True, "source": "local_only",
+                     "snapshot_age_seconds": round(age, 2) if age is not None else None,
+                     "freshness_check_ms": round((time.perf_counter() - started) * 1000, 2)})
+        return base
+
+    with _business_freshness_locks[group]:
+        now_ts = time.time()
+        age = _business_snapshot_age(group, now_ts)
+        if age is not None and age < BUSINESS_FRESHNESS_TTL_SECONDS:
+            base.update({"cache_hit": True, "snapshot_age_seconds": round(age, 2),
+                         "freshness_check_ms": round((time.perf_counter() - started) * 1000, 2)})
+            return base
+        sync_started = time.perf_counter()
+        try:
+            _pull_business_freshness_group(group)
+        except Exception as exc:
+            stale_age = _business_snapshot_age(group, time.time())
+            base.update({"sync_ms": round((time.perf_counter() - sync_started) * 1000, 2),
+                         "freshness_check_ms": round((time.perf_counter() - started) * 1000, 2),
+                         "snapshot_age_seconds": round(stale_age, 2) if stale_age is not None else None})
+            app.logger.warning("BUSINESS_OPERATION_FRESHNESS %s", json.dumps({"operation": operation_name, **base, "status": "stale" if stale_age is not None else "unavailable"}, sort_keys=True))
+            if stale_age is not None:
+                return base
+            raise ControlledOperationError("DATA_UNAVAILABLE", "Dane biznesowe nie są obecnie dostępne; brak bezpiecznego lokalnego snapshotu") from exc
+    base.update({"sync_ms": round((time.perf_counter() - sync_started) * 1000, 2),
+                 "freshness_check_ms": round((time.perf_counter() - started) * 1000, 2), "snapshot_age_seconds": 0.0})
+    app.logger.info("BUSINESS_OPERATION_FRESHNESS %s", json.dumps({"operation": operation_name, **base, "status": "synced"}, sort_keys=True))
+    return base
 
 
 def pull_shared_tables_from_supabase(force: bool = False, delete_missing: bool = True):
