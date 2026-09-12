@@ -6,8 +6,9 @@
   .ai-messages{flex:1;overflow-y:auto;padding:28px;display:flex;flex-direction:column;gap:16px;scroll-behavior:smooth}
   .ai-empty{margin:auto;max-width:720px;text-align:center;padding:28px}.ai-empty-icon{width:62px;height:62px;margin:0 auto 16px;border-radius:20px;display:grid;place-items:center;background:#eef3ff;color:var(--blue);font-size:28px}.ai-empty h2{font-size:22px;margin-bottom:7px}.ai-examples{display:flex;justify-content:center;flex-wrap:wrap;gap:9px;margin-top:22px}.ai-example{border:1px solid #dfe5f2;background:#fafbff;color:#40506d;border-radius:999px;padding:9px 14px;font:inherit;font-size:13px;cursor:pointer}.ai-example:hover{border-color:#aebdec;background:#f3f6ff}
   .ai-message{display:flex;gap:10px;max-width:min(780px,88%)}.ai-message.user{align-self:flex-end;flex-direction:row-reverse}.ai-avatar{width:34px;height:34px;flex:0 0 34px;border-radius:12px;display:grid;place-items:center;background:#edf2ff;color:var(--blue);font-weight:800;font-size:12px}.ai-message.user .ai-avatar{background:var(--navy);color:#fff}.ai-bubble{padding:12px 15px;border-radius:17px 17px 17px 5px;background:#f2f5fb;border:1px solid #e6eaf2;white-space:pre-wrap;overflow-wrap:anywhere}.ai-message.user .ai-bubble{border:0;border-radius:17px 17px 5px 17px;background:linear-gradient(135deg,var(--blue),var(--blue2));color:#fff}.ai-message.error .ai-bubble{background:#fff3f4;border-color:#ffd9de;color:#a92d41}.ai-loading .ai-bubble{color:var(--muted)}
+  .ai-artifacts{display:grid;gap:10px;margin-top:12px;white-space:normal}.ai-artifact{padding:13px;border:1px solid #dce3f0;border-radius:14px;background:#fff;color:var(--ink)}.ai-artifact h3{font-size:15px;margin:0 0 10px}.ai-artifact-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px 14px;font-size:12px}.ai-artifact-grid span{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.04em}.ai-artifact-items{margin-top:10px;display:grid;gap:5px}.ai-artifact-item{display:flex;justify-content:space-between;gap:12px;padding-top:5px;border-top:1px solid #edf0f5;font-size:12px}.ai-artifact-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:11px}.ai-product-image{display:block;max-width:100%;max-height:260px;margin:auto;border-radius:11px;object-fit:contain}.ai-document{display:flex;align-items:center;justify-content:space-between;gap:12px}.ai-document h3{margin:0}
   .ai-compose{padding:17px 20px;border-top:1px solid var(--line);background:#fff}.ai-form{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:end}.ai-input{min-height:48px;max-height:150px;resize:none}.ai-send{height:48px;min-width:112px}.ai-send:disabled,.ai-example:disabled{opacity:.55;cursor:not-allowed;transform:none}.ai-note{margin:8px 3px 0;color:var(--muted);font-size:11px}
-  @media(max-width:680px){.ai-card{height:calc(100vh - 125px);min-height:460px}.ai-messages{padding:18px 14px}.ai-message{max-width:95%}.ai-compose{padding:13px}.ai-form{grid-template-columns:1fr}.ai-send{width:100%}.ai-empty{padding:15px}}
+  @media(max-width:680px){.ai-card{height:calc(100vh - 125px);min-height:460px}.ai-messages{padding:18px 14px}.ai-message{max-width:95%}.ai-compose{padding:13px}.ai-form{grid-template-columns:1fr}.ai-send{width:100%}.ai-empty{padding:15px}.ai-artifact-grid{grid-template-columns:1fr}}
 </style>
 
 <div class="ai-page-head">
@@ -66,6 +67,73 @@
     return row;
   }
 
+  function safeInternalUrl(value) {
+    return typeof value === 'string' && value.startsWith('/') && !value.startsWith('//') && !value.includes('\\');
+  }
+
+  function renderArtifacts(row, artifacts) {
+    if (!row || !Array.isArray(artifacts) || !artifacts.length) return;
+    const allowed = new Set(['invoice_card', 'order_card', 'product_card', 'china_order_card', 'document_link', 'product_image']);
+    const labels = {
+      invoice_number:'Numer', buyer_name:'Klient', issue_date:'Data', due_date:'Termin płatności', currency:'Waluta',
+      total_net:'Netto', total_gross:'Brutto', payment_status:'Płatność', amount_outstanding:'Pozostało',
+      order_number:'Numer', customer_name:'Klient', created_at:'Data', status:'Status', item_count:'Pozycje', total_units:'Sztuki',
+      sku:'SKU', model:'Model', name:'Nazwa', stock:'Stan fizyczny', available:'Dostępne', reserved:'Zarezerwowane', incoming:'W drodze',
+      po_number:'P/O', supplier:'Dostawca', order_status:'Status zamówienia', delivery_stage:'Etap dostawy', tracking_eta:'ETA',
+      carrier:'Przewoźnik', tracking_number:'Tracking', shipping_method:'Wysyłka'
+    };
+    const titles = {invoice_card:'Faktura', order_card:'Zamówienie', product_card:'Produkt', china_order_card:'China P/O'};
+    const wrap = document.createElement('div');
+    wrap.className = 'ai-artifacts';
+    for (const artifact of artifacts.slice(0, 6)) {
+      if (!artifact || !allowed.has(artifact.type)) continue;
+      const card = document.createElement('section');
+      card.className = 'ai-artifact';
+      if (artifact.type === 'product_image') {
+        if (!safeInternalUrl(artifact.url)) continue;
+        const link = document.createElement('a'); link.href = artifact.url; link.target = '_blank'; link.rel = 'noopener';
+        const img = document.createElement('img'); img.className = 'ai-product-image'; img.src = artifact.url;
+        img.alt = typeof artifact.alt === 'string' ? artifact.alt : 'Produkt'; img.loading = 'lazy';
+        link.appendChild(img); card.appendChild(link); wrap.appendChild(card); continue;
+      }
+      if (artifact.type === 'document_link') {
+        if (!safeInternalUrl(artifact.url)) continue;
+        card.classList.add('ai-document');
+        const title = document.createElement('h3'); title.textContent = artifact.name || 'Dokument';
+        const link = document.createElement('a'); link.className = 'btn'; link.href = artifact.url;
+        link.target = '_blank'; link.rel = 'noopener'; link.textContent = artifact.document_type === 'invoice_pdf' ? 'Otwórz PDF' : 'Otwórz dokument';
+        card.append(title, link); wrap.appendChild(card); continue;
+      }
+      const title = document.createElement('h3'); title.textContent = titles[artifact.type] || 'Szczegóły'; card.appendChild(title);
+      const grid = document.createElement('div'); grid.className = 'ai-artifact-grid';
+      for (const [key, label] of Object.entries(labels)) {
+        const value = artifact[key];
+        if (value === null || value === undefined || value === '' || typeof value === 'object') continue;
+        const field = document.createElement('div'); const caption = document.createElement('span'); caption.textContent = label;
+        const content = document.createElement('b'); content.textContent = String(value); field.append(caption, content); grid.appendChild(field);
+      }
+      card.appendChild(grid);
+      if (Array.isArray(artifact.items) && artifact.items.length) {
+        const items = document.createElement('div'); items.className = 'ai-artifact-items';
+        for (const item of artifact.items.slice(0, 6)) {
+          const line = document.createElement('div'); line.className = 'ai-artifact-item';
+          const name = document.createElement('span'); name.textContent = item.sku || item.model || item.name || 'Pozycja';
+          const qty = document.createElement('b'); qty.textContent = item.qty != null ? `${item.qty} szt.` : item.quantity != null ? `${item.quantity} szt.` : '';
+          line.append(name, qty); items.appendChild(line);
+        }
+        card.appendChild(items);
+      }
+      if (safeInternalUrl(artifact.detail_url)) {
+        const actions = document.createElement('div'); actions.className = 'ai-artifact-actions';
+        const link = document.createElement('a'); link.className = 'btn'; link.href = artifact.detail_url;
+        link.textContent = artifact.type === 'order_card' ? 'Otwórz zamówienie' : artifact.type === 'china_order_card' ? 'Otwórz P/O' : 'Otwórz';
+        actions.appendChild(link); card.appendChild(actions);
+      }
+      wrap.appendChild(card);
+    }
+    if (wrap.childElementCount) row.querySelector('.ai-bubble').appendChild(wrap);
+  }
+
   function friendlyError(response, data) {
     if (response.status === 401) return 'Sesja wygasła. Zaloguj się ponownie.';
     if (response.status === 403 || data?.status === 'DENIED') return data?.message || 'Nie możesz wykonać tej operacji.';
@@ -97,7 +165,7 @@
       const data = await response.json().catch(() => ({}));
       if (typeof data.conversation_id === 'string') conversationId = data.conversation_id;
       loading.remove();
-      for (const approval of data.pending_approvals || []) {
+      for (const approval of data.approvals || data.pending_approvals || []) {
         const card = addMessage('assistant', `Zmiana wymaga zatwierdzenia\nZamówienie #${approval.order_id} → ${approval.target_status} (wersja ${approval.expected_version})`);
         const bubble = card.querySelector('.ai-bubble');
         for (const [action, label] of [['approve', 'Zatwierdź'], ['reject', 'Odrzuć']]) {
@@ -128,7 +196,8 @@
       if (!response.ok || data.status !== 'SUCCESS') {
         addMessage('assistant', friendlyError(response, data), 'error');
       } else {
-        addMessage('assistant', typeof data.message === 'string' ? data.message : 'Nie udało się odczytać odpowiedzi. Spróbuj ponownie.', '');
+        const answer = addMessage('assistant', typeof data.message === 'string' ? data.message : 'Nie udało się odczytać odpowiedzi. Spróbuj ponownie.', '');
+        renderArtifacts(answer, data.artifacts);
       }
     } catch (_error) {
       loading.remove();
