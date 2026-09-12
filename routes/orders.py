@@ -1147,31 +1147,20 @@ def register_routes(context):
         new_status = norm(request.form.get("status")).lower()
         # Status "shipped" można nadać wyłącznie osobnym formularzem,
         # który wymaga numeru przesyłki i wysyła powiadomienie do klienta.
-        allowed = {
-            "new", "confirmed", "packed", "packed_partial", "in_delivery",
-            "shipped", "partially_shipped", "issued", "completed", "cancelled",
-        }
+        from order_write import STATUSES, transition
+        allowed = STATUSES
         if new_status not in allowed:
             return "NieprawidĹ‚owy status", 400
 
         c = conn()
-        cur = c.cursor()
-        cur.execute("SELECT id, order_no, qr_data_url, status, created_at, warehouse_issued FROM orders WHERE id=?", (order_id,))
-        o = cur.fetchone()
-        if not o:
+        try:
+            changed = transition(c, order_id, new_status, make_qr=make_qr_data_url,
+                                 canonical_number=canonical_order_no)
+        except LookupError:
             c.close()
             abort(404)
-
-        qr_data_url = (o["qr_data_url"] or "").strip()
-        if new_status == "confirmed":
-            qr_data_url = make_qr_data_url(canonical_order_no(o["id"], o["created_at"], o["order_no"]))
-
-        warehouse_issued = int(o["warehouse_issued"] or 0)
-
-        cur.execute(
-            "UPDATE orders SET status=?, qr_data_url=?, warehouse_issued=? WHERE id=?",
-            (new_status, qr_data_url, warehouse_issued, order_id)
-        )
+        qr_data_url = changed['qr_data_url']
+        warehouse_issued = changed['warehouse_issued']
         c.commit()
         c.close()
 
