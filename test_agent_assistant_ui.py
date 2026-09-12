@@ -95,9 +95,11 @@ def test_ui_has_controlled_error_mapping(client):
     assert "Sesja wygasła. Zaloguj się ponownie." in html
 
 
-def test_assistant_ui_is_read_only(client):
+def test_assistant_ui_has_supervised_approval(client):
     login(client)
     html = client.get("/ai-assistant").get_data(as_text=True)
-    assert "trybie tylko do odczytu" in html
+    assert "Zmiana wymaga zatwierdzenia" in html
+    assert "Zatwierdź" in html and "Odrzuć" in html
+    assert "/api/internal/ai/approvals/" in html
     assert "mikrofon" not in html.lower()
     assert "getUserMedia" not in html

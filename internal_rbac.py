@@ -37,6 +37,7 @@ BOOTSTRAP_OWNER_DISPLAY_NAME = "Bootstrap Owner"
 
 
 PERMISSIONS = {
+    "orders.internal_note.add": "Dodawanie wewnętrznych notatek zamówienia",
     "agent.terminology.remember": "Zapis potwierdzonej terminologii firmy",
     "orders.read_full": "Pełny odczyt zamówień",
     "orders.fulfillment_read": "Ograniczony odczyt do realizacji",
@@ -253,7 +254,8 @@ ROLE_PERMISSION_DECISIONS = {
         },
         approval={"purchases.manage", "purchases.costs"},
     ),
-    "AI_OWNER_ASSISTANT": _decisions(allow={
+    "AI_OWNER_ASSISTANT": _decisions(approval={"orders.change_status"}, allow={
+        "orders.internal_note.add",
         "agent.terminology.remember",
         "orders.read_full", "orders.fulfillment_read", "orders.stock_audit",
         "inventory.read", "inventory.replenishment_read", "invoices.read",

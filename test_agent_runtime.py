@@ -290,7 +290,7 @@ def test_invented_or_write_tool_is_denied(name):
 def test_prompt_injection_cannot_expose_write_tool():
     ai = rbac.load_actor_context(rbac.AI_OWNER_ASSISTANT_ACTOR_ID)
     descriptors = runtime._tool_descriptors(ai)
-    assert all(operations.OPERATION_REGISTRY[item['name']].read_only or item['name']==runtime.MEMORY_WRITE for item in descriptors)
+    assert all(operations.OPERATION_REGISTRY[item['name']].read_only or item['name'] in operations.ORDER_WRITES | {runtime.MEMORY_WRITE} for item in descriptors)
     assert not any(item['name'].startswith('assistant.') for item in descriptors)
     assert all(item['strict'] is False for item in descriptors)
 

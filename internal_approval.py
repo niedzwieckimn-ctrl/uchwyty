@@ -91,6 +91,8 @@ _configuration_lock = threading.Lock()
 
 
 PILOT_POLICIES = (
+    ("policy-orders-note-add", "orders.internal_note.add", 1, "orders.internal_note.add", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
+    ("policy-orders-status-transition", "orders.status.transition", 1, "orders.change_status", YELLOW, 1, "approvals.decide", 3600, 0, None, 1),
     ("policy-agent-terminology-search", "agent.terminology.search", 1, "inventory.read", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
     ("policy-agent-terminology-remember", "agent.terminology.remember", 1, "agent.terminology.remember", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
     ("policy-inventory-product-search", "inventory.product.search", 1, "inventory.read", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
@@ -557,7 +559,13 @@ def authorize_execution(
     actor = _trusted_actor(requesting_actor_context)
     def deny(code: str, message: str, *, stale: bool = False):
         _deny(row, actor, code, message, stale=stale, transaction_connection=transaction_connection)
-    row = _expire_if_needed(_request_row(approval_id))
+    if transaction_connection is not None:
+        row = transaction_connection.execute(
+            'SELECT * FROM internal_approval_requests WHERE approval_id=?', (approval_id,)).fetchone()
+        if row is not None and _parse_time(row['expires_at']) <= _utc_now_dt():
+            deny('APPROVAL_EXPIRED', 'Approval wygasł')
+    else:
+        row = _expire_if_needed(_request_row(approval_id))
     if row is None:
         raise ApprovalDenied("APPROVAL_NOT_FOUND", "Nie znaleziono approval")
     if row["status"] != APPROVED:
@@ -641,17 +649,28 @@ def execute_pilot_change(
 ) -> Any:
     """Execute the isolated YELLOW pilot after the central gate succeeds."""
     from internal_concurrency import get_versioned_resource, update_versioned_resource
-    current = get_versioned_resource(resource_id)
-    if current is None:
-        raise KeyError(resource_id)
-    authorize_execution(
-        approval_id, actor_context, "internal.test.change_setting",
-        payload=payload, entity_type="internal_versioned_resource", entity_id=resource_id,
-        operation_version=1, expected_entity_version=expected_entity_version,
-        current_entity_version=current.version,
-    )
-    row = _request_row(approval_id)
-    return update_versioned_resource(
-        resource_id, expected_entity_version, payload,
-        actor_context=actor_context, correlation_id=row["correlation_id"],
-    )
+    db = _factory()()
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        current = get_versioned_resource(resource_id, transaction_connection=db)
+        if current is None:
+            raise KeyError(resource_id)
+        authorize_execution(
+            approval_id, actor_context, "internal.test.change_setting",
+            payload=payload, entity_type="internal_versioned_resource", entity_id=resource_id,
+            operation_version=1, expected_entity_version=expected_entity_version,
+            current_entity_version=current.version, transaction_connection=db,
+        )
+        row = db.execute('SELECT * FROM internal_approval_requests WHERE approval_id=?', (approval_id,)).fetchone()
+        result = update_versioned_resource(
+            resource_id, expected_entity_version, payload,
+            actor_context=actor_context, correlation_id=row['correlation_id'],
+            transaction_connection=db,
+        )
+        db.commit()
+        return result
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()

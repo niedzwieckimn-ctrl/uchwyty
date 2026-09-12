@@ -837,10 +837,49 @@ def api_external_execution_health():
 AGENT_MODEL_PROVIDER = None
 
 
+@app.post('/api/internal/ai/approvals/<approval_id>/<decision>')
+@require_permission('approvals.decide')
+def api_ai_approval_decide(approval_id, decision):
+    import business_operations
+    import internal_approval
+    from internal_rbac import load_actor_context
+    human = current_actor_context()
+    if human.actor_type != 'HUMAN' or decision not in {'approve', 'reject'}:
+        return jsonify(status='DENIED'), 403
+    snapshot = internal_approval.get_request_snapshot(approval_id)
+    if not snapshot or snapshot['operation'] != 'orders.status.transition':
+        return jsonify(status='DENIED'), 404
+    db = conn()
+    try:
+        execution = db.execute('SELECT * FROM internal_operation_executions WHERE approval_id=?', (approval_id,)).fetchone()
+        binding = db.execute('SELECT human_id FROM internal_order_write_actors WHERE execution_id=?',
+                             (execution['execution_id'],)).fetchone() if execution else None
+    finally:
+        db.close()
+    if not execution or not binding:
+        return jsonify(status='DENIED'), 403
+    if human.permission_decision('orders.change_status') != 'ALLOW':
+        return jsonify(status='DENIED'), 403
+    try:
+        if decision == 'reject':
+            internal_approval.reject_request(approval_id, human)
+            return jsonify(status='REJECTED')
+        if snapshot['status'] == 'PENDING':
+            internal_approval.approve_request(approval_id, human)
+        requester = load_actor_context(snapshot['requesting_actor_id'],
+            delegated_by_actor_id=binding['human_id'], source='approval_execution')
+        result = business_operations.execute_business_operation(requester, snapshot['operation'],
+            json.loads(snapshot['safe_payload']), idempotency_key=execution['idempotency_key'], approval_id=approval_id)
+        return jsonify(result.to_dict())
+    except internal_approval.ApprovalDenied as exc:
+        return jsonify(status='DENIED', error_code=exc.code), 409
+
+
+
 @app.post("/api/internal/ai/chat")
 @require_permission("inventory.read")
 def api_internal_ai_chat():
-    """Internal text-only, read-only AI runtime. Request identity fields are ignored."""
+    """Internal text-only AI runtime with supervised order writes. Request identity fields are ignored."""
     if not _rate_limit("internal_ai_chat", 30, 60):
         return jsonify(ok=False, status="DENIED", error_code="RATE_LIMITED",
                        message="Zbyt wiele żądań do asystenta."), 429
@@ -7452,6 +7491,12 @@ def _send_invoice_to_client(invoice_id: int) -> tuple[int, bool, str]:
 # =========================
 # RUN
 # =========================
+
+# Shared local status mutation; the legacy form retains its existing sync behavior.
+from business_operations import configure_order_status
+from order_write import transition as local_order_transition
+configure_order_status(lambda db, order_id, status: local_order_transition(
+    db, order_id, status, make_qr=make_qr_data_url, canonical_number=canonical_order_no))
 
 # Domain routes are registered after infrastructure and shared helpers exist.
 _startup_step("routes_import_begin")

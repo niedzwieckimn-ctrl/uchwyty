@@ -21,6 +21,8 @@ from decimal import Decimal
 from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
+from pathlib import Path
+import order_write
 import agent_conversation
 import internal_approval as approvals
 from cash_flow_module import cash_flow_overdue_invoices
@@ -388,6 +390,20 @@ EXTERNAL_TEST_OUTPUT = {
 }
 
 
+ORDER_WRITES = frozenset({'orders.internal_note.add', 'orders.status.transition'})
+_ORDER_WRITE_INPUT = {
+    'type': 'object', 'additionalProperties': False,
+    'required': ['order_id', 'expected_version', 'idempotency_key'],
+    'properties': {
+        'order_id': {'type': 'integer', 'minimum': 1},
+        'expected_version': {'type': 'integer', 'minimum': 0},
+        'idempotency_key': {'type': 'string', 'minLength': 1, 'maxLength': 200},
+    },
+}
+_ORDER_WRITE_OUTPUT = {'type': 'object', 'required': ['ok', 'order_id', 'version'],
+    'properties': {'ok': {'type': 'boolean'}, 'order_id': {'type': 'integer'},
+                   'version': {'type': 'integer'}, 'status': {'type': 'string'}, 'note_id': {'type': 'integer'}}}
+
 OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
     "agent.terminology.search": BusinessOperationDefinition(
         "agent.terminology.search", 1, "Odczytuje zapisane znaczenie terminu firmy i wersję. Query jest fragmentem nazwy terminu, nie zdaniem do interpretacji.",
@@ -506,6 +522,31 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
 }
 
 
+for _name, _permission, _risk, _field, _rule in (
+    ('orders.internal_note.add', 'orders.internal_note.add', approvals.GREEN, 'note',
+     {'type': 'string', 'minLength': 1, 'maxLength': 2000}),
+    ('orders.status.transition', 'orders.change_status', approvals.YELLOW, 'target_status',
+     {'type': 'string', 'enum': sorted(order_write.STATUSES)}),
+):
+    _schema = json.loads(json.dumps(_ORDER_WRITE_INPUT))
+    _schema['required'].append(_field)
+    _schema['properties'][_field] = _rule
+    OPERATION_REGISTRY[_name] = BusinessOperationDefinition(
+        _name, 1,
+        ('Adds a private internal order note. ' if _risk == approvals.GREEN else
+         'Requests a human-approved order status change; never executes before approval. ') +
+        'Use expected_version=0 initially; a CONFLICT reports the current version. Review conflicts before retrying with a fresh idempotency_key. Reuse the same key and arguments for network retries.',
+        _permission, _risk, 'NONE' if _risk == approvals.GREEN else 'REQUIRED',
+        frozenset({'HUMAN', 'AI_AGENT'}), _schema, _ORDER_WRITE_OUTPUT,
+        IDEMPOTENCY_REQUIRED, 'WRITE', False,
+    )
+_order_status_handler = None
+
+def configure_order_status(handler):
+    global _order_status_handler
+    _order_status_handler = handler
+
+
 _connection_factory: Callable[[], sqlite3.Connection] | None = None
 _configuration_lock = threading.Lock()
 
@@ -529,6 +570,7 @@ def _now() -> str:
 
 
 def initialize_schema(db: sqlite3.Connection) -> None:
+    db.executescript((Path(__file__).parent / 'migrations' / 'first_supervised_write.sql').read_text(encoding='utf-8'))
     db.executescript(
         """
         CREATE TABLE IF NOT EXISTS internal_operation_executions(
@@ -644,13 +686,17 @@ def validate_output(definition: BusinessOperationDefinition, supplied: Any) -> d
 def _fingerprint(definition: BusinessOperationDefinition, actor: ActorContext, data: Mapping[str, Any]) -> str:
     canonical = json.dumps(
         {"operation": definition.operation_name, "version": definition.operation_version,
-         "actor_id": actor.actor_id, "input": sanitize_audit_data(dict(data))},
+         "actor_id": actor.actor_id,
+         "input": ({'payload': dict(data), 'initiated_by': actor.delegated_by_actor_id}
+                   if definition.operation_name in ORDER_WRITES else sanitize_audit_data(dict(data)))},
         ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _entity(definition: BusinessOperationDefinition, data: Mapping[str, Any]) -> tuple[str, str, int | None]:
+    if definition.operation_name in ORDER_WRITES:
+        return 'order', str(data['order_id']), data['expected_version']
     if definition.operation_name == "agent.terminology.search":
         return "agent_terminology_search", data["query"], None
     if definition.operation_name == "agent.terminology.remember":
@@ -1486,6 +1532,58 @@ def _sales_summary(data, actor, correlation_id, transaction_connection=None):
         if transaction_connection is None: db.close()
 
 
+def _order_version(db, order_id):
+    row = db.execute('SELECT version FROM internal_order_versions WHERE order_id=?', (order_id,)).fetchone()
+    return int(row['version']) if row else 0
+
+
+def _validate_order_write(db, data, actor, definition):
+    trusted = _trusted_actor(actor)
+    if trusted.permission_decision(definition.required_permission) == PERMISSION_DENY:
+        raise ControlledOperationError('PERMISSION_DENIED', 'Permission został odebrany', status=DENIED)
+    if actor.delegated_by_actor_id:
+        human = load_actor_context(actor.delegated_by_actor_id)
+        if human is None or human.permission_decision(definition.required_permission) != 'ALLOW':
+            raise ControlledOperationError('PERMISSION_DENIED', 'Inicjator utracił permission', status=DENIED)
+    if db.execute('SELECT id FROM orders WHERE id=?', (data['order_id'],)).fetchone() is None:
+        raise ControlledOperationError('ORDER_NOT_FOUND', 'Nie znaleziono zamówienia', status=CONFLICT)
+    version = _order_version(db, data['order_id'])
+    if version != data['expected_version']:
+        raise ControlledOperationError('ENTITY_VERSION_CONFLICT',
+            f'Wersja zamówienia zmieniła się. Aktualna expected_version={version}.', status=CONFLICT)
+    if 'note' in data and not data['note'].strip():
+        raise ControlledOperationError('INVALID_NOTE', 'Notatka nie może być pusta', status=DENIED)
+    return version
+
+
+def _order_note_add(data, actor, correlation_id, transaction_connection=None):
+    db = transaction_connection
+    cursor = db.execute('INSERT INTO internal_order_notes(order_id,note,actor_id,created_at) VALUES(?,?,?,?)',
+        (data['order_id'], data['note'], actor.actor_id, _now()))
+    record_audit_event('orders.internal_note.add', result=SUCCESS, actor_context=actor,
+        entity_type='order', entity_id=str(data['order_id']), correlation_id=correlation_id,
+        expected_version=data['expected_version'], entity_version_before=data['expected_version'],
+        entity_version_after=_order_version(db, data['order_id']),
+        after_state={'note_id': cursor.lastrowid}, transaction_connection=db)
+    return {'ok': True, 'order_id': data['order_id'], 'note_id': cursor.lastrowid,
+            'version': _order_version(db, data['order_id'])}
+
+
+def _order_transition(data, actor, correlation_id, transaction_connection=None):
+    if _order_status_handler is None:
+        raise ControlledOperationError('HANDLER_NOT_CONFIGURED', 'Brak helpera statusu')
+    before = transaction_connection.execute('SELECT status FROM orders WHERE id=?', (data['order_id'],)).fetchone()['status']
+    _order_status_handler(transaction_connection, data['order_id'], data['target_status'])
+    record_audit_event('orders.status.transition', result=SUCCESS, actor_context=actor,
+        entity_type='order', entity_id=str(data['order_id']), correlation_id=correlation_id,
+        expected_version=data['expected_version'], entity_version_before=data['expected_version'],
+        entity_version_after=_order_version(transaction_connection, data['order_id']),
+        before_state={'status': before}, after_state={'status': data['target_status']},
+        transaction_connection=transaction_connection)
+    return {'ok': True, 'order_id': data['order_id'], 'status': data['target_status'],
+            'version': _order_version(transaction_connection, data['order_id'])}
+
+
 def _pilot_change(data, actor, correlation_id, transaction_connection=None):
     if transaction_connection is None:
         raise ControlledOperationError("TRANSACTION_REQUIRED", "Pilot wymaga wspólnej transakcji")
@@ -1518,6 +1616,8 @@ def _pilot_change(data, actor, correlation_id, transaction_connection=None):
 
 
 _HANDLERS: dict[str, Callable[[Mapping[str, Any], ActorContext, str, sqlite3.Connection | None], Any]] = {
+    "orders.internal_note.add": _order_note_add,
+    "orders.status.transition": _order_transition,
     "agent.terminology.search": agent_conversation.search_terminology,
     "agent.terminology.remember": agent_conversation.remember_terminology,
     "inventory.product.search": _product_search,
@@ -1549,18 +1649,28 @@ def _execute_local_approved(
     db = _factory()()
     try:
         db.execute("BEGIN IMMEDIATE")
-        current = db.execute(
-            "SELECT version FROM internal_versioned_resources WHERE resource_id=?", (entity_id,)
-        ).fetchone()
-        current_version = int(current["version"]) if current else None
-        approvals.authorize_execution(
-            stored_approval, actor, definition.operation_name, payload=data,
-            entity_type=entity_type, entity_id=entity_id,
-            operation_version=definition.operation_version,
-            expected_entity_version=expected_version,
-            current_entity_version=current_version,
-            transaction_connection=db,
-        )
+        if definition.operation_name in ORDER_WRITES:
+            binding = db.execute('SELECT human_id FROM internal_order_write_actors WHERE execution_id=?',
+                                 (execution_id,)).fetchone()
+            if binding:
+                human = load_actor_context(binding['human_id'])
+                if human is None or human.permission_decision(definition.required_permission) != 'ALLOW':
+                    raise ControlledOperationError('PERMISSION_DENIED', 'Inicjator utracił permission', status=DENIED)
+            current_version = _validate_order_write(db, data, actor, definition)
+        else:
+            current = db.execute(
+                "SELECT version FROM internal_versioned_resources WHERE resource_id=?", (entity_id,)
+            ).fetchone()
+            current_version = int(current["version"]) if current else None
+        if stored_approval:
+            approvals.authorize_execution(
+                stored_approval, actor, definition.operation_name, payload=data,
+                entity_type=entity_type, entity_id=entity_id,
+                operation_version=definition.operation_version,
+                expected_entity_version=expected_version,
+                current_entity_version=current_version,
+                transaction_connection=db,
+            )
         output = validate_output(
             definition,
             _HANDLERS[definition.operation_name](data, actor, correlation_id, db),
@@ -1590,9 +1700,9 @@ def _execute_local_approved(
         return _result_from_row(row)
     except ControlledOperationError as exc:
         db.rollback()
-        terminal = "CONFLICT" if exc.status == CONFLICT else "FAILED"
-        event = "business_operation.conflict" if exc.status == CONFLICT else "business_operation.failed"
-        result = CONFLICT if exc.status == CONFLICT else FAILED
+        terminal = exc.status if exc.status in TERMINAL_STATUSES else FAILED
+        event = 'business_operation.' + terminal.lower()
+        result = terminal
         row = _transition(execution_id, definition, actor, terminal, event, result,
                           error_code=exc.error_code, message=exc.safe_message, completed=True)
         return _result_from_row(row)
@@ -1669,6 +1779,10 @@ def execute_business_operation(
         if definition.operation_name not in _HANDLERS:
             raise ControlledOperationError("HANDLER_NOT_FOUND", "Brak bezpiecznego handlera", status=DENIED)
         data = validate_input(definition, input_data)
+        if definition.operation_name in ORDER_WRITES:
+            if idempotency_key and idempotency_key != data['idempotency_key']:
+                raise ControlledOperationError('IDEMPOTENCY_CONFLICT', 'Niezgodny klucz idempotency', status=CONFLICT)
+            idempotency_key = data['idempotency_key']
         if actor.actor_type not in definition.actor_types_allowed:
             raise ControlledOperationError("ACTOR_TYPE_DENIED", "Ten typ aktora nie może wykonać operacji", status=DENIED)
         policy = approvals.get_policy(definition.operation_name, definition.operation_version)
@@ -1691,8 +1805,25 @@ def execute_business_operation(
         else:
             row = _create_execution(definition, actor, fingerprint, entity_type, entity_id, expected_version, effective_key, correlation)
         execution_id = row["execution_id"]
+        if definition.operation_name in ORDER_WRITES and row['input_fingerprint'] != fingerprint:
+            return _safe_denial(definition.operation_name, definition.operation_version, execution_id,
+                actor, row['correlation_id'], 'IDEMPOTENCY_CONFLICT',
+                'Idempotency key został użyty dla innego inputu', status=CONFLICT)
         if row["status"] in TERMINAL_STATUSES:
             return _result_from_row(row)
+        if definition.operation_name in ORDER_WRITES and row['status'] == 'CREATED':
+            db = _factory()()
+            try:
+                _validate_order_write(db, data, actor, definition)
+            except ControlledOperationError as exc:
+                terminal = exc.status if exc.status in TERMINAL_STATUSES else FAILED
+                row = _transition(execution_id, definition, actor, terminal,
+                    'business_operation.' + terminal.lower(), terminal,
+                    error_code=exc.error_code, message=exc.safe_message, completed=True,
+                    expected_statuses=('CREATED',))
+                return _result_from_row(row or _execution(execution_id))
+            finally:
+                db.close()
         evaluation = approvals.evaluate_operation(actor, definition.operation_name, operation_version=definition.operation_version)
         if not evaluation.allowed:
             row = _transition(execution_id, definition, actor, "DENIED", "business_operation.denied", DENIED,
@@ -1708,12 +1839,20 @@ def execute_business_operation(
                     expected_entity_version=expected_version,
                     correlation_id=row["correlation_id"], reason="Business Operation wymaga zgody",
                 )
+                if definition.operation_name in ORDER_WRITES:
+                    db = _factory()()
+                    try:
+                        db.execute('INSERT OR IGNORE INTO internal_order_write_actors(execution_id,human_id) VALUES(?,?)',
+                                   (execution_id, actor.delegated_by_actor_id or actor.actor_id))
+                        db.commit()
+                    finally:
+                        db.close()
                 row = _transition(
                     execution_id, definition, actor, "PENDING_APPROVAL",
                     "business_operation.pending_approval", PENDING_APPROVAL,
                     approval_id=created_approval, expected_statuses=("CREATED",),
                 )
-                return _result_from_row(row)
+                return _result_from_row(row or _execution(execution_id))
             if approval_id and approval_id != stored_approval:
                 return _safe_denial(definition.operation_name, definition.operation_version, execution_id, actor, row["correlation_id"], "APPROVAL_MISMATCH", "Approval nie należy do execution")
             snapshot = approvals.get_request_snapshot(stored_approval)
@@ -1734,7 +1873,7 @@ def execute_business_operation(
             if claimed is None:
                 current = _execution(execution_id)
                 return _result_from_row(current, status=NOOP if current["status"] == "RUNNING" else None)
-            if definition.operation_name != "internal.test.change_setting":
+            if definition.operation_name not in ORDER_WRITES | {"internal.test.change_setting"}:
                 row = _transition(
                     execution_id, definition, actor, "DENIED", "business_operation.denied", DENIED,
                     error_code="EXECUTION_MODE_NOT_IMPLEMENTED",
@@ -1750,6 +1889,9 @@ def execute_business_operation(
                                   started=True, expected_statuses=("CREATED",))
             if claimed is None:
                 return _result_from_row(_execution(execution_id), status=NOOP)
+        if definition.operation_name in ORDER_WRITES:
+            return _execute_local_approved(execution_id, definition, actor, data, '',
+                entity_type, entity_id, expected_version, row['correlation_id'])
         handler_started = time.perf_counter()
         freshness: Mapping[str, Any] = {}
         logger.info("BUSINESS_OPERATION_INPUT %s", json.dumps({

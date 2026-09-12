@@ -67,6 +67,8 @@ class OperationDefinition:
 
 # This backend catalogue is the only source of operation version and risk.
 OPERATION_DEFINITIONS: dict[str, OperationDefinition] = {
+    'orders.internal_note.add': OperationDefinition('orders.internal_note.add', 1, 'orders.internal_note.add', GREEN, WRITE),
+    'orders.status.transition': OperationDefinition('orders.status.transition', 1, 'orders.change_status', YELLOW, WRITE),
     "security.login": OperationDefinition("security.login", 1, None, GREEN, SECURITY),
     "security.permission.denied": OperationDefinition(
         "security.permission.denied", 1, None, YELLOW, SECURITY

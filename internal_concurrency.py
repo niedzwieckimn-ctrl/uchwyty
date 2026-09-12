@@ -84,15 +84,16 @@ def _decode(row) -> VersionedResource:
     )
 
 
-def get_versioned_resource(resource_id: str) -> VersionedResource | None:
-    db = _factory()()
+def get_versioned_resource(resource_id: str, *, transaction_connection=None) -> VersionedResource | None:
+    db = transaction_connection or _factory()()
     try:
         row = db.execute(
             "SELECT * FROM internal_versioned_resources WHERE resource_id=?", (resource_id,)
         ).fetchone()
         return _decode(row) if row else None
     finally:
-        db.close()
+        if transaction_connection is None:
+            db.close()
 
 
 def create_versioned_resource(
@@ -138,15 +139,17 @@ def update_versioned_resource(
     *,
     actor_context=None,
     correlation_id: str = "",
+    transaction_connection=None,
 ) -> VersionedResource:
     """Atomically update only when the caller still owns the current version."""
-    db = _factory()()
+    db = transaction_connection or _factory()()
     previous = None
     current_version = None
     new_version = expected_version + 1
     normalized_payload = dict(payload)
     try:
-        db.execute("BEGIN IMMEDIATE")
+        if transaction_connection is None:
+            db.execute("BEGIN IMMEDIATE")
         row = db.execute(
             "SELECT * FROM internal_versioned_resources WHERE resource_id=?", (resource_id,)
         ).fetchone()
@@ -179,9 +182,11 @@ def update_versioned_resource(
                 ).fetchone()
                 current_version = int(current[0]) if current else None
             else:
-                db.commit()
+                if transaction_connection is None:
+                    db.commit()
     finally:
-        db.close()
+        if transaction_connection is None:
+            db.close()
 
     if current_version != expected_version:
         record_audit_event(
@@ -202,7 +207,7 @@ def update_versioned_resource(
         )
         raise OptimisticConcurrencyConflict(resource_id, expected_version, current_version)
 
-    resource = get_versioned_resource(resource_id)
+    resource = get_versioned_resource(resource_id, transaction_connection=transaction_connection)
     record_audit_event(
         "internal.versioned_resource.update",
         result=SUCCESS,
@@ -214,5 +219,6 @@ def update_versioned_resource(
         after_state=normalized_payload,
         entity_version_before=expected_version,
         entity_version_after=new_version,
+        transaction_connection=transaction_connection,
     )
     return resource
