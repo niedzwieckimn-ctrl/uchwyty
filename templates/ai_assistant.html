@@ -108,10 +108,14 @@
             buttons.forEach(b => b.disabled = true);
             try {
               const response = await fetch(`/api/internal/ai/approvals/${encodeURIComponent(approval.approval_id)}/${action}`, {
-                method: 'POST', credentials: 'same-origin', headers: {'Content-Type': 'application/json'}, body: '{}'
+                method: 'POST', credentials: 'same-origin', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({conversation_id: conversationId})
               });
               const result = await response.json();
-              addMessage('assistant', `Wynik decyzji: ${result.status}`);
+              if (typeof result.conversation_id === 'string') conversationId = result.conversation_id;
+              addMessage('assistant', typeof result.message === 'string'
+                ? result.message
+                : JSON.stringify(result.execution_outcome || {status: result.status}));
               if (!response.ok || result.status === 'NOOP') buttons.forEach(b => b.disabled = false);
             } catch (_) {
               addMessage('assistant', 'Nie udało się odczytać wyniku. Możesz ponowić decyzję.');
