@@ -238,7 +238,7 @@ def _validate_numeric_claims(value: Any) -> list[dict[str, str]]:
         kind = item.get("kind")
         raw_value = item.get("value")
         currency = item.get("currency", "")
-        if kind not in _BUSINESS_NUMERIC_KINDS or isinstance(raw_value, bool) or not isinstance(raw_value, (str, int, float)):
+        if kind not in _BUSINESS_NUMERIC_KINDS or not isinstance(raw_value, str) or not 1 <= len(raw_value) <= 64:
             raise RuntimeError("INVALID_ORCHESTRATION_ARGUMENTS")
         normalized = _canonical_number(raw_value)
         if normalized is None:
@@ -471,11 +471,11 @@ def _tool_descriptors(ai_actor: ActorContext) -> list[dict[str, Any]]:
                             "message": {"type": "string", "minLength": 1, "maxLength": 2000},
                             "numeric_claims": {"type": "array", "maxItems": 100, "items": {
                                 "type": "object", "additionalProperties": False,
-                                "required": ["kind", "value"],
+                                "required": ["kind", "value", "currency"],
                                 "properties": {
                                     "kind": {"type": "string", "enum": sorted(_BUSINESS_NUMERIC_KINDS)},
-                                    "value": {"type": ["string", "number", "integer"]},
-                                    "currency": {"type": "string", "maxLength": 8},
+                                    "value": {"type": "string", "minLength": 1, "maxLength": 64},
+                                    "currency": {"type": ["string", "null"], "maxLength": 8},
                                 },
                             }},
                         }},
