@@ -989,7 +989,7 @@ def register_routes(context):
 
         c = conn()
         cur = c.cursor()
-        cur.execute("SELECT status, warehouse_issued FROM orders WHERE id=?", (order_id,))
+        cur.execute("SELECT status, warehouse_issued,price_list,currency FROM orders WHERE id=?", (order_id,))
         o = cur.fetchone()
         if not o:
             c.close()
@@ -998,32 +998,58 @@ def register_routes(context):
             c.close()
             return "ZamĂłwienie wydane z magazynu jest tylko do podglÄ…du", 400
 
-        cur.execute("SELECT sku FROM products WHERE id=? AND COALESCE(archived,0)=0", (product_id,))
+        cur.execute("SELECT sku,model FROM products WHERE id=? AND COALESCE(archived,0)=0", (product_id,))
         p = cur.fetchone()
         if not p:
             c.close()
             return "Brak produktu", 404
 
-        if supabase_enabled():
-            created_item = supabase_insert_row("order_items", {
+        price_list = normalize_client_price_list(o["price_list"])
+        currency = normalize_order_currency(o["currency"] or price_list_currency(price_list))
+        if price_list == "eu_eur":
+            price = cur.execute("SELECT price_eur,uvp_eur FROM pricing_eur WHERE LOWER(TRIM(sku))=LOWER(TRIM(?))", (p["sku"],)).fetchone()
+            unit_net = money_float(price["price_eur"]) if price else 0
+            unit_gross = unit_net
+            unit_retail = money_float(price["uvp_eur"]) if price else 0
+        else:
+            price = cur.execute("SELECT net_price,gross_price FROM pricing WHERE LOWER(TRIM(model)) IN (LOWER(TRIM(?)),LOWER(TRIM(?))) ORDER BY CASE WHEN LOWER(TRIM(model))=LOWER(TRIM(?)) THEN 0 ELSE 1 END LIMIT 1", (p["model"], p["sku"], p["model"])).fetchone()
+            unit_net = money_float(price["net_price"]) if price else 0
+            unit_gross = money_float(price["gross_price"]) if price else 0
+            unit_retail = unit_gross
+        if unit_net <= 0:
+            existing_price = cur.execute("""SELECT unit_net_price,unit_gross_price,unit_retail_price,currency
+                FROM order_items WHERE order_id=? AND product_id=? AND unit_net_price IS NOT NULL
+                ORDER BY id DESC LIMIT 1""", (order_id, product_id)).fetchone()
+            if existing_price:
+                unit_net = money_float(existing_price["unit_net_price"])
+                unit_gross = money_float(existing_price["unit_gross_price"] if existing_price["unit_gross_price"] is not None else unit_net)
+                unit_retail = money_float(existing_price["unit_retail_price"] if existing_price["unit_retail_price"] is not None else unit_gross)
+                currency = normalize_order_currency(existing_price["currency"] or currency)
+        item_payload = {
                 "order_id": order_id,
                 "product_id": product_id,
                 "sku": p["sku"],
                 "qty": qty,
+                "unit_net_price": unit_net,
+                "unit_gross_price": unit_gross,
+                "unit_retail_price": unit_retail,
+                "currency": currency,
                 "created_at": now_iso(),
-            })
+            }
+        if supabase_enabled():
+            created_item = supabase_insert_row("order_items", item_payload)
             if not created_item or "id" not in created_item:
                 c.close()
                 return "Nie udaĹ‚o siÄ™ dodaÄ‡ pozycji do Supabase", 500
             cur.execute(
-                "INSERT INTO order_items(id, order_id, product_id, sku, qty, created_at) VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET order_id=excluded.order_id, product_id=excluded.product_id, sku=excluded.sku, qty=excluded.qty, created_at=excluded.created_at",
-                (int(created_item["id"]), order_id, product_id, p["sku"], qty, created_item.get("created_at") or now_iso())
+                "INSERT INTO order_items(id,order_id,product_id,sku,qty,unit_net_price,unit_gross_price,unit_retail_price,currency,created_at) VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET order_id=excluded.order_id,product_id=excluded.product_id,sku=excluded.sku,qty=excluded.qty,unit_net_price=excluded.unit_net_price,unit_gross_price=excluded.unit_gross_price,unit_retail_price=excluded.unit_retail_price,currency=excluded.currency,created_at=excluded.created_at",
+                (int(created_item["id"]), order_id, product_id, p["sku"], qty, unit_net, unit_gross, unit_retail, currency, created_item.get("created_at") or now_iso())
             )
         else:
             cur.execute("""
-              INSERT INTO order_items(order_id, product_id, sku, qty, created_at)
-              VALUES(?,?,?,?,?)
-            """, (order_id, product_id, p["sku"], qty, now_iso()))
+              INSERT INTO order_items(order_id,product_id,sku,qty,unit_net_price,unit_gross_price,unit_retail_price,currency,created_at)
+              VALUES(?,?,?,?,?,?,?,?,?)
+            """, (order_id, product_id, p["sku"], qty, unit_net, unit_gross, unit_retail, currency, now_iso()))
         c.commit()
         c.close()
         return redirect(url_for("order_view", order_id=order_id))
