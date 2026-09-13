@@ -343,6 +343,10 @@ def register_routes(context):
                     batch_id = save_packing_selection(order_id, invoice_items)
                     session["latest_packing_selection"] = load_open_packing_selection(order_id)
                     return redirect(url_for("order_invoice", order_id=order_id, from_packing="1"))
+            # Allocate only on an actual valid issue request, not on GET.
+            if invoice_items and not msg:
+                import invoice_numbering, sys
+                data['invoice_no'] = invoice_numbering.reserve(sys.modules.get('app') or sys.modules['__main__'], data['issue_date'], data['invoice_no'])
             existing_invoice_id = invoice_no_exists(data["invoice_no"])
             if existing_invoice_id:
                 msg = f"Faktura o takim numerze już istnieje! Numer: {data['invoice_no']}. Wybierz inny numer faktury."
