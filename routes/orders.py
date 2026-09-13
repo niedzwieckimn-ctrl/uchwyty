@@ -644,69 +644,36 @@ def register_routes(context):
             it["line_shortage"] = 0
 
         if norm(o["status"]).lower() in CURRENT_ORDER_STATUSES:
-            status_ph = ",".join(["?"] * len(CURRENT_ORDER_STATUSES))
-            cur.execute(f"SELECT id FROM orders WHERE LOWER(COALESCE(status,'')) IN ({status_ph}) AND id<=? ORDER BY id", (*sorted(CURRENT_ORDER_STATUSES), order_id))
-            scoped_order_ids = [int(r["id"]) for r in cur.fetchall()]
-            if scoped_order_ids:
-                sph = ",".join(["?"] * len(scoped_order_ids))
-                cur.execute(f"""
-                  SELECT oi.id, oi.order_id, oi.product_id, oi.qty
-                  FROM order_items oi
-                  WHERE oi.order_id IN ({sph})
-                  ORDER BY oi.order_id, oi.id
-                """, tuple(scoped_order_ids))
-                seq_items = cur.fetchall()
+            availability = {
+                int(row["id"]): row
+                for row in build_replenishment_analysis(
+                    conn, today=app_now().date(), horizon_days=60
+                )
+            }
+            pool_available = {
+                product_id: int(row.get("available_qty") or 0)
+                for product_id, row in availability.items()
+            }
+            pool_delivery = {
+                product_id: int(row.get("available_incoming") or 0)
+                for product_id, row in availability.items()
+            }
+            for it in items:
+                product_id = int(it["product_id"])
+                need = int(it["qty"])
+                available_now = pool_available.get(product_id, 0)
+                from_stock = min(available_now, need)
+                pool_available[product_id] = available_now - from_stock
+                need_after_stock = need - from_stock
 
-                product_ids = {int(r["product_id"]) for r in seq_items}
-                pool_stock = {}
-                pool_delivery = {}
-                if product_ids:
-                    pph = ",".join(["?"] * len(product_ids))
-                    cur.execute(f"""
-                      SELECT p.id AS product_id,
-                             COALESCE(s.qty,0) AS stock_qty,
-                             COALESCE((
-                               SELECT SUM(ci.qty)
-                               FROM china_items ci
-                               JOIN china_packages cp ON cp.id=ci.package_id
-                               WHERE ci.product_id=p.id
-                                 AND cp.status IN ('ordered', 'shipped', 'problem')
-                             ),0) AS in_delivery_qty
-                      FROM products p
-                      LEFT JOIN stock s ON s.product_id=p.id
-                      WHERE p.id IN ({pph})
-                    """, tuple(product_ids))
-                    for pr in cur.fetchall():
-                        pid = int(pr["product_id"])
-                        pool_stock[pid] = int(pr["stock_qty"])
-                        pool_delivery[pid] = int(pr["in_delivery_qty"])
-
-                item_alloc = {}
-                for sr in seq_items:
-                    pid = int(sr["product_id"])
-                    need = int(sr["qty"])
-
-                    stock_now = pool_stock.get(pid, 0)
-                    from_stock = min(stock_now, need)
-                    pool_stock[pid] = stock_now - from_stock
-                    need_after_stock = need - from_stock
-
-                    delivery_now = pool_delivery.get(pid, 0)
-                    from_delivery = min(delivery_now, need_after_stock)
-                    pool_delivery[pid] = delivery_now - from_delivery
-                    shortage = need_after_stock - from_delivery
-
-                    if int(sr["order_id"]) == order_id:
-                        item_alloc[int(sr["id"])] = {
-                            "in_delivery_available": from_delivery,
-                            "delivery_used": from_delivery,
-                            "line_shortage": shortage,
-                        }
-
-                for it in items:
-                    al = item_alloc.get(int(it["id"]))
-                    if al:
-                        it.update(al)
+                delivery_now = pool_delivery.get(product_id, 0)
+                from_delivery = min(delivery_now, need_after_stock)
+                pool_delivery[product_id] = delivery_now - from_delivery
+                it.update({
+                    "in_delivery_available": from_delivery,
+                    "delivery_used": from_delivery,
+                    "line_shortage": need_after_stock - from_delivery,
+                })
 
         cur.execute("SELECT id, sku, model, name FROM products WHERE COALESCE(archived,0)=0 ORDER BY sku LIMIT 5000")
         products_rows = cur.fetchall()
