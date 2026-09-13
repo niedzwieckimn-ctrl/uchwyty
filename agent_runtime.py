@@ -320,6 +320,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
     resolved_entities = {}
     ambiguous_entities = set()
     historical_entity_types = set()
+    previous_turn_entities = {}
 
     def _finish(status, answer, code=''):
         nonlocal active
@@ -421,12 +422,26 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         agent_conversation.begin_turn(human_actor,ai_actor,conversation_id,run_id,turn_message)
         active = True
         history = agent_conversation.history_for_model(human_actor,ai_actor,conversation_id,run_id)
-        for item in history:
+        last_history_user = max(
+            (index for index, item in enumerate(history) if item.get('role') == 'user'),
+            default=-1,
+        )
+        previous_turn_entity_ids = {}
+        for index, item in enumerate(history):
             if item.get('type') == 'function_call_output' and str(item.get('call_id') or '').startswith('trusted-artifacts-'):
                 try:
-                    historical_entity_types.update(source.get('entity_type') for source in json.loads(item.get('output') or '[]'))
+                    sources = json.loads(item.get('output') or '[]')
+                    historical_entity_types.update(source.get('entity_type') for source in sources)
+                    if index > last_history_user:
+                        for source in sources:
+                            previous_turn_entity_ids.setdefault(source.get('entity_type'), set()).add(source.get('entity_id'))
                 except (TypeError, ValueError, json.JSONDecodeError):
                     pass
+        previous_turn_entities.update({
+            entity_type: next(iter(entity_ids))
+            for entity_type, entity_ids in previous_turn_entity_ids.items()
+            if len(entity_ids) == 1 and None not in entity_ids
+        })
         import human_approval
         eligible_approvals = human_approval.pending(business_operations, conversation_id, human_actor) if message.strip() and execution_outcome is None else []
         memory = agent_conversation.memory_for_model(human_actor,ai_actor)
@@ -528,9 +543,16 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 if current is None or current.permission_decision(definition.required_permission)==DENY:
                     return finish('DENIED','Brak uprawnień do operacji.','PERMISSION_DENIED')
                 if not definition.read_only and call.name != 'approval.decide':
+                    continued_order_scope = (
+                        bool(arguments.get('order_id'))
+                        and previous_turn_entities.get('order') == arguments.get('order_id')
+                        and not ({'order', 'customer'} & set(resolved_entities))
+                        and not re.search(r'\b(?:innego|inna|inne|inny|drugiego|druga|drugie|drugi)\b', message.casefold())
+                    )
                     needs_fresh_scope = (
                         bool(arguments.get('order_id')) and bool({'order', 'customer'} & historical_entity_types)
                         and not ({'order', 'customer'} & set(resolved_entities))
+                        and not continued_order_scope
                     ) or (
                         bool(arguments.get('invoice_id')) and 'invoice' in historical_entity_types
                         and 'invoice' not in resolved_entities

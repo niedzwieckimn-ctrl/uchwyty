@@ -97,6 +97,45 @@ def test_historical_order_cannot_be_inherited_for_write_without_fresh_resolution
     db = b.conn(); assert db.execute("SELECT COUNT(*) FROM internal_order_notes WHERE note='wrong'").fetchone()[0] == 0; db.close()
 
 
+def test_direct_followup_reuses_previous_fresh_order_and_runs_write_preflight(isolated):
+    first = runtime.run_agent_turn(owner(), 'pokaż A', runtime.FakeModelProvider([
+        tool('orders.get', {'id': 10}), respond('Zamówienie A jest kompletne.'),
+    ]))
+    db = b.conn(); version = ops._order_version(db, 10); db.close()
+
+    second = runtime.run_agent_turn(owner(), 'realizujemy zamówienie', runtime.FakeModelProvider([
+        tool('orders.internal_note.add', {'order_id': 10, 'note': 'realizacja rozpoczęta',
+             'expected_version': version, 'idempotency_key': 'direct-followup-a'}),
+        respond('Rozpoczęto realizację.'),
+    ]), conversation_id=first['conversation_id'])
+
+    assert second['status'] == 'SUCCESS'
+    db = b.conn()
+    assert db.execute("SELECT COUNT(*) FROM internal_order_notes WHERE order_id=10 AND note='realizacja rozpoczęta'").fetchone()[0] == 1
+    db.close()
+
+
+def test_explicit_new_order_wins_and_prevents_write_to_previous_order(isolated):
+    db = b.conn(); now = b.now_iso()
+    db.execute("INSERT INTO orders(id,order_no,customer_name,status,created_at,currency,price_list) VALUES(20,'ZAM-B','Klient B','confirmed',?,'PLN','pln')", (now,))
+    version_a = ops._order_version(db, 10)
+    db.commit(); db.close()
+    first = runtime.run_agent_turn(owner(), 'pokaż A', runtime.FakeModelProvider([
+        tool('orders.get', {'id': 10}), respond('Pokazuję A.'),
+    ]))
+
+    second = runtime.run_agent_turn(owner(), 'realizujemy ZAM-B', runtime.FakeModelProvider([
+        tool('orders.get', {'id': 20}, 'read-b'),
+        tool('orders.internal_note.add', {'order_id': 10, 'note': 'wrong-order',
+             'expected_version': version_a, 'idempotency_key': 'must-not-write-a'}, 'write-a'),
+    ]), conversation_id=first['conversation_id'])
+
+    assert second['status'] == 'DENIED' and second['error_code'] == 'ENTITY_SCOPE_CONFLICT'
+    db = b.conn()
+    assert db.execute("SELECT COUNT(*) FROM internal_order_notes WHERE order_id=10 AND note='wrong-order'").fetchone()[0] == 0
+    db.close()
+
+
 def test_conflicting_or_ambiguous_current_scope_blocks_write(isolated):
     db = b.conn(); version = ops._order_version(db, 10)
     db.execute("INSERT INTO customers(id,name,created_at) VALUES(11,'Other Interiors',?)", (b.now_iso(),))
