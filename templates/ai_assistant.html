@@ -113,6 +113,9 @@
       card.appendChild(title);
       const grid = document.createElement('div'); grid.className = 'ai-artifact-grid';
       for (const [key, label] of Object.entries(labels)) {
+        if (artifact.type === 'inventory_count_card' && artifact.expected_quantity != null && !['expected_quantity','counted_quantity','difference'].includes(key)) continue;
+        if (artifact.type === 'inventory_count_card' && artifact.matches === true && key === 'difference') continue;
+        if (artifact.type === 'product_card' && !['model','name','stock','ordered_quantity','available_for_customers'].includes(key)) continue;
         const value = artifact[key];
         if (value === null || value === undefined || value === '' || typeof value === 'object') continue;
         const field = document.createElement('div'); const caption = document.createElement('span'); caption.textContent = label;
@@ -179,6 +182,14 @@
       loading.remove();
       for (const approval of data.approvals || data.pending_approvals || []) {
         let approvalLabel = 'Zmiana operacyjna';
+        const fulfillmentLabels = {'orders.packing_list.generate':'Przygotowanie listy pakowej i powiadomienia o pakowaniu', 'orders.invoice.create':'Wystawienie faktury i jej rozliczenie magazynowe', 'orders.items.add':'Dodanie pozycji do zamówienia', 'orders.items.update':'Zmiana ilości w zamówieniu', 'orders.items.remove':'Usunięcie pozycji z zamówienia', 'shipping.shipment.create':'Utworzenie przesyłki InPost i zlecenie podjazdu kuriera'};
+        if (fulfillmentLabels[approval.operation]) approvalLabel = fulfillmentLabels[approval.operation];
+        if (approval.operation === 'shipping.pickup.request') approvalLabel = 'Zlecenie podjazdu kuriera do istniejącej przesyłki';
+        if (approval.operation === 'invoices.remove') {
+          const number = typeof approval.invoice_number === 'string' ? approval.invoice_number : '';
+          const orders = Array.isArray(approval.order_numbers) ? approval.order_numbers.join(', ') : '';
+          approvalLabel = `Usunięcie faktury ${number}\nZamówienia: ${orders}\nUsunięte zostaną dokumenty faktury, a jej rozliczenie magazynowe zostanie cofnięte. Przesyłka pozostaje.`;
+        }
         if (approval.operation === 'orders.status.transition') approvalLabel = 'Zmiana statusu zamówienia';
         if (approval.operation === 'inventory.adjust') {
           const productName = typeof approval.product_name === 'string' && approval.product_name ? approval.product_name : 'Produkt';
