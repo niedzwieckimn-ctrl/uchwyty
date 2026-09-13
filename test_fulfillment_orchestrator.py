@@ -135,6 +135,32 @@ def test_normal_fulfillment_real_document_services(flow):
     c.close()
 
 
+def test_ready_order_with_stale_invoice_can_create_shipment(flow):
+    docs()
+    c = b.conn()
+    c.execute("UPDATE fulfillment_documents SET content_hash='stale' WHERE order_id=702 AND kind='invoice'")
+    c.commit(); c.close()
+    requirements()
+    assert state()['invoice']['current'] is False
+
+    pending = run('shipping.shipment.create', approve=False)
+    assert pending.status == 'PENDING_APPROVAL'
+    success('shipping.shipment.create')
+    assert len(flow['calls']) == 1
+
+
+def test_not_ready_order_still_blocks_shipment(flow):
+    c = b.conn()
+    c.execute('UPDATE stock SET qty=0 WHERE product_id=701')
+    c.commit(); c.close()
+    requirements()
+
+    result = run('shipping.shipment.create', approve=False)
+    assert result.status == 'FAILED' and result.error_code == 'ORDER_NOT_READY'
+    assert not result.approval_id
+    assert not flow['calls']
+
+
 def test_only_weight_missing_and_invalid_numbers(flow):
     success('shipping.requirements.update', carrier='inpost', length=45, width=30, height=15, dimension_unit='cm', weight_unit='kg', sms=False, email=False)
     assert state()['requirements']['missing_fields'] == ['weight']

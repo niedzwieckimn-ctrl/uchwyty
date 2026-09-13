@@ -226,8 +226,10 @@ def preflight(name, data, actor=None):
         if not current['packing_list']['current']:
             raise error('PACKING_REQUIRED', 'Najpierw przygotuj aktualną listę pakową.')
     if name == 'shipping.shipment.create' and not current['shipment']['exists']:
-        if not current['invoice']['current'] or not current['packing_list']['current']:
-            raise error('CURRENT_DOCUMENTS_REQUIRED', 'Przed nadaniem wymagane są aktualne dokumenty.')
+        if not current['readiness']['complete']:
+            raise error('ORDER_NOT_READY', 'Zamówienie nie jest gotowe do wysyłki.')
+        if not current['packing_list']['current']:
+            raise error('CURRENT_DOCUMENTS_REQUIRED', 'Przed nadaniem wymagana jest aktualna lista pakowa.')
         if current['requirements']['missing_fields']:
             raise error('MISSING_SHIPPING_FIELDS', 'Brakuje danych paczki: ' + ', '.join(current['requirements']['missing_fields']))
         _validate_requirements(current['requirements']['known'])
@@ -237,7 +239,7 @@ def preflight(name, data, actor=None):
             other = state({'order_id': member})['state']
             if other['requirements']['recipient'] != current['requirements']['recipient']:
                 raise error('PACKAGE_RECIPIENT_CONFLICT', 'Zamówienia w paczce mają różnych odbiorców lub adresy.', 'CONFLICT')
-            if other['shipment']['exists'] or not other['packing_list']['current'] or not other['invoice']['current'] or not other['readiness']['complete']:
+            if other['shipment']['exists'] or not other['packing_list']['current'] or not other['readiness']['complete']:
                 raise error('PACKAGE_STATE_CONFLICT', 'Jedno z zamówień paczki ma przesyłkę, brak gotowości lub nieaktualne dokumenty.', 'CONFLICT')
     if name.startswith('orders.items.') and not current['editable']:
         raise error('INVOICE_BLOCKS_EDIT', 'Najpierw wykonaj istniejącą obsługę faktury, która blokuje edycję.')
@@ -650,8 +652,10 @@ def perform(name, data, actor):
     elif name == 'shipping.shipment.create':
         if current['shipment']['exists']:
             return state(data)
-        if not current['packing_list']['current'] or not current['invoice']['current']:
-            raise error('CURRENT_DOCUMENTS_REQUIRED', 'Przed nadaniem wymagane są aktualne dokumenty.')
+        if not current['readiness']['complete']:
+            raise error('ORDER_NOT_READY', 'Zamówienie nie jest gotowe do wysyłki.')
+        if not current['packing_list']['current']:
+            raise error('CURRENT_DOCUMENTS_REQUIRED', 'Przed nadaniem wymagana jest aktualna lista pakowa.')
         if current['requirements']['missing_fields']:
             raise error('MISSING_SHIPPING_FIELDS', 'Brakuje danych paczki: ' + ', '.join(current['requirements']['missing_fields']))
         c = b.conn()
