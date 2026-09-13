@@ -81,8 +81,7 @@
       sku:'SKU', model:'Model', name:'Nazwa', stock:'Magazyn', ordered_quantity:'Zamówione', incoming_quantity:'W drodze', available_for_customers:'Dostępne dla klientów',
       po_number:'P/O', supplier:'Dostawca', order_status:'Status zamówienia', delivery_stage:'Etap dostawy', tracking_eta:'ETA',
       carrier:'Przewoźnik', tracking_number:'Tracking', shipping_method:'Wysyłka',
-      product_id:'Produkt', count_id:'Sesja remanentu', expected_quantity:'Stan oczekiwany',
-      counted_quantity:'Stan policzony', difference:'Różnica', version:'Wersja', matched_count:'Zgodne',
+      expected_quantity:'System', counted_quantity:'Policzono', difference:'Różnica', matched_count:'Zgodne',
       variance_count:'Rozbieżności', adjusted_count:'Skorygowane', unresolved_count:'Nierozwiązane',
       positive_units:'Nadwyżka szt.', negative_units:'Niedobór szt.', order_id:'Zamówienie', ready:'Kompletne'
     };
@@ -108,20 +107,29 @@
         link.target = '_blank'; link.rel = 'noopener'; link.textContent = artifact.document_type === 'invoice_pdf' ? 'Otwórz PDF' : artifact.document_type === 'packing_list' ? 'Otwórz listę pakową' : 'Otwórz dokument';
         card.append(title, link); wrap.appendChild(card); continue;
       }
-      const title = document.createElement('h3'); title.textContent = titles[artifact.type] || 'Szczegóły'; card.appendChild(title);
+      const title = document.createElement('h3');
+      title.textContent = artifact.type === 'inventory_count_card' && artifact.display_name
+        ? artifact.display_name : titles[artifact.type] || 'Szczegóły';
+      card.appendChild(title);
       const grid = document.createElement('div'); grid.className = 'ai-artifact-grid';
       for (const [key, label] of Object.entries(labels)) {
         const value = artifact[key];
         if (value === null || value === undefined || value === '' || typeof value === 'object') continue;
         const field = document.createElement('div'); const caption = document.createElement('span'); caption.textContent = label;
-        const content = document.createElement('b'); content.textContent = String(value); field.append(caption, content); grid.appendChild(field);
+        const content = document.createElement('b');
+        content.textContent = key === 'difference' && Number(value) > 0 ? `+${value}` : String(value);
+        field.append(caption, content); grid.appendChild(field);
+      }
+      if (artifact.type === 'inventory_count_card' && artifact.matches === true) {
+        const field = document.createElement('div'); const content = document.createElement('b');
+        content.textContent = 'Zgadza się.'; field.appendChild(content); grid.appendChild(field);
       }
       card.appendChild(grid);
       if (Array.isArray(artifact.items) && artifact.items.length) {
         const items = document.createElement('div'); items.className = 'ai-artifact-items';
         for (const item of artifact.items.slice(0, 6)) {
           const line = document.createElement('div'); line.className = 'ai-artifact-item';
-          const name = document.createElement('span'); name.textContent = item.sku || item.model || item.name || 'Pozycja';
+          const name = document.createElement('span'); name.textContent = item.display_name || item.sku || item.model || item.name || 'Pozycja';
           const qty = document.createElement('b'); qty.textContent = item.qty != null ? `${item.qty} szt.` : item.quantity != null ? `${item.quantity} szt.` : item.shortage_quantity != null ? `brak ${item.shortage_quantity} szt.` : item.difference != null ? `${item.difference > 0 ? '+' : ''}${item.difference} szt.` : '';
           line.append(name, qty); items.appendChild(line);
         }
@@ -172,7 +180,12 @@
       for (const approval of data.approvals || data.pending_approvals || []) {
         let approvalLabel = 'Zmiana operacyjna';
         if (approval.operation === 'orders.status.transition') approvalLabel = 'Zmiana statusu zamówienia';
-        if (approval.operation === 'inventory.adjust') approvalLabel = 'Korekta stanu po remanencie';
+        if (approval.operation === 'inventory.adjust') {
+          const productName = typeof approval.product_name === 'string' && approval.product_name ? approval.product_name : 'Produkt';
+          const change = Number.isInteger(approval.from_quantity) && Number.isInteger(approval.to_quantity)
+            ? `\n${approval.from_quantity} → ${approval.to_quantity}` : '';
+          approvalLabel = `Korekta stanu\n${productName}${change}`;
+        }
         if (approval.operation === 'orders.packing.confirm') approvalLabel = 'Potwierdzenie spakowania zamówienia';
         const card = addMessage('assistant', `Zmiana wymaga zatwierdzenia\n${approvalLabel}`);
         const bubble = card.querySelector('.ai-bubble');
