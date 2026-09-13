@@ -46,6 +46,7 @@ from flask import (
     send_file, abort
 )
 from flask import render_template, render_template_string
+from werkzeug.exceptions import HTTPException
 from jinja2 import ChoiceLoader, DictLoader, FileSystemLoader
 from werkzeug.security import check_password_hash
 
@@ -2516,7 +2517,9 @@ def pull_shared_tables_from_supabase(force: bool = False, delete_missing: bool =
 
     try:
         normalize_temp_order_numbers()
-        link_orders_to_customers_by_email(sync_remote=True)
+        # A cloud-to-local bootstrap is a READ path. Reconciliation may update
+        # the local copy, but must never write back to Supabase from this pull.
+        link_orders_to_customers_by_email(sync_remote=False)
     except Exception:
         pass
     return result
@@ -2575,7 +2578,14 @@ def trigger_background_supabase_pull(reason: str = "read"):
     return True, "started"
 
 
-def maybe_pull_shared_from_supabase(force: bool = False):
+def _raise_required_bootstrap_failure(result: dict | None) -> None:
+    result = result or {}
+    reason = norm(result.get("reason") or result.get("error") or "SYNC_FAILED")[:200]
+    app.logger.error("MAIN_PANEL_BOOTSTRAP status=unavailable reason=%s", reason)
+    abort(503, description=f"DATA_UNAVAILABLE: bootstrap Supabase nie powiódł się ({reason})")
+
+
+def maybe_pull_shared_from_supabase(force: bool = False, required: bool = False):
     """Keep GET fast; protected write paths may still request a blocking refresh."""
     try:
         if request.method == "GET":
@@ -2612,7 +2622,10 @@ def maybe_pull_shared_from_supabase(force: bool = False):
                                     ",".join(failed_tables) or "unknown",
                                 )
                     _perf_add("supabase_initial_bootstrap", time.perf_counter() - started)
-                    return result if not already_attempted else None
+                    if not already_attempted:
+                        if required and not result.get("ok") and not _local_supabase_data_present():
+                            _raise_required_bootstrap_failure(result)
+                        return result
             return trigger_background_supabase_pull(reason=f"GET {request.path}")
         if force:
             started = time.perf_counter()
@@ -2622,8 +2635,12 @@ def maybe_pull_shared_from_supabase(force: bool = False):
                     _run_post_pull_reconciliation()
             _perf_add("supabase_pull_blocking", time.perf_counter() - started)
             return result
+    except HTTPException:
+        raise
     except Exception as exc:
         app.logger.warning("Synchronizacja Supabase nie powiodła się: %s", type(exc).__name__)
+        if required and not _local_supabase_data_present():
+            _raise_required_bootstrap_failure({"reason": type(exc).__name__})
     return None
 
 
