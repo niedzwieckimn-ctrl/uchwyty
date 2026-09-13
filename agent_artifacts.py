@@ -163,13 +163,24 @@ def build_artifacts(
                 'invoice_id': links.get('packing_invoice_id'),
             })
 
-    elif operation in {'inventory.count.get_expected','inventory.count.record','inventory.count.summary','inventory.adjust'}:
+    elif operation in {'inventory.count.get_expected','inventory.count.record','inventory.adjust'}:
+        display_name = str(record.get('model') or record.get('name') or record.get('sku') or '').strip()
+        card = {'type':'inventory_count_card', 'display_name':display_name,
+                **_fields(record, ('expected_quantity','counted_quantity','difference'))}
+        if operation != 'inventory.count.get_expected':
+            card['matches'] = int(record.get('difference') or 0) == 0
+        artifacts.append(card)
+
+    elif operation == 'inventory.count.summary':
         card = {'type':'inventory_count_card', **_fields(record, (
-            'product_id','count_id','expected_quantity','counted_quantity','difference',
-            'version','status','matched_count','variance_count','adjusted_count','unresolved_count',
+            'matched_count','variance_count','adjusted_count','unresolved_count',
             'positive_units','negative_units',
         ))}
-        card['items'] = _items(record, ('product_id','expected_quantity','counted_quantity','difference','status'))
+        card['items'] = [
+            {'display_name':str(item.get('model') or item.get('name') or item.get('sku') or '').strip(),
+             **_fields(item, ('expected_quantity','counted_quantity','difference'))}
+            for item in record.get('items',[])[:20] if isinstance(item,Mapping)
+        ] if isinstance(record.get('items'),list) else []
         artifacts.append(card)
 
     elif operation in {'orders.packing.check','orders.packing.shortage.report','orders.packing.confirm'}:

@@ -296,6 +296,15 @@ def operation_fingerprint(
     expected_entity_version: int | None,
 ) -> tuple[str, dict[str, Any]]:
     safe_payload = sanitize_audit_data(dict(payload))
+    # This UUID identifies an inventory-count record; it is not an authentication
+    # session. The generic audit sanitizer redacts keys containing "session", but
+    # approval execution must retain this trusted identifier to replay the exact
+    # validated inventory.adjust request after a human decision.
+    if operation == "inventory.adjust" and isinstance(payload.get("count_session_id"), str):
+        try:
+            safe_payload["count_session_id"] = str(uuid.UUID(payload["count_session_id"]))
+        except ValueError:
+            pass
     canonical = json.dumps(
         {
             "operation": operation,

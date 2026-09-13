@@ -171,3 +171,13 @@ def test_i_approval_cards_remain_independent_of_artifacts(order):
     assert result['approvals'] == result['pending_approvals']
     assert result['approvals'][0]['order_id'] == order
     assert _artifact(result['artifacts'], 'order_card')['id'] == order
+
+
+def test_inventory_count_card_source_has_clean_labels_and_adjustment_preview(order):
+    source=(__import__('pathlib').Path(__file__).parent/'templates'/'ai_assistant.html').read_text(encoding='utf-8')
+    assert "expected_quantity:'System'" in source
+    assert "counted_quantity:'Policzono'" in source
+    assert "product_id:'Produkt'" not in source
+    assert "count_id:'Sesja remanentu'" not in source
+    assert "version:'Wersja'" not in source
+    assert 'approval.from_quantity' in source and 'approval.to_quantity' in source

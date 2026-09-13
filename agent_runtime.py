@@ -223,6 +223,9 @@ Podawaj najważniejszy wynik; szczegóły, SKU, pozycje, tracking i zdjęcie pok
 Dla produktu domyślnie podaj nazwę lub model, stan fizyczny, zamówione, dostawę w drodze i dostępne dla klientów. Dla zamówienia podaj numer, klienta, naturalny status oraz kompletność i braki. Fakturę streść numerem, klientem, kwotą, terminem i naturalnym statusem płatności. China P/O streść numerem, naturalnym statusem, ETA i liczbą sztuk.
 Możesz dodać notatkę wewnętrzną, zapisać potwierdzony wynik remanentu i zgłosić potwierdzony brak przy pakowaniu.
 Gdy użytkownik rozpoczyna remanent, wywołaj inventory.count.session.start. Dalsze operacje remanentu dostaną aktywną sesję z backendu; nigdy nie pytaj użytkownika o jej identyfikator.
+Po inventory.count.record zawsze domknij wynik bieżącego produktu. Gdy difference=0, krótko potwierdź zgodność i możesz przyjąć kolejny produkt. Gdy difference jest różne od zera, podaj system, policzono i różnicę, a następnie zapytaj czy skorygować stan do policzonej wartości. Nie proponuj kolejnego produktu, dopóki użytkownik nie zgodzi się na korektę, nie odmówi albo nie odłoży jej jednoznacznie.
+Po zgodzie użytkownika wywołaj istniejące inventory.adjust z product_id i expected_version z zaufanego wyniku liczenia. To jedynie przygotowuje approval; nie twierdź wtedy, że stan już się zmienił. Nigdy nie zatwierdzaj własnego approval.
+Po zatwierdzonej korekcie krótko potwierdź nowy stan na podstawie execution outcome. Po odrzuceniu powiedz, że korekta została odrzucona i stan pozostał bez zmian. Po konflikcie wersji powiedz, że stan zmienił się od czasu liczenia i produkt trzeba policzyć ponownie; nie zgaduj nowej wartości.
 Korekta stanu i potwierdzenie pakowania wymagają zatwierdzenia przez człowieka. Przed korektą użyj zapisanego wyniku liczenia i jego aktualnej wersji.
 Przed potwierdzeniem pakowania sprawdź kompletność. Ustaw human_confirmed=true tylko gdy człowiek jasno potwierdził, że zamówienie jest fizycznie spakowane; w innym przypadku dopytaj.
 Nigdy nie twierdź, że fizyczne liczenie, pakowanie, zapis lub wysyłka się odbyły bez wypowiedzi człowieka i odpowiedniego wyniku sukcesu.
@@ -495,9 +498,17 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                                 'expected_version':arguments.get('expected_version',0)}
                     for key in ('order_id','product_id','count_session_id','target_status'):
                         if key in arguments: approval[key]=arguments[key]
+                    if call.name == 'inventory.adjust':
+                        try:
+                            approval.update(business_operations.inventory_adjustment_preview(
+                                ai_actor,human_actor,conversation_id,arguments['product_id']))
+                        except business_operations.ControlledOperationError:
+                            pass
                     pending_approvals.append(approval)
                 if result.status == 'SUCCESS' and _artifact_builder and len(artifacts) < 6:
                     try:
+                        if call.name == 'inventory.count.record':
+                            artifacts[:] = [item for item in artifacts if item.get('type') not in {'product_card','inventory_count_card'}]
                         candidates = _artifact_builder(call.name, result.data)
                         if isinstance(candidates, list):
                             for candidate in candidates:

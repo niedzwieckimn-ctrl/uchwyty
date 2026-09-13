@@ -553,6 +553,7 @@ _WAREHOUSE_OUTPUT = {'type':'object','additionalProperties':False,
         'ok':{'type':'boolean'}, 'product_id':{'type':'integer'}, 'order_id':{'type':'integer'},
         'count_id':{'type':'string'}, 'expected_quantity':{'type':'integer'},
         'counted_quantity':{'type':'integer'}, 'difference':{'type':'integer'},
+        'sku':{'type':'string'}, 'model':{'type':'string'}, 'name':{'type':'string'},
         'version':{'type':'integer'}, 'status':{'type':'string'}, 'ready':{'type':'boolean'},
         'order_number':{'type':'string'}, 'order_status':{'type':'string'},
         'total_items':{'type':'integer'}, 'total_units':{'type':'integer'},
@@ -583,7 +584,7 @@ OPERATION_REGISTRY.update({
         'inventory.count.summary', 'Podsumowuje zapisaną sesję remanentu i nierozwiązane rozbieżności.',
         'inventory.read', approvals.GREEN, {'count_session_id':_SESSION,'conversation_id':_SESSION}, ['count_session_id'], read_only=True),
     'inventory.count.record': _warehouse_definition(
-        'inventory.count.record', 'Zapisuje obserwację fizycznego liczenia bez zmiany stanu magazynowego.',
+        'inventory.count.record', 'Zapisuje obserwację fizycznego liczenia bez zmiany stanu magazynowego. Gdy difference jest różne od zera, zapytaj użytkownika czy przygotować korektę i nie kończ bieżącej rozbieżności sugestią kolejnego produktu.',
         'inventory.discrepancy_report', approvals.GREEN,
         {'product_id':_PID,'count_session_id':_SESSION,'conversation_id':_SESSION,'counted_quantity':{'type':'integer','minimum':0},
          'expected_version':_VERSION,'idempotency_key':_IDEM,'note':{'type':'string','minLength':1,'maxLength':500}},
@@ -593,7 +594,7 @@ OPERATION_REGISTRY.update({
         'inventory.discrepancy_report', approvals.GREEN,
         {'count_session_id':_SESSION,'conversation_id':_SESSION,'idempotency_key':_IDEM}, ['count_session_id','idempotency_key']),
     'inventory.adjust': _warehouse_definition(
-        'inventory.adjust', 'Po zatwierdzeniu ustawia stan na zapisaną ilość policzoną; różnicę wylicza backend.',
+        'inventory.adjust', 'Po jednoznacznej zgodzie użytkownika przygotowuje human approval; dopiero po zatwierdzeniu ustawia stan na zapisaną ilość policzoną. Różnicę wylicza backend.',
         'inventory.adjust', approvals.YELLOW,
         {'product_id':_PID,'count_session_id':_SESSION,'conversation_id':_SESSION,'expected_version':_VERSION,'idempotency_key':_IDEM},
         ['product_id','count_session_id','expected_version','idempotency_key']),
@@ -1726,6 +1727,32 @@ def active_inventory_count_session(ai_actor, human_actor, conversation_id):
     finally: db.close()
 
 
+def inventory_adjustment_preview(ai_actor, human_actor, conversation_id, product_id):
+    """Trusted user-facing preview for an adjustment approval in the active session."""
+    ai = _trusted_actor(ai_actor)
+    human = load_actor_context(human_actor.actor_id) if isinstance(human_actor,ActorContext) else None
+    if human is None or human.actor_type != 'HUMAN' or ai.delegated_by_actor_id != human.actor_id:
+        raise ControlledOperationError('UNTRUSTED_ACTOR','Brak zaufanego właściciela sesji',status=DENIED)
+    db=_factory()()
+    try:
+        _assert_count_conversation(db,ai,conversation_id)
+        row=db.execute('''SELECT p.sku,p.model,p.name,i.expected_quantity,i.counted_quantity,i.difference
+                            FROM internal_inventory_count_sessions s
+                            JOIN internal_inventory_count_items i ON i.session_id=s.session_id
+                            JOIN products p ON p.id=i.product_id
+                           WHERE s.created_by=? AND s.conversation_id=? AND s.status='OPEN'
+                             AND i.product_id=? AND i.status='PENDING_ADJUSTMENT'
+                           ORDER BY i.item_id DESC LIMIT 1''',
+                       (human.actor_id,conversation_id,int(product_id))).fetchone()
+        if row is None:
+            raise ControlledOperationError('COUNT_DISCREPANCY_NOT_PENDING','Brak nierozwiązanej rozbieżności dla produktu',status=CONFLICT)
+        display_name=str(row['model'] or row['name'] or row['sku'] or '').strip()
+        return {'product_name':display_name,'from_quantity':int(row['expected_quantity']),
+                'to_quantity':int(row['counted_quantity']),'difference':int(row['difference'])}
+    finally:
+        db.close()
+
+
 def _assert_operation_permission(actor, definition):
     trusted = _trusted_actor(actor)
     if trusted.permission_decision(definition.required_permission) == PERMISSION_DENY:
@@ -1823,7 +1850,9 @@ def _inventory_count_expected(data, actor, correlation_id, transaction_connectio
                          (data['product_id'],)).fetchone()
         if row is None:
             raise ControlledOperationError('PRODUCT_NOT_FOUND', 'Nie znaleziono produktu', status=CONFLICT)
-        return {'ok':True,'product_id':int(row['id']),'expected_quantity':max(0,int(row['qty'] or 0)),
+        return {'ok':True,'product_id':int(row['id']),'sku':row['sku'] or '',
+                'model':row['model'] or '', 'name':row['name'] or '',
+                'expected_quantity':max(0,int(row['qty'] or 0)),
                 'version':_inventory_version(db,data['product_id']),'status':'READY'}
     finally:
         if transaction_connection is None: db.close()
@@ -1862,11 +1891,14 @@ def _inventory_count_summary(data, actor, correlation_id, transaction_connection
         session = _assert_count_session(db,data,actor,require_open=False)
         if session is None:
             raise ControlledOperationError('COUNT_SESSION_NOT_FOUND', 'Nie znaleziono sesji remanentu', status=CONFLICT)
-        rows = db.execute('SELECT * FROM internal_inventory_count_items WHERE session_id=? ORDER BY product_id',
+        rows = db.execute('''SELECT i.*,p.sku,p.model,p.name
+                               FROM internal_inventory_count_items i JOIN products p ON p.id=i.product_id
+                              WHERE i.session_id=? ORDER BY i.product_id''',
                           (data['count_session_id'],)).fetchall()
         items = [{'product_id':int(r['product_id']),'expected_quantity':int(r['expected_quantity']),
                   'counted_quantity':int(r['counted_quantity']),'difference':int(r['difference']),
-                  'version':int(r['stock_version']),'status':r['status']} for r in rows]
+                  'version':int(r['stock_version']),'status':r['status'],'sku':r['sku'] or '',
+                  'model':r['model'] or '','name':r['name'] or ''} for r in rows]
         return {'ok':True,'count_id':data['count_session_id'],'status':session['status'],
                 'matched_count':sum(i['status']=='MATCHED' for i in items),
                 'variance_count':sum(i['difference']!=0 for i in items),
@@ -1883,7 +1915,9 @@ def _inventory_count_record(data, actor, correlation_id, transaction_connection=
     db.execute('''INSERT OR IGNORE INTO internal_inventory_count_sessions(
                   session_id,status,created_by,conversation_id,created_at) VALUES(?,?,?,?,?)''',
                (data['count_session_id'],'OPEN',human_id,data.get('conversation_id',''),now))
-    stock_row=db.execute('SELECT COALESCE(qty,0) qty FROM stock WHERE product_id=?',(data['product_id'],)).fetchone()
+    stock_row=db.execute('''SELECT p.sku,p.model,p.name,COALESCE(s.qty,0) qty
+                              FROM products p LEFT JOIN stock s ON s.product_id=p.id WHERE p.id=?''',
+                         (data['product_id'],)).fetchone()
     expected=int(stock_row['qty']) if stock_row else 0
     difference=int(data['counted_quantity'])-expected
     status='MATCHED' if difference==0 else 'PENDING_ADJUSTMENT'
@@ -1897,7 +1931,9 @@ def _inventory_count_record(data, actor, correlation_id, transaction_connection=
         correlation_id=correlation_id,expected_version=data['expected_version'],entity_version_before=data['expected_version'],
         entity_version_after=data['expected_version'],after_state={'count_item_id':cur.lastrowid,'expected_quantity':expected,
         'counted_quantity':data['counted_quantity'],'difference':difference,'basis':'physical_count'},transaction_connection=db)
-    return {'ok':True,'product_id':data['product_id'],'count_id':data['count_session_id'],
+    return {'ok':True,'product_id':data['product_id'],'sku':stock_row['sku'] or '',
+            'model':stock_row['model'] or '','name':stock_row['name'] or '',
+            'count_id':data['count_session_id'],
             'expected_quantity':expected,'counted_quantity':data['counted_quantity'],'difference':difference,
             'version':data['expected_version'],'status':status}
 
@@ -1915,7 +1951,9 @@ def _inventory_count_complete(data, actor, correlation_id, transaction_connectio
 
 def _inventory_adjust(data, actor, correlation_id, transaction_connection=None):
     db=transaction_connection
-    item=db.execute('SELECT * FROM internal_inventory_count_items WHERE session_id=? AND product_id=?',
+    item=db.execute('''SELECT i.*,p.sku,p.model,p.name
+                         FROM internal_inventory_count_items i JOIN products p ON p.id=i.product_id
+                        WHERE i.session_id=? AND i.product_id=?''',
                     (data['count_session_id'],data['product_id'])).fetchone()
     stock_row=db.execute('SELECT COALESCE(qty,0) qty FROM stock WHERE product_id=?',(data['product_id'],)).fetchone()
     old=int(stock_row['qty']) if stock_row else 0
@@ -1931,7 +1969,9 @@ def _inventory_adjust(data, actor, correlation_id, transaction_connection=None):
     record_audit_event('inventory.adjust',result=SUCCESS,actor_context=actor,entity_type='product',entity_id=str(data['product_id']),
         correlation_id=correlation_id,expected_version=data['expected_version'],entity_version_before=data['expected_version'],entity_version_after=version,
         before_state={'quantity':old},after_state={'quantity':new,'difference':delta,'basis':'approved_physical_count','count_session_id':data['count_session_id']},transaction_connection=db)
-    return {'ok':True,'product_id':data['product_id'],'count_id':data['count_session_id'],
+    return {'ok':True,'product_id':data['product_id'],'sku':item['sku'] or '',
+            'model':item['model'] or '','name':item['name'] or '',
+            'count_id':data['count_session_id'],
             'expected_quantity':old,'counted_quantity':new,'difference':delta,'version':version,'status':'ADJUSTED'}
 
 
