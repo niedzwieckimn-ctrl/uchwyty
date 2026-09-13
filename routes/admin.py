@@ -41,7 +41,7 @@ def register_routes(context):
 
     @app.get("/")
     def home():
-        maybe_pull_shared_from_supabase()
+        maybe_pull_shared_from_supabase(required=True)
         # Historyczna reconciliacja działa po synchronizacji w tle, poza
         # krytyczną ścieżką renderowania pulpitu.
         c = conn()

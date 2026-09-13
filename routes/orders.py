@@ -82,7 +82,7 @@ def register_routes(context):
 
     @app.get("/orders")
     def orders():
-        maybe_pull_shared_from_supabase()
+        maybe_pull_shared_from_supabase(required=True)
         q = norm(request.args.get("q"))
         tab = norm(request.args.get("tab")) or "new"
         ready_today = norm(request.args.get("ready_today")) == "1"

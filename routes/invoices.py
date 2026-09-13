@@ -653,7 +653,7 @@ def register_routes(context):
 
     @app.get("/invoices")
     def invoices():
-        maybe_pull_shared_from_supabase()
+        maybe_pull_shared_from_supabase(required=True)
         q = norm(request.args.get("q"))
         selected_customer = norm(request.args.get("customer"))
         selected_month = norm(request.args.get("month"))
