@@ -8,8 +8,8 @@ Runtime pracuje na jawnej historii, korzysta z Business Operations i odpowiada z
 2. Zapisuje wypowiedź użytkownika, buduje ograniczoną historię i dołącza terminologię oraz opcjonalne preferencje komunikacji. Dodaje aktualny czas Europe/Warsaw jako punkt odniesienia dla modelu.
 3. Responses API otrzymuje historię jawnie, `store=false`, narzędzia z rejestru i `tool_choice=auto`.
 4. Model może odpowiedzieć, dopytać albo wywołać operację. Backend sprawdza dostępność narzędzia i uprawnienia inicjującego człowieka, a następnie wywołuje istniejący execution gate Business Operations.
-5. Model dostaje wynik lub kontrolowany błąd narzędzia i generuje zwykły tekst. Możliwe są kolejne operacje, jeśli pytanie faktycznie ich wymaga.
-6. Runtime zapisuje odpowiedź i dowody narzędziowe, zwalnia blokadę oraz zapisuje audit i pomiary czasu.
+5. Model dostaje wynik lub kontrolowany błąd narzędzia i generuje krótki tekst operacyjny. Możliwe są kolejne operacje, jeśli pytanie faktycznie ich wymaga.
+6. Runtime usuwa z głównego tekstu składnię Markdown i wiersze z technicznymi identyfikatorami, przygotowuje skrócone `speech_text`, zapisuje odpowiedź i dowody narzędziowe, zwalnia blokadę oraz zapisuje audit i pomiary czasu.
 
 Jedna zwykła odpowiedź bez narzędzi wymaga jednego wywołania modelu. Prosty odczyt: dwie odpowiedzi modelu, jedna operacja biznesowa. Nie ma dodatkowej rundy klasyfikowania intencji, walidowania liczb ani streszczania.
 
@@ -24,6 +24,16 @@ Jedna zwykła odpowiedź bez narzędzi wymaga jednego wywołania modelu. Prosty 
 - TTL rozmowy: 45 minut bez aktywności. Wygaśnięcie usuwa jej tekst przy ponownym otwarciu. Reset czyści historię, zachowując audit i pamięć firmy.
 - Blokada turnu w SQLite działa między procesami, wygasa po pięciu minutach w razie awarii workera. Reset aktywnej rozmowy jest odrzucany.
 - Redakcja sekretów pozostaje wyjątkiem od verbatim. Brak analizy liczb, dat biznesowych, zaimków i polskich zwrotów.
+
+## Odpowiedź użytkowa i przyszły voice
+
+Endpoint zwraca `message`, `speech_text`, `artifacts` i `approvals`. `message` oraz `speech_text` są zwykłym tekstem bez surowego Markdownu. `speech_text` jest skrócone do 700 znaków, nie zawiera adresów URL, UUID ani technicznych nazw pól. Nie dodano TTS, mikrofonu ani PTT.
+
+Instrukcje modelu wymagają krótkich odpowiedzi operacyjnych oraz ukrywają nazwy operacji, identyfikatory wykonania i approval, wersje rekordów oraz surowe statusy wykonania. Dane techniczne nadal trafiają do evidence, historii wykonania, audytu i odpowiedzi technicznej endpointu approval.
+
+Dla produktu domyślny trusted artifact pokazuje nazwę lub model, stan fizyczny, ilość zamówioną, dostawę w drodze i ilość dostępną dla klientów. Wartości pochodzą z istniejącego `build_replenishment_analysis`; dostępność jest tym samym polem `available_qty`, które aplikacja już wylicza jako stan po odjęciu rezerwacji z ograniczeniem do zera. SKU, EAN, pozycje, tracking i inne szczegóły model pobiera i opisuje na wyraźne semantyczne żądanie użytkownika.
+
+Obraz produktu jest opcjonalnym artifactem. Model ustawia strukturalne `include_image=true`, gdy rozpozna prośbę o obraz; backend nie analizuje słów ani fraz użytkownika. Bez tej flagi runtime i UI nie tworzą `product_image`.
 
 ## Pamięć terminologii
 

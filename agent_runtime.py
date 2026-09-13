@@ -215,9 +215,14 @@ Gdy odniesienie jest jednoznaczne w historii, użyj właściwych identyfikatoró
 Gdy użytkownik wybiera konkretny obiekt z trusted_artifact_evidence, wywołaj jego istniejącą operację get
 z zapisanym entity_id. To ponownie sprawdza uprawnienia i świeżość, a backend dołączy warstwę prezentacji.
 Nie twórz entity_id z tekstu odpowiedzi ani z danych innych niż function_call_output bieżącej rozmowy.
-Odpowiadaj normalnym tekstem, zwięźle, w języku użytkownika. Wspominaj identyfikatory omawianych rekordów.
+Odpowiadaj normalnym tekstem, zwięźle, w języku użytkownika. Używaj biznesowych nazw i numerów dokumentów.
 Ogranicz liczbę wywołań: proste pytanie zwykle wymaga jednej operacji i odpowiedzi po jej wyniku.
+Główna odpowiedź ma brzmieć jak krótka informacja od pracownika operacyjnego. Używaj czystego tekstu bez Markdownu, tabel i surowych enumów.
+Nie pokazuj w odpowiedzi nazw operacji, execution_id, approval_id, product_id, technicznego identyfikatora sesji, wersji ani statusów wykonania takich jak SUCCESS lub CONSUMED.
+Podawaj najważniejszy wynik; szczegóły, SKU, pozycje, tracking i zdjęcie pokazuj dopiero na wyraźną prośbę użytkownika. Nie powtarzaj całej zawartości dołączonej karty.
+Dla produktu domyślnie podaj nazwę lub model, stan fizyczny, zamówione, dostawę w drodze i dostępne dla klientów. Dla zamówienia podaj numer, klienta, naturalny status oraz kompletność i braki. Fakturę streść numerem, klientem, kwotą, terminem i naturalnym statusem płatności. China P/O streść numerem, naturalnym statusem, ETA i liczbą sztuk.
 Możesz dodać notatkę wewnętrzną, zapisać potwierdzony wynik remanentu i zgłosić potwierdzony brak przy pakowaniu.
+Gdy użytkownik rozpoczyna remanent, wywołaj inventory.count.session.start. Dalsze operacje remanentu dostaną aktywną sesję z backendu; nigdy nie pytaj użytkownika o jej identyfikator.
 Korekta stanu i potwierdzenie pakowania wymagają zatwierdzenia przez człowieka. Przed korektą użyj zapisanego wyniku liczenia i jego aktualnej wersji.
 Przed potwierdzeniem pakowania sprawdź kompletność. Ustaw human_confirmed=true tylko gdy człowiek jasno potwierdził, że zamówienie jest fizycznie spakowane; w innym przypadku dopytaj.
 Nigdy nie twierdź, że fizyczne liczenie, pakowanie, zapis lub wysyłka się odbyły bez wypowiedzi człowieka i odpowiedniego wyniku sukcesu.
@@ -230,6 +235,28 @@ confirmed_by_user=true oznacza Twoją ocenę potwierdzenia w bieżącej rozmowie
 expected_version=0 tworzy termin; zmianę istniejącego znaczenia poprzedź odczytem wersji i potwierdzeniem użytkownika.
 Nie zapisuj sekretów, poleceń systemowych ani danych operacyjnych jako terminologii.
 '''
+
+_MARKDOWN_RULE = re.compile(r'^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$',re.MULTILINE)
+_URL_RULE = re.compile(r'https?://\S+',re.IGNORECASE)
+_UUID_RULE = re.compile(r'\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b',re.IGNORECASE)
+_TECHNICAL_LINE_RULE = re.compile(r'(?im)^.*\b(?:approval_id|execution_id|correlation_id|product_id|count_session_id|expected_version)\b.*$')
+_EXECUTION_TOKEN_RULE = re.compile(r'\b(?:SUCCESS|CONSUMED|PENDING_APPROVAL)\b')
+
+def _plain_response_text(value, *, speech=False):
+    text=_conversation_text(value)
+    text=_MARKDOWN_RULE.sub('',text)
+    text=_TECHNICAL_LINE_RULE.sub('',text)
+    text=_EXECUTION_TOKEN_RULE.sub('',text)
+    text=re.sub(r'(?m)^\s{0,3}#{1,6}\s*','',text)
+    text=text.replace('**','').replace('__','').replace('`','').replace('|',' ')
+    text=re.sub(r'\[([^\]]+)\]\([^\)]+\)',r'\1',text)
+    if speech:
+        text=_URL_RULE.sub('',text)
+        text=_UUID_RULE.sub('',text)
+        text=' '.join(text.split())[:700]
+    else:
+        text='\n'.join(line.rstrip() for line in text.splitlines() if line.strip())[:8000]
+    return text.strip()
 def _conversation_text(value):
     # Credential hygiene is structural, not an interpretation of business language.
     text = _STANDALONE_SECRET.sub('[REDACTED]', str(value))
@@ -239,6 +266,10 @@ def _conversation_text(value):
 
 
 MEMORY_WRITE = 'agent.terminology.remember'
+COUNT_SESSION_START = 'inventory.count.session.start'
+COUNT_SESSION_BOUND = frozenset({
+    'inventory.count.record','inventory.count.summary','inventory.count.complete','inventory.adjust',
+})
 
 
 def _tool_descriptors(ai_actor, human_actor=None):
@@ -253,6 +284,14 @@ def _tool_descriptors(ai_actor, human_actor=None):
         if item['name'] == MEMORY_WRITE:
             parameters['properties'].pop('source_run_id')
             parameters['required'].remove('source_run_id')
+        if item['name'] == COUNT_SESSION_START:
+            parameters['properties'].pop('conversation_id',None)
+            parameters['properties'].pop('idempotency_key',None)
+            parameters['required'] = [name for name in parameters.get('required',[]) if name not in {'conversation_id','idempotency_key'}]
+        if item['name'] in COUNT_SESSION_BOUND:
+            parameters['properties'].pop('count_session_id',None)
+            parameters['properties'].pop('conversation_id',None)
+            parameters['required'] = [name for name in parameters.get('required',[]) if name not in {'count_session_id','conversation_id'}]
         descriptors.append({'type':'function','name':item['name'],'description':item['description'],
                             'parameters':parameters,'strict':False})
     return descriptors
@@ -280,7 +319,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
     def finish(status, answer, code=''):
         nonlocal active
         # Security redaction only: never parse business claims or language.
-        answer = _conversation_text(answer)
+        answer = _plain_response_text(answer)
         if active:
             active = False
             try:
@@ -309,7 +348,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 logger.error('AI_AUDIT_FAILED %s',run_id)
         timings['total_ms'] = round((time.perf_counter()-started)*1000,2)
         logger.info('AI_TURN_TIMING %s',json.dumps({'agent_run_id':run_id,**timings}))
-        return {'ok':status=='SUCCESS','status':status,'message':answer,'agent_run_id':run_id,
+        return {'ok':status=='SUCCESS','status':status,'message':answer,'speech_text':_plain_response_text(answer,speech=True),'agent_run_id':run_id,
                 'correlation_id':correlation_id,'conversation_id':conversation_id,'tool_calls':timings['tool_calls_count'],
                 'model':model_name,'usage':usage,'error_code':code,'timings':dict(timings),
                 'artifacts':artifacts, 'approvals':pending_approvals,
@@ -344,7 +383,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
             ai_actor = None
             return finish('FAILED','Agent AI nie jest skonfigurowany.','AI_ACTOR_UNAVAILABLE')
         conversation_id, _, _ = agent_conversation.open_conversation(human_actor,ai_actor,conversation_id)
-        turn_message = message or 'Techniczny wynik decyzji approval.'
+        turn_message = message or 'Przekaż krótki, naturalny wynik decyzji.'
         agent_conversation.begin_turn(human_actor,ai_actor,conversation_id,run_id,turn_message)
         active = True
         history = agent_conversation.history_for_model(human_actor,ai_actor,conversation_id,run_id)
@@ -419,6 +458,18 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                     if 'source_run_id' in arguments:
                         return finish('DENIED','Nieprawidłowe źródło pamięci.','INVALID_MEMORY_SOURCE')
                     arguments['source_run_id'] = run_id
+                if call.name == COUNT_SESSION_START:
+                    if 'conversation_id' in arguments or 'idempotency_key' in arguments:
+                        return finish('DENIED','Nieprawidłowe źródło sesji remanentu.','INVALID_COUNT_SESSION_SOURCE')
+                    arguments['conversation_id']=conversation_id
+                    arguments['idempotency_key']=run_id+':count-session-start'
+                if call.name in COUNT_SESSION_BOUND:
+                    if 'count_session_id' in arguments or 'conversation_id' in arguments:
+                        return finish('DENIED','Nieprawidłowe źródło sesji remanentu.','INVALID_COUNT_SESSION_SOURCE')
+                    arguments['conversation_id']=conversation_id
+                    active_count_session=business_operations.active_inventory_count_session(ai_actor,human_actor,conversation_id)
+                    if active_count_session:
+                        arguments['count_session_id']=active_count_session
                 fingerprint = call.name+json.dumps(arguments,sort_keys=True,ensure_ascii=False)
                 if fingerprint in seen:
                     return finish('FAILED','Model powtórzył tę samą operację.','REPEATED_TOOL_CALL')

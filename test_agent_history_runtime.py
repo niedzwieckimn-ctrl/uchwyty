@@ -224,7 +224,7 @@ def test_text_is_verbatim_and_secret_redaction_is_only_structural():
     text='Treść '*450
     p=runtime.FakeModelProvider([respond(text)])
     result=runtime.run_agent_turn(owner(),'  Cześć!  ',p)
-    assert result['message']==text
+    assert result['message']==text.strip()
     assert p.calls[0]['input_items'][-1]['content']=='  Cześć!  '
     secret='sk-abcdefghijklmnopqrstuv'
     result=runtime.run_agent_turn(owner(),'hello',runtime.FakeModelProvider([respond('api_key='+secret)]))
@@ -257,7 +257,7 @@ def test_history_storage_failure_returns_controlled_response_without_retry(monke
 
 def test_forbidden_call_in_batch_is_denied_before_any_execution():
     p=runtime.FakeModelProvider([runtime.ProviderResponse(tool_calls=(
-        runtime.ToolCall('a','inventory.summary','{}'),runtime.ToolCall('b','inventory.adjust','{}')))])
+        runtime.ToolCall('a','inventory.summary','{}'),runtime.ToolCall('b','finance.transfer','{}')))])
     result=runtime.run_agent_turn(owner(),'test',p)
     assert result['status']=='DENIED'
     db=backend.conn();assert db.execute('SELECT COUNT(*) FROM internal_operation_executions').fetchone()[0]==0;db.close()

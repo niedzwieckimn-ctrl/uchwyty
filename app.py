@@ -951,6 +951,8 @@ def _artifact_links(operation_name: str, record: dict) -> dict:
         local = invoice_pdf_exists(pdf_path, invoice.get('invoice_no', ''))[0]
         return {'document_url': f'/invoices/{entity_id}/download'} if stored or local else {}
     if operation_name in {'inventory.product.get', 'inventory.product.search'}:
+        if record.get('image_requested') is not True:
+            return {}
         db = conn()
         try:
             row = db.execute(
@@ -1110,6 +1112,7 @@ def api_ai_approval_decide(approval_id, decision):
                 )
                 response['model_status'] = model_result['status']
                 response['message'] = model_result['message']
+                response['speech_text'] = model_result.get('speech_text', '')
                 response['conversation_id'] = model_result['conversation_id']
             except Exception:
                 response['model_status'] = 'FAILED'

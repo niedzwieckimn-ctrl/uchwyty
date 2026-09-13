@@ -45,7 +45,7 @@ def _two_products_with_images():
 def _search_turn():
     provider = runtime.FakeModelProvider([
         runtime.ProviderResponse(tool_calls=(runtime.ToolCall(
-            'search-products', 'inventory.product.search', json.dumps({'query': 'Avery'}),
+            'search-products', 'inventory.product.search', json.dumps({'query': 'Avery', 'include_image': True}),
         ),), model='fake'),
         runtime.ProviderResponse(text='Znalazłem dwa produkty.', model='fake'),
     ])
@@ -55,7 +55,7 @@ def _search_turn():
 def _followup(conversation_id, product_id, message):
     provider = runtime.FakeModelProvider([
         runtime.ProviderResponse(tool_calls=(runtime.ToolCall(
-            f'get-{product_id}', 'inventory.product.get', json.dumps({'product_id': product_id}),
+            f'get-{product_id}', 'inventory.product.get', json.dumps({'product_id': product_id, 'include_image': True}),
         ),), model='fake'),
         runtime.ProviderResponse(text=f'Wybrany produkt {product_id}.', model='fake'),
     ])
@@ -65,7 +65,7 @@ def _followup(conversation_id, product_id, message):
 
 def test_a_direct_product_uses_relative_existing_image(order, isolated):
     _two_products_with_images()
-    result = operations.execute_business_operation(ai(), 'inventory.product.search', {'query': 'AVERY-FIRST'})
+    result = operations.execute_business_operation(ai(), 'inventory.product.search', {'query': 'AVERY-FIRST', 'include_image': True})
     artifacts = backend.build_business_artifacts('inventory.product.search', result.data)
     assert _artifact(artifacts, 'product_card')['id'] == 702
     image = _artifact(artifacts, 'product_image')

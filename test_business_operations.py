@@ -117,6 +117,9 @@ def test_registry_is_closed_and_contains_required_contracts(isolated):
         "customers.search", "customers.get", "china.orders.summary", "china.orders.search", "china.orders.get", "business.sales.summary",
         "internal.test.change_setting", "internal.test.external.execute",
         "orders.internal_note.add", "orders.status.transition"
+        , "inventory.count.get_expected", "inventory.count.session.start", "inventory.count.summary", "inventory.count.record",
+        "inventory.count.complete", "inventory.adjust", "orders.packing.check",
+        "orders.packing.shortage.report", "orders.packing.confirm"
     }
     for item in operations.OPERATION_REGISTRY.values():
         assert item.operation_version == 1
@@ -194,7 +197,8 @@ def test_read_operation_owner_success_and_least_privilege_output(isolated):
     _product()
     result = operations.execute_business_operation(_owner(), "inventory.product.get", {"product_id": 1})
     assert result.status == "SUCCESS"
-    assert result.data == {"ok": True, "id": 1, "sku": "BO-1", "model": "Andre", "ean": "123", "name": "Uchwyt", "stock": 7}
+    assert result.data == {"ok": True, "id": 1, "sku": "BO-1", "model": "Andre", "ean": "123", "name": "Uchwyt", "stock": 7,
+                           "ordered_quantity":0,"incoming_quantity":0,"available_for_customers":7,"image_requested":False}
     assert "archived" not in result.data and "created_at" not in result.data
 
 

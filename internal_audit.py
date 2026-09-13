@@ -70,6 +70,7 @@ OPERATION_DEFINITIONS: dict[str, OperationDefinition] = {
     'orders.internal_note.add': OperationDefinition('orders.internal_note.add', 1, 'orders.internal_note.add', GREEN, WRITE),
     'orders.status.transition': OperationDefinition('orders.status.transition', 1, 'orders.change_status', YELLOW, WRITE),
     'inventory.count.record': OperationDefinition('inventory.count.record', 1, 'inventory.discrepancy_report', GREEN, WRITE),
+    'inventory.count.session.start': OperationDefinition('inventory.count.session.start', 1, 'inventory.discrepancy_report', GREEN, WRITE),
     'inventory.count.complete': OperationDefinition('inventory.count.complete', 1, 'inventory.discrepancy_report', GREEN, WRITE),
     'inventory.adjust': OperationDefinition('inventory.adjust', 1, 'inventory.adjust', YELLOW, WRITE),
     'orders.packing.shortage.report': OperationDefinition('orders.packing.shortage.report', 1, 'packing.prepare', GREEN, WRITE),

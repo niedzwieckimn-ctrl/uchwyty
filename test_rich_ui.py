@@ -85,7 +85,7 @@ def test_d_product_with_image_builds_card_and_product_image(order, tmp_path):
     image = tmp_path / 'avery.png'
     image.write_bytes(b'not-decoded-by-artifact-builder')
     _product(image)
-    result = operations.execute_business_operation(ai(), 'inventory.product.get', {'product_id': 702})
+    result = operations.execute_business_operation(ai(), 'inventory.product.get', {'product_id': 702, 'include_image':True})
     artifacts = backend.build_business_artifacts('inventory.product.get', result.data)
     card = _artifact(artifacts, 'product_card')
     picture = _artifact(artifacts, 'product_image')
@@ -97,7 +97,8 @@ def test_e_product_without_image_keeps_product_card(order):
     _product()
     result = operations.execute_business_operation(ai(), 'inventory.product.get', {'product_id': 702})
     artifacts = backend.build_business_artifacts('inventory.product.get', result.data)
-    assert _artifact(artifacts, 'product_card')['sku'] == 'CH034-BB-160'
+    assert _artifact(artifacts, 'product_card')['model'] == 'Avery 160'
+    assert 'sku' not in _artifact(artifacts, 'product_card')
     assert not any(item['type'] == 'product_image' for item in artifacts)
 
 
@@ -144,7 +145,7 @@ def test_runtime_attaches_trusted_product_artifacts_to_natural_answer(order):
     _product()
     provider = runtime.FakeModelProvider([
         runtime.ProviderResponse(tool_calls=(runtime.ToolCall(
-            'product-call', 'inventory.product.get', json.dumps({'product_id': 702}),
+            'product-call', 'inventory.product.get', json.dumps({'product_id': 702, 'include_image': True}),
         ),), model='fake'),
         runtime.ProviderResponse(text='Avery 160 ma 12 sztuk.', model='fake'),
     ])

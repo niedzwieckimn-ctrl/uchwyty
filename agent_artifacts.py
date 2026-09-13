@@ -127,10 +127,7 @@ def build_artifacts(
             'currency', 'total_net', 'total_gross', 'payment_status', 'paid',
             'amount_outstanding', 'buyer_tax_no', 'payment_type',
         ))}
-        card['items'] = _items(record, (
-            'sku', 'model', 'name', 'qty', 'quantity', 'unit_net_price',
-            'unit_gross_price', 'currency',
-        ))
+        card['items'] = []
         detail_url = _safe_url(links.get('detail_url'), ('/invoices/',))
         if detail_url:
             card['detail_url'] = detail_url
@@ -147,12 +144,9 @@ def build_artifacts(
             'id', 'order_number', 'customer_name', 'created_at', 'status',
             'currency', 'tracking_number', 'carrier', 'totals',
         ))}
-        card['items'] = _items(record, (
-            'product_id', 'sku', 'model', 'name', 'qty', 'unit_net_price',
-            'unit_gross_price', 'currency',
-        ))
-        card['item_count'] = len(card['items']) if card['items'] else int(record.get('item_lines') or 0)
-        card['total_units'] = sum(int(item.get('qty') or 0) for item in card['items']) if card['items'] else int(record.get('item_qty') or 0)
+        card['items'] = []
+        card['item_count'] = int(record.get('item_lines') or len(record.get('items') or []))
+        card['total_units'] = int(record.get('item_qty') or sum(int(item.get('qty') or 0) for item in record.get('items') or [] if isinstance(item,Mapping)))
         detail_url = _safe_url(links.get('detail_url'), ('/orders/',))
         if detail_url:
             card['detail_url'] = detail_url
@@ -190,15 +184,15 @@ def build_artifacts(
 
     elif operation in {'inventory.product.get', 'inventory.product.search'}:
         card = {'type': 'product_card', **_fields(record, (
-            'id', 'sku', 'model', 'ean', 'name', 'stock', 'physical_stock',
-            'available', 'available_stock', 'reserved', 'incoming', 'variant',
+            'id', 'model', 'name', 'stock', 'physical_stock',
+            'ordered_quantity', 'incoming_quantity', 'available_for_customers', 'variant',
             'color', 'spacing',
         ))}
         detail_url = _safe_url(links.get('detail_url'), ('/api/stock/products/', '/api/product/'))
         if detail_url:
             card['detail_url'] = detail_url
         artifacts.append(card)
-        image_url = _safe_url(links.get('image_url'), ('/stock/images/',))
+        image_url = _safe_url(links.get('image_url'), ('/stock/images/',)) if record.get('image_requested') is True else ''
         if image_url:
             artifacts.append({
                 'type': 'product_image', 'product_id': record.get('id'),
@@ -207,14 +201,10 @@ def build_artifacts(
 
     elif operation in {'china.orders.get', 'china.orders.search'}:
         card = {'type': 'china_order_card', **_fields(record, (
-            'id', 'po_number', 'supplier', 'order_status', 'delivery_stage',
-            'delivery_substatus', 'tracking_eta', 'carrier', 'tracking_number',
-            'shipping_method', 'ordered_at', 'shipped_at', 'arrived_at',
-            'created_at', 'item_count', 'total_units',
+            'id', 'po_number', 'order_status', 'delivery_stage',
+            'tracking_eta', 'item_count', 'total_units',
         ))}
-        card['items'] = _items(record, (
-            'product_id', 'sku', 'model', 'name', 'quantity', 'created_at',
-        ))
+        card['items'] = []
         detail_url = _safe_url(links.get('detail_url'), ('/china/',))
         if detail_url:
             card['detail_url'] = detail_url

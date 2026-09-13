@@ -4,6 +4,7 @@ Moduł udostępnia asystentowi jawne operacje remanentu i pakowania przez istnie
 
 ## Operacje
 
+- `inventory.count.session.start` — GREEN WRITE; tworzy albo zwraca jedną aktywną sesję `OPEN` dla inicjującego człowieka i bieżącej rozmowy. Techniczny identyfikator pozostaje w runtime i nie jest wymagany od użytkownika.
 - `inventory.count.get_expected` — GREEN READ; zwraca fizyczny stan `stock.qty` i wersję produktu.
 - `inventory.count.record` — GREEN WRITE; zapisuje wynik fizycznego liczenia, ale nie zmienia `stock`.
 - `inventory.count.summary` — GREEN READ; pokazuje pozycje zgodne, rozbieżności, korekty i nierozwiązane pozycje.
@@ -17,7 +18,9 @@ Potwierdzenie pakowania nie odejmuje zapasu i nie ustawia `warehouse_issued`. Dz
 
 ## Sesje i wersje
 
-Migracja `migrations/warehouse_operations.sql` tworzy wewnętrzne sesje `OPEN`, `COMPLETED`, `CANCELLED`, pozycje remanentu, raporty braków, sidecar wersji zapasu oraz wiązanie execution z inicjującym człowiekiem. Migracja jest addytywna i idempotentna; nie zmienia schematu panelu klienta i nie jest migracją Supabase.
+Migracja `migrations/warehouse_operations.sql` tworzy wewnętrzne sesje `OPEN`, `COMPLETED`, `CANCELLED`, pozycje remanentu, raporty braków, sidecar wersji zapasu oraz wiązanie execution z inicjującym człowiekiem. Sesja przechowuje także `conversation_id`. Inicjalizator uzupełnia to pole w bazie utworzonej przez wcześniejszą wersję migracji i zakłada unikalny indeks jednej otwartej sesji na człowieka i rozmowę. Migracja jest addytywna i idempotentna; nie zmienia schematu panelu klienta i nie jest migracją Supabase.
+
+Runtime ukrywa `count_session_id` i `conversation_id` w opisach narzędzi dostępnych modelowi. Przy zapisie, podsumowaniu, korekcie i zakończeniu remanentu pobiera aktywną sesję na podstawie zaufanej tożsamości człowieka oraz bieżącej rozmowy. Handler ponownie sprawdza właściciela, rozmowę i status `OPEN`. Zakończona sesja nie może zostać użyta ponownie; następne rozpoczęcie remanentu tworzy nową. Backend nie rozpoznaje polskich słów ani intencji — wybór operacji nadal należy do modelu.
 
 Zmiana `stock` zwiększa wersję produktu. Zapis liczenia i korekta wymagają wersji zwróconej przez `inventory.count.get_expected`. Korekta po zmianie stanu kończy się kontrolowanym konfliktem. Approval jest konsumowane w tej samej transakcji co zapis biznesowy i audit.
 
@@ -31,4 +34,4 @@ Asystent może ustawić `human_confirmed=true` dla pakowania tylko wtedy, gdy cz
 
 ## Weryfikacja
 
-Testy `test_warehouse_operations.py` obejmują odczyt oczekiwanego stanu, obserwacyjny zapis liczenia, rozbieżności, approval, idempotency, RBAC, stale version, rollback, wspólną kontrolę kompletności, raport braków, brak podwójnego wydania, konkurencyjne potwierdzenie, audit, endpoint approval i karty Rich UI.
+Testy `test_warehouse_operations.py` obejmują odczyt oczekiwanego stanu, obserwacyjny zapis liczenia, rozbieżności, approval, idempotency, RBAC, stale version, rollback, wspólną kontrolę kompletności, raport braków, brak podwójnego wydania, konkurencyjne potwierdzenie, audit, endpoint approval i karty Rich UI. `test_warehouse_ux.py` sprawdza automatyczne rozpoczęcie i użycie aktywnej sesji, izolację aktora i rozmowy, brak technicznych identyfikatorów w kontrakcie użytkowym, `speech_text`, źródło dostępności produktu oraz obraz wyłącznie na żądanie.

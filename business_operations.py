@@ -142,21 +142,25 @@ PRODUCT_GET_INPUT = {
     "type": "object",
     "additionalProperties": False,
     "required": ["product_id"],
-    "properties": {"product_id": {"type": "integer", "minimum": 1, "maximum": 9_223_372_036_854_775_807}},
+    "properties": {"product_id": {"type": "integer", "minimum": 1, "maximum": 9_223_372_036_854_775_807},
+                   "include_image": {"type":"boolean"}},
 }
 PRODUCT_GET_OUTPUT = {
     "type": "object",
-    "required": ["ok", "id", "sku", "model", "ean", "name", "stock"],
+    "required": ["ok", "id", "sku", "model", "ean", "name", "stock", "ordered_quantity", "incoming_quantity", "available_for_customers", "image_requested"],
     "properties": {
         "ok": {"type": "boolean"}, "id": {"type": "integer"},
         "sku": {"type": "string"}, "model": {"type": ["string", "null"]},
         "ean": {"type": ["string", "null"]}, "name": {"type": ["string", "null"]},
-        "stock": {"type": "integer"},
+        "stock": {"type": "integer"}, "ordered_quantity":{"type":"integer"},
+        "incoming_quantity":{"type":"integer"}, "available_for_customers":{"type":"integer"},
+        "image_requested":{"type":"boolean"},
     },
 }
 PRODUCT_SEARCH_INPUT = {
     "type": "object", "additionalProperties": False, "required": ["query"],
-    "properties": {"query": {"type": "string", "minLength": 1, "maxLength": 120}},
+    "properties": {"query": {"type": "string", "minLength": 1, "maxLength": 120},
+                   "include_image":{"type":"boolean"}},
 }
 _PRODUCT_FIELDS = {
     "type": "object", "additionalProperties": False,
@@ -164,7 +168,9 @@ _PRODUCT_FIELDS = {
     "properties": {
         "id": {"type": "integer"}, "sku": {"type": "string"},
         "model": {"type": ["string", "null"]}, "name": {"type": ["string", "null"]},
-        "stock": {"type": "integer"},
+        "stock": {"type": "integer"}, "ordered_quantity":{"type":"integer"},
+        "incoming_quantity":{"type":"integer"}, "available_for_customers":{"type":"integer"},
+        "image_requested":{"type":"boolean"},
     },
 }
 PRODUCT_SEARCH_OUTPUT = {
@@ -403,7 +409,7 @@ EXTERNAL_TEST_OUTPUT = {
 
 ORDER_WRITES = frozenset({'orders.internal_note.add', 'orders.status.transition'})
 WAREHOUSE_WRITES = frozenset({
-    'inventory.count.record', 'inventory.count.complete', 'inventory.adjust',
+    'inventory.count.session.start', 'inventory.count.record', 'inventory.count.complete', 'inventory.adjust',
     'orders.packing.shortage.report', 'orders.packing.confirm',
 })
 LOCAL_WRITES = ORDER_WRITES | WAREHOUSE_WRITES
@@ -566,26 +572,30 @@ def _warehouse_definition(name, description, permission, risk, properties, requi
         'READ_STANDARD' if read_only else 'WRITE', read_only)
 
 OPERATION_REGISTRY.update({
+    'inventory.count.session.start': _warehouse_definition(
+        'inventory.count.session.start', 'Tworzy albo zwraca jedną aktywną sesję remanentu dla bieżącego pracownika i rozmowy.',
+        'inventory.discrepancy_report', approvals.GREEN,
+        {'conversation_id':_SESSION,'idempotency_key':_IDEM}, ['conversation_id','idempotency_key']),
     'inventory.count.get_expected': _warehouse_definition(
         'inventory.count.get_expected', 'Pobiera aktualny fizyczny stan produktu i wersję do bezpiecznego zapisu remanentu.',
         'inventory.read', approvals.GREEN, {'product_id':_PID}, ['product_id'], read_only=True),
     'inventory.count.summary': _warehouse_definition(
         'inventory.count.summary', 'Podsumowuje zapisaną sesję remanentu i nierozwiązane rozbieżności.',
-        'inventory.read', approvals.GREEN, {'count_session_id':_SESSION}, ['count_session_id'], read_only=True),
+        'inventory.read', approvals.GREEN, {'count_session_id':_SESSION,'conversation_id':_SESSION}, ['count_session_id'], read_only=True),
     'inventory.count.record': _warehouse_definition(
         'inventory.count.record', 'Zapisuje obserwację fizycznego liczenia bez zmiany stanu magazynowego.',
         'inventory.discrepancy_report', approvals.GREEN,
-        {'product_id':_PID,'count_session_id':_SESSION,'counted_quantity':{'type':'integer','minimum':0},
+        {'product_id':_PID,'count_session_id':_SESSION,'conversation_id':_SESSION,'counted_quantity':{'type':'integer','minimum':0},
          'expected_version':_VERSION,'idempotency_key':_IDEM,'note':{'type':'string','minLength':1,'maxLength':500}},
         ['product_id','count_session_id','counted_quantity','expected_version','idempotency_key']),
     'inventory.count.complete': _warehouse_definition(
         'inventory.count.complete', 'Kończy sesję remanentu wyłącznie gdy nie ma nierozwiązanych rozbieżności.',
         'inventory.discrepancy_report', approvals.GREEN,
-        {'count_session_id':_SESSION,'idempotency_key':_IDEM}, ['count_session_id','idempotency_key']),
+        {'count_session_id':_SESSION,'conversation_id':_SESSION,'idempotency_key':_IDEM}, ['count_session_id','idempotency_key']),
     'inventory.adjust': _warehouse_definition(
         'inventory.adjust', 'Po zatwierdzeniu ustawia stan na zapisaną ilość policzoną; różnicę wylicza backend.',
         'inventory.adjust', approvals.YELLOW,
-        {'product_id':_PID,'count_session_id':_SESSION,'expected_version':_VERSION,'idempotency_key':_IDEM},
+        {'product_id':_PID,'count_session_id':_SESSION,'conversation_id':_SESSION,'expected_version':_VERSION,'idempotency_key':_IDEM},
         ['product_id','count_session_id','expected_version','idempotency_key']),
     'orders.packing.check': _warehouse_definition(
         'orders.packing.check', 'Sprawdza kompletność zamówienia wspólnym algorytmem dostępności magazynowej.',
@@ -654,6 +664,12 @@ def _now() -> str:
 def initialize_schema(db: sqlite3.Connection) -> None:
     db.executescript((Path(__file__).parent / 'migrations' / 'first_supervised_write.sql').read_text(encoding='utf-8'))
     db.executescript((Path(__file__).parent / 'migrations' / 'warehouse_operations.sql').read_text(encoding='utf-8'))
+    count_columns = {row['name'] for row in db.execute('PRAGMA table_info(internal_inventory_count_sessions)').fetchall()}
+    if 'conversation_id' not in count_columns:
+        db.execute("ALTER TABLE internal_inventory_count_sessions ADD COLUMN conversation_id TEXT NOT NULL DEFAULT ''")
+    db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_inventory_count_open_owner_conversation
+                  ON internal_inventory_count_sessions(created_by,conversation_id)
+                  WHERE status='OPEN' AND conversation_id<>''""")
     db.executescript(
         """
         CREATE TABLE IF NOT EXISTS internal_operation_executions(
@@ -787,6 +803,8 @@ def _entity(definition: BusinessOperationDefinition, data: Mapping[str, Any]) ->
         return 'product', str(data['product_id']), data.get('expected_version')
     if definition.operation_name in {'inventory.count.summary','inventory.count.complete'}:
         return 'inventory_count_session', str(data['count_session_id']), None
+    if definition.operation_name == 'inventory.count.session.start':
+        return 'inventory_count_session', str(data['conversation_id']), None
     if definition.operation_name in {'orders.packing.check','orders.packing.shortage.report','orders.packing.confirm'}:
         return 'order', str(data['order_id']), data.get('expected_version')
     if definition.operation_name == "agent.terminology.search":
@@ -970,8 +988,14 @@ def _product_get(data, actor, correlation_id, transaction_connection=None):
             db.close()
     if row is None:
         raise ControlledOperationError("PRODUCT_NOT_FOUND", "Nie znaleziono produktu", status=NOOP)
+    metric=next((item for item in build_replenishment_analysis(_factory(),today=_business_now().date())
+                 if int(item['id'])==int(row['id'])),{})
     return {"ok": True, "id": row["id"], "sku": row["sku"], "model": row["model"],
-            "ean": row["ean"], "name": row["name"], "stock": int(row["stock"])}
+            "ean": row["ean"], "name": row["name"], "stock": int(row["stock"]),
+            "ordered_quantity":int(metric.get('reserved_qty') or 0),
+            "incoming_quantity":int(metric.get('incoming_qty') or 0),
+            "available_for_customers":int(metric.get('available_qty') or 0),
+            "image_requested":data.get('include_image') is True}
 
 
 def _product_search(data, actor, correlation_id, transaction_connection=None):
@@ -1017,8 +1041,13 @@ def _product_search(data, actor, correlation_id, transaction_connection=None):
     found = [(match_rank, row) for row in catalog if (match_rank := rank(row)) is not None]
     found.sort(key=lambda item: item[0])
     selected = [row for _, row in found[:MAX_PRODUCT_SEARCH_RESULTS]]
+    metrics={int(item['id']):item for item in build_replenishment_analysis(_factory(),today=_business_now().date())}
     candidates = [{"id": int(row["id"]), "sku": row["sku"] or "", "model": row["model"],
-                   "name": row["name"], "stock": int(row["stock"])} for row in selected]
+                   "name": row["name"], "stock": int(row["stock"]),
+                   "ordered_quantity":int(metrics.get(int(row['id']),{}).get('reserved_qty') or 0),
+                   "incoming_quantity":int(metrics.get(int(row['id']),{}).get('incoming_qty') or 0),
+                   "available_for_customers":int(metrics.get(int(row['id']),{}).get('available_qty') or 0),
+                   "image_requested":data.get('include_image') is True} for row in selected]
     return {"ok": True, "query": query, "candidates": candidates,
             "count": len(candidates), "truncated": len(found) > MAX_PRODUCT_SEARCH_RESULTS}
 
@@ -1657,6 +1686,46 @@ def _human_actor_id(actor):
     return actor.delegated_by_actor_id or actor.actor_id
 
 
+def _assert_count_conversation(db, actor, conversation_id):
+    human_id = _human_actor_id(actor)
+    row = db.execute('''SELECT conversation_id FROM internal_agent_conversations
+                        WHERE conversation_id=? AND human_actor_id=? AND ai_actor_id=?''',
+                     (conversation_id,human_id,actor.actor_id)).fetchone()
+    if row is None:
+        raise ControlledOperationError('CONVERSATION_ACCESS_DENIED','Rozmowa nie należy do bieżącego pracownika',status=DENIED)
+
+
+def _assert_count_session(db, data, actor, *, require_open=True):
+    session = db.execute('SELECT * FROM internal_inventory_count_sessions WHERE session_id=?',
+                         (data['count_session_id'],)).fetchone()
+    if session is None:
+        return None
+    if session['created_by'] != _human_actor_id(actor):
+        raise ControlledOperationError('COUNT_SESSION_ACCESS_DENIED','Sesja remanentu należy do innego pracownika',status=DENIED)
+    conversation_id = data.get('conversation_id')
+    if conversation_id and session['conversation_id'] != conversation_id:
+        raise ControlledOperationError('COUNT_SESSION_ACCESS_DENIED','Sesja remanentu należy do innej rozmowy',status=DENIED)
+    if require_open and session['status'] != 'OPEN':
+        raise ControlledOperationError('COUNT_SESSION_CLOSED','Sesja remanentu nie jest otwarta',status=CONFLICT)
+    return session
+
+
+def active_inventory_count_session(ai_actor, human_actor, conversation_id):
+    """Resolve technical session state for the trusted runtime, never from user text."""
+    ai = _trusted_actor(ai_actor)
+    human = load_actor_context(human_actor.actor_id) if isinstance(human_actor,ActorContext) else None
+    if human is None or human.actor_type != 'HUMAN' or ai.delegated_by_actor_id != human.actor_id:
+        raise ControlledOperationError('UNTRUSTED_ACTOR','Brak zaufanego właściciela sesji',status=DENIED)
+    db=_factory()()
+    try:
+        _assert_count_conversation(db,ai,conversation_id)
+        row=db.execute("""SELECT session_id FROM internal_inventory_count_sessions
+                          WHERE created_by=? AND conversation_id=? AND status='OPEN'
+                          ORDER BY created_at DESC LIMIT 1""",(human.actor_id,conversation_id)).fetchone()
+        return str(row['session_id']) if row else ''
+    finally: db.close()
+
+
 def _assert_operation_permission(actor, definition):
     trusted = _trusted_actor(actor)
     if trusted.permission_decision(definition.required_permission) == PERMISSION_DENY:
@@ -1685,6 +1754,9 @@ def _packing_readiness(db, order_id):
 def _validate_warehouse_write(db, data, actor, definition):
     _assert_operation_permission(actor, definition)
     name = definition.operation_name
+    if name == 'inventory.count.session.start':
+        _assert_count_conversation(db,actor,data['conversation_id'])
+        return None
     if name in {'inventory.count.record','inventory.adjust'}:
         row = db.execute('SELECT p.id,COALESCE(s.qty,0) qty FROM products p LEFT JOIN stock s ON s.product_id=p.id WHERE p.id=?',
                          (data['product_id'],)).fetchone()
@@ -1694,10 +1766,7 @@ def _validate_warehouse_write(db, data, actor, definition):
         if version != data['expected_version']:
             raise ControlledOperationError('ENTITY_VERSION_CONFLICT',
                 f'Stan produktu zmienił się. Aktualna expected_version={version}.', status=CONFLICT)
-        session = db.execute('SELECT status FROM internal_inventory_count_sessions WHERE session_id=?',
-                             (data['count_session_id'],)).fetchone()
-        if session and session['status'] != 'OPEN':
-            raise ControlledOperationError('COUNT_SESSION_CLOSED', 'Sesja remanentu nie jest otwarta', status=CONFLICT)
+        session = _assert_count_session(db,data,actor)
         if name == 'inventory.adjust':
             item = db.execute('SELECT * FROM internal_inventory_count_items WHERE session_id=? AND product_id=?',
                               (data['count_session_id'],data['product_id'])).fetchone()
@@ -1708,12 +1777,9 @@ def _validate_warehouse_write(db, data, actor, definition):
                     f'Stan produktu zmienił się. Aktualna expected_version={version}.', status=CONFLICT)
         return version
     if name == 'inventory.count.complete':
-        session = db.execute('SELECT status FROM internal_inventory_count_sessions WHERE session_id=?',
-                             (data['count_session_id'],)).fetchone()
+        session = _assert_count_session(db,data,actor)
         if session is None:
             raise ControlledOperationError('COUNT_SESSION_NOT_FOUND', 'Nie znaleziono sesji remanentu', status=CONFLICT)
-        if session['status'] != 'OPEN':
-            raise ControlledOperationError('COUNT_SESSION_CLOSED', 'Sesja remanentu nie jest otwarta', status=CONFLICT)
         return None
     if name == 'orders.packing.shortage.report':
         row = db.execute('SELECT 1 FROM order_items WHERE order_id=? AND product_id=? LIMIT 1',
@@ -1763,11 +1829,37 @@ def _inventory_count_expected(data, actor, correlation_id, transaction_connectio
         if transaction_connection is None: db.close()
 
 
+def _inventory_count_session_start(data, actor, correlation_id, transaction_connection=None):
+    db=transaction_connection; human_id=_human_actor_id(actor)
+    existing=db.execute("""SELECT session_id FROM internal_inventory_count_sessions
+                           WHERE created_by=? AND conversation_id=? AND status='OPEN'
+                           ORDER BY created_at DESC LIMIT 1""",(human_id,data['conversation_id'])).fetchone()
+    if existing:
+        session_id=str(existing['session_id'])
+    else:
+        session_id=str(uuid.uuid4())
+        try:
+            db.execute('''INSERT INTO internal_inventory_count_sessions(
+                          session_id,status,created_by,conversation_id,created_at) VALUES(?,'OPEN',?,?,?)''',
+                       (session_id,human_id,data['conversation_id'],_now()))
+        except sqlite3.IntegrityError:
+            row=db.execute("""SELECT session_id FROM internal_inventory_count_sessions
+                              WHERE created_by=? AND conversation_id=? AND status='OPEN'""",
+                           (human_id,data['conversation_id'])).fetchone()
+            if not row: raise
+            session_id=str(row['session_id'])
+    record_audit_event('inventory.count.session.start',result=SUCCESS,actor_context=actor,
+        entity_type='inventory_count_session',entity_id=session_id,correlation_id=correlation_id,
+        after_state={'status':'OPEN','conversation_id':data['conversation_id'],'created_by':human_id},
+        transaction_connection=db)
+    return {'ok':True,'count_id':session_id,'status':'OPEN'}
+
+
 def _inventory_count_summary(data, actor, correlation_id, transaction_connection=None):
-    del actor, correlation_id
+    del correlation_id
     db = transaction_connection or _factory()()
     try:
-        session = db.execute('SELECT * FROM internal_inventory_count_sessions WHERE session_id=?', (data['count_session_id'],)).fetchone()
+        session = _assert_count_session(db,data,actor,require_open=False)
         if session is None:
             raise ControlledOperationError('COUNT_SESSION_NOT_FOUND', 'Nie znaleziono sesji remanentu', status=CONFLICT)
         rows = db.execute('SELECT * FROM internal_inventory_count_items WHERE session_id=? ORDER BY product_id',
@@ -1788,8 +1880,9 @@ def _inventory_count_summary(data, actor, correlation_id, transaction_connection
 
 def _inventory_count_record(data, actor, correlation_id, transaction_connection=None):
     db=transaction_connection; now=_now(); human_id=_human_actor_id(actor)
-    db.execute('INSERT OR IGNORE INTO internal_inventory_count_sessions(session_id,status,created_by,created_at) VALUES(?,?,?,?)',
-               (data['count_session_id'],'OPEN',human_id,now))
+    db.execute('''INSERT OR IGNORE INTO internal_inventory_count_sessions(
+                  session_id,status,created_by,conversation_id,created_at) VALUES(?,?,?,?,?)''',
+               (data['count_session_id'],'OPEN',human_id,data.get('conversation_id',''),now))
     stock_row=db.execute('SELECT COALESCE(qty,0) qty FROM stock WHERE product_id=?',(data['product_id'],)).fetchone()
     expected=int(stock_row['qty']) if stock_row else 0
     difference=int(data['counted_quantity'])-expected
@@ -1940,6 +2033,7 @@ _HANDLERS: dict[str, Callable[[Mapping[str, Any], ActorContext, str, sqlite3.Con
     "inventory.product.get": _product_get,
     "inventory.summary": _inventory_summary,
     "inventory.count.get_expected": _inventory_count_expected,
+    "inventory.count.session.start": _inventory_count_session_start,
     "inventory.count.summary": _inventory_count_summary,
     "inventory.count.record": _inventory_count_record,
     "inventory.count.complete": _inventory_count_complete,
