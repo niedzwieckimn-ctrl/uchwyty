@@ -145,6 +145,16 @@ def finish_turn(human, ai, cid, run_id, answer, evidence):
         db.execute('DELETE FROM internal_agent_turn_leases WHERE conversation_id=? AND run_id=?', (cid,run_id))
 
 
+def release_turn(human, ai, cid, run_id):
+    """Release only this run's lease when any later lifecycle step fails."""
+    if not cid or not run_id or ai is None:
+        return
+    with connection() as db:
+        db.execute('BEGIN IMMEDIATE')
+        _owned(db, human, ai, cid)
+        db.execute('DELETE FROM internal_agent_turn_leases WHERE conversation_id=? AND run_id=?', (cid, run_id))
+
+
 def memory_for_model(human, ai):
     # The existing installation is single-company, one SQLite database per company.
     with connection() as db:

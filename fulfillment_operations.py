@@ -173,6 +173,11 @@ def preflight(name, data, actor=None):
     if name == 'shipping.shipment.create' and current['shipment']['exists']:
         if any(str(snapshot(member)['order'].get('inpost_shipment_id') or '') != str(o.get('inpost_shipment_id') or '') for member in s['package_ids']):
             raise error('PACKAGE_SHIPMENT_CONFLICT', 'Zamówienia w paczce nie mają wspólnej przesyłki. Najpierw zweryfikuj powiązanie istniejącego nadania.', 'CONFLICT')
+    if name == 'shipping.shipment.create' and not current['shipment']['exists'] and any(
+        attempt['state'] in {'SENDING', 'UNKNOWN'} for attempt in s['attempts']
+    ):
+        raise error('SHIPMENT_RECOVERY_REQUIRED',
+                    'Wynik wcześniejszego nadania jest niepewny. Użyj shipping.shipment.refresh; nie tworzę kolejnej przesyłki.')
     if s['persistence']['pending'] and name != 'orders.fulfillment.reconcile':
         raise error('RECONCILIATION_PENDING', 'Najpierw uzgodnij wcześniejszy zapis metadanych realizacji.', 'CONFLICT')
     if name == 'shipping.shipment.confirm_parameters':
@@ -197,8 +202,15 @@ def preflight(name, data, actor=None):
             raise error('EXISTING_INVOICE', 'Najpierw sprawdź istniejącą fakturę.')
         if not current['readiness']['complete']:
             raise error('ORDER_NOT_READY', 'Brakuje produktów do kompletnej realizacji.')
-    if name == 'orders.invoice.create' and not current['invoice']['current'] and not current['packing_list']['current']:
-        raise error('PACKING_REQUIRED', 'Najpierw przygotuj aktualną listę pakową.')
+    if name == 'orders.invoice.create' and not current['invoice']['current']:
+        if s['invoices']:
+            matching_intent = any(i['kind'] == 'invoice' and i['content_hash'] == s['content_hash'] for i in s['intents'])
+            resumable_partial = matching_intent and any(i.get('publication_state', 'complete') != 'complete' for i in s['invoices'])
+            if not resumable_partial:
+                raise error('EXISTING_INVOICE_RECONCILE_REQUIRED',
+                            'Faktura już istnieje. Zweryfikuj ją przez podgląd adopcji/reconciliation; nie tworzę kolejnej.')
+        if not current['packing_list']['current']:
+            raise error('PACKING_REQUIRED', 'Najpierw przygotuj aktualną listę pakową.')
     if name == 'shipping.shipment.create' and not current['shipment']['exists']:
         if not current['invoice']['current'] or not current['packing_list']['current']:
             raise error('CURRENT_DOCUMENTS_REQUIRED', 'Przed nadaniem wymagane są aktualne dokumenty.')
@@ -291,8 +303,6 @@ def state(data, actor=None, correlation_id='', transaction_connection=None):
                  'label' if not documents['label']['current'] else
                  'pickup' if not (pickup or {}).get('state') else
                  'pickup_review' if (pickup or {}).get('state') in {'unknown', 'rejected', 'configuration_error'} else 'print')
-    if next_step == 'review_existing_invoice' and any(i['kind'] == 'invoice' and i['content_hash'] == s['content_hash'] for i in s['intents']):
-        next_step = 'invoice'
     return {'ok': True, 'state': {'order_id': o['id'], 'order_number': o.get('order_no'),
         'customer': o.get('customer_name'), 'order_status': o['status'], 'expected_version': version(s),
         'package': {'order_ids': s['package_ids'], 'package_key': _hash(s['package_ids']), 'member_versions': s['package_versions'], 'fingerprint': _hash(s)},
@@ -593,13 +603,23 @@ def perform(name, data, actor):
                 b.consume_packing_selection(selection['batch_id'], iid)
             result = {'invoice_id': iid}
         else:
-            if s['intents'] and not any(d['kind'] == 'invoice' for d in s['documents']):
-                raise error('INVOICE_OUTCOME_UNKNOWN', 'Istnieje rozpoczęte wystawienie faktury bez potwierdzonego rekordu. Najpierw uzgodnij istniejącą próbę; nie tworzę drugiej faktury.')
-            c = b.conn()
-            c.execute("INSERT OR REPLACE INTO fulfillment_document_intents VALUES(?,'invoice',?)", (oid, s['content_hash']))
-            c.commit(); c.close()
-            import reconciliation_store
-            reconciliation_store.publish(b, oid)
+            if s['intents']:
+                matching = [intent for intent in s['intents'] if intent['kind'] == 'invoice' and intent['content_hash'] == s['content_hash']]
+                prior_completed = any(d['kind'] == 'invoice' for d in s['documents'])
+                if not matching and not prior_completed:
+                    raise error('INVOICE_ATTEMPT_CONFLICT', 'Rozpoczęta próba dotyczy innej wersji zamówienia. Najpierw uzgodnij jej wynik.', 'CONFLICT')
+                if not matching and prior_completed:
+                    c = b.conn()
+                    c.execute("INSERT OR REPLACE INTO fulfillment_document_intents VALUES(?,'invoice',?)", (oid, s['content_hash']))
+                    c.commit(); c.close()
+                    import reconciliation_store
+                    reconciliation_store.publish(b, oid)
+            else:
+                c = b.conn()
+                c.execute("INSERT OR REPLACE INTO fulfillment_document_intents VALUES(?,'invoice',?)", (oid, s['content_hash']))
+                c.commit(); c.close()
+                import reconciliation_store
+                reconciliation_store.publish(b, oid)
             plan = _check_response(b.order_invoice_service(oid, request=request_view('GET'), session={}, structured=True))
             form = dict(plan['defaults'])
             form.update({f'invoice_qty_{iid}': qty for iid, qty in plan['packing_qty'].items()})

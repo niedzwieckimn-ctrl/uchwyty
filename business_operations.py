@@ -15,6 +15,7 @@ import re
 import sqlite3
 import threading
 import time
+import unicodedata
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -28,7 +29,7 @@ import fulfillment_operations
 import agent_conversation
 import internal_approval as approvals
 from cash_flow_module import cash_flow_overdue_invoices
-from inventory_analytics import build_replenishment_analysis
+from inventory_analytics import build_replenishment_analysis, recommended_replenishments
 from fulfillment_readiness import calculate_fulfillment_readiness
 from internal_audit import (
     CONFLICT, DENIED, FAILED, NOOP, PENDING_APPROVAL, SUCCESS,
@@ -61,6 +62,7 @@ _write_success_observer: Callable[[str, Mapping[str, Any]], None] | None = None
 
 FRESHNESS_GROUP_BY_OPERATION = {
     "inventory.product.search": "inventory", "inventory.product.get": "inventory", "inventory.summary": "inventory",
+    "inventory.replenishment.ranking": "inventory",
     "orders.search": "orders", "orders.get": "orders", "orders.summary": "orders",
     "orders.fulfillment.readiness": "fulfillment",
     "inventory.count.get_expected": "inventory", "inventory.count.summary": "inventory",
@@ -326,6 +328,16 @@ INVENTORY_SUMMARY_OUTPUT = {
         "reserved_units": {"type": "integer"}, "incoming_units": {"type": "integer"},
     },
 }
+REPLENISHMENT_INPUT = {
+    "type": "object", "additionalProperties": False,
+    "properties": {"limit": _LIMIT, "include_all": {"type": "boolean"}},
+}
+REPLENISHMENT_OUTPUT = {
+    "type": "object", "additionalProperties": False,
+    "required": ["ok", "results", "count", "truncated"],
+    "properties": {"ok": {"type": "boolean"}, "results": {"type": "array"},
+                   "count": {"type": "integer"}, "truncated": {"type": "boolean"}},
+}
 CHINA_SUMMARY_INPUT = {
     "type": "object", "additionalProperties": False,
     "properties": {"scope": {"type": "string", "enum": ["active", "all", "arrived"]}},
@@ -465,6 +477,12 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
         "inventory.summary", 1, "Podsumowuje cały magazyn: fizyczny stan, dostępność, rezerwacje i dostawy w drodze.",
         "inventory.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "SYSTEM", "AI_AGENT"}),
         INVENTORY_SUMMARY_INPUT, INVENTORY_SUMMARY_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
+    ),
+    "inventory.replenishment.ranking": BusinessOperationDefinition(
+        "inventory.replenishment.ranking", 1,
+        "Zwraca istniejący ranking uzupełniania używany przez UI. Domyślnie 5 pozycji; include_all=true zwraca do limitu bez własnych obliczeń AI.",
+        "inventory.replenishment_read", approvals.GREEN, "NONE", frozenset({"HUMAN", "SYSTEM", "AI_AGENT"}),
+        REPLENISHMENT_INPUT, REPLENISHMENT_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
     "orders.search": BusinessOperationDefinition(
         "orders.search", 1, "Wyszukuje zamówienia po numerze lub nazwie klienta (query), customer_id, product_id, statusie i okresie; limit=1 zwraca najnowszy pasujący rekord z customer_id. product_id pozwala ustalić ostatniego nabywcę produktu.",
@@ -836,6 +854,8 @@ def _entity(definition: BusinessOperationDefinition, data: Mapping[str, Any]) ->
         return "product", str(data["product_id"]), None
     if definition.operation_name == "inventory.summary":
         return "inventory_summary", "all", None
+    if definition.operation_name == "inventory.replenishment.ranking":
+        return "inventory_replenishment", "all", None
     if definition.operation_name in {"orders.search", "invoices.search", "invoices.overdue", "customers.search"}:
         return definition.operation_name.replace(".", "_"), sanitize_audit_text(data.get("query", "all"))[:160], None
     if definition.operation_name == "orders.summary":
@@ -1419,7 +1439,10 @@ def _invoices_overdue(data, actor, correlation_id, transaction_connection=None):
 def _customers_search(data, actor, correlation_id, transaction_connection=None):
     db = transaction_connection or _factory()()
     try:
-        q = " ".join(str(data["query"]).split()).casefold(); limit = _limit(data)
+        def searchable(value):
+            value = " ".join(str(value or "").split()).casefold()
+            return "".join(ch for ch in unicodedata.normalize("NFKD", value) if not unicodedata.combining(ch))
+        q = searchable(data["query"]); limit = _limit(data)
         tokens = q.split()
         registered = [dict(row) for row in db.execute(
             "SELECT id,name,nip,email,phone FROM customers ORDER BY name,id"
@@ -1435,7 +1458,7 @@ def _customers_search(data, actor, correlation_id, transaction_connection=None):
         ).fetchall()]
         matches, seen = [], set()
         for row in registered + order_identities:
-            fields = [" ".join(str(row.get(key) or "").split()).casefold()
+            fields = [searchable(row.get(key))
                       for key in ("name", "nip", "email", "phone")]
             haystack = " ".join(fields)
             compact_haystack = re.sub(r"[^\w]+", "", haystack, flags=re.UNICODE)
@@ -1470,6 +1493,61 @@ def _inventory_summary(data, actor, correlation_id, transaction_connection=None)
         "reserved_units": sum(int(row.get("reserved_qty") or 0) for row in rows),
         "incoming_units": sum(int(row.get("incoming_qty") or 0) for row in rows),
     }
+
+
+def _replenishment_ranking(data, actor, correlation_id, transaction_connection=None):
+    del actor, correlation_id
+    if transaction_connection is not None:
+        rows = build_replenishment_analysis(lambda: transaction_connection, today=_business_now().date())
+    else:
+        rows = build_replenishment_analysis(_factory(), today=_business_now().date())
+    ranked = recommended_replenishments(rows, limit=max(10, len(rows)))
+    limit = int(data.get("limit") or (50 if data.get("include_all") else 5))
+    selected = ranked[:limit]
+    # Return the exact rows calculated and filtered by inventory_analytics.
+    return {"ok": True, "results": [dict(row) for row in selected],
+            "count": len(selected), "truncated": len(ranked) > limit}
+
+
+def search_entity_type(operation_name):
+    if operation_name.startswith("customers."):
+        return "customer"
+    if operation_name.startswith("orders.") and operation_name in {"orders.search", "orders.get", "orders.fulfillment.state"}:
+        return "order"
+    if operation_name.startswith("inventory.product."):
+        return "product"
+    if operation_name.startswith("invoices.") and operation_name in {"invoices.search", "invoices.get"}:
+        return "invoice"
+    return None
+
+
+def validate_resolved_entity_scope(operation_name, data, resolved, ambiguous):
+    """Validate the model's fresh structured resolution; no parsing of user language."""
+    if operation_name.startswith("orders.") or operation_name.startswith("shipping."):
+        if "customer" in ambiguous or "order" in ambiguous:
+            return "ENTITY_SCOPE_AMBIGUOUS", "Nie ustalono jednoznacznie klienta lub zamówienia. Najpierw doprecyzuj obiekt."
+        target = int(data.get("order_id") or 0)
+        if resolved.get("order") and target != int(resolved["order"]):
+            return "ENTITY_SCOPE_CONFLICT", "Cel zapisu nie zgadza się z ostatnio odczytanym zamówieniem."
+        if resolved.get("customer") and target:
+            db = _factory()()
+            try:
+                row = db.execute("SELECT customer_id FROM orders WHERE id=?", (target,)).fetchone()
+            finally:
+                db.close()
+            if not row or int(row["customer_id"] or 0) != int(resolved["customer"]):
+                return "ENTITY_SCOPE_CONFLICT", "Zamówienie nie należy do ostatnio wskazanego klienta."
+    if operation_name.startswith("invoices.") and not operation_name.endswith("search"):
+        if "invoice" in ambiguous:
+            return "ENTITY_SCOPE_AMBIGUOUS", "Nie ustalono jednoznacznie faktury."
+        if resolved.get("invoice") and int(data.get("invoice_id") or 0) != int(resolved["invoice"]):
+            return "ENTITY_SCOPE_CONFLICT", "Cel zapisu nie zgadza się z ostatnio odczytaną fakturą."
+    if data.get("product_id"):
+        if "product" in ambiguous:
+            return "ENTITY_SCOPE_AMBIGUOUS", "Nie ustalono jednoznacznie produktu."
+        if resolved.get("product") and int(data["product_id"]) != int(resolved["product"]):
+            return "ENTITY_SCOPE_CONFLICT", "Produkt zapisu nie zgadza się z ostatnio odczytanym produktem."
+    return None
 
 
 def _orders_fulfillment_readiness(data, actor, correlation_id, transaction_connection=None):
@@ -2093,6 +2171,7 @@ _HANDLERS: dict[str, Callable[[Mapping[str, Any], ActorContext, str, sqlite3.Con
     "inventory.product.search": _product_search,
     "inventory.product.get": _product_get,
     "inventory.summary": _inventory_summary,
+    "inventory.replenishment.ranking": _replenishment_ranking,
     "inventory.count.get_expected": _inventory_count_expected,
     "inventory.count.session.start": _inventory_count_session_start,
     "inventory.count.summary": _inventory_count_summary,

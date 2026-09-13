@@ -109,6 +109,7 @@ PILOT_POLICIES = FULFILLMENT_POLICIES + (
     ("policy-inventory-product-search", "inventory.product.search", 1, "inventory.read", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
     ("policy-inventory-product-get", "inventory.product.get", 1, "inventory.read", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
     ("policy-inventory-summary", "inventory.summary", 1, "inventory.read", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
+    ("policy-inventory-replenishment-ranking", "inventory.replenishment.ranking", 1, "inventory.replenishment_read", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
     ("policy-inventory-count-get-expected", "inventory.count.get_expected", 1, "inventory.read", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
     ("policy-inventory-count-session-start", "inventory.count.session.start", 1, "inventory.discrepancy_report", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
     ("policy-inventory-count-summary", "inventory.count.summary", 1, "inventory.read", GREEN, 0, "approvals.decide", 3600, 1, None, 1),

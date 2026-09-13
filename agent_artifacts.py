@@ -70,6 +70,7 @@ def build_artifact_sources(
         'inventory.product.get': 'product', 'inventory.product.search': 'product',
         'orders.get': 'order', 'orders.search': 'order',
         'invoices.get': 'invoice', 'invoices.search': 'invoice',
+        'customers.get': 'customer', 'customers.search': 'customer',
         'china.orders.get': 'china_order', 'china.orders.search': 'china_order',
     }
     entity_type = entity_types.get(operation)
@@ -89,6 +90,7 @@ def build_artifact_sources(
         'product': ('id', 'sku', 'model', 'name', 'stock'),
         'order': ('id', 'order_number', 'customer_name', 'created_at', 'status'),
         'invoice': ('id', 'invoice_number', 'buyer_name', 'issue_date'),
+        'customer': ('id', 'name', 'nip'),
         'china_order': ('id', 'po_number', 'supplier', 'order_status', 'delivery_stage'),
     }[entity_type]
     sources = []

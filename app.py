@@ -997,7 +997,8 @@ def build_business_artifacts(operation_name: str, result: dict) -> list[dict]:
         for kind, name in [('packing_list', 'Lista pakowa'), ('invoice', 'Faktura'), ('label', 'Etykieta InPost')]:
             if state[kind]['current'] and not (kind == 'label' and state['shipment']['parameters_need_review']):
                 cards.append({'type': 'document_link', 'document_type': kind, 'name': name,
-                              'url': f"/api/internal/fulfillment/{state['order_id']}/documents/{kind}"})
+                              'url': f"/api/internal/fulfillment/{state['order_id']}/documents/{kind}",
+                              'order_id': state['order_id']})
         return cards
     return build_artifacts(operation_name, result, _artifact_links)
 
@@ -2335,6 +2336,7 @@ BUSINESS_FRESHNESS_OPERATION_GROUP = {
     **{name: 'fulfillment_workflow' for name in ('orders.fulfillment.state','shipping.requirements.get','orders.documents.print_ready','orders.documents.adoption.preview','shipping.shipment.adoption.preview')},
     'invoices.removal.preview': 'invoice_amendment',
     "inventory.product.search": "inventory", "inventory.product.get": "inventory", "inventory.summary": "inventory",
+    "inventory.replenishment.ranking": "inventory",
     "orders.search": "orders", "orders.get": "orders", "orders.summary": "orders",
     "orders.fulfillment.readiness": "fulfillment",
     "inventory.count.get_expected": "inventory", "inventory.count.summary": "inventory",

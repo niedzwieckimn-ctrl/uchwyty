@@ -131,7 +131,8 @@ def test_timeout_recovers_without_second_post(flow, monkeypatch):
     result = run('shipping.shipment.create')
     assert result.status == 'FAILED'
     assert state()['shipment']['attempt_state'] == 'UNKNOWN'
-    assert run('shipping.shipment.create').status == 'FAILED'
+    retry = run('shipping.shipment.create')
+    assert retry.status == 'FAILED' and retry.error_code == 'SHIPMENT_RECOVERY_REQUIRED' and not retry.approval_id
     assert len(calls) == 1
     monkeypatch.setattr(inpost_module, 'find_shipment_by_reference', lambda *args: {'id': 123456, 'tracking_number': 'TRACK-TEST'})
     success('shipping.shipment.refresh')
