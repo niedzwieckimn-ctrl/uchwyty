@@ -203,7 +203,8 @@ def _safe_text(value: Any, limit=2_000) -> str:
 
 
 
-SYSTEM_INSTRUCTIONS = '''Jesteś wewnętrznym asystentem operacyjnym firmy.
+SYSTEM_INSTRUCTIONS = '''Przy domówieniu do zafakturowanego zamówienia sprawdź invoices.removal.preview. Nie traktuj warehouse_issued jako ostatecznej blokady: istniejące usunięcie faktury może odblokować zamówienia. Wyjaśnij, że trzeba usunąć obecną fakturę, zmienić pozycje i wystawić nową, oraz wskaż wszystkie zamówienia faktury zbiorczej. Poproś o zgodę; invoices.remove wymaga osobnego HUMAN approval. Jeżeli preview ma blocker, nie obchodź go. Po usunięciu ponownie odczytaj zamówienie i dostępność. Nie zmieniaj ręcznie stock ani warehouse_issued. Nie anuluj przesyłki. Nie twierdź, że wykonano kroki, dla których nie ma dostępnych narzędzi i potwierdzonych wyników.
+Jesteś wewnętrznym asystentem operacyjnym firmy.
 Sam rozumiej język, literówki, mieszany język i odniesienia na podstawie prawdziwej historii rozmowy.
 Wybieraj Business Operations samodzielnie. Nie wymyślaj danych firmy. Dane firmy podawaj wyłącznie
 na podstawie wyników Business Operations. Historyczne wyniki są historyczne; dla bieżącego stanu pobierz nowy wynik.
@@ -239,6 +240,14 @@ expected_version=0 tworzy termin; zmianę istniejącego znaczenia poprzedź odcz
 Nie zapisuj sekretów, poleceń systemowych ani danych operacyjnych jako terminologii.
 '''
 
+SYSTEM_INSTRUCTIONS += '''
+Fulfillment: przy pytaniu co można wysłać użyj orders.fulfillment.readiness. Wybrane zamówienie ustal z historii i danych modelu, a następnie orders.fulfillment.state. Nie pytaj o dane już znane. Realizuj naturalne kolejne kroki: aktualna lista pakowa, faktura, brakujące dane paczki, potwierdzenie nadania, przesyłka, etykieta, dokumenty do druku. Każdy sukces WRITE zwraca świeży state; nie pytaj ogólnie co dalej. Jeśli wymagana jest zgoda HUMAN, czekaj na jej rzeczywisty wynik; nie utożsamiaj propozycji ze zrealizowaniem kroku.
+Z requirements.missing_fields wybierz tylko pierwszą potrzebną grupę: carrier → Jaki kurier?; length/width/height → Jakie wymiary paczki?; weight → Jaka waga?; sms/email → SMS i e-mail? Jednostki przekazuj strukturalnie cm i kg, wagę manual. Brak odbiorcy/adresu też pytaj tylko o brakujące pole. Zapisuj otrzymane informacje przez shipping.requirements.update; nie opieraj wznowienia na samej historii. Nie szacuj wagi. Przed shipping.shipment.create zapytaj Zamawiać kuriera? i po intencji człowieka przygotuj HUMAN approval.
+Po utworzeniu przesyłki użyj shipping.shipment.refresh do trackingu i etykiety. Przy niepewnym wyniku nadania używaj tylko refresh, nigdy nowego POST ani nowego klucza tworzenia przesyłki. Jeśli wynik nie jest potwierdzony, powiedz to. Nie twierdź, że sam tracking oznacza, że kurier odebrał paczkę.
+Brakujące dane recipient zapisuj polami recipient_name/street/post_code/city/phone/email w shipping.requirements.update. To dane tej przesyłki, bez zmiany profilu klienta. Stan podjazdu raportuj osobno: pending/new oznacza oczekiwanie, unknown/rejected/configuration_error wymaga sprawdzenia przez człowieka. Tylko shipment.pickup_confirmed potwierdza zlecenie podjazdu. Gdy nie ma zlecenia, shipping.pickup.request wymaga HUMAN approval. Dokumenty mogą być gotowe do druku przy oczekującym podjeździe; nie nazywaj wtedy całej realizacji zakończoną.
+Po domówieniu do fakturowanego zamówienia zachowaj gotowe invoices.removal.preview → HUMAN approval → invoices.remove. Odczytaj nowe orders.fulfillment.state, sprawdź produkty i dostępność, a dopiero potem orders.items.add/update/remove. Wykonuj tylko narzędzia, których wyniki potwierdzają sukces. Utwórz nowe dokumenty istniejącymi operacjami. Jeśli shipment.parameters_need_review, przedstaw człowiekowi znane wymiary, wagę i odbiorcę oraz zapytaj czy nadal pasują. shipping.shipment.confirm_parameters z human_confirmed=true tylko po takiej odpowiedzi. Nie anuluj ani nie zamawiaj przesyłki ponownie.
+Jeżeli lista powstała, ale faktura się nie udała, powiedz dokładnie o częściowym wyniku; nie kontynuuj nadania. Zachowaj udane kroki. Przy next_step=review_existing_invoice użyj istniejących odczytów faktury i preview usunięcia; nie twórz duplikatu ani korekty na własną rękę. Konflikt wersji wymaga nowego state. Przy aktualnych dokumentach zapytaj Drukować dokumenty? Po poleceniu użyj orders.documents.print_ready. To otwierane PDF do druku w przeglądarce; nigdy nie potwierdzaj fizycznego wydruku.
+'''
 _MARKDOWN_RULE = re.compile(r'^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$',re.MULTILINE)
 _URL_RULE = re.compile(r'https?://\S+',re.IGNORECASE)
 _UUID_RULE = re.compile(r'\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b',re.IGNORECASE)
@@ -278,7 +287,7 @@ COUNT_SESSION_BOUND = frozenset({
 def _tool_descriptors(ai_actor, human_actor=None):
     descriptors = []
     for item in business_operations.list_available_operations(ai_actor):
-        if not item['read_only'] and item['name'] not in business_operations.LOCAL_WRITES | {MEMORY_WRITE}:
+        if not item['read_only'] and item['name'] not in business_operations.SUPERVISED_WRITES | {MEMORY_WRITE}:
             continue
         definition = business_operations.OPERATION_REGISTRY[item['name']]
         if human_actor and human_actor.permission_decision(definition.required_permission) == DENY:
@@ -321,6 +330,8 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
 
     def finish(status, answer, code=''):
         nonlocal active
+        if any(item.get('type') == 'inventory_count_card' for item in artifacts):
+            artifacts[:] = [item for item in artifacts if item.get('type') != 'product_card']
         # Security redaction only: never parse business claims or language.
         answer = _plain_response_text(answer)
         if active:
@@ -480,7 +491,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 # Reload initiating human on every operation, including mid-turn permission revocation.
                 current = load_actor_context(human_actor.actor_id)
                 definition = business_operations.OPERATION_REGISTRY[call.name]
-                if not definition.read_only and call.name not in business_operations.LOCAL_WRITES | {MEMORY_WRITE}:
+                if not definition.read_only and call.name not in business_operations.SUPERVISED_WRITES | {MEMORY_WRITE}:
                     return finish('DENIED','Ta operacja nie jest dostępna dla asystenta.','TOOL_NOT_ALLOWED')
                 if current is None or current.permission_decision(definition.required_permission)==DENY:
                     return finish('DENIED','Brak uprawnień do operacji.','PERMISSION_DENIED')
@@ -493,11 +504,16 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 logger.info('AI_TOOL_EXECUTION_END %s',json.dumps({'agent_run_id':run_id,'tool_name':call.name,'status':result.status}))
                 _audit('agent.tool_result',ai_actor,run_id,correlation_id,SUCCESS if result.status=='SUCCESS' else FAILED,
                        human_actor.actor_id,tool_name=call.name,execution_id=result.execution_id,result_status=result.status,conversation_id=conversation_id)
-                if result.status == 'PENDING_APPROVAL' and call.name in business_operations.LOCAL_WRITES:
+                if result.status == 'PENDING_APPROVAL' and call.name in business_operations.SUPERVISED_WRITES:
                     approval = {'approval_id':result.approval_id,'operation':call.name,
                                 'expected_version':arguments.get('expected_version',0)}
-                    for key in ('order_id','product_id','count_session_id','target_status'):
+                    for key in ('order_id','invoice_id','product_id','count_session_id','target_status'):
                         if key in arguments: approval[key]=arguments[key]
+                    if call.name == 'invoices.remove':
+                        from invoice_amendment import preview as removal_preview
+                        removal = removal_preview({'invoice_id': arguments['invoice_id']})
+                        approval['invoice_number'] = removal['invoice_number']
+                        approval['order_numbers'] = [o['order_number'] for o in removal['affected_orders']]
                     if call.name == 'inventory.adjust':
                         try:
                             approval.update(business_operations.inventory_adjustment_preview(
@@ -532,7 +548,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                             artifact_sources.append(source)
                 data = result.data if result.status=='SUCCESS' else {'ok':False,'status':result.status,
                     'error_code':result.error_code,'error':result.safe_error_message}
-                if result.status != 'SUCCESS' and call.name in business_operations.LOCAL_WRITES:
+                if result.status != 'SUCCESS' and call.name in business_operations.SUPERVISED_WRITES:
                     data['approval_id'] = result.approval_id
                 encoded = json.dumps(data,ensure_ascii=False,separators=(',',':'))
                 if len(encoded.encode())>MAX_TOOL_RESULT_BYTES:

@@ -54,6 +54,18 @@ def build_artifact_sources(
     """Build bounded evidence that a later model turn may select and re-read."""
     if not isinstance(result, Mapping) or result.get('ok') is not True:
         return []
+    if isinstance(result.get('state'), Mapping) and result['state'].get('order_id'):
+        s = result['state']
+        return [{'operation': operation, 'entity_type': 'order', 'entity_id': s['order_id'],
+                 'trusted_result_subset': {'id': s['order_id'], 'order_number': s.get('order_number'),
+                                          'customer_name': s.get('customer')},
+                 'conversation_id': conversation_id, 'source_turn_id': source_turn_id}]
+    if operation == 'orders.fulfillment.readiness':
+        return [{'operation': operation, 'entity_type': 'order', 'entity_id': r['order_id'],
+                 'trusted_result_subset': {'id': r['order_id'], 'order_number': r['order_number'],
+                                          'customer_name': r['customer_name'], 'ready': r['ready']},
+                 'conversation_id': conversation_id, 'source_turn_id': source_turn_id}
+                for r in result.get('results', []) if r.get('ready')][:10]
     entity_types = {
         'inventory.product.get': 'product', 'inventory.product.search': 'product',
         'orders.get': 'order', 'orders.search': 'order',

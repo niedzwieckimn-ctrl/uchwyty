@@ -979,7 +979,39 @@ def _artifact_links(operation_name: str, record: dict) -> dict:
 
 
 def build_business_artifacts(operation_name: str, result: dict) -> list[dict]:
+    if operation_name == 'orders.fulfillment.readiness':
+        return [{'type': 'order_card', 'id': r['order_id'], 'order_number': r['order_number'],
+                 'customer_name': r['customer_name'], 'total_units': r['total_units'],
+                 'detail_url': f"/orders/{r['order_id']}"} for r in result.get('results', []) if r.get('ready')][:6]
+    if operation_name == 'orders.documents.print_ready':
+        return result.get('documents', [])
+    if isinstance(result.get('state'), dict) and result.get('ok'):
+        state = result['state']
+        cards = [{'type': 'order_card', 'id': state['order_id'], 'order_number': state['order_number'],
+                  'customer_name': state['customer'], 'carrier': state['shipment'].get('carrier'),
+                  'tracking_number': state['shipment'].get('tracking'), 'detail_url': f"/orders/{state['order_id']}"}]
+        for kind, name in [('packing_list', 'Lista pakowa'), ('invoice', 'Faktura'), ('label', 'Etykieta InPost')]:
+            if state[kind]['current'] and not (kind == 'label' and state['shipment']['parameters_need_review']):
+                cards.append({'type': 'document_link', 'document_type': kind, 'name': name,
+                              'url': f"/api/internal/fulfillment/{state['order_id']}/documents/{kind}"})
+        return cards
     return build_artifacts(operation_name, result, _artifact_links)
+
+
+@app.get('/api/internal/fulfillment/<int:order_id>/documents/<kind>')
+@require_permission('orders.read_full')
+def fulfillment_document_download(order_id, kind):
+    from fulfillment_operations import state as fulfillment_state, snapshot as fulfillment_snapshot
+    permissions = {'packing_list': 'packing.read', 'invoice': 'invoices.read', 'label': 'shipping.label_read'}
+    if kind not in permissions:
+        abort(404)
+    if current_actor_context().permission_decision(permissions[kind]) == 'DENY':
+        abort(403)
+    current = fulfillment_state({'order_id': order_id})['state']
+    if not current[kind]['current'] or (kind == 'label' and current['shipment']['parameters_need_review']):
+        abort(409, description='Dokument jest nieaktualny lub wymaga sprawdzenia przesyłki.')
+    doc = next(d for d in fulfillment_snapshot(order_id)['documents'] if d['kind'] == kind)
+    return send_file(doc['path'], mimetype='application/pdf', as_attachment=False, conditional=True)
 
 
 @app.get('/api/internal/ai/documents/packing-lists/<int:invoice_id>')
@@ -1076,8 +1108,10 @@ def api_ai_approval_decide(approval_id, decision):
         return jsonify(status='DENIED'), 403
     snapshot = internal_approval.get_request_snapshot(approval_id)
     allowed_approval_operations = {
-        'orders.status.transition', 'inventory.adjust', 'orders.packing.confirm',
+        'orders.status.transition', 'inventory.adjust', 'orders.packing.confirm', 'invoices.remove',
     }
+    from fulfillment_operations import WRITES as _fulfillment_writes
+    allowed_approval_operations |= _fulfillment_writes
     if not snapshot or snapshot['operation'] not in allowed_approval_operations:
         return jsonify(status='DENIED'), 404
     db = conn()
@@ -2273,6 +2307,9 @@ def sqlite_delete_missing_rows(table: str, conflict_col: str, remote_keys: list)
 # an empty company.
 BUSINESS_FRESHNESS_TTL_SECONDS = float(os.environ.get("BUSINESS_FRESHNESS_TTL_SECONDS", "45"))
 BUSINESS_FRESHNESS_GROUPS = {
+    'fulfillment_workflow': [('orders','id'),('order_items','id'),('products','id'),('stock','product_id'),('invoices','id'),('invoice_meta','invoice_id'),('invoice_allocations','id')],
+    'invoice_amendment': [('orders', 'id'), ('order_items', 'id'), ('invoices', 'id'),
+                          ('invoice_meta', 'invoice_id'), ('invoice_allocations', 'id')],
     "inventory": [("products", "id"), ("stock", "product_id"), ("orders", "id"),
                   ("order_items", "id"), ("invoice_allocations", "id"),
                   ("china_packages", "id"), ("china_items", "id")],
@@ -2291,6 +2328,8 @@ BUSINESS_FRESHNESS_DATA_TABLES = {
     for group, specs in BUSINESS_FRESHNESS_GROUPS.items()
 }
 BUSINESS_FRESHNESS_OPERATION_GROUP = {
+    **{name: 'fulfillment_workflow' for name in ('orders.fulfillment.state','shipping.requirements.get','orders.documents.print_ready')},
+    'invoices.removal.preview': 'invoice_amendment',
     "inventory.product.search": "inventory", "inventory.product.get": "inventory", "inventory.summary": "inventory",
     "orders.search": "orders", "orders.get": "orders", "orders.summary": "orders",
     "orders.fulfillment.readiness": "fulfillment",
@@ -2347,6 +2386,17 @@ def _business_group_has_local_data(group: str) -> bool:
 
 def reconcile_business_freshness_after_write(operation_name: str, _result: dict) -> None:
     """Keep only snapshots affected by the committed local order state current."""
+    from fulfillment_operations import WRITES as _fulfillment_writes
+    if operation_name in _fulfillment_writes:
+        completed_at = time.time()
+        for group in ('orders','inventory','fulfillment','invoices','fulfillment_workflow','invoice_amendment'):
+            _mark_business_freshness(group, completed_at)
+        return
+    if operation_name == 'invoices.remove':
+        completed_at = time.time()
+        for group in ('orders', 'inventory', 'fulfillment', 'invoices', 'customers', 'sales', 'invoice_amendment', 'fulfillment_workflow'):
+            _mark_business_freshness(group, completed_at)
+        return
     if operation_name == "orders.status.transition":
         completed_at = time.time()
         for group in ('orders', 'inventory', 'fulfillment', 'customers'):
@@ -7846,6 +7896,11 @@ def _send_invoice_to_client(invoice_id: int) -> tuple[int, bool, str]:
 # =========================
 
 # Shared local status mutation; the legacy form retains its existing sync behavior.
+import invoice_amendment
+import sys as _amendment_sys
+invoice_amendment.configure(_amendment_sys.modules[__name__])
+import fulfillment_operations
+fulfillment_operations.configure(_amendment_sys.modules[__name__])
 from business_operations import configure_order_status
 from order_write import transition as local_order_transition
 configure_order_status(lambda db, order_id, status: local_order_transition(

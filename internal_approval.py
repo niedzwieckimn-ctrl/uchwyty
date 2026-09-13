@@ -90,7 +90,17 @@ _connection_factory: Callable[[], sqlite3.Connection] | None = None
 _configuration_lock = threading.Lock()
 
 
-PILOT_POLICIES = (
+from fulfillment_operations import PERMISSIONS as _fulfillment_permissions, READS as _fulfillment_reads, GREEN as _fulfillment_green
+FULFILLMENT_POLICIES = tuple(
+    ('policy-' + name.replace('.', '-'), name, 1, permission,
+     GREEN if name in _fulfillment_reads or name in _fulfillment_green else YELLOW,
+     0 if name in _fulfillment_reads or name in _fulfillment_green else 1,
+     'approvals.decide', 1800, 0, None, 1)
+    for name, permission in _fulfillment_permissions.items())
+
+PILOT_POLICIES = FULFILLMENT_POLICIES + (
+    ("policy-invoices-removal-preview", "invoices.removal.preview", 1, "invoices.read", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
+    ("policy-invoices-remove", "invoices.remove", 1, "invoices.reverse", RED, 1, "approvals.decide", 900, 0, None, 1),
     ("policy-orders-note-add", "orders.internal_note.add", 1, "orders.internal_note.add", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
     ("policy-orders-status-transition", "orders.status.transition", 1, "orders.change_status", YELLOW, 1, "approvals.decide", 3600, 0, None, 1),
     ("policy-agent-terminology-search", "agent.terminology.search", 1, "inventory.read", GREEN, 0, "approvals.decide", 3600, 1, None, 1),

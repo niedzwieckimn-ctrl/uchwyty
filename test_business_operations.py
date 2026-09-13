@@ -110,7 +110,9 @@ def _execution(execution_id):
 
 
 def test_registry_is_closed_and_contains_required_contracts(isolated):
+    import fulfillment_operations
     assert set(operations.OPERATION_REGISTRY) == {
+        'invoices.removal.preview', 'invoices.remove',
         "orders.summary", "agent.terminology.search", "agent.terminology.remember",
         "inventory.product.get", "inventory.product.search", "inventory.summary",
         "orders.search", "orders.get", "orders.fulfillment.readiness", "invoices.search", "invoices.get", "invoices.overdue",
@@ -120,7 +122,7 @@ def test_registry_is_closed_and_contains_required_contracts(isolated):
         , "inventory.count.get_expected", "inventory.count.session.start", "inventory.count.summary", "inventory.count.record",
         "inventory.count.complete", "inventory.adjust", "orders.packing.check",
         "orders.packing.shortage.report", "orders.packing.confirm"
-    }
+    } | fulfillment_operations.READS | fulfillment_operations.WRITES
     for item in operations.OPERATION_REGISTRY.values():
         assert item.operation_version == 1
         assert item.required_permission and item.input_schema and item.output_schema

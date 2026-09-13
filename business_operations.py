@@ -23,6 +23,8 @@ from zoneinfo import ZoneInfo
 
 from pathlib import Path
 import order_write
+import invoice_amendment
+import fulfillment_operations
 import agent_conversation
 import internal_approval as approvals
 from cash_flow_module import cash_flow_overdue_invoices
@@ -413,6 +415,8 @@ WAREHOUSE_WRITES = frozenset({
     'orders.packing.shortage.report', 'orders.packing.confirm',
 })
 LOCAL_WRITES = ORDER_WRITES | WAREHOUSE_WRITES
+SERVICE_WRITES = invoice_amendment.WRITES | fulfillment_operations.WRITES
+SUPERVISED_WRITES = LOCAL_WRITES | SERVICE_WRITES
 _ORDER_WRITE_INPUT = {
     'type': 'object', 'additionalProperties': False,
     'required': ['order_id', 'expected_version', 'idempotency_key'],
@@ -663,6 +667,8 @@ def _now() -> str:
 
 
 def initialize_schema(db: sqlite3.Connection) -> None:
+    invoice_amendment.initialize(db)
+    fulfillment_operations.initialize(db)
     db.executescript((Path(__file__).parent / 'migrations' / 'first_supervised_write.sql').read_text(encoding='utf-8'))
     db.executescript((Path(__file__).parent / 'migrations' / 'warehouse_operations.sql').read_text(encoding='utf-8'))
     count_columns = {row['name'] for row in db.execute('PRAGMA table_info(internal_inventory_count_sessions)').fetchall()}
@@ -791,13 +797,17 @@ def _fingerprint(definition: BusinessOperationDefinition, actor: ActorContext, d
         {"operation": definition.operation_name, "version": definition.operation_version,
          "actor_id": actor.actor_id,
          "input": ({'payload': dict(data), 'initiated_by': actor.delegated_by_actor_id}
-                   if definition.operation_name in LOCAL_WRITES else sanitize_audit_data(dict(data)))},
+                   if definition.operation_name in SUPERVISED_WRITES else sanitize_audit_data(dict(data)))},
         ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _entity(definition: BusinessOperationDefinition, data: Mapping[str, Any]) -> tuple[str, str, int | None]:
+    if definition.operation_name in fulfillment_operations.READS | fulfillment_operations.WRITES:
+        return 'order', str(data['order_id']), data.get('expected_version')
+    if definition.operation_name in {invoice_amendment.READ, invoice_amendment.WRITE}:
+        return 'invoice', str(data['invoice_id']), data.get('expected_version')
     if definition.operation_name in ORDER_WRITES:
         return 'order', str(data['order_id']), data['expected_version']
     if definition.operation_name in {'inventory.count.get_expected','inventory.count.record','inventory.adjust'}:
@@ -2253,7 +2263,7 @@ def execute_business_operation(
         if definition.operation_name not in _HANDLERS:
             raise ControlledOperationError("HANDLER_NOT_FOUND", "Brak bezpiecznego handlera", status=DENIED)
         data = validate_input(definition, input_data)
-        if definition.operation_name in LOCAL_WRITES:
+        if definition.operation_name in SUPERVISED_WRITES:
             if idempotency_key and idempotency_key != data['idempotency_key']:
                 raise ControlledOperationError('IDEMPOTENCY_CONFLICT', 'Niezgodny klucz idempotency', status=CONFLICT)
             idempotency_key = data['idempotency_key']
@@ -2279,7 +2289,7 @@ def execute_business_operation(
         else:
             row = _create_execution(definition, actor, fingerprint, entity_type, entity_id, expected_version, effective_key, correlation)
         execution_id = row["execution_id"]
-        if definition.operation_name in LOCAL_WRITES and row['input_fingerprint'] != fingerprint:
+        if definition.operation_name in SUPERVISED_WRITES and row['input_fingerprint'] != fingerprint:
             return _safe_denial(definition.operation_name, definition.operation_version, execution_id,
                 actor, row['correlation_id'], 'IDEMPOTENCY_CONFLICT',
                 'Idempotency key został użyty dla innego inputu', status=CONFLICT)
@@ -2298,6 +2308,8 @@ def execute_business_operation(
                 return _result_from_row(row or _execution(execution_id))
             finally:
                 db.close()
+        if definition.operation_name in invoice_amendment.WRITES and row['status'] == 'CREATED':
+            invoice_amendment.validate(data)
         evaluation = approvals.evaluate_operation(actor, definition.operation_name, operation_version=definition.operation_version)
         if not evaluation.allowed:
             row = _transition(execution_id, definition, actor, "DENIED", "business_operation.denied", DENIED,
@@ -2313,7 +2325,7 @@ def execute_business_operation(
                     expected_entity_version=expected_version,
                     correlation_id=row["correlation_id"], reason="Business Operation wymaga zgody",
                 )
-                if definition.operation_name in LOCAL_WRITES:
+                if definition.operation_name in SUPERVISED_WRITES:
                     db = _factory()()
                     try:
                         db.execute('INSERT OR IGNORE INTO internal_business_write_actors(execution_id,human_id) VALUES(?,?)',
@@ -2347,6 +2359,10 @@ def execute_business_operation(
             if claimed is None:
                 current = _execution(execution_id)
                 return _result_from_row(current, status=NOOP if current["status"] == "RUNNING" else None)
+            if definition.operation_name in SERVICE_WRITES:
+                executor = fulfillment_operations.execute if definition.operation_name in fulfillment_operations.WRITES else invoice_amendment.execute
+                return executor(execution_id, definition, actor, data, stored_approval,
+                    entity_type, entity_id, expected_version, row['correlation_id'])
             if definition.operation_name not in LOCAL_WRITES | {"internal.test.change_setting"}:
                 row = _transition(
                     execution_id, definition, actor, "DENIED", "business_operation.denied", DENIED,
@@ -2365,6 +2381,9 @@ def execute_business_operation(
                 return _result_from_row(_execution(execution_id), status=NOOP)
         if definition.operation_name in LOCAL_WRITES:
             return _execute_local_approved(execution_id, definition, actor, data, '',
+                entity_type, entity_id, expected_version, row['correlation_id'])
+        if definition.operation_name in fulfillment_operations.WRITES:
+            return fulfillment_operations.execute(execution_id, definition, actor, data, '',
                 entity_type, entity_id, expected_version, row['correlation_id'])
         handler_started = time.perf_counter()
         freshness: Mapping[str, Any] = {}
@@ -2442,3 +2461,7 @@ def list_available_operations(actor_context: ActorContext) -> list[dict[str, Any
             continue
         visible.append(operation_descriptor(definition))
     return sorted(visible, key=lambda item: item["name"])
+
+
+invoice_amendment.install(__import__(__name__))
+fulfillment_operations.install(__import__(__name__))

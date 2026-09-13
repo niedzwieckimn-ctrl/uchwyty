@@ -65,8 +65,12 @@ class OperationDefinition:
             raise ValueError(f"Nieznana polityka audytu: {self.audit_policy}")
 
 
+from fulfillment_operations import PERMISSIONS as _fulfillment_permissions, WRITES as _fulfillment_writes, GREEN as _fulfillment_green
+
 # This backend catalogue is the only source of operation version and risk.
 OPERATION_DEFINITIONS: dict[str, OperationDefinition] = {
+    **{name: OperationDefinition(name, 1, _fulfillment_permissions[name], GREEN if name in _fulfillment_green else YELLOW, WRITE) for name in _fulfillment_writes},
+    'invoices.remove': OperationDefinition('invoices.remove', 1, 'invoices.reverse', RED, WRITE),
     'orders.internal_note.add': OperationDefinition('orders.internal_note.add', 1, 'orders.internal_note.add', GREEN, WRITE),
     'orders.status.transition': OperationDefinition('orders.status.transition', 1, 'orders.change_status', YELLOW, WRITE),
     'inventory.count.record': OperationDefinition('inventory.count.record', 1, 'inventory.discrepancy_report', GREEN, WRITE),

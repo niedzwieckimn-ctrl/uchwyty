@@ -37,6 +37,7 @@ BOOTSTRAP_OWNER_DISPLAY_NAME = "Bootstrap Owner"
 
 
 PERMISSIONS = {
+    "shipping.prepare": "Zapis danych paczki",
     "orders.internal_note.add": "Dodawanie wewnętrznych notatek zamówienia",
     "agent.terminology.remember": "Zapis potwierdzonej terminologii firmy",
     "orders.read_full": "Pełny odczyt zamówień",
@@ -254,7 +255,8 @@ ROLE_PERMISSION_DECISIONS = {
         },
         approval={"purchases.manage", "purchases.costs"},
     ),
-    "AI_OWNER_ASSISTANT": _decisions(approval={"orders.change_status", "inventory.adjust", "packing.confirm"}, allow={
+    "AI_OWNER_ASSISTANT": _decisions(approval={"orders.change_status", "inventory.adjust", "packing.confirm", "invoices.reverse", "invoices.publish", "shipping.create", "shipping.request_pickup", "orders.update"}, allow={
+        "shipping.prepare", "shipping.label_read",
         "orders.internal_note.add",
         "agent.terminology.remember",
         "orders.read_full", "orders.fulfillment_read", "orders.stock_audit",
