@@ -73,16 +73,20 @@
 
   function renderArtifacts(row, artifacts) {
     if (!row || !Array.isArray(artifacts) || !artifacts.length) return;
-    const allowed = new Set(['invoice_card', 'order_card', 'product_card', 'china_order_card', 'document_link', 'product_image']);
+    const allowed = new Set(['invoice_card', 'order_card', 'product_card', 'china_order_card', 'inventory_count_card', 'packing_check_card', 'document_link', 'product_image']);
     const labels = {
       invoice_number:'Numer', buyer_name:'Klient', issue_date:'Data', due_date:'Termin płatności', currency:'Waluta',
       total_net:'Netto', total_gross:'Brutto', payment_status:'Płatność', amount_outstanding:'Pozostało',
       order_number:'Numer', customer_name:'Klient', created_at:'Data', status:'Status', item_count:'Pozycje', total_units:'Sztuki',
       sku:'SKU', model:'Model', name:'Nazwa', stock:'Stan fizyczny', available:'Dostępne', reserved:'Zarezerwowane', incoming:'W drodze',
       po_number:'P/O', supplier:'Dostawca', order_status:'Status zamówienia', delivery_stage:'Etap dostawy', tracking_eta:'ETA',
-      carrier:'Przewoźnik', tracking_number:'Tracking', shipping_method:'Wysyłka'
+      carrier:'Przewoźnik', tracking_number:'Tracking', shipping_method:'Wysyłka',
+      product_id:'Produkt', count_id:'Sesja remanentu', expected_quantity:'Stan oczekiwany',
+      counted_quantity:'Stan policzony', difference:'Różnica', version:'Wersja', matched_count:'Zgodne',
+      variance_count:'Rozbieżności', adjusted_count:'Skorygowane', unresolved_count:'Nierozwiązane',
+      positive_units:'Nadwyżka szt.', negative_units:'Niedobór szt.', order_id:'Zamówienie', ready:'Kompletne'
     };
-    const titles = {invoice_card:'Faktura', order_card:'Zamówienie', product_card:'Produkt', china_order_card:'China P/O'};
+    const titles = {invoice_card:'Faktura', order_card:'Zamówienie', product_card:'Produkt', china_order_card:'China P/O', inventory_count_card:'Remanent', packing_check_card:'Kontrola pakowania'};
     const wrap = document.createElement('div');
     wrap.className = 'ai-artifacts';
     for (const artifact of artifacts.slice(0, 6)) {
@@ -118,7 +122,7 @@
         for (const item of artifact.items.slice(0, 6)) {
           const line = document.createElement('div'); line.className = 'ai-artifact-item';
           const name = document.createElement('span'); name.textContent = item.sku || item.model || item.name || 'Pozycja';
-          const qty = document.createElement('b'); qty.textContent = item.qty != null ? `${item.qty} szt.` : item.quantity != null ? `${item.quantity} szt.` : '';
+          const qty = document.createElement('b'); qty.textContent = item.qty != null ? `${item.qty} szt.` : item.quantity != null ? `${item.quantity} szt.` : item.shortage_quantity != null ? `brak ${item.shortage_quantity} szt.` : item.difference != null ? `${item.difference > 0 ? '+' : ''}${item.difference} szt.` : '';
           line.append(name, qty); items.appendChild(line);
         }
         card.appendChild(items);
@@ -166,7 +170,11 @@
       if (typeof data.conversation_id === 'string') conversationId = data.conversation_id;
       loading.remove();
       for (const approval of data.approvals || data.pending_approvals || []) {
-        const card = addMessage('assistant', `Zmiana wymaga zatwierdzenia\nZamówienie #${approval.order_id} → ${approval.target_status} (wersja ${approval.expected_version})`);
+        let approvalLabel = `Operacja ${approval.operation || 'magazynowa'} (wersja ${approval.expected_version})`;
+        if (approval.operation === 'orders.status.transition') approvalLabel = `Zamówienie #${approval.order_id} → ${approval.target_status} (wersja ${approval.expected_version})`;
+        if (approval.operation === 'inventory.adjust') approvalLabel = `Korekta stanu produktu #${approval.product_id} z remanentu (wersja ${approval.expected_version})`;
+        if (approval.operation === 'orders.packing.confirm') approvalLabel = `Potwierdzenie spakowania zamówienia #${approval.order_id} (wersja ${approval.expected_version})`;
+        const card = addMessage('assistant', `Zmiana wymaga zatwierdzenia\n${approvalLabel}`);
         const bubble = card.querySelector('.ai-bubble');
         for (const [action, label] of [['approve', 'Zatwierdź'], ['reject', 'Odrzuć']]) {
           const button = document.createElement('button');
