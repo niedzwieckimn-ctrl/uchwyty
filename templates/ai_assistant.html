@@ -180,11 +180,22 @@
       const data = await response.json().catch(() => ({}));
       if (typeof data.conversation_id === 'string') conversationId = data.conversation_id;
       loading.remove();
+      for (const decision of data.decisions || []) {
+        for (const card of messages.querySelectorAll('[data-approval-id]')) {
+          if (card.dataset.approvalId === decision.approval_id) {
+            card.querySelectorAll('button').forEach(button => button.disabled = true);
+          }
+        }
+      }
       for (const approval of data.approvals || data.pending_approvals || []) {
         let approvalLabel = 'Zmiana operacyjna';
         const fulfillmentLabels = {'orders.packing_list.generate':'Przygotowanie listy pakowej i powiadomienia o pakowaniu', 'orders.invoice.create':'Wystawienie faktury i jej rozliczenie magazynowe', 'orders.items.add':'Dodanie pozycji do zamówienia', 'orders.items.update':'Zmiana ilości w zamówieniu', 'orders.items.remove':'Usunięcie pozycji z zamówienia', 'shipping.shipment.create':'Utworzenie przesyłki InPost i zlecenie podjazdu kuriera'};
         if (fulfillmentLabels[approval.operation]) approvalLabel = fulfillmentLabels[approval.operation];
         if (approval.operation === 'shipping.pickup.request') approvalLabel = 'Zlecenie podjazdu kuriera do istniejącej przesyłki';
+        if (approval.operation === 'orders.documents.adopt') approvalLabel = 'Potwierdzenie zgodności istniejących dokumentów';
+        if (approval.operation === 'shipping.shipment.adopt') approvalLabel = 'Potwierdzenie danych istniejącej przesyłki';
+        if (approval.operation === 'shipping.shipment.confirm_parameters') approvalLabel = 'Potwierdzenie parametrów przesyłki po zmianie zawartości';
+        if (approval.operation === 'orders.fulfillment.reconcile') approvalLabel = 'Uzgodnienie zapisu stanu realizacji';
         if (approval.operation === 'invoices.remove') {
           const number = typeof approval.invoice_number === 'string' ? approval.invoice_number : '';
           const orders = Array.isArray(approval.order_numbers) ? approval.order_numbers.join(', ') : '';
@@ -199,6 +210,7 @@
         }
         if (approval.operation === 'orders.packing.confirm') approvalLabel = 'Potwierdzenie spakowania zamówienia';
         const card = addMessage('assistant', `Zmiana wymaga zatwierdzenia\n${approvalLabel}`);
+        card.dataset.approvalId = approval.approval_id;
         const bubble = card.querySelector('.ai-bubble');
         for (const [action, label] of [['approve', 'Zatwierdź'], ['reject', 'Odrzuć']]) {
           const button = document.createElement('button');
