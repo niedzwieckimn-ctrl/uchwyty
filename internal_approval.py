@@ -99,6 +99,7 @@ FULFILLMENT_POLICIES = tuple(
     for name, permission in _fulfillment_permissions.items())
 
 PILOT_POLICIES = FULFILLMENT_POLICIES + (
+    ('policy-human-chat-decision', 'approval.decide', 1, 'approvals.decide', GREEN, 0, 'approvals.decide', 1800, 0, None, 1),
     ("policy-invoices-removal-preview", "invoices.removal.preview", 1, "invoices.read", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
     ("policy-invoices-remove", "invoices.remove", 1, "invoices.reverse", RED, 1, "approvals.decide", 900, 0, None, 1),
     ("policy-orders-note-add", "orders.internal_note.add", 1, "orders.internal_note.add", GREEN, 0, "approvals.decide", 3600, 1, None, 1),

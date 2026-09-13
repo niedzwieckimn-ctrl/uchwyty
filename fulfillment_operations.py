@@ -10,11 +10,18 @@ from types import SimpleNamespace
 from werkzeug.datastructures import MultiDict
 from werkzeug.exceptions import HTTPException, Conflict
 
-READS = {'orders.fulfillment.state', 'shipping.requirements.get', 'orders.documents.print_ready'}
+READS = {'orders.fulfillment.state', 'shipping.requirements.get', 'orders.documents.print_ready', 'shipping.capabilities'}
+READS |= {'orders.documents.adoption.preview', 'shipping.shipment.adoption.preview'}
 WRITES = {'orders.packing_list.generate', 'orders.invoice.create', 'orders.items.add',
           'orders.items.update', 'orders.items.remove', 'shipping.requirements.update',
           'shipping.shipment.create', 'shipping.shipment.refresh', 'shipping.shipment.confirm_parameters', 'shipping.pickup.request'}
+WRITES |= {'orders.documents.adopt', 'shipping.shipment.adopt'}
+WRITES.add('orders.fulfillment.reconcile')
 PERMISSIONS = {
+    'orders.fulfillment.reconcile': 'orders.update',
+    'orders.documents.adoption.preview': 'invoices.read', 'orders.documents.adopt': 'invoices.publish',
+    'shipping.shipment.adoption.preview': 'shipping.read', 'shipping.shipment.adopt': 'shipping.prepare',
+    'shipping.capabilities': 'shipping.read',
     'orders.fulfillment.state': 'orders.read_full', 'shipping.requirements.get': 'shipping.read',
     'orders.documents.print_ready': 'orders.read_full',
     'orders.packing_list.generate': 'packing.prepare', 'orders.invoice.create': 'invoices.publish',
@@ -23,7 +30,7 @@ PERMISSIONS = {
     'shipping.shipment.refresh': 'shipping.read', 'shipping.shipment.confirm_parameters': 'shipping.prepare',
     'shipping.pickup.request': 'shipping.request_pickup',
 }
-GREEN = {'shipping.requirements.update', 'shipping.shipment.refresh'}
+GREEN = {'shipping.requirements.update', 'shipping.shipment.refresh', 'orders.fulfillment.reconcile'}
 b = None
 
 
@@ -33,6 +40,8 @@ def configure(backend):
 
 
 def initialize(db):
+    import reconciliation_store
+    reconciliation_store.initialize(db)
     db.executescript('''
     CREATE TABLE IF NOT EXISTS order_shipping_requirements(order_id INTEGER PRIMARY KEY,
         payload TEXT NOT NULL, updated_at TEXT NOT NULL);
@@ -64,8 +73,14 @@ def _rows(db, sql, params=()):
     return [dict(r) for r in db.execute(sql, params)]
 
 
-def snapshot(oid, db=None):
+def snapshot(oid, db=None, include_package=True):
     owned = db is None
+    if owned:
+        import reconciliation_store
+        try:
+            reconciliation_store.restore(b, oid)
+        except Exception as exc:
+            raise error('RECONCILIATION_UNAVAILABLE', 'Nie można odczytać trwałych metadanych realizacji. Sprawdź dostęp do Supabase i migrację 14.1.') from exc
     db = db or b.conn()
     try:
         order = db.execute('SELECT * FROM orders WHERE id=?', (oid,)).fetchone()
@@ -83,6 +98,17 @@ def snapshot(oid, db=None):
             WHERE a.order_id=? OR a.order_id IN (SELECT attempt_order_id FROM fulfillment_shipping_members WHERE order_id=?)''', (oid, oid))
         intents = _rows(db, 'SELECT * FROM fulfillment_document_intents WHERE order_id=? ORDER BY kind', (oid,))
         allocations = _rows(db, 'SELECT * FROM invoice_allocations WHERE order_id=? ORDER BY id', (oid,))
+        verifications = _rows(db, 'SELECT * FROM fulfillment_verifications WHERE order_id=? ORDER BY kind', (oid,))
+        import reconciliation_store
+        persistence = reconciliation_store.local_status(b, db, oid)
+        package_ids = sorted({int(o['id']) for o in b._packed_package_orders(db.cursor(), order)}) if include_package else [oid]
+        if owned:
+            for member in package_ids:
+                if member != oid:
+                    reconciliation_store.restore(b, member)
+        package_versions = {str(member): version(snapshot(member, db, include_package=False)) for member in package_ids if member != oid}
+        pending_members = [member for member in package_ids if reconciliation_store.local_status(b, db, member)['pending']]
+        persistence.update(pending=bool(pending_members), durable=not bool(pending_members), pending_order_ids=pending_members)
         # Content identity excludes workflow flags so creating an invoice does
         # not stale the packing document that was generated for those items.
         content = {k: order.get(k) for k in ('customer_id', 'customer_name', 'customer_email',
@@ -92,6 +118,8 @@ def snapshot(oid, db=None):
                 'requirements': json.loads(requirements[0]) if requirements else {},
                 'documents': docs, 'batches': batches, 'attempts': attempts,
                 'allocations': allocations, 'intents': intents, 'receiver': receiver(order),
+                'verifications': verifications, 'package_ids': package_ids, 'package_versions': package_versions,
+                'persistence': persistence,
                 'content_hash': _hash(content)}
     finally:
         if owned:
@@ -100,6 +128,12 @@ def snapshot(oid, db=None):
 
 def version(s):
     return int(_hash(s)[:15], 16)
+
+
+def shipment_content(s):
+    if len(s['package_ids']) == 1:
+        return s['content_hash']
+    return _hash([(oid, s['content_hash'] if oid == s['order']['id'] else snapshot(oid, include_package=False)['content_hash']) for oid in s['package_ids']])
 
 
 def receiver(order):
@@ -113,6 +147,88 @@ def receiver(order):
 
 def effective_receiver(s):
     return {key: s['requirements'].get('recipient_' + key, value) for key, value in s['receiver'].items()}
+
+
+def capabilities(data, actor=None, correlation_id='', transaction_connection=None):
+    cfg = b.inpost_config_summary()
+    return {'ok': True, 'state': {}, 'capabilities': [{
+        'provider': 'inpost', 'configured': bool(cfg.get('configured')),
+        'blocker': '' if cfg.get('configured') else 'MISSING_CONFIGURATION',
+        'create_shipment': True, 'retrieve_label': True, 'tracking': True,
+        'parcel_types': ['courier_standard'], 'dimension_unit': 'cm', 'weight_unit': 'kg',
+        'required_parameters': ['length', 'width', 'height', 'weight', 'sms', 'email'],
+        'missing_configuration': cfg.get('missing') or []}]}
+
+
+def preflight(name, data, actor=None):
+    s = snapshot(data['order_id'])
+    if version(s) != data['expected_version']:
+        raise error('ENTITY_VERSION_CONFLICT', 'Zamówienie zmieniło się. Odczytaj aktualny stan.', 'CONFLICT')
+    o = s['order']
+    if name not in {'shipping.shipment.refresh', 'shipping.pickup.request', 'orders.fulfillment.reconcile'} and (o.get('shipped_at') or o['status'] in {'shipped', 'partially_shipped', 'completed', 'cancelled', 'issued', 'in_delivery'}):
+        raise error('ORDER_CLOSED', 'Zamówienie zostało wysłane lub zamknięte.', 'DENIED')
+    current = state({'order_id': o['id']})['state']
+    if name == 'shipping.shipment.create' and len(s['package_ids']) > 1 and data.get('package_fingerprint') != _hash(s):
+        raise error('PACKAGE_SCOPE_CONFLICT', 'Odczytaj aktualny zakres całej paczki i dołącz jego fingerprint do nadania.', 'CONFLICT')
+    if name == 'shipping.shipment.create' and current['shipment']['exists']:
+        if any(str(snapshot(member)['order'].get('inpost_shipment_id') or '') != str(o.get('inpost_shipment_id') or '') for member in s['package_ids']):
+            raise error('PACKAGE_SHIPMENT_CONFLICT', 'Zamówienia w paczce nie mają wspólnej przesyłki. Najpierw zweryfikuj powiązanie istniejącego nadania.', 'CONFLICT')
+    if s['persistence']['pending'] and name != 'orders.fulfillment.reconcile':
+        raise error('RECONCILIATION_PENDING', 'Najpierw uzgodnij wcześniejszy zapis metadanych realizacji.', 'CONFLICT')
+    if name == 'shipping.shipment.confirm_parameters':
+        if not data.get('human_confirmed'):
+            raise error('CONFIRMATION_REQUIRED', 'Człowiek musi potwierdzić dane istniejącej przesyłki.')
+        if not s['attempts']:
+            raise error('LEGACY_SHIPMENT_REVIEW', 'Najpierw zweryfikuj istniejącą przesyłkę przez podgląd adopcji.')
+        booked = json.loads(s['attempts'][0]['payload'])
+        if sorted(booked.get('order_ids') or [o['id']]) != s['package_ids']:
+            raise error('PACKAGE_SHIPMENT_CONFLICT', 'Zmienił się zestaw zamówień paczki.', 'CONFLICT')
+        if booked['receiver'] != effective_receiver(s):
+            raise error('RECIPIENT_CHANGED', 'Odbiorca lub adres różni się od nadania.')
+        if not parameters_match(booked, current['requirements']['known']):
+            raise error('PARCEL_CHANGED', 'Parametry paczki różnią się od nadania. Wymagana jest obsługa u przewoźnika.')
+    if name in {'orders.documents.adopt', 'shipping.shipment.adopt'}:
+        import fulfillment_adoption
+        proof = fulfillment_adoption.document_proof(__import__(__name__), o['id']) if name == 'orders.documents.adopt' else fulfillment_adoption.shipment_proof(__import__(__name__), o['id'])
+        if proof.get('status') != 'SAFE' or proof.get('fingerprint') != data['preview_fingerprint']:
+            raise error('ADOPTION_CONFLICT', 'Adopcja wymaga zgodnego, kompletnego podglądu.', 'CONFLICT')
+    if name == 'orders.packing_list.generate' and not current['packing_list']['current']:
+        if s['invoices']:
+            raise error('EXISTING_INVOICE', 'Najpierw sprawdź istniejącą fakturę.')
+        if not current['readiness']['complete']:
+            raise error('ORDER_NOT_READY', 'Brakuje produktów do kompletnej realizacji.')
+    if name == 'orders.invoice.create' and not current['invoice']['current'] and not current['packing_list']['current']:
+        raise error('PACKING_REQUIRED', 'Najpierw przygotuj aktualną listę pakową.')
+    if name == 'shipping.shipment.create' and not current['shipment']['exists']:
+        if not current['invoice']['current'] or not current['packing_list']['current']:
+            raise error('CURRENT_DOCUMENTS_REQUIRED', 'Przed nadaniem wymagane są aktualne dokumenty.')
+        if current['requirements']['missing_fields']:
+            raise error('MISSING_SHIPPING_FIELDS', 'Brakuje danych paczki: ' + ', '.join(current['requirements']['missing_fields']))
+        _validate_requirements(current['requirements']['known'])
+        if not b.inpost_config_summary().get('configured'):
+            raise error('MISSING_CONFIGURATION', 'Brakuje konfiguracji wybranego przewoźnika.')
+        for member in s['package_ids']:
+            other = state({'order_id': member})['state']
+            if other['requirements']['recipient'] != current['requirements']['recipient']:
+                raise error('PACKAGE_RECIPIENT_CONFLICT', 'Zamówienia w paczce mają różnych odbiorców lub adresy.', 'CONFLICT')
+            if other['shipment']['exists'] or not other['packing_list']['current'] or not other['invoice']['current'] or not other['readiness']['complete']:
+                raise error('PACKAGE_STATE_CONFLICT', 'Jedno z zamówień paczki ma przesyłkę, brak gotowości lub nieaktualne dokumenty.', 'CONFLICT')
+    if name.startswith('orders.items.') and not current['editable']:
+        raise error('INVOICE_BLOCKS_EDIT', 'Najpierw wykonaj istniejącą obsługę faktury, która blokuje edycję.')
+    if name.startswith('orders.items.'):
+        if (s['invoices'] or s['documents']) and not data.get('documents_change_confirmed'):
+            raise error('DOCUMENTS_CONFIRMATION_REQUIRED', 'Zmiana unieważni dokumenty. Potwierdź ich ponowne przygotowanie.')
+        if name != 'orders.items.add' and not any(i['id'] == data['item_id'] for i in s['items']):
+            raise error('ITEM_NOT_FOUND', 'Pozycja nie należy do zamówienia.')
+        if name == 'orders.items.add':
+            c = b.conn()
+            try:
+                product = c.execute('SELECT id FROM products WHERE id=? AND COALESCE(archived,0)=0', (data['product_id'],)).fetchone()
+            finally:
+                c.close()
+            if not product:
+                raise error('PRODUCT_NOT_FOUND', 'Nie znaleziono aktywnego produktu.')
+    return current
 
 
 def state(data, actor=None, correlation_id='', transaction_connection=None):
@@ -133,7 +249,8 @@ def state(data, actor=None, correlation_id='', transaction_connection=None):
                        record.get('file_hash') == hashlib.sha256(Path(record['path']).read_bytes()).hexdigest())
         if kind == 'packing_list' and record:
             batch = next((x for x in s['batches'] if x['id'] == record['document_id']), None)
-            if not batch or (batch.get('invoice_id') and not any(i['id'] == batch['invoice_id'] for i in s['invoices'])):
+            adopted = any(v['kind'] == 'documents' and json.loads(v['payload']).get('content_hash') == s['content_hash'] for v in s['verifications'])
+            if (not batch and not adopted) or (batch and batch.get('invoice_id') and not any(i['id'] == batch['invoice_id'] for i in s['invoices'])):
                 current = False
         if kind == 'invoice':
             exists = bool(s['invoices'])
@@ -155,14 +272,15 @@ def state(data, actor=None, correlation_id='', transaction_connection=None):
     target = effective_receiver(s)
     missing = [k for k in ('carrier', 'length', 'width', 'height', 'dimension_unit', 'weight', 'weight_unit', 'sms', 'email') if k not in fields or fields[k] is None or fields[k] == '']
     missing += ['recipient.' + k for k in ('name', 'street', 'post_code', 'city', 'phone', 'email') if not target.get(k)]
-    changed = bool(o.get('inpost_shipment_id') and (not attempt or attempt['content_hash'] != s['content_hash'] or
+    changed = bool(o.get('inpost_shipment_id') and (not attempt or attempt['content_hash'] != shipment_content(s) or
         json.loads(attempt['payload']).get('receiver') != target))
     if attempt and o.get('inpost_shipment_id'):
         booked = json.loads(attempt['payload'])
         changed = changed or not parameters_match(booked, fields)
     ready = bool(fully or (readiness and readiness['ready']))
     pickup = b.inpost_pickup_status(o.get('inpost_shipment_id')) if o.get('inpost_shipment_id') else None
-    next_step = ('readiness' if not ready and not s['invoices'] else
+    next_step = ('reconcile_metadata' if s['persistence']['pending'] else
+                 'readiness' if not ready and not s['invoices'] else
                  'review_existing_invoice' if s['invoices'] and not documents['invoice']['current'] else
                  'packing_list' if not documents['packing_list']['current'] else
                  'invoice' if not documents['invoice']['current'] else
@@ -177,10 +295,12 @@ def state(data, actor=None, correlation_id='', transaction_connection=None):
         next_step = 'invoice'
     return {'ok': True, 'state': {'order_id': o['id'], 'order_number': o.get('order_no'),
         'customer': o.get('customer_name'), 'order_status': o['status'], 'expected_version': version(s),
+        'package': {'order_ids': s['package_ids'], 'package_key': _hash(s['package_ids']), 'member_versions': s['package_versions'], 'fingerprint': _hash(s)},
+        'persistence': s['persistence'],
         'editable': not bool(o.get('warehouse_issued')), 'content_hash': s['content_hash'],
         'readiness': {'complete': ready, 'details': readiness},
         'packing': {'confirmed': o['status'] in ('packed', 'packed_partial'), 'packed_at': o.get('packed_at')},
-        **documents, 'invoices': [{'invoice_id': i['id'], 'invoice_number': i['invoice_no'], 'publication_state': i.get('publication_state', 'complete')} for i in s['invoices']],
+        **documents, 'invoices': [invoice_outcome(i, s) for i in s['invoices']],
         'shipment': {'exists': bool(o.get('inpost_shipment_id')), 'carrier': o.get('carrier'),
                      'tracking': o.get('tracking_no'), 'parameters_need_review': changed,
                      'label_exists': documents['label']['exists'],
@@ -189,6 +309,21 @@ def state(data, actor=None, correlation_id='', transaction_connection=None):
                      'attempt_state': attempt['state'] if attempt else None},
         'requirements': {'known': fields, 'recipient': target, 'missing_fields': missing},
         'next_step': next_step}}
+
+
+def invoice_outcome(i, s):
+    meta = next((m for m in s['metas'] if m['invoice_id'] == i['id']), {})
+    found, _ = b.invoice_pdf_exists(meta.get('pdf_path', ''), i.get('invoice_no', ''))
+    c = b.conn()
+    try:
+        job = c.execute('SELECT state,error FROM invoice_jobs WHERE invoice_id=?', (i['id'],)).fetchone()
+    finally:
+        c.close()
+    return {'invoice_id': i['id'], 'invoice_number': i['invoice_no'], 'record_created': True,
+            'number_assigned': bool(i['invoice_no']), 'pdf_available': bool(found),
+            'publication_state': i.get('publication_state', 'complete'),
+            'publication_error': str(job['error'] or '') if job else '',
+            'ksef_state': meta.get('ksef_status') or i.get('ksef_status') or ''}
 
 
 @contextmanager
@@ -310,22 +445,25 @@ def safe_create_shipment(oid, recipient, parcel, reference, service, options):
                 old = None
         if old:
             if old['state'] == 'SUCCESS':
-                if json.loads(old['payload']) != payload or old['content_hash'] != s['content_hash']:
+                if json.loads(old['payload']) != payload or old['content_hash'] != shipment_content(s):
                     raise InPostError('Istnieje wcześniejsze nadanie z inną zawartością lub parametrami. Zweryfikuj przesyłkę przed kolejną paczką.')
                 return json.loads(old['provider_json'])
             raise InPostError('Wynik wcześniejszego nadania jest niepewny. Sprawdź przesyłkę; nie twórz kolejnej.')
         stable = 'fulfillment-' + str(uuid.uuid4())
         c.execute('INSERT INTO fulfillment_shipping_attempts VALUES(?,?,?,?,?,?,?)',
-            (oid, stable, json.dumps(payload), s['content_hash'], 'SENDING', None, b.now_iso()))
+            (oid, stable, json.dumps(payload), shipment_content(s), 'SENDING', None, b.now_iso()))
         c.executemany('INSERT INTO fulfillment_shipping_members VALUES(?,?)', [(member, oid) for member in package_ids])
         c.commit()
     finally:
         c.close()
     try:
         if b.supabase_enabled():
-            claim = b.supabase_request('/rest/v1/rpc/claim_fulfillment_shipment', method='POST',
-                payload={'p_order_ids': package_ids, 'p_reference': stable, 'p_payload': payload,
-                         'p_content_hash': s['content_hash'], 'p_created_at': b.now_iso()})
+            try:
+                claim = b.supabase_request('/rest/v1/rpc/claim_fulfillment_shipment', method='POST',
+                    payload={'p_order_ids': package_ids, 'p_reference': stable, 'p_payload': payload,
+                             'p_content_hash': shipment_content(s), 'p_created_at': b.now_iso()})
+            except Exception as exc:
+                raise error('SHIPPING_RESERVATION_UNAVAILABLE', 'Nie można potwierdzić rezerwacji nadania w Supabase. Sprawdź migrację i dostępność RPC; nie wysłano nowego żądania do przewoźnika.') from exc
             if not isinstance(claim, dict) or not isinstance(claim.get('claim'), dict):
                 raise InPostError('Nie potwierdzono trwałej rezerwacji nadania. Sprawdź migrację fulfillment.')
             saved = claim['claim']
@@ -335,7 +473,7 @@ def safe_create_shipment(oid, recipient, parcel, reference, service, options):
                     (saved['reference'], json.dumps(saved['payload']), saved['content_hash'], saved['state'], json.dumps(saved.get('provider_json')) if saved.get('provider_json') else None, saved['created_at'], oid))
                 c.commit(); c.close()
                 if saved['state'] == 'SUCCESS' and saved.get('provider_json'):
-                    if saved['payload'] != payload or saved['content_hash'] != s['content_hash']:
+                    if saved['payload'] != payload or saved['content_hash'] != shipment_content(s):
                         raise InPostError('Istnieje wcześniejsze nadanie w chmurze. Zweryfikuj jego zawartość i parametry.')
                     return saved['provider_json']
                 raise InPostError('W chmurze istnieje niepewna próba nadania. Wolno tylko sprawdzić jej wynik.')
@@ -382,7 +520,8 @@ def _validate_requirements(fields):
             raise error('INVALID_INPUT', 'Opcje powiadomień wymagają wartości logicznej.')
     for key, expected in [('carrier', 'inpost'), ('dimension_unit', 'cm'), ('weight_unit', 'kg'), ('weight_source', 'manual')]:
         if key in fields and fields[key] != expected:
-            raise error('INVALID_INPUT', 'Nieobsługiwany przewoźnik, jednostka lub źródło wagi.')
+            raise error('UNSUPPORTED_PROVIDER' if key == 'carrier' else 'INVALID_INPUT',
+                        'Wybrany przewoźnik nie ma adaptera w aplikacji.' if key == 'carrier' else 'Nieobsługiwana jednostka lub źródło wagi.')
 
 
 def parameters_match(booked, fields):
@@ -398,7 +537,14 @@ def perform(name, data, actor):
     oid = data['order_id']
     s = snapshot(oid)
     current = state({'order_id': oid})['state']
-    if name == 'shipping.requirements.update':
+    if name == 'orders.fulfillment.reconcile':
+        import reconciliation_store
+        for member in s['package_ids']:
+            reconciliation_store.retry_pending(b, member)
+    elif name in {'orders.documents.adopt', 'shipping.shipment.adopt'}:
+        import fulfillment_adoption
+        fulfillment_adoption.adopt(__import__(__name__), name, data, actor)
+    elif name == 'shipping.requirements.update':
         fields = {k: v for k, v in data.items() if k not in ('order_id', 'expected_version', 'idempotency_key')}
         _validate_requirements(fields)
         merged = {**s['requirements'], **fields}
@@ -447,9 +593,13 @@ def perform(name, data, actor):
                 b.consume_packing_selection(selection['batch_id'], iid)
             result = {'invoice_id': iid}
         else:
+            if s['intents'] and not any(d['kind'] == 'invoice' for d in s['documents']):
+                raise error('INVOICE_OUTCOME_UNKNOWN', 'Istnieje rozpoczęte wystawienie faktury bez potwierdzonego rekordu. Najpierw uzgodnij istniejącą próbę; nie tworzę drugiej faktury.')
             c = b.conn()
             c.execute("INSERT OR REPLACE INTO fulfillment_document_intents VALUES(?,'invoice',?)", (oid, s['content_hash']))
             c.commit(); c.close()
+            import reconciliation_store
+            reconciliation_store.publish(b, oid)
             plan = _check_response(b.order_invoice_service(oid, request=request_view('GET'), session={}, structured=True))
             form = dict(plan['defaults'])
             form.update({f'invoice_qty_{iid}': qty for iid, qty in plan['packing_qty'].items()})
@@ -469,8 +619,6 @@ def perform(name, data, actor):
         c = b.conn()
         package_ids = [int(o['id']) for o in b._packed_package_orders(c.cursor(), s['order'])]
         c.close()
-        if package_ids != [oid]:
-            raise error('COMBINED_PACKAGE_REVIEW', 'Zamówienie należy do paczki zbiorczej. Nadaj ją istniejącym formularzem po sprawdzeniu wszystkich zamówień.')
         fields = current['requirements']['known']
         _validate_requirements(fields)
         form = {**fields, 'service': 'inpost_courier_standard', 'sms': '1' if fields['sms'] else '0', 'email': '1' if fields['email'] else '0', 'quantity': 1}
@@ -512,11 +660,13 @@ def perform(name, data, actor):
         if not s['attempts']:
             raise error('LEGACY_SHIPMENT_REVIEW', 'Brakuje zapisanych parametrów przesyłki. Sprawdź je w InPost; nie potwierdzam ich automatycznie.')
         old = json.loads(s['attempts'][0]['payload'])
+        if sorted(old.get('order_ids') or [oid]) != s['package_ids']:
+            raise error('PACKAGE_SHIPMENT_CONFLICT', 'Zmienił się zestaw zamówień paczki. Zweryfikuj powiązanie istniejącej przesyłki przed potwierdzeniem parametrów.', 'CONFLICT')
         if old['receiver'] != effective_receiver(s):
             raise error('RECIPIENT_CHANGED', 'Odbiorca lub adres różni się od nadania. Wymagana jest obsługa u przewoźnika.')
         if not parameters_match(old, current['requirements']['known']):
             raise error('PARCEL_CHANGED', 'Parametry paczki różnią się od nadania. Wymagana jest obsługa u przewoźnika; nie anuluję przesyłki.')
-        c = b.conn(); c.execute('UPDATE fulfillment_shipping_attempts SET content_hash=? WHERE order_id=?', (s['content_hash'], oid)); c.commit(); c.close()
+        c = b.conn(); c.execute('UPDATE fulfillment_shipping_attempts SET content_hash=? WHERE order_id=?', (shipment_content(s), s['attempts'][0]['order_id'])); c.commit(); c.close()
     return state(data)
 
 
@@ -524,6 +674,8 @@ def print_ready(data, actor, correlation_id='', transaction_connection=None):
     from internal_rbac import DENY
     permissions = {'packing_list': 'packing.read', 'invoice': 'invoices.read', 'label': 'shipping.label_read'}
     current = state(data)['state']
+    if not current['persistence']['durable']:
+        raise error('RECONCILIATION_PENDING', 'Nie potwierdzono trwałego zapisu dokumentów.')
     if current['shipment']['parameters_need_review']:
         raise error('SHIPMENT_REVIEW_REQUIRED', 'Po zmianie zamówienia trzeba sprawdzić parametry istniejącej przesyłki przed drukiem.')
     result = []
@@ -535,7 +687,33 @@ def print_ready(data, actor, correlation_id='', transaction_connection=None):
         result.append({'type': 'document_link', 'document_type': kind,
             'name': {'packing_list': 'Lista pakowa', 'invoice': 'Faktura', 'label': 'Etykieta InPost'}[kind],
             'url': f"/api/internal/fulfillment/{data['order_id']}/documents/{kind}"})
+    if len(current['package']['order_ids']) > 1:
+        for member in current['package']['order_ids']:
+            other = state({'order_id': member})['state']
+            if not other['persistence']['durable'] or not other['invoice']['current'] or not other['packing_list']['current'] or other['shipment']['parameters_need_review']:
+                raise error('STALE_PACKAGE_DOCUMENT', 'Nie wszystkie zamówienia w paczce mają aktualne dokumenty.')
+        result = [{'type': 'document_link', 'document_type': 'package', 'name': 'Komplet dokumentów paczki',
+                   'url': f"/api/internal/fulfillment/{data['order_id']}/documents/package"}]
     return {'ok': True, 'state': current, 'documents': result, 'message': 'Aktualne dokumenty są gotowe do otwarcia i druku w przeglądarce. Nie potwierdzam fizycznego wydruku.'}
+
+
+def package_pdf(data, actor):
+    from io import BytesIO
+    from contextlib import ExitStack
+    from pypdf import PdfWriter
+    with ExitStack() as stack:
+        for oid in snapshot(data['order_id'])['package_ids']:
+            stack.enter_context(order_lease(oid, 'print:' + str(uuid.uuid4())))
+        current = print_ready(data, actor)['state']
+        writer = PdfWriter(); seen = set()
+        for member in current['package']['order_ids']:
+            for doc in snapshot(member)['documents']:
+                if doc['kind'] == 'label' and member != data['order_id']:
+                    continue
+                if doc['file_hash'] not in seen:
+                    writer.append(doc['path']); seen.add(doc['file_hash'])
+        stream = BytesIO(); writer.write(stream); stream.seek(0)
+        return stream
 
 
 def execute(execution_id, definition, actor, data, approval_id, entity_type, entity_id, expected_version, correlation_id):
@@ -552,11 +730,18 @@ def execute(execution_id, definition, actor, data, approval_id, entity_type, ent
             raise error('PERMISSION_DENIED', 'Brak uprawnienia do zlecenia podjazdu.', 'DENIED')
         if definition.operation_name == 'shipping.shipment.refresh' and any(a.permission_decision('shipping.label_read') == DENY for a in (human, actor)):
             raise error('PERMISSION_DENIED', 'Brak uprawnienia do pobrania etykiety.', 'DENIED')
-        lease = order_lease(oid, execution_id)
-        lease.__enter__()
+        from contextlib import ExitStack
+        lease = ExitStack()
+        try:
+            for member in snapshot(oid)['package_ids']:
+                lease.enter_context(order_lease(member, execution_id))
+        except Exception:
+            lease.close()
+            raise
         locked = True
+        preflight(definition.operation_name, data, actor)
         before = snapshot(oid)
-        if definition.operation_name not in {'shipping.shipment.refresh', 'shipping.pickup.request'} and (before['order'].get('shipped_at') or before['order']['status'] in {'shipped', 'partially_shipped', 'completed', 'cancelled', 'issued', 'in_delivery'}):
+        if definition.operation_name not in {'shipping.shipment.refresh', 'shipping.pickup.request', 'orders.fulfillment.reconcile'} and (before['order'].get('shipped_at') or before['order']['status'] in {'shipped', 'partially_shipped', 'completed', 'cancelled', 'issued', 'in_delivery'}):
             raise error('ORDER_CLOSED', 'Zamówienie zostało wysłane lub zamknięte.', 'DENIED')
         db = b.conn(); db.execute('BEGIN IMMEDIATE')
         now_version = version(snapshot(oid, db))
@@ -571,6 +756,11 @@ def execute(execution_id, definition, actor, data, approval_id, entity_type, ent
             before_state=before, after_state={'phase': 'started'}, transaction_connection=db)
         db.commit(); db.close(); db = None; locked = True
         output = ops.validate_output(definition, perform(definition.operation_name, data, actor))
+        import reconciliation_store
+        if definition.operation_name != 'orders.fulfillment.reconcile':
+            for member in snapshot(oid)['package_ids']:
+                reconciliation_store.publish(b, member)
+        output = ops.validate_output(definition, state(data))
         record_audit_event(definition.operation_name, result='SUCCESS', actor_context=actor,
             entity_type='order', entity_id=str(oid), correlation_id=correlation_id, approval_id=approval_id,
             before_state=before, after_state=output)
@@ -587,19 +777,29 @@ def execute(execution_id, definition, actor, data, approval_id, entity_type, ent
         if isinstance(exc, approval.StaleApproval): status = 'CONFLICT'
         message = str(exc.description) if isinstance(exc, HTTPException) else str(exc)
         code = getattr(exc, 'error_code', 'FULFILLMENT_STEP_FAILED')
+        partial = None
+        if definition.operation_name == 'orders.invoice.create':
+            try:
+                partial = state(data)
+                if partial['state']['invoices']:
+                    message = 'Rekord faktury istnieje. Nie ukończono przygotowania lub publikacji dokumentu; sprawdź dostępność PDF i wznów istniejącą fakturę.'
+            except Exception:
+                pass
         row = ops._transition(execution_id, definition, actor, status, 'business_operation.' + status.lower(), status,
-            error_code=code, message=message, completed=True, expected_statuses=('RUNNING',))
+            error_code=code, message=message, data=partial, completed=True, expected_statuses=('RUNNING',))
         return ops._result_from_row(row or ops._execution(execution_id))
     finally:
         if locked: lease.__exit__(None, None, None)
 
 
 def install(ops):
-    output = {'ok': {'type': 'boolean'}, 'state': {'type': 'object'}, 'documents': {'type': 'array'}, 'message': {'type': 'string'}}
+    output = {'ok': {'type': 'boolean'}, 'state': {'type': 'object'}, 'documents': {'type': 'array'}, 'capabilities': {'type': 'array'}, 'preview': {'type': 'object'}, 'message': {'type': 'string'}}
     for name in sorted(READS | WRITES):
         read = name in READS
         props = {'order_id': {'type': 'integer', 'minimum': 1}}
         required = ['order_id']
+        if name == 'shipping.capabilities':
+            props = {}; required = []
         if not read:
             props.update(expected_version={'type': 'integer', 'minimum': 0}, idempotency_key={'type': 'string', 'minLength': 1, 'maxLength': 200})
             required += ['expected_version', 'idempotency_key']
@@ -616,6 +816,12 @@ def install(ops):
                           for k in ('name', 'street', 'post_code', 'city', 'phone', 'email')})
         if name == 'shipping.shipment.confirm_parameters':
             props['human_confirmed'] = {'type': 'boolean'}; required += ['human_confirmed']
+        if name == 'shipping.shipment.create':
+            props['package_fingerprint'] = {'type': 'string', 'minLength': 64, 'maxLength': 64,
+                'description': 'Dla wielu zamówień wymagane package.fingerprint z orders.fulfillment.state. Zawiera cały zakres i wersje wszystkich zamówień.'}
+        if name in {'orders.documents.adopt', 'shipping.shipment.adopt'}:
+            props['preview_fingerprint'] = {'type': 'string', 'minLength': 64, 'maxLength': 64}
+            required += ['preview_fingerprint']
         risk = 'GREEN' if read or name in GREEN else 'YELLOW'
         ops.OPERATION_REGISTRY[name] = ops.BusinessOperationDefinition(name, 1,
             'Realizuje jeden krok istniejącego fulfillment. Najpierw orders.fulfillment.state; użyj zwróconej expected_version. Po WRITE odczytaj state z wyniku i kontynuuj next_step. Nie odtwarzaj poprawnych dokumentów. Pytaj tylko o requirements.missing_fields. Nie anuluj przesyłki. shipping.shipment.refresh odzyskuje wynik timeoutu bez ponownego POST. Druk oznacza przygotowanie PDF, nie fizyczny wydruk.',
@@ -623,5 +829,8 @@ def install(ops):
             {'type': 'object', 'additionalProperties': False, 'required': required, 'properties': props},
             {'type': 'object', 'required': ['ok', 'state'], 'properties': output},
             ops.IDEMPOTENCY_NONE if read else ops.IDEMPOTENCY_REQUIRED, 'READ_STANDARD' if read else 'WRITE', read)
-        ops._HANDLERS[name] = print_ready if name == 'orders.documents.print_ready' else state
+        ops._HANDLERS[name] = capabilities if name == 'shipping.capabilities' else print_ready if name == 'orders.documents.print_ready' else state
+        if name.endswith('.adoption.preview'):
+            import fulfillment_adoption
+            ops._HANDLERS[name] = lambda data, actor, correlation_id='', transaction_connection=None, operation=name: fulfillment_adoption.preview(__import__(__name__), operation, data)
         if read: ops.FRESHNESS_GROUP_BY_OPERATION[name] = 'fulfillment_workflow'

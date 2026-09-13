@@ -112,7 +112,7 @@ def _execution(execution_id):
 def test_registry_is_closed_and_contains_required_contracts(isolated):
     import fulfillment_operations
     assert set(operations.OPERATION_REGISTRY) == {
-        'invoices.removal.preview', 'invoices.remove',
+        'invoices.removal.preview', 'invoices.remove', 'approval.decide',
         "orders.summary", "agent.terminology.search", "agent.terminology.remember",
         "inventory.product.get", "inventory.product.search", "inventory.summary",
         "orders.search", "orders.get", "orders.fulfillment.readiness", "invoices.search", "invoices.get", "invoices.overdue",

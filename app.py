@@ -810,6 +810,8 @@ def init_db():
     _startup_step("application_schema_initialized")
     import invoice_jobs, invoice_stock
     invoice_jobs.initialize(c)
+    import invoice_numbering
+    invoice_numbering.initialize(c)
     invoice_stock.initialize(c)
     _startup_step("invoice_schema_initialized")
     import inpost_history
@@ -979,13 +981,15 @@ def _artifact_links(operation_name: str, record: dict) -> dict:
 
 
 def build_business_artifacts(operation_name: str, result: dict) -> list[dict]:
+    if operation_name == 'approval.decide' and result.get('execution_status') == 'SUCCESS':
+        return build_business_artifacts(result['operation'], result.get('outcome') or {})
     if operation_name == 'orders.fulfillment.readiness':
         return [{'type': 'order_card', 'id': r['order_id'], 'order_number': r['order_number'],
                  'customer_name': r['customer_name'], 'total_units': r['total_units'],
                  'detail_url': f"/orders/{r['order_id']}"} for r in result.get('results', []) if r.get('ready')][:6]
     if operation_name == 'orders.documents.print_ready':
         return result.get('documents', [])
-    if isinstance(result.get('state'), dict) and result.get('ok'):
+    if isinstance(result.get('state'), dict) and result.get('ok') and result['state'].get('order_id'):
         state = result['state']
         cards = [{'type': 'order_card', 'id': state['order_id'], 'order_number': state['order_number'],
                   'customer_name': state['customer'], 'carrier': state['shipment'].get('carrier'),
@@ -1002,13 +1006,20 @@ def build_business_artifacts(operation_name: str, result: dict) -> list[dict]:
 @require_permission('orders.read_full')
 def fulfillment_document_download(order_id, kind):
     from fulfillment_operations import state as fulfillment_state, snapshot as fulfillment_snapshot
+    if kind == 'package':
+        from fulfillment_operations import package_pdf
+        try:
+            stream = package_pdf({'order_id': order_id}, current_actor_context())
+        except Exception:
+            abort(409, description='Nie można przygotować aktualnego kompletu dokumentów paczki.')
+        return send_file(stream, mimetype='application/pdf', download_name='dokumenty-paczki.pdf', as_attachment=False)
     permissions = {'packing_list': 'packing.read', 'invoice': 'invoices.read', 'label': 'shipping.label_read'}
     if kind not in permissions:
         abort(404)
     if current_actor_context().permission_decision(permissions[kind]) == 'DENY':
         abort(403)
     current = fulfillment_state({'order_id': order_id})['state']
-    if not current[kind]['current'] or (kind == 'label' and current['shipment']['parameters_need_review']):
+    if not current['persistence']['durable'] or not current[kind]['current'] or (kind == 'label' and current['shipment']['parameters_need_review']):
         abort(409, description='Dokument jest nieaktualny lub wymaga sprawdzenia przesyłki.')
     doc = next(d for d in fulfillment_snapshot(order_id)['documents'] if d['kind'] == kind)
     return send_file(doc['path'], mimetype='application/pdf', as_attachment=False, conditional=True)
@@ -1405,15 +1416,8 @@ def make_qr_data_url(value: str) -> str:
 
 
 def next_invoice_no(issue_date: str) -> str:
-    dt = datetime.strptime(issue_date, "%Y-%m-%d")
-    mm = dt.strftime("%m")
-    yyyy = dt.strftime("%Y")
-    c = conn()
-    cur = c.cursor()
-    cur.execute("SELECT COUNT(*) AS n FROM invoices WHERE substr(issue_date,1,7)=?", (f"{yyyy}-{mm}",))
-    n = int(cur.fetchone()["n"] or 0) + 1
-    c.close()
-    return f"FVAT {n}/{mm}/{yyyy}"
+    import invoice_numbering, sys
+    return invoice_numbering.preview(sys.modules[__name__], issue_date)
 
 
 def invoice_no_exists(invoice_no: str, exclude_invoice_id: int = 0) -> int:
@@ -2328,7 +2332,7 @@ BUSINESS_FRESHNESS_DATA_TABLES = {
     for group, specs in BUSINESS_FRESHNESS_GROUPS.items()
 }
 BUSINESS_FRESHNESS_OPERATION_GROUP = {
-    **{name: 'fulfillment_workflow' for name in ('orders.fulfillment.state','shipping.requirements.get','orders.documents.print_ready')},
+    **{name: 'fulfillment_workflow' for name in ('orders.fulfillment.state','shipping.requirements.get','orders.documents.print_ready','orders.documents.adoption.preview','shipping.shipment.adoption.preview')},
     'invoices.removal.preview': 'invoice_amendment',
     "inventory.product.search": "inventory", "inventory.product.get": "inventory", "inventory.summary": "inventory",
     "orders.search": "orders", "orders.get": "orders", "orders.summary": "orders",

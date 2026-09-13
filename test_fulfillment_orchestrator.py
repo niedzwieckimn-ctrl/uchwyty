@@ -55,6 +55,8 @@ def state():
 
 def run(name, approve=True, **values):
     data = {'order_id': 702, 'expected_version': state()['expected_version'], 'idempotency_key': str(uuid.uuid4()), **values}
+    if name == 'shipping.shipment.create' and len(state()['package']['order_ids']) > 1:
+        data['package_fingerprint'] = state()['package']['fingerprint']
     with b.app.test_request_context():
         b._refresh_domain_route_context()
         result = ops.execute_business_operation(actor(), name, data)
@@ -200,10 +202,13 @@ def test_legacy_document_without_provenance_is_not_duplicated(flow):
 
 def test_combined_package_fails_closed_before_provider(flow, monkeypatch):
     docs(); requirements()
+    expected_version = state()['expected_version']
     original = b._packed_package_orders
     monkeypatch.setattr(b, '_packed_package_orders', lambda cur, order: original(cur, order) + [{'id': 999}])
-    result = run('shipping.shipment.create')
-    assert result.error_code == 'COMBINED_PACKAGE_REVIEW'
+    with b.app.test_request_context():
+        result = ops.execute_business_operation(actor(), 'shipping.shipment.create',
+            {'order_id': 702, 'expected_version': expected_version, 'idempotency_key': 'invalid-member'})
+    assert result.error_code == 'NOT_FOUND'
     assert not flow['calls']
 
 
@@ -262,7 +267,7 @@ def test_changed_parcel_keeps_shipment_and_requires_human(flow):
     success('shipping.requirements.update', weight=4)
     assert state()['shipment']['parameters_need_review']
     pending = run('shipping.shipment.confirm_parameters', approve=False, human_confirmed=True)
-    assert pending.status == 'PENDING_APPROVAL'
+    assert pending.error_code == 'PARCEL_CHANGED'
     assert run('shipping.shipment.confirm_parameters', human_confirmed=True).error_code == 'PARCEL_CHANGED'
     with b.app.test_request_context():
         result = ops.execute_business_operation(actor(), 'orders.documents.print_ready', {'order_id': 702})
@@ -305,6 +310,8 @@ def test_cloud_claim_after_local_loss_never_posts_twice(flow, monkeypatch):
     payload = {'length': 450, 'width': 300, 'height': 150, 'weight': 3}
     cloud = {}
     def rpc(path, method='GET', payload=None, **kw):
+        if path.endswith('/fulfillment_reconciliation'):
+            return []
         if path.endswith('claim_fulfillment_shipment'):
             if cloud:
                 return {'acquired': False, 'claim': dict(cloud)}

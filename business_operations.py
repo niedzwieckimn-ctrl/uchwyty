@@ -671,6 +671,10 @@ def initialize_schema(db: sqlite3.Connection) -> None:
     fulfillment_operations.initialize(db)
     db.executescript((Path(__file__).parent / 'migrations' / 'first_supervised_write.sql').read_text(encoding='utf-8'))
     db.executescript((Path(__file__).parent / 'migrations' / 'warehouse_operations.sql').read_text(encoding='utf-8'))
+    import inventory_recount
+    inventory_recount.initialize(db)
+    import human_approval
+    human_approval.initialize(db)
     count_columns = {row['name'] for row in db.execute('PRAGMA table_info(internal_inventory_count_sessions)').fetchall()}
     if 'conversation_id' not in count_columns:
         db.execute("ALTER TABLE internal_inventory_count_sessions ADD COLUMN conversation_id TEXT NOT NULL DEFAULT ''")
@@ -804,6 +808,10 @@ def _fingerprint(definition: BusinessOperationDefinition, actor: ActorContext, d
 
 
 def _entity(definition: BusinessOperationDefinition, data: Mapping[str, Any]) -> tuple[str, str, int | None]:
+    if definition.operation_name == 'approval.decide':
+        return 'approval', data['approval_id'], None
+    if definition.operation_name == 'shipping.capabilities':
+        return 'capability', 'shipping', None
     if definition.operation_name in fulfillment_operations.READS | fulfillment_operations.WRITES:
         return 'order', str(data['order_id']), data.get('expected_version')
     if definition.operation_name in {invoice_amendment.READ, invoice_amendment.WRITE}:
@@ -1805,7 +1813,7 @@ def _validate_warehouse_write(db, data, actor, definition):
                 f'Stan produktu zmienił się. Aktualna expected_version={version}.', status=CONFLICT)
         session = _assert_count_session(db,data,actor)
         if name == 'inventory.adjust':
-            item = db.execute('SELECT * FROM internal_inventory_count_items WHERE session_id=? AND product_id=?',
+            item = db.execute("SELECT * FROM internal_inventory_count_items WHERE session_id=? AND product_id=? AND status<>'SUPERSEDED'",
                               (data['count_session_id'],data['product_id'])).fetchone()
             if item is None or item['status'] != 'PENDING_ADJUSTMENT':
                 raise ControlledOperationError('COUNT_DISCREPANCY_NOT_PENDING', 'Brak nierozwiązanej rozbieżności dla produktu', status=CONFLICT)
@@ -1911,17 +1919,20 @@ def _inventory_count_summary(data, actor, correlation_id, transaction_connection
                   'model':r['model'] or '','name':r['name'] or ''} for r in rows]
         return {'ok':True,'count_id':data['count_session_id'],'status':session['status'],
                 'matched_count':sum(i['status']=='MATCHED' for i in items),
-                'variance_count':sum(i['difference']!=0 for i in items),
+                'variance_count':sum(i['difference']!=0 for i in items if i['status'] != 'SUPERSEDED'),
                 'adjusted_count':sum(i['status']=='ADJUSTED' for i in items),
                 'unresolved_count':sum(i['status']=='PENDING_ADJUSTMENT' for i in items),
-                'positive_units':sum(max(0,i['difference']) for i in items),
-                'negative_units':sum(max(0,-i['difference']) for i in items),'items':items}
+                'positive_units':sum(max(0,i['difference']) for i in items if i['status'] != 'SUPERSEDED'),
+                'negative_units':sum(max(0,-i['difference']) for i in items if i['status'] != 'SUPERSEDED'),'items':items}
     finally:
         if transaction_connection is None: db.close()
 
 
 def _inventory_count_record(data, actor, correlation_id, transaction_connection=None):
     db=transaction_connection; now=_now(); human_id=_human_actor_id(actor)
+    import inventory_recount
+    inventory_recount.supersede(db, data['count_session_id'], data['product_id'])
+    data = dict(data, expected_version=_inventory_version(db, data['product_id']))
     db.execute('''INSERT OR IGNORE INTO internal_inventory_count_sessions(
                   session_id,status,created_by,conversation_id,created_at) VALUES(?,?,?,?,?)''',
                (data['count_session_id'],'OPEN',human_id,data.get('conversation_id',''),now))
@@ -1963,7 +1974,7 @@ def _inventory_adjust(data, actor, correlation_id, transaction_connection=None):
     db=transaction_connection
     item=db.execute('''SELECT i.*,p.sku,p.model,p.name
                          FROM internal_inventory_count_items i JOIN products p ON p.id=i.product_id
-                        WHERE i.session_id=? AND i.product_id=?''',
+                        WHERE i.session_id=? AND i.product_id=? AND i.status<>'SUPERSEDED' ''',
                     (data['count_session_id'],data['product_id'])).fetchone()
     stock_row=db.execute('SELECT COALESCE(qty,0) qty FROM stock WHERE product_id=?',(data['product_id'],)).fetchone()
     old=int(stock_row['qty']) if stock_row else 0
@@ -2310,6 +2321,13 @@ def execute_business_operation(
                 db.close()
         if definition.operation_name in invoice_amendment.WRITES and row['status'] == 'CREATED':
             invoice_amendment.validate(data)
+        if definition.operation_name in fulfillment_operations.WRITES and row['status'] == 'CREATED':
+            try:
+                fulfillment_operations.preflight(definition.operation_name, data, actor)
+            except ControlledOperationError as exc:
+                row = _transition(execution_id, definition, actor, exc.status, 'business_operation.' + exc.status.lower(), exc.status,
+                                  error_code=exc.error_code, message=exc.safe_message, completed=True, expected_statuses=('CREATED',))
+                return _result_from_row(row)
         evaluation = approvals.evaluate_operation(actor, definition.operation_name, operation_version=definition.operation_version)
         if not evaluation.allowed:
             row = _transition(execution_id, definition, actor, "DENIED", "business_operation.denied", DENIED,
@@ -2465,3 +2483,5 @@ def list_available_operations(actor_context: ActorContext) -> list[dict[str, Any
 
 invoice_amendment.install(__import__(__name__))
 fulfillment_operations.install(__import__(__name__))
+import human_approval
+human_approval.install(__import__(__name__))
