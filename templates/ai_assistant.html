@@ -78,7 +78,7 @@
       invoice_number:'Numer', buyer_name:'Klient', issue_date:'Data', due_date:'Termin płatności', currency:'Waluta',
       total_net:'Netto', total_gross:'Brutto', payment_status:'Płatność', amount_outstanding:'Pozostało',
       order_number:'Numer', customer_name:'Klient', created_at:'Data', status:'Status', item_count:'Pozycje', total_units:'Sztuki',
-      sku:'SKU', model:'Model', name:'Nazwa', stock:'Stan fizyczny', available:'Dostępne', reserved:'Zarezerwowane', incoming:'W drodze',
+      sku:'SKU', model:'Model', name:'Nazwa', stock:'Magazyn', ordered_quantity:'Zamówione', incoming_quantity:'W drodze', available_for_customers:'Dostępne dla klientów',
       po_number:'P/O', supplier:'Dostawca', order_status:'Status zamówienia', delivery_stage:'Etap dostawy', tracking_eta:'ETA',
       carrier:'Przewoźnik', tracking_number:'Tracking', shipping_method:'Wysyłka',
       product_id:'Produkt', count_id:'Sesja remanentu', expected_quantity:'Stan oczekiwany',
@@ -170,10 +170,10 @@
       if (typeof data.conversation_id === 'string') conversationId = data.conversation_id;
       loading.remove();
       for (const approval of data.approvals || data.pending_approvals || []) {
-        let approvalLabel = `Operacja ${approval.operation || 'magazynowa'} (wersja ${approval.expected_version})`;
-        if (approval.operation === 'orders.status.transition') approvalLabel = `Zamówienie #${approval.order_id} → ${approval.target_status} (wersja ${approval.expected_version})`;
-        if (approval.operation === 'inventory.adjust') approvalLabel = `Korekta stanu produktu #${approval.product_id} z remanentu (wersja ${approval.expected_version})`;
-        if (approval.operation === 'orders.packing.confirm') approvalLabel = `Potwierdzenie spakowania zamówienia #${approval.order_id} (wersja ${approval.expected_version})`;
+        let approvalLabel = 'Zmiana operacyjna';
+        if (approval.operation === 'orders.status.transition') approvalLabel = 'Zmiana statusu zamówienia';
+        if (approval.operation === 'inventory.adjust') approvalLabel = 'Korekta stanu po remanencie';
+        if (approval.operation === 'orders.packing.confirm') approvalLabel = 'Potwierdzenie spakowania zamówienia';
         const card = addMessage('assistant', `Zmiana wymaga zatwierdzenia\n${approvalLabel}`);
         const bubble = card.querySelector('.ai-bubble');
         for (const [action, label] of [['approve', 'Zatwierdź'], ['reject', 'Odrzuć']]) {
@@ -191,7 +191,7 @@
               if (typeof result.conversation_id === 'string') conversationId = result.conversation_id;
               addMessage('assistant', typeof result.message === 'string'
                 ? result.message
-                : JSON.stringify(result.execution_outcome || {status: result.status}));
+                : response.ok ? 'Decyzja została zapisana.' : 'Nie udało się wykonać zmiany.');
               if (!response.ok || result.status === 'NOOP') buttons.forEach(b => b.disabled = false);
             } catch (_) {
               addMessage('assistant', 'Nie udało się odczytać wyniku. Możesz ponowić decyzję.');
