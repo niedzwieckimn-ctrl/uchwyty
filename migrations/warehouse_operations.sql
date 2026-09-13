@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS internal_inventory_count_sessions(
     session_id TEXT PRIMARY KEY,
     status TEXT NOT NULL DEFAULT 'OPEN' CHECK(status IN ('OPEN','COMPLETED','CANCELLED')),
     created_by TEXT NOT NULL REFERENCES internal_actors(actor_id),
+    conversation_id TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     completed_at TEXT,
     cancelled_at TEXT
