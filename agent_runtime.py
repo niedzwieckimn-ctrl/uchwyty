@@ -657,7 +657,11 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
     except agent_conversation.ConversationBusy:
         return finish('DENIED','Ta rozmowa ma już aktywny turn. Spróbuj po jego zakończeniu.','CONVERSATION_BUSY')
     except Exception as exc:
-        logger.error('AI_RUNTIME_FAILURE %s',json.dumps({'agent_run_id':run_id,'exception_type':type(exc).__name__}))
+        logger.error('AI_RUNTIME_FAILURE %s', json.dumps({
+            'agent_run_id': run_id,
+            'exception_type': type(exc).__name__,
+            'exception_message': _safe_text(exc),
+        }, ensure_ascii=False, sort_keys=True), exc_info=True)
         return finish('FAILED','Asystent chwilowo nie może zakończyć odpowiedzi.','MODEL_FAILED')
 
 

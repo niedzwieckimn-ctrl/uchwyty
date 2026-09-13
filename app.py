@@ -66,6 +66,7 @@ from agent_conversation import (
 from internal_audit import (
     configure as configure_internal_audit,
     initialize_schema as initialize_internal_audit_schema,
+    sanitize_audit_text,
     try_record_audit_event,
 )
 from internal_concurrency import (
@@ -2694,7 +2695,12 @@ def maybe_pull_shared_from_supabase(force: bool = False, required: bool = False)
     except HTTPException:
         raise
     except Exception as exc:
-        app.logger.warning("Synchronizacja Supabase nie powiodła się: %s", type(exc).__name__)
+        app.logger.warning(
+            "Synchronizacja Supabase nie powiodła się: type=%s error=%s",
+            type(exc).__name__,
+            sanitize_audit_text(exc),
+            exc_info=True,
+        )
         if required and not _local_supabase_data_present():
             _raise_required_bootstrap_failure({"reason": type(exc).__name__})
     return None
