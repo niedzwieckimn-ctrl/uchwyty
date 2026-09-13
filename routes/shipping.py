@@ -4,6 +4,33 @@ def register_routes(context):
     globals().update(context)
 
 
+    def persist_inpost_result(package_ids, shipment_id, tracking_number, *, enqueue_pickup=True):
+        c = conn()
+        try:
+            placeholders = ",".join(["?"] * len(package_ids))
+            c.execute(
+                f"""UPDATE orders SET inpost_shipment_id=?, inpost_label_format='pdf',
+                    tracking_no=CASE WHEN ?<>'' THEN ? ELSE tracking_no END, carrier='inpost'
+                    WHERE id IN ({placeholders})""",
+                (shipment_id, tracking_number, tracking_number, *package_ids),
+            )
+            c.commit()
+        finally:
+            c.close()
+        try:
+            if enqueue_pickup:
+                enqueue_automatic_inpost_pickup(shipment_id)
+        except Exception:
+            app.logger.exception("Etykieta utworzona, ale kolejka podjazdu wymaga sprawdzenia")
+        if supabase_enabled():
+            try:
+                sync_local_rows_to_supabase("orders", "id", package_ids)
+            except Exception as exc:
+                # Przesyłka w InPost już istnieje. Błąd synchronizacji
+                # nie może ukryć identyfikatora ani prowokować ponownego
+                # utworzenia płatnej przesyłki.
+                app.logger.exception("Przesyłka InPost %s utworzona, ale synchronizacja zamówień nie powiodła się: %s", shipment_id, exc)
+
     @app.post("/webhooks/inpost")
     def inpost_tracking_webhook():
         if not _rate_limit("inpost_webhook", 240, 60):
@@ -52,13 +79,12 @@ def register_routes(context):
         return jsonify(result), (200 if result.get("ok") else 503)
 
 
-    @app.route("/orders/<int:order_id>/inpost", methods=["GET", "POST"])
-    def order_inpost_create(order_id):
+    def order_inpost_create_service(order_id, *, request, session=None, structured=False, receiver_override=None):
         # Po utworzeniu przesyłki nie pobieramy natychmiast starszej kopii rekordu
         # z Supabase. Dzięki temu zapisany identyfikator i przycisk PDF są widoczne
         # od razu również wtedy, gdy synchronizacja zdalna potrzebuje chwili.
         just_created = request.args.get("created") == "1"
-        if not just_created:
+        if not just_created and not structured:
             maybe_pull_shared_from_supabase(force=True)
         c = conn()
         try:
@@ -104,6 +130,8 @@ def register_routes(context):
                     "post_code": post_code, "city": city, "phone": phone,
                     "email": order.get("customer_email"),
                 }
+                if structured and receiver_override is not None:
+                    receiver = dict(receiver_override)
                 try:
                     allowed_services = {
                         "inpost_courier_standard", "inpost_courier_express_1700",
@@ -134,7 +162,8 @@ def register_routes(context):
                         canonical_order_no(item["id"], item["created_at"], item["order_no"])
                         for item in package_orders
                     )
-                    shipment = create_courier_shipment(receiver, parcel, reference, service, options)
+                    from fulfillment_operations import safe_create_shipment
+                    shipment = safe_create_shipment(order_id, receiver, parcel, reference, service, options)
                     shipment_id = norm(shipment.get("id"))
                     tracking_number = norm(shipment.get("tracking_number"))
                     if not shipment_id:
@@ -156,36 +185,20 @@ def register_routes(context):
                                 shipment = current_shipment
                                 break
                     package_ids = [int(item["id"]) for item in package_orders]
-                    c = conn()
-                    try:
-                        placeholders = ",".join(["?"] * len(package_ids))
-                        c.execute(
-                            f"""UPDATE orders SET inpost_shipment_id=?, inpost_label_format='pdf',
-                                tracking_no=CASE WHEN ?<>'' THEN ? ELSE tracking_no END, carrier='inpost'
-                                WHERE id IN ({placeholders})""",
-                            (shipment_id, tracking_number, tracking_number, *package_ids),
-                        )
-                        c.commit()
-                    finally:
-                        c.close()
-                    try:
-                        enqueue_automatic_inpost_pickup(shipment_id)
-                    except Exception:
-                        app.logger.exception("Etykieta utworzona, ale kolejka podjazdu wymaga sprawdzenia")
-                    if supabase_enabled():
-                        try:
-                            sync_local_rows_to_supabase("orders", "id", package_ids)
-                        except Exception as exc:
-                            # Przesyłka w InPost już istnieje. Błąd synchronizacji
-                            # nie może ukryć identyfikatora ani prowokować ponownego
-                            # utworzenia płatnej przesyłki.
-                            app.logger.exception("Przesyłka InPost %s utworzona, ale synchronizacja zamówień nie powiodła się: %s", shipment_id, exc)
+                    persist_inpost_result(package_ids, shipment_id, tracking_number)
+                    if structured:
+                        return {'ok': True, 'shipment_id': shipment_id, 'tracking': tracking_number}
                     return redirect(url_for(
                         "order_inpost_create", order_id=order_id, created="1",
                         bundle="1" if bundle else None,
                     ))
                 except InPostError as exc:
                     error = str(exc)
+
+        if structured:
+            if error:
+                return {'ok': False, 'error': error}
+            return {'ok': False, 'error': 'Nie potwierdzono utworzenia przesyłki.'}
 
         tpl = r"""
         {% extends "base.html" %}{% block content %}
@@ -216,6 +229,15 @@ def register_routes(context):
         """
         labels = [canonical_order_no(item["id"], item["created_at"], item["order_no"]) for item in package_orders]
         return render_template_string(tpl, title="Etykieta InPost", base_url=BASE_URL, db_path=DB_PATH, o=order, cfg=cfg, error=error, package_labels=labels, bundle=bundle, created=just_created, pickup=inpost_pickup_status(order.get("inpost_shipment_id")))
+
+
+    @app.route("/orders/<int:order_id>/inpost", methods=["GET", "POST"])
+    def order_inpost_create(order_id):
+        from fulfillment_operations import ui_write
+        if request.method == 'POST':
+            with ui_write(order_id):
+                return order_inpost_create_service(order_id, request=request, session=session)
+        return order_inpost_create_service(order_id, request=request, session=session)
 
 
 
@@ -445,8 +467,7 @@ def register_routes(context):
 
 
 
-    @app.route("/orders/<int:order_id>/packing-list", methods=["GET", "POST"])
-    def order_packing_list_download_admin(order_id):
+    def order_packing_list_download_admin_service(order_id, *, request, session=None, structured=False):
         """Generuje wspolna liste pakowania dla zamowien tego samego klienta."""
         selected_carrier = norm(request.form.get("carrier") or request.args.get("carrier")).lower()
         after_invoice = request.args.get("after_invoice") == "1"
@@ -488,7 +509,8 @@ def register_routes(context):
             return render_template_string(tpl, title="Wybierz kuriera", base_url=BASE_URL, db_path=DB_PATH, order_id=order_id)
         if selected_carrier not in {"inpost", "other", "pending"}:
             selected_carrier = "pending"
-        maybe_pull_shared_from_supabase()
+        if not structured:
+            maybe_pull_shared_from_supabase()
         c = conn()
         cur = c.cursor()
         cur.execute("SELECT * FROM orders WHERE id=?", (order_id,))
@@ -611,6 +633,8 @@ def register_routes(context):
         }
         pack_path = generate_invoice_packing_list_pdf(order_row, items, meta)
         mark_orders_packed(packed_order_ids, packing_path=pack_path, packing_items=items)
+        if structured:
+            return {'ok': True, 'path': pack_path, 'batch_id': packing_state['batch_id'], 'order_ids': packed_order_ids}
         filename_suffix = "_zbiorcza" if len(packed_order_ids) > 1 else ""
         if selected_carrier in {"inpost", "pending"}:
             session[f"inpost_pack_path_{order_id}"] = pack_path
@@ -623,6 +647,15 @@ def register_routes(context):
             as_attachment=True,
             download_name=f"{safe_filename(order_no)}{filename_suffix}_lista_pakowania.pdf",
         )
+
+
+    @app.route("/orders/<int:order_id>/packing-list", methods=["GET", "POST"])
+    def order_packing_list_download_admin(order_id):
+        from fulfillment_operations import ui_write
+        if request.method == 'POST':
+            with ui_write(order_id):
+                return order_packing_list_download_admin_service(order_id, request=request, session=session)
+        return order_packing_list_download_admin_service(order_id, request=request, session=session)
 
 
 
@@ -667,6 +700,6 @@ def register_routes(context):
         return send_file(pack_path, mimetype="application/pdf", as_attachment=True, download_name=os.path.basename(pack_path))
 
 
-    exported = {'order_inpost_create': order_inpost_create, 'order_inpost_label': order_inpost_label, 'inpost_dispatch_order': inpost_dispatch_order, 'order_mark_shipped': order_mark_shipped, 'order_packing_list_download_admin': order_packing_list_download_admin, 'invoice_packing_list_download_admin': invoice_packing_list_download_admin}
+    exported = {'persist_inpost_result': persist_inpost_result, 'order_packing_list_download_admin_service': order_packing_list_download_admin_service, 'order_inpost_create_service': order_inpost_create_service, 'order_inpost_create': order_inpost_create, 'order_inpost_label': order_inpost_label, 'inpost_dispatch_order': inpost_dispatch_order, 'order_mark_shipped': order_mark_shipped, 'order_packing_list_download_admin': order_packing_list_download_admin, 'invoice_packing_list_download_admin': invoice_packing_list_download_admin}
     globals().update(exported)
     return exported

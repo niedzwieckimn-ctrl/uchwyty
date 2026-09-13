@@ -26,9 +26,9 @@ def register_routes(context):
     globals().update(context)
 
 
-    @app.route("/orders/<int:order_id>/invoice", methods=["GET", "POST"])
-    def order_invoice(order_id):
-        maybe_pull_shared_from_supabase()
+    def order_invoice_service(order_id, *, request, session=None, structured=False):
+        if not structured:
+            maybe_pull_shared_from_supabase()
         sent_invoice_id = to_int(request.args.get("invoice_id"), 0) if norm(request.args.get("sent")) == "1" else 0
         if sent_invoice_id:
             meta = load_invoice_meta(sent_invoice_id) or {}
@@ -415,7 +415,12 @@ def register_routes(context):
                 }
                 if email_error:
                     redirect_args["email_error"] = email_error[:300]
+                if structured:
+                    return {'ok': True, 'invoice_id': invoice_id}
                 return redirect(url_for("order_packing_list_download_admin", order_id=order_id, after_invoice="1"))
+
+        if structured:
+            return {'ok': request.method == 'GET', 'error': msg, 'defaults': data, 'items': items, 'packing_qty': packing_qty_by_item}
 
         tpl = r"""
         {% extends "base.html" %}
@@ -584,6 +589,15 @@ def register_routes(context):
         {% endblock %}
         """
         return render_template_string(tpl, title="Faktura", base_url=BASE_URL, db_path=DB_PATH, o=o, d=data, company=company, items=items, invoice_rows=invoice_rows, msg=msg, canonical_order_no=canonical_order_no, invoice_from_packing=invoice_from_packing)
+
+
+    @app.route("/orders/<int:order_id>/invoice", methods=["GET", "POST"])
+    def order_invoice(order_id):
+        from fulfillment_operations import ui_write
+        if request.method == 'POST':
+            with ui_write(order_id):
+                return order_invoice_service(order_id, request=request, session=session)
+        return order_invoice_service(order_id, request=request, session=session)
 
 
 
@@ -1935,6 +1949,6 @@ def register_routes(context):
         return render_template_string(tpl, title="Edytuj fakturę", base_url=BASE_URL, db_path=DB_PATH, inv=inv, buyer_address=buyer_address, msg=msg, edit_items=edit_items)
 
 
-    exported = {'order_invoice': order_invoice, 'api_client_invoices': api_client_invoices, 'invoices': invoices, 'ksef_dashboard': ksef_dashboard, 'invoice_ksef_validate': invoice_ksef_validate, 'invoice_ksef_mark_sent': invoice_ksef_mark_sent, 'invoice_ksef_send': invoice_ksef_send, 'invoice_ksef_xml': invoice_ksef_xml, 'invoice_download_admin': invoice_download_admin, 'invoice_regenerate_admin': invoice_regenerate_admin, 'invoice_payment_reminder_admin': invoice_payment_reminder_admin, 'invoice_paid_admin': invoice_paid_admin, 'invoice_unpaid_admin': invoice_unpaid_admin, 'api_invoice_seen': api_invoice_seen, 'api_invoice_download': api_invoice_download, 'invoice_delete_admin': invoice_delete_admin, 'invoice_rollback_admin': invoice_rollback_admin, 'order_invoice_delete': order_invoice_delete, 'invoice_send_admin': invoice_send_admin, 'order_invoice_send': order_invoice_send, 'invoice_edit_admin': invoice_edit_admin}
+    exported = {'order_invoice_service': order_invoice_service, 'order_invoice': order_invoice, 'api_client_invoices': api_client_invoices, 'invoices': invoices, 'ksef_dashboard': ksef_dashboard, 'invoice_ksef_validate': invoice_ksef_validate, 'invoice_ksef_mark_sent': invoice_ksef_mark_sent, 'invoice_ksef_send': invoice_ksef_send, 'invoice_ksef_xml': invoice_ksef_xml, 'invoice_download_admin': invoice_download_admin, 'invoice_regenerate_admin': invoice_regenerate_admin, 'invoice_payment_reminder_admin': invoice_payment_reminder_admin, 'invoice_paid_admin': invoice_paid_admin, 'invoice_unpaid_admin': invoice_unpaid_admin, 'api_invoice_seen': api_invoice_seen, 'api_invoice_download': api_invoice_download, 'invoice_delete_admin': invoice_delete_admin, 'invoice_rollback_admin': invoice_rollback_admin, 'order_invoice_delete': order_invoice_delete, 'invoice_send_admin': invoice_send_admin, 'order_invoice_send': order_invoice_send, 'invoice_edit_admin': invoice_edit_admin}
     globals().update(exported)
     return exported

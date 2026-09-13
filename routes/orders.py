@@ -981,8 +981,7 @@ def register_routes(context):
 
 
 
-    @app.post("/orders/<int:order_id>/items/add")
-    def order_item_add(order_id):
+    def order_item_add_service(order_id, *, request, session=None, structured=False):
         product_id = to_int(request.form.get("product_id"), 0)
         qty = to_int(request.form.get("qty"), 0)
         if product_id <= 0 or qty <= 0:
@@ -1030,9 +1029,17 @@ def register_routes(context):
         return redirect(url_for("order_view", order_id=order_id))
 
 
+    @app.post("/orders/<int:order_id>/items/add")
+    def order_item_add(order_id):
+        from fulfillment_operations import ui_write
+        if request.method == 'POST':
+            with ui_write(order_id):
+                return order_item_add_service(order_id, request=request, session=session)
+        return order_item_add_service(order_id, request=request, session=session)
 
-    @app.post("/orders/<int:order_id>/items/<int:item_id>/update")
-    def order_item_update(order_id, item_id):
+
+
+    def order_item_update_service(order_id, item_id, *, request, session=None, structured=False):
         qty = to_int(request.form.get("qty"), 0)
         if qty <= 0:
             return "IloĹ›Ä‡ musi byÄ‡ > 0", 400
@@ -1060,10 +1067,18 @@ def register_routes(context):
         return redirect(url_for("order_view", order_id=order_id))
 
 
+    @app.post("/orders/<int:order_id>/items/<int:item_id>/update")
+    def order_item_update(order_id, item_id):
+        from fulfillment_operations import ui_write
+        if request.method == 'POST':
+            with ui_write(order_id):
+                return order_item_update_service(order_id, item_id, request=request, session=session)
+        return order_item_update_service(order_id, item_id, request=request, session=session)
 
 
-    @app.post("/orders/<int:order_id>/items/<int:item_id>/delete")
-    def order_item_delete(order_id, item_id):
+
+
+    def order_item_delete_service(order_id, item_id, *, request, session=None, structured=False):
         c = conn()
         cur = c.cursor()
         cur.execute("SELECT status, warehouse_issued FROM orders WHERE id=?", (order_id,))
@@ -1086,6 +1101,15 @@ def register_routes(context):
         c.commit()
         c.close()
         return redirect(url_for("order_view", order_id=order_id))
+
+
+    @app.post("/orders/<int:order_id>/items/<int:item_id>/delete")
+    def order_item_delete(order_id, item_id):
+        from fulfillment_operations import ui_write
+        if request.method == 'POST':
+            with ui_write(order_id):
+                return order_item_delete_service(order_id, item_id, request=request, session=session)
+        return order_item_delete_service(order_id, item_id, request=request, session=session)
 
 
 
@@ -1912,6 +1936,6 @@ def register_routes(context):
 
 
 
-    exported = {'stock_issue_audit': stock_issue_audit, 'stock_issue_repair': stock_issue_repair, 'orders': orders, 'order_new': order_new, 'order_create': order_create, 'order_view': order_view, 'order_confirmation_resend': order_confirmation_resend, 'order_item_add': order_item_add, 'order_item_update': order_item_update, 'order_item_delete': order_item_delete, 'order_delete': order_delete, 'order_status_update': order_status_update, 'order_issue': order_issue, 'order_print': order_print, 'order_label': order_label, 'api_client_orders_create': api_client_orders_create, 'api_client_order_email': api_client_order_email, 'api_order_lookup': api_order_lookup, 'api_client_order_pdf': api_client_order_pdf, 'api_client_order_pdf_retail': api_client_order_pdf_retail, 'order_proforma': order_proforma, 'order_by_code': order_by_code, 'order_scan': order_scan}
+    exported = {'order_item_add_service': order_item_add_service, 'order_item_update_service': order_item_update_service, 'order_item_delete_service': order_item_delete_service, 'stock_issue_audit': stock_issue_audit, 'stock_issue_repair': stock_issue_repair, 'orders': orders, 'order_new': order_new, 'order_create': order_create, 'order_view': order_view, 'order_confirmation_resend': order_confirmation_resend, 'order_item_add': order_item_add, 'order_item_update': order_item_update, 'order_item_delete': order_item_delete, 'order_delete': order_delete, 'order_status_update': order_status_update, 'order_issue': order_issue, 'order_print': order_print, 'order_label': order_label, 'api_client_orders_create': api_client_orders_create, 'api_client_order_email': api_client_order_email, 'api_order_lookup': api_order_lookup, 'api_client_order_pdf': api_client_order_pdf, 'api_client_order_pdf_retail': api_client_order_pdf_retail, 'order_proforma': order_proforma, 'order_by_code': order_by_code, 'order_scan': order_scan}
     globals().update(exported)
     return exported
