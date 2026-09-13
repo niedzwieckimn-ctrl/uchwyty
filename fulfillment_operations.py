@@ -69,6 +69,20 @@ def _hash(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False, default=str, separators=(',', ':')).encode()).hexdigest()
 
 
+def _document_file_hash(path):
+    try:
+        value = str(path or '')
+        downloaded = b.supabase_storage_download_bytes(value) if b.parse_supabase_storage_ref(value) else None
+        content = downloaded[0] if isinstance(downloaded, tuple) else downloaded
+        if content is None:
+            content = Path(value).read_bytes()
+        if not isinstance(content, bytes):
+            raise ValueError('Nieprawidłowa zawartość dokumentu')
+        return hashlib.sha256(content).hexdigest()
+    except Exception:
+        return ''
+
+
 def _rows(db, sql, params=()):
     return [dict(r) for r in db.execute(sql, params)]
 
@@ -256,9 +270,10 @@ def state(data, actor=None, correlation_id='', transaction_connection=None):
     documents = {}
     for kind in ('packing_list', 'invoice', 'label'):
         record = next((d for d in s['documents'] if d['kind'] == kind), None)
-        exists = bool(record and Path(record['path']).is_file())
+        actual_file_hash = _document_file_hash(record['path']) if record else ''
+        exists = bool(record and actual_file_hash)
         current = bool(exists and record['content_hash'] == s['content_hash'] and
-                       record.get('file_hash') == hashlib.sha256(Path(record['path']).read_bytes()).hexdigest())
+                       record.get('file_hash') == actual_file_hash)
         if kind == 'packing_list' and record:
             batch = next((x for x in s['batches'] if x['id'] == record['document_id']), None)
             adopted = any(v['kind'] == 'documents' and json.loads(v['payload']).get('content_hash') == s['content_hash'] for v in s['verifications'])
@@ -417,11 +432,14 @@ def _check_response(result):
 
 def save_document(oid, kind, document_id, path):
     s = snapshot(oid)
+    file_hash = _document_file_hash(path)
+    if not file_hash:
+        raise error('DOCUMENT_FILE_UNAVAILABLE', 'Nie można odczytać zapisanego dokumentu.')
     c = b.conn()
     try:
         c.execute('INSERT OR REPLACE INTO fulfillment_documents VALUES(?,?,?,?,?,?,?)',
                   (oid, kind, document_id, s['content_hash'], str(path), b.now_iso(),
-                   hashlib.sha256(Path(path).read_bytes()).hexdigest()))
+                   file_hash))
         c.commit()
     finally:
         c.close()

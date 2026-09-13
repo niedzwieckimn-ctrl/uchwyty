@@ -77,6 +77,37 @@ def docs():
     success('orders.invoice.create')
 
 
+def remote_invoice_pdf(monkeypatch):
+    stored = {}
+
+    def upload(invoice_id, invoice_no, invoice_pdf_path, packing_pdf_path=''):
+        reference = f'supabase://invoices/{invoice_id}/invoice.pdf'
+        stored[reference] = Path(invoice_pdf_path).read_bytes()
+        return reference
+
+    monkeypatch.setattr(b, 'upload_invoice_pdfs_to_supabase', upload)
+    monkeypatch.setattr(b, 'supabase_storage_download_bytes', lambda reference: (stored[reference], 'invoice.pdf'))
+
+
+def test_fresh_remote_invoice_is_current_after_create(flow, monkeypatch):
+    remote_invoice_pdf(monkeypatch)
+    success('orders.packing_list.generate')
+    success('orders.invoice.create')
+
+    assert state()['invoice']['current'] is True
+
+
+def test_invoice_is_stale_after_order_changes(flow, monkeypatch):
+    remote_invoice_pdf(monkeypatch)
+    success('orders.packing_list.generate')
+    success('orders.invoice.create')
+    db = b.conn()
+    db.execute('UPDATE order_items SET qty=qty+1 WHERE id=703')
+    db.commit(); db.close()
+
+    assert state()['invoice']['current'] is False
+
+
 def requirements(**override):
     return success('shipping.requirements.update', carrier='inpost', length=45, width=30, height=15,
         dimension_unit='cm', weight_unit='kg', sms=True, email=True, **({'weight': 3} | override))
