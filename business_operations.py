@@ -61,6 +61,8 @@ FRESHNESS_GROUP_BY_OPERATION = {
     "inventory.product.search": "inventory", "inventory.product.get": "inventory", "inventory.summary": "inventory",
     "orders.search": "orders", "orders.get": "orders", "orders.summary": "orders",
     "orders.fulfillment.readiness": "fulfillment",
+    "inventory.count.get_expected": "inventory", "inventory.count.summary": "inventory",
+    "orders.packing.check": "fulfillment",
     "customers.search": "customers", "customers.get": "customers",
     "invoices.search": "invoices", "invoices.get": "invoices", "invoices.overdue": "invoices",
     "china.orders.summary": "china", "china.orders.search": "china", "china.orders.get": "china",
@@ -400,6 +402,11 @@ EXTERNAL_TEST_OUTPUT = {
 
 
 ORDER_WRITES = frozenset({'orders.internal_note.add', 'orders.status.transition'})
+WAREHOUSE_WRITES = frozenset({
+    'inventory.count.record', 'inventory.count.complete', 'inventory.adjust',
+    'orders.packing.shortage.report', 'orders.packing.confirm',
+})
+LOCAL_WRITES = ORDER_WRITES | WAREHOUSE_WRITES
 _ORDER_WRITE_INPUT = {
     'type': 'object', 'additionalProperties': False,
     'required': ['order_id', 'expected_version', 'idempotency_key'],
@@ -530,6 +537,72 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
     ),
 }
 
+_PID = {'type':'integer','minimum':1,'maximum':9_223_372_036_854_775_807}
+_OID = dict(_PID)
+_VERSION = {'type':'integer','minimum':0,'maximum':2_147_483_647}
+_IDEM = {'type':'string','minLength':1,'maxLength':200}
+_SESSION = {'type':'string','format':'uuid','maxLength':36}
+_WAREHOUSE_OUTPUT = {'type':'object','additionalProperties':False,
+    'required':['ok'], 'properties':{
+        'ok':{'type':'boolean'}, 'product_id':{'type':'integer'}, 'order_id':{'type':'integer'},
+        'count_id':{'type':'string'}, 'expected_quantity':{'type':'integer'},
+        'counted_quantity':{'type':'integer'}, 'difference':{'type':'integer'},
+        'version':{'type':'integer'}, 'status':{'type':'string'}, 'ready':{'type':'boolean'},
+        'order_number':{'type':'string'}, 'order_status':{'type':'string'},
+        'total_items':{'type':'integer'}, 'total_units':{'type':'integer'},
+        'missing_items':{'type':'array','maxItems':100}, 'shortage_id':{'type':'integer'},
+        'matched_count':{'type':'integer'}, 'variance_count':{'type':'integer'},
+        'adjusted_count':{'type':'integer'}, 'unresolved_count':{'type':'integer'},
+        'positive_units':{'type':'integer'}, 'negative_units':{'type':'integer'},
+        'items':{'type':'array','maxItems':500},
+    }}
+
+def _warehouse_definition(name, description, permission, risk, properties, required, *, read_only=False):
+    schema = {'type':'object','additionalProperties':False,'required':required,'properties':properties}
+    return BusinessOperationDefinition(name, 1, description, permission, risk,
+        'REQUIRED' if risk == approvals.YELLOW else 'NONE',
+        frozenset({'HUMAN','AI_AGENT'}), schema, _WAREHOUSE_OUTPUT,
+        IDEMPOTENCY_NONE if read_only else IDEMPOTENCY_REQUIRED,
+        'READ_STANDARD' if read_only else 'WRITE', read_only)
+
+OPERATION_REGISTRY.update({
+    'inventory.count.get_expected': _warehouse_definition(
+        'inventory.count.get_expected', 'Pobiera aktualny fizyczny stan produktu i wersję do bezpiecznego zapisu remanentu.',
+        'inventory.read', approvals.GREEN, {'product_id':_PID}, ['product_id'], read_only=True),
+    'inventory.count.summary': _warehouse_definition(
+        'inventory.count.summary', 'Podsumowuje zapisaną sesję remanentu i nierozwiązane rozbieżności.',
+        'inventory.read', approvals.GREEN, {'count_session_id':_SESSION}, ['count_session_id'], read_only=True),
+    'inventory.count.record': _warehouse_definition(
+        'inventory.count.record', 'Zapisuje obserwację fizycznego liczenia bez zmiany stanu magazynowego.',
+        'inventory.discrepancy_report', approvals.GREEN,
+        {'product_id':_PID,'count_session_id':_SESSION,'counted_quantity':{'type':'integer','minimum':0},
+         'expected_version':_VERSION,'idempotency_key':_IDEM,'note':{'type':'string','minLength':1,'maxLength':500}},
+        ['product_id','count_session_id','counted_quantity','expected_version','idempotency_key']),
+    'inventory.count.complete': _warehouse_definition(
+        'inventory.count.complete', 'Kończy sesję remanentu wyłącznie gdy nie ma nierozwiązanych rozbieżności.',
+        'inventory.discrepancy_report', approvals.GREEN,
+        {'count_session_id':_SESSION,'idempotency_key':_IDEM}, ['count_session_id','idempotency_key']),
+    'inventory.adjust': _warehouse_definition(
+        'inventory.adjust', 'Po zatwierdzeniu ustawia stan na zapisaną ilość policzoną; różnicę wylicza backend.',
+        'inventory.adjust', approvals.YELLOW,
+        {'product_id':_PID,'count_session_id':_SESSION,'expected_version':_VERSION,'idempotency_key':_IDEM},
+        ['product_id','count_session_id','expected_version','idempotency_key']),
+    'orders.packing.check': _warehouse_definition(
+        'orders.packing.check', 'Sprawdza kompletność zamówienia wspólnym algorytmem dostępności magazynowej.',
+        'packing.read', approvals.GREEN, {'order_id':_OID}, ['order_id'], read_only=True),
+    'orders.packing.shortage.report': _warehouse_definition(
+        'orders.packing.shortage.report', 'Zapisuje potwierdzony fizycznie brak podczas pakowania bez zmiany stanu i statusu.',
+        'packing.prepare', approvals.GREEN,
+        {'order_id':_OID,'product_id':_PID,'missing_quantity':{'type':'integer','minimum':1},
+         'idempotency_key':_IDEM,'note':{'type':'string','minLength':1,'maxLength':500}},
+        ['order_id','product_id','missing_quantity','idempotency_key']),
+    'orders.packing.confirm': _warehouse_definition(
+        'orders.packing.confirm', 'Po zatwierdzeniu oznacza kompletne zamówienie jako spakowane; nie zdejmuje ponownie stanu.',
+        'packing.confirm', approvals.YELLOW,
+        {'order_id':_OID,'expected_version':_VERSION,'idempotency_key':_IDEM,'human_confirmed':{'type':'boolean'}},
+        ['order_id','expected_version','idempotency_key','human_confirmed']),
+})
+
 
 for _name, _permission, _risk, _field, _rule in (
     ('orders.internal_note.add', 'orders.internal_note.add', approvals.GREEN, 'note',
@@ -580,6 +653,7 @@ def _now() -> str:
 
 def initialize_schema(db: sqlite3.Connection) -> None:
     db.executescript((Path(__file__).parent / 'migrations' / 'first_supervised_write.sql').read_text(encoding='utf-8'))
+    db.executescript((Path(__file__).parent / 'migrations' / 'warehouse_operations.sql').read_text(encoding='utf-8'))
     db.executescript(
         """
         CREATE TABLE IF NOT EXISTS internal_operation_executions(
@@ -648,6 +722,9 @@ def _validate_value(name: str, value: Any, rule: Mapping[str, Any]) -> Any:
                 value = str(uuid.UUID(value))
             except (ValueError, AttributeError, TypeError):
                 raise ControlledOperationError("INVALID_INPUT", f"Pole {name} musi być UUID", status=DENIED)
+    elif expected == "boolean":
+        if not isinstance(value, bool):
+            raise ControlledOperationError("INVALID_INPUT", f"Pole {name} musi być wartością logiczną", status=DENIED)
     if "enum" in rule and value not in rule["enum"]:
         raise ControlledOperationError("INVALID_INPUT", f"Pole {name} ma wartość spoza enum", status=DENIED)
     return value
@@ -697,7 +774,7 @@ def _fingerprint(definition: BusinessOperationDefinition, actor: ActorContext, d
         {"operation": definition.operation_name, "version": definition.operation_version,
          "actor_id": actor.actor_id,
          "input": ({'payload': dict(data), 'initiated_by': actor.delegated_by_actor_id}
-                   if definition.operation_name in ORDER_WRITES else sanitize_audit_data(dict(data)))},
+                   if definition.operation_name in LOCAL_WRITES else sanitize_audit_data(dict(data)))},
         ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -706,6 +783,12 @@ def _fingerprint(definition: BusinessOperationDefinition, actor: ActorContext, d
 def _entity(definition: BusinessOperationDefinition, data: Mapping[str, Any]) -> tuple[str, str, int | None]:
     if definition.operation_name in ORDER_WRITES:
         return 'order', str(data['order_id']), data['expected_version']
+    if definition.operation_name in {'inventory.count.get_expected','inventory.count.record','inventory.adjust'}:
+        return 'product', str(data['product_id']), data.get('expected_version')
+    if definition.operation_name in {'inventory.count.summary','inventory.count.complete'}:
+        return 'inventory_count_session', str(data['count_session_id']), None
+    if definition.operation_name in {'orders.packing.check','orders.packing.shortage.report','orders.packing.confirm'}:
+        return 'order', str(data['order_id']), data.get('expected_version')
     if definition.operation_name == "agent.terminology.search":
         return "agent_terminology_search", data["query"], None
     if definition.operation_name == "agent.terminology.remember":
@@ -1552,7 +1635,7 @@ def _validate_order_write(db, data, actor, definition):
         raise ControlledOperationError('PERMISSION_DENIED', 'Permission został odebrany', status=DENIED)
     if actor.delegated_by_actor_id:
         human = load_actor_context(actor.delegated_by_actor_id)
-        if human is None or human.permission_decision(definition.required_permission) != 'ALLOW':
+        if human is None or human.permission_decision(definition.required_permission) == PERMISSION_DENY:
             raise ControlledOperationError('PERMISSION_DENIED', 'Inicjator utracił permission', status=DENIED)
     if db.execute('SELECT id FROM orders WHERE id=?', (data['order_id'],)).fetchone() is None:
         raise ControlledOperationError('ORDER_NOT_FOUND', 'Nie znaleziono zamówienia', status=CONFLICT)
@@ -1563,6 +1646,230 @@ def _validate_order_write(db, data, actor, definition):
     if 'note' in data and not data['note'].strip():
         raise ControlledOperationError('INVALID_NOTE', 'Notatka nie może być pusta', status=DENIED)
     return version
+
+
+def _inventory_version(db, product_id):
+    row = db.execute('SELECT version FROM internal_inventory_versions WHERE product_id=?', (product_id,)).fetchone()
+    return int(row['version']) if row else 0
+
+
+def _human_actor_id(actor):
+    return actor.delegated_by_actor_id or actor.actor_id
+
+
+def _assert_operation_permission(actor, definition):
+    trusted = _trusted_actor(actor)
+    if trusted.permission_decision(definition.required_permission) == PERMISSION_DENY:
+        raise ControlledOperationError('PERMISSION_DENIED', 'Permission został odebrany', status=DENIED)
+    if actor.delegated_by_actor_id:
+        human = load_actor_context(actor.delegated_by_actor_id)
+        if human is None or human.permission_decision(definition.required_permission) == PERMISSION_DENY:
+            raise ControlledOperationError('PERMISSION_DENIED', 'Inicjator utracił permission', status=DENIED)
+
+
+def _packing_readiness(db, order_id):
+    order = db.execute('SELECT id,order_no,status,COALESCE(warehouse_issued,0) warehouse_issued FROM orders WHERE id=?', (order_id,)).fetchone()
+    if order is None:
+        raise ControlledOperationError('ORDER_NOT_FOUND', 'Nie znaleziono zamówienia', status=CONFLICT)
+    result = next((item for item in calculate_fulfillment_readiness(db) if int(item['order_id']) == int(order_id)), None)
+    if result is None:
+        return {'ok':True,'order_id':int(order_id),'order_number':order['order_no'] or '',
+                'order_status':order['status'] or '', 'ready':False, 'total_items':0,
+                'total_units':0, 'missing_items':[], 'version':_order_version(db, order_id)}
+    return {'ok':True,'order_id':int(order_id),'order_number':result['order_number'],
+            'order_status':result['order_status'],'ready':bool(result['ready']),
+            'total_items':int(result['total_items']),'total_units':int(result['total_units']),
+            'missing_items':result['missing_items'],'version':_order_version(db, order_id)}
+
+
+def _validate_warehouse_write(db, data, actor, definition):
+    _assert_operation_permission(actor, definition)
+    name = definition.operation_name
+    if name in {'inventory.count.record','inventory.adjust'}:
+        row = db.execute('SELECT p.id,COALESCE(s.qty,0) qty FROM products p LEFT JOIN stock s ON s.product_id=p.id WHERE p.id=?',
+                         (data['product_id'],)).fetchone()
+        if row is None:
+            raise ControlledOperationError('PRODUCT_NOT_FOUND', 'Nie znaleziono produktu', status=CONFLICT)
+        version = _inventory_version(db, data['product_id'])
+        if version != data['expected_version']:
+            raise ControlledOperationError('ENTITY_VERSION_CONFLICT',
+                f'Stan produktu zmienił się. Aktualna expected_version={version}.', status=CONFLICT)
+        session = db.execute('SELECT status FROM internal_inventory_count_sessions WHERE session_id=?',
+                             (data['count_session_id'],)).fetchone()
+        if session and session['status'] != 'OPEN':
+            raise ControlledOperationError('COUNT_SESSION_CLOSED', 'Sesja remanentu nie jest otwarta', status=CONFLICT)
+        if name == 'inventory.adjust':
+            item = db.execute('SELECT * FROM internal_inventory_count_items WHERE session_id=? AND product_id=?',
+                              (data['count_session_id'],data['product_id'])).fetchone()
+            if item is None or item['status'] != 'PENDING_ADJUSTMENT':
+                raise ControlledOperationError('COUNT_DISCREPANCY_NOT_PENDING', 'Brak nierozwiązanej rozbieżności dla produktu', status=CONFLICT)
+            if int(item['stock_version']) != version:
+                raise ControlledOperationError('ENTITY_VERSION_CONFLICT',
+                    f'Stan produktu zmienił się. Aktualna expected_version={version}.', status=CONFLICT)
+        return version
+    if name == 'inventory.count.complete':
+        session = db.execute('SELECT status FROM internal_inventory_count_sessions WHERE session_id=?',
+                             (data['count_session_id'],)).fetchone()
+        if session is None:
+            raise ControlledOperationError('COUNT_SESSION_NOT_FOUND', 'Nie znaleziono sesji remanentu', status=CONFLICT)
+        if session['status'] != 'OPEN':
+            raise ControlledOperationError('COUNT_SESSION_CLOSED', 'Sesja remanentu nie jest otwarta', status=CONFLICT)
+        return None
+    if name == 'orders.packing.shortage.report':
+        row = db.execute('SELECT 1 FROM order_items WHERE order_id=? AND product_id=? LIMIT 1',
+                         (data['order_id'],data['product_id'])).fetchone()
+        if row is None:
+            raise ControlledOperationError('ORDER_ITEM_NOT_FOUND', 'Produkt nie należy do zamówienia', status=CONFLICT)
+        return _order_version(db, data['order_id'])
+    if name == 'orders.packing.confirm':
+        if data['human_confirmed'] is not True:
+            raise ControlledOperationError('PHYSICAL_CONFIRMATION_REQUIRED', 'Wymagane jest potwierdzenie fizycznego spakowania', status=DENIED)
+        order = db.execute('SELECT status FROM orders WHERE id=?', (data['order_id'],)).fetchone()
+        if order is None:
+            raise ControlledOperationError('ORDER_NOT_FOUND', 'Nie znaleziono zamówienia', status=CONFLICT)
+        version = _order_version(db, data['order_id'])
+        if version != data['expected_version']:
+            raise ControlledOperationError('ENTITY_VERSION_CONFLICT',
+                f'Zamówienie zmieniło się. Aktualna expected_version={version}.', status=CONFLICT)
+        if str(order['status'] or '').lower() not in {'new','pending','unconfirmed','confirmed','packed_partial','partially_shipped'}:
+            raise ControlledOperationError('ORDER_NOT_PACKABLE', 'Status zamówienia nie pozwala na potwierdzenie pakowania', status=CONFLICT)
+        if not _packing_readiness(db, data['order_id'])['ready']:
+            raise ControlledOperationError('ORDER_NOT_READY', 'Zamówienie nie jest kompletne według aktualnego stanu', status=CONFLICT)
+        return version
+    raise ControlledOperationError('REGISTRY_INCONSISTENT', 'Brak walidacji operacji magazynowej', status=DENIED)
+
+
+def _validate_local_write(db, data, actor, definition):
+    if definition.operation_name in ORDER_WRITES:
+        return _validate_order_write(db, data, actor, definition)
+    if definition.operation_name in WAREHOUSE_WRITES:
+        return _validate_warehouse_write(db, data, actor, definition)
+    current = db.execute('SELECT version FROM internal_versioned_resources WHERE resource_id=?',
+                         (data['resource_id'],)).fetchone()
+    return int(current['version']) if current else None
+
+
+def _inventory_count_expected(data, actor, correlation_id, transaction_connection=None):
+    del actor, correlation_id
+    db = transaction_connection or _factory()()
+    try:
+        row = db.execute('SELECT p.id,p.sku,p.model,p.name,COALESCE(s.qty,0) qty FROM products p LEFT JOIN stock s ON s.product_id=p.id WHERE p.id=?',
+                         (data['product_id'],)).fetchone()
+        if row is None:
+            raise ControlledOperationError('PRODUCT_NOT_FOUND', 'Nie znaleziono produktu', status=CONFLICT)
+        return {'ok':True,'product_id':int(row['id']),'expected_quantity':max(0,int(row['qty'] or 0)),
+                'version':_inventory_version(db,data['product_id']),'status':'READY'}
+    finally:
+        if transaction_connection is None: db.close()
+
+
+def _inventory_count_summary(data, actor, correlation_id, transaction_connection=None):
+    del actor, correlation_id
+    db = transaction_connection or _factory()()
+    try:
+        session = db.execute('SELECT * FROM internal_inventory_count_sessions WHERE session_id=?', (data['count_session_id'],)).fetchone()
+        if session is None:
+            raise ControlledOperationError('COUNT_SESSION_NOT_FOUND', 'Nie znaleziono sesji remanentu', status=CONFLICT)
+        rows = db.execute('SELECT * FROM internal_inventory_count_items WHERE session_id=? ORDER BY product_id',
+                          (data['count_session_id'],)).fetchall()
+        items = [{'product_id':int(r['product_id']),'expected_quantity':int(r['expected_quantity']),
+                  'counted_quantity':int(r['counted_quantity']),'difference':int(r['difference']),
+                  'version':int(r['stock_version']),'status':r['status']} for r in rows]
+        return {'ok':True,'count_id':data['count_session_id'],'status':session['status'],
+                'matched_count':sum(i['status']=='MATCHED' for i in items),
+                'variance_count':sum(i['difference']!=0 for i in items),
+                'adjusted_count':sum(i['status']=='ADJUSTED' for i in items),
+                'unresolved_count':sum(i['status']=='PENDING_ADJUSTMENT' for i in items),
+                'positive_units':sum(max(0,i['difference']) for i in items),
+                'negative_units':sum(max(0,-i['difference']) for i in items),'items':items}
+    finally:
+        if transaction_connection is None: db.close()
+
+
+def _inventory_count_record(data, actor, correlation_id, transaction_connection=None):
+    db=transaction_connection; now=_now(); human_id=_human_actor_id(actor)
+    db.execute('INSERT OR IGNORE INTO internal_inventory_count_sessions(session_id,status,created_by,created_at) VALUES(?,?,?,?)',
+               (data['count_session_id'],'OPEN',human_id,now))
+    stock_row=db.execute('SELECT COALESCE(qty,0) qty FROM stock WHERE product_id=?',(data['product_id'],)).fetchone()
+    expected=int(stock_row['qty']) if stock_row else 0
+    difference=int(data['counted_quantity'])-expected
+    status='MATCHED' if difference==0 else 'PENDING_ADJUSTMENT'
+    try:
+        cur=db.execute('''INSERT INTO internal_inventory_count_items(session_id,product_id,expected_quantity,counted_quantity,difference,stock_version,status,note,created_by,created_at)
+                          VALUES(?,?,?,?,?,?,?,?,?,?)''',(data['count_session_id'],data['product_id'],expected,data['counted_quantity'],difference,
+                          data['expected_version'],status,data.get('note'),human_id,now))
+    except sqlite3.IntegrityError:
+        raise ControlledOperationError('COUNT_ALREADY_RECORDED','Produkt został już policzony w tej sesji',status=CONFLICT)
+    record_audit_event('inventory.count.record',result=SUCCESS,actor_context=actor,entity_type='product',entity_id=str(data['product_id']),
+        correlation_id=correlation_id,expected_version=data['expected_version'],entity_version_before=data['expected_version'],
+        entity_version_after=data['expected_version'],after_state={'count_item_id':cur.lastrowid,'expected_quantity':expected,
+        'counted_quantity':data['counted_quantity'],'difference':difference,'basis':'physical_count'},transaction_connection=db)
+    return {'ok':True,'product_id':data['product_id'],'count_id':data['count_session_id'],
+            'expected_quantity':expected,'counted_quantity':data['counted_quantity'],'difference':difference,
+            'version':data['expected_version'],'status':status}
+
+
+def _inventory_count_complete(data, actor, correlation_id, transaction_connection=None):
+    db=transaction_connection
+    unresolved=int(db.execute("SELECT COUNT(*) n FROM internal_inventory_count_items WHERE session_id=? AND status='PENDING_ADJUSTMENT'",(data['count_session_id'],)).fetchone()['n'])
+    if unresolved:
+        raise ControlledOperationError('UNRESOLVED_DISCREPANCIES','Nie można zakończyć remanentu z nierozwiązanymi rozbieżnościami',status=CONFLICT)
+    db.execute("UPDATE internal_inventory_count_sessions SET status='COMPLETED',completed_at=? WHERE session_id=? AND status='OPEN'",(_now(),data['count_session_id']))
+    record_audit_event('inventory.count.complete',result=SUCCESS,actor_context=actor,entity_type='inventory_count_session',entity_id=data['count_session_id'],
+        correlation_id=correlation_id,before_state={'status':'OPEN'},after_state={'status':'COMPLETED'},transaction_connection=db)
+    return {'ok':True,'count_id':data['count_session_id'],'status':'COMPLETED'}
+
+
+def _inventory_adjust(data, actor, correlation_id, transaction_connection=None):
+    db=transaction_connection
+    item=db.execute('SELECT * FROM internal_inventory_count_items WHERE session_id=? AND product_id=?',
+                    (data['count_session_id'],data['product_id'])).fetchone()
+    stock_row=db.execute('SELECT COALESCE(qty,0) qty FROM stock WHERE product_id=?',(data['product_id'],)).fetchone()
+    old=int(stock_row['qty']) if stock_row else 0
+    new=int(item['counted_quantity']); delta=new-old; now=_now()
+    cur=db.execute('UPDATE stock SET qty=? WHERE product_id=?',(new,data['product_id']))
+    if cur.rowcount != 1:
+        db.execute('INSERT INTO stock(product_id,qty) VALUES(?,?)',(data['product_id'],new))
+    db.execute('INSERT INTO stock_adjustments(product_id,old_qty,new_qty,delta,mode,created_at) VALUES(?,?,?,?,?,?)',
+               (data['product_id'],old,new,delta,'inventory_count',now))
+    db.execute("UPDATE internal_inventory_count_items SET status='ADJUSTED',adjusted_at=? WHERE session_id=? AND product_id=? AND status='PENDING_ADJUSTMENT'",
+               (now,data['count_session_id'],data['product_id']))
+    version=_inventory_version(db,data['product_id'])
+    record_audit_event('inventory.adjust',result=SUCCESS,actor_context=actor,entity_type='product',entity_id=str(data['product_id']),
+        correlation_id=correlation_id,expected_version=data['expected_version'],entity_version_before=data['expected_version'],entity_version_after=version,
+        before_state={'quantity':old},after_state={'quantity':new,'difference':delta,'basis':'approved_physical_count','count_session_id':data['count_session_id']},transaction_connection=db)
+    return {'ok':True,'product_id':data['product_id'],'count_id':data['count_session_id'],
+            'expected_quantity':old,'counted_quantity':new,'difference':delta,'version':version,'status':'ADJUSTED'}
+
+
+def _orders_packing_check(data, actor, correlation_id, transaction_connection=None):
+    del actor, correlation_id
+    db=transaction_connection or _factory()()
+    try: return _packing_readiness(db,data['order_id'])
+    finally:
+        if transaction_connection is None: db.close()
+
+
+def _packing_shortage_report(data, actor, correlation_id, transaction_connection=None):
+    db=transaction_connection
+    cur=db.execute('INSERT INTO internal_packing_shortages(order_id,product_id,missing_quantity,note,reported_by,created_at) VALUES(?,?,?,?,?,?)',
+        (data['order_id'],data['product_id'],data['missing_quantity'],data.get('note'),_human_actor_id(actor),_now()))
+    record_audit_event('orders.packing.shortage.report',result=SUCCESS,actor_context=actor,entity_type='order',entity_id=str(data['order_id']),
+        correlation_id=correlation_id,after_state={'shortage_id':cur.lastrowid,'product_id':data['product_id'],
+        'missing_quantity':data['missing_quantity'],'basis':'physical_packing_report'},transaction_connection=db)
+    return {'ok':True,'order_id':data['order_id'],'product_id':data['product_id'],'shortage_id':cur.lastrowid,'status':'REPORTED'}
+
+
+def _packing_confirm(data, actor, correlation_id, transaction_connection=None):
+    db=transaction_connection
+    before=db.execute('SELECT status FROM orders WHERE id=?',(data['order_id'],)).fetchone()['status']
+    now=_now()
+    db.execute("UPDATE orders SET status='packed',packed_at=? WHERE id=?",(now,data['order_id']))
+    version=_order_version(db,data['order_id'])
+    record_audit_event('orders.packing.confirm',result=SUCCESS,actor_context=actor,entity_type='order',entity_id=str(data['order_id']),
+        correlation_id=correlation_id,expected_version=data['expected_version'],entity_version_before=data['expected_version'],entity_version_after=version,
+        before_state={'status':before},after_state={'status':'packed','packed_at':now,'stock_changed':False,'basis':'human_physical_confirmation'},transaction_connection=db)
+    return {'ok':True,'order_id':data['order_id'],'status':'packed','version':version,'ready':True}
 
 
 def _order_note_add(data, actor, correlation_id, transaction_connection=None):
@@ -1632,10 +1939,18 @@ _HANDLERS: dict[str, Callable[[Mapping[str, Any], ActorContext, str, sqlite3.Con
     "inventory.product.search": _product_search,
     "inventory.product.get": _product_get,
     "inventory.summary": _inventory_summary,
+    "inventory.count.get_expected": _inventory_count_expected,
+    "inventory.count.summary": _inventory_count_summary,
+    "inventory.count.record": _inventory_count_record,
+    "inventory.count.complete": _inventory_count_complete,
+    "inventory.adjust": _inventory_adjust,
     "orders.search": _orders_search,
     "orders.get": _orders_get,
     "orders.summary": _orders_summary,
     "orders.fulfillment.readiness": _orders_fulfillment_readiness,
+    "orders.packing.check": _orders_packing_check,
+    "orders.packing.shortage.report": _packing_shortage_report,
+    "orders.packing.confirm": _packing_confirm,
     "invoices.search": _invoices_search,
     "invoices.get": _invoices_get,
     "invoices.overdue": _invoices_overdue,
@@ -1658,14 +1973,17 @@ def _execute_local_approved(
     db = _factory()()
     try:
         db.execute("BEGIN IMMEDIATE")
-        if definition.operation_name in ORDER_WRITES:
-            binding = db.execute('SELECT human_id FROM internal_order_write_actors WHERE execution_id=?',
+        if definition.operation_name in LOCAL_WRITES:
+            binding = db.execute('SELECT human_id FROM internal_business_write_actors WHERE execution_id=?',
                                  (execution_id,)).fetchone()
+            if not binding and definition.operation_name in ORDER_WRITES:
+                binding = db.execute('SELECT human_id FROM internal_order_write_actors WHERE execution_id=?',
+                                     (execution_id,)).fetchone()
             if binding:
                 human = load_actor_context(binding['human_id'])
-                if human is None or human.permission_decision(definition.required_permission) != 'ALLOW':
+                if human is None or human.permission_decision(definition.required_permission) == PERMISSION_DENY:
                     raise ControlledOperationError('PERMISSION_DENIED', 'Inicjator utracił permission', status=DENIED)
-            current_version = _validate_order_write(db, data, actor, definition)
+            current_version = _validate_local_write(db, data, actor, definition)
         else:
             current = db.execute(
                 "SELECT version FROM internal_versioned_resources WHERE resource_id=?", (entity_id,)
@@ -1697,7 +2015,7 @@ def _execute_local_approved(
         _audit("business_operation.success", definition, actor, row, SUCCESS, transaction_connection=db)
         result = _result_from_row(row)
         db.commit()
-        if _write_success_observer and definition.operation_name in ORDER_WRITES:
+        if _write_success_observer and definition.operation_name in LOCAL_WRITES:
             try:
                 _write_success_observer(definition.operation_name, output)
             except Exception as exc:
@@ -1801,7 +2119,7 @@ def execute_business_operation(
         if definition.operation_name not in _HANDLERS:
             raise ControlledOperationError("HANDLER_NOT_FOUND", "Brak bezpiecznego handlera", status=DENIED)
         data = validate_input(definition, input_data)
-        if definition.operation_name in ORDER_WRITES:
+        if definition.operation_name in LOCAL_WRITES:
             if idempotency_key and idempotency_key != data['idempotency_key']:
                 raise ControlledOperationError('IDEMPOTENCY_CONFLICT', 'Niezgodny klucz idempotency', status=CONFLICT)
             idempotency_key = data['idempotency_key']
@@ -1827,16 +2145,16 @@ def execute_business_operation(
         else:
             row = _create_execution(definition, actor, fingerprint, entity_type, entity_id, expected_version, effective_key, correlation)
         execution_id = row["execution_id"]
-        if definition.operation_name in ORDER_WRITES and row['input_fingerprint'] != fingerprint:
+        if definition.operation_name in LOCAL_WRITES and row['input_fingerprint'] != fingerprint:
             return _safe_denial(definition.operation_name, definition.operation_version, execution_id,
                 actor, row['correlation_id'], 'IDEMPOTENCY_CONFLICT',
                 'Idempotency key został użyty dla innego inputu', status=CONFLICT)
         if row["status"] in TERMINAL_STATUSES:
             return _result_from_row(row)
-        if definition.operation_name in ORDER_WRITES and row['status'] == 'CREATED':
+        if definition.operation_name in LOCAL_WRITES and row['status'] == 'CREATED':
             db = _factory()()
             try:
-                _validate_order_write(db, data, actor, definition)
+                _validate_local_write(db, data, actor, definition)
             except ControlledOperationError as exc:
                 terminal = exc.status if exc.status in TERMINAL_STATUSES else FAILED
                 row = _transition(execution_id, definition, actor, terminal,
@@ -1861,10 +2179,10 @@ def execute_business_operation(
                     expected_entity_version=expected_version,
                     correlation_id=row["correlation_id"], reason="Business Operation wymaga zgody",
                 )
-                if definition.operation_name in ORDER_WRITES:
+                if definition.operation_name in LOCAL_WRITES:
                     db = _factory()()
                     try:
-                        db.execute('INSERT OR IGNORE INTO internal_order_write_actors(execution_id,human_id) VALUES(?,?)',
+                        db.execute('INSERT OR IGNORE INTO internal_business_write_actors(execution_id,human_id) VALUES(?,?)',
                                    (execution_id, actor.delegated_by_actor_id or actor.actor_id))
                         db.commit()
                     finally:
@@ -1895,7 +2213,7 @@ def execute_business_operation(
             if claimed is None:
                 current = _execution(execution_id)
                 return _result_from_row(current, status=NOOP if current["status"] == "RUNNING" else None)
-            if definition.operation_name not in ORDER_WRITES | {"internal.test.change_setting"}:
+            if definition.operation_name not in LOCAL_WRITES | {"internal.test.change_setting"}:
                 row = _transition(
                     execution_id, definition, actor, "DENIED", "business_operation.denied", DENIED,
                     error_code="EXECUTION_MODE_NOT_IMPLEMENTED",
@@ -1911,7 +2229,7 @@ def execute_business_operation(
                                   started=True, expected_statuses=("CREATED",))
             if claimed is None:
                 return _result_from_row(_execution(execution_id), status=NOOP)
-        if definition.operation_name in ORDER_WRITES:
+        if definition.operation_name in LOCAL_WRITES:
             return _execute_local_approved(execution_id, definition, actor, data, '',
                 entity_type, entity_id, expected_version, row['correlation_id'])
         handler_started = time.perf_counter()

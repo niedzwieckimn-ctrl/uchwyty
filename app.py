@@ -1066,18 +1066,25 @@ def api_ai_approval_decide(approval_id, decision):
     if human.actor_type != 'HUMAN' or decision not in {'approve', 'reject'}:
         return jsonify(status='DENIED'), 403
     snapshot = internal_approval.get_request_snapshot(approval_id)
-    if not snapshot or snapshot['operation'] != 'orders.status.transition':
+    allowed_approval_operations = {
+        'orders.status.transition', 'inventory.adjust', 'orders.packing.confirm',
+    }
+    if not snapshot or snapshot['operation'] not in allowed_approval_operations:
         return jsonify(status='DENIED'), 404
     db = conn()
     try:
         execution = db.execute('SELECT * FROM internal_operation_executions WHERE approval_id=?', (approval_id,)).fetchone()
-        binding = db.execute('SELECT human_id FROM internal_order_write_actors WHERE execution_id=?',
+        binding = db.execute('SELECT human_id FROM internal_business_write_actors WHERE execution_id=?',
                              (execution['execution_id'],)).fetchone() if execution else None
+        if not binding and execution and snapshot['operation'] == 'orders.status.transition':
+            binding = db.execute('SELECT human_id FROM internal_order_write_actors WHERE execution_id=?',
+                                 (execution['execution_id'],)).fetchone()
     finally:
         db.close()
     if not execution or not binding:
         return jsonify(status='DENIED'), 403
-    if human.permission_decision('orders.change_status') != 'ALLOW':
+    permission = business_operations.OPERATION_REGISTRY[snapshot['operation']].required_permission
+    if human.permission_decision(permission) == 'DENY':
         return jsonify(status='DENIED'), 403
     try:
         if decision == 'reject':
@@ -2252,6 +2259,8 @@ BUSINESS_FRESHNESS_OPERATION_GROUP = {
     "inventory.product.search": "inventory", "inventory.product.get": "inventory", "inventory.summary": "inventory",
     "orders.search": "orders", "orders.get": "orders", "orders.summary": "orders",
     "orders.fulfillment.readiness": "fulfillment",
+    "inventory.count.get_expected": "inventory", "inventory.count.summary": "inventory",
+    "orders.packing.check": "fulfillment",
     "customers.search": "customers", "customers.get": "customers",
     "invoices.search": "invoices", "invoices.get": "invoices", "invoices.overdue": "invoices",
     "china.orders.summary": "china", "china.orders.search": "china", "china.orders.get": "china",
@@ -2291,6 +2300,24 @@ def reconcile_business_freshness_after_write(operation_name: str, _result: dict)
     if operation_name == "orders.status.transition":
         completed_at = time.time()
         for group in ('orders', 'inventory', 'fulfillment', 'customers'):
+            _mark_business_freshness(group, completed_at)
+    elif operation_name == 'inventory.adjust':
+        if supabase_enabled() and _result.get('product_id'):
+            try:
+                sync_local_rows_to_supabase('stock','product_id',[int(_result['product_id'])])
+            except Exception:
+                app.logger.warning('Korekta remanentowa zapisana lokalnie; synchronizacja Supabase nieudana',exc_info=True)
+        completed_at = time.time()
+        for group in ('inventory','fulfillment'):
+            _mark_business_freshness(group, completed_at)
+    elif operation_name == 'orders.packing.confirm':
+        if supabase_enabled() and _result.get('order_id'):
+            try:
+                sync_local_rows_to_supabase('orders','id',[int(_result['order_id'])])
+            except Exception:
+                app.logger.warning('Pakowanie zapisane lokalnie; synchronizacja Supabase nieudana',exc_info=True)
+        completed_at = time.time()
+        for group in ('orders','fulfillment'):
             _mark_business_freshness(group, completed_at)
 
 

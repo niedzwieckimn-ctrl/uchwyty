@@ -215,7 +215,7 @@ ROLE_PERMISSION_DECISIONS = {
         "orders.fulfillment_read", "inventory.read", "inventory.replenishment_read",
         "inventory.discrepancy_report", "packing.read", "packing.prepare",
         "customers.shipping_read", "shipping.read", "shipping.label_read", "shipping.track",
-    }),
+    }, approval={"inventory.adjust", "packing.confirm"}),
     "AI_SALES": _decisions(
         allow={
             "orders.read_full", "orders.fulfillment_read", "invoices.status_read",
@@ -254,11 +254,12 @@ ROLE_PERMISSION_DECISIONS = {
         },
         approval={"purchases.manage", "purchases.costs"},
     ),
-    "AI_OWNER_ASSISTANT": _decisions(approval={"orders.change_status"}, allow={
+    "AI_OWNER_ASSISTANT": _decisions(approval={"orders.change_status", "inventory.adjust", "packing.confirm"}, allow={
         "orders.internal_note.add",
         "agent.terminology.remember",
         "orders.read_full", "orders.fulfillment_read", "orders.stock_audit",
-        "inventory.read", "inventory.replenishment_read", "invoices.read",
+        "inventory.read", "inventory.replenishment_read", "inventory.discrepancy_report",
+        "packing.read", "packing.prepare", "invoices.read",
         "invoices.status_read", "ksef.read", "customers.read", "shipping.read",
         "shipping.track", "purchases.read", "payments.read", "reports.read",
         "cashflow.read", "system.audit_read", "approvals.review",

@@ -7,7 +7,7 @@ from typing import Any, Callable, Mapping
 
 ARTIFACT_TYPES = frozenset({
     'invoice_card', 'order_card', 'product_card', 'china_order_card',
-    'document_link', 'product_image',
+    'inventory_count_card', 'packing_check_card', 'document_link', 'product_image',
 })
 
 
@@ -29,6 +29,10 @@ def _items(record: Mapping[str, Any], names) -> list[dict[str, Any]]:
 
 
 def _record(operation: str, result: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    if operation in {'inventory.count.get_expected','inventory.count.record','inventory.count.summary',
+                     'inventory.adjust','orders.packing.check','orders.packing.shortage.report',
+                     'orders.packing.confirm'}:
+        return result
     if operation == 'inventory.product.get' and result.get('id') is not None:
         return result
     record = result.get('record')
@@ -164,6 +168,25 @@ def build_artifacts(
                 'order_id': record.get('id'),
                 'invoice_id': links.get('packing_invoice_id'),
             })
+
+    elif operation in {'inventory.count.get_expected','inventory.count.record','inventory.count.summary','inventory.adjust'}:
+        card = {'type':'inventory_count_card', **_fields(record, (
+            'product_id','count_id','expected_quantity','counted_quantity','difference',
+            'version','status','matched_count','variance_count','adjusted_count','unresolved_count',
+            'positive_units','negative_units',
+        ))}
+        card['items'] = _items(record, ('product_id','expected_quantity','counted_quantity','difference','status'))
+        artifacts.append(card)
+
+    elif operation in {'orders.packing.check','orders.packing.shortage.report','orders.packing.confirm'}:
+        card = {'type':'packing_check_card', **_fields(record, (
+            'order_id','order_number','order_status','ready','total_items','total_units','status',
+            'product_id','shortage_id','version',
+        ))}
+        missing = record.get('missing_items')
+        card['items'] = [_fields(item, ('product_id','sku','model','name','required_quantity','available_quantity','shortage_quantity'))
+                         for item in missing[:20] if isinstance(item,Mapping)] if isinstance(missing,list) else []
+        artifacts.append(card)
 
     elif operation in {'inventory.product.get', 'inventory.product.search'}:
         card = {'type': 'product_card', **_fields(record, (

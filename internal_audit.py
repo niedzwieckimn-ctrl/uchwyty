@@ -69,6 +69,11 @@ class OperationDefinition:
 OPERATION_DEFINITIONS: dict[str, OperationDefinition] = {
     'orders.internal_note.add': OperationDefinition('orders.internal_note.add', 1, 'orders.internal_note.add', GREEN, WRITE),
     'orders.status.transition': OperationDefinition('orders.status.transition', 1, 'orders.change_status', YELLOW, WRITE),
+    'inventory.count.record': OperationDefinition('inventory.count.record', 1, 'inventory.discrepancy_report', GREEN, WRITE),
+    'inventory.count.complete': OperationDefinition('inventory.count.complete', 1, 'inventory.discrepancy_report', GREEN, WRITE),
+    'inventory.adjust': OperationDefinition('inventory.adjust', 1, 'inventory.adjust', YELLOW, WRITE),
+    'orders.packing.shortage.report': OperationDefinition('orders.packing.shortage.report', 1, 'packing.prepare', GREEN, WRITE),
+    'orders.packing.confirm': OperationDefinition('orders.packing.confirm', 1, 'packing.confirm', YELLOW, WRITE),
     "security.login": OperationDefinition("security.login", 1, None, GREEN, SECURITY),
     "security.permission.denied": OperationDefinition(
         "security.permission.denied", 1, None, YELLOW, SECURITY
