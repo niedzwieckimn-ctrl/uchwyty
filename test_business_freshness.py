@@ -62,6 +62,75 @@ def test_cold_inventory_syncs_then_hits_group_ttl(freshness):
     assert len(calls) == first_call_count
 
 
+def test_fresh_marker_does_not_hide_empty_local_group(freshness):
+    actor, calls, _rows = freshness
+    backend._mark_business_freshness("inventory", __import__("time").time())
+
+    result = _run(actor, "inventory.summary", {})
+
+    assert result["product_count"] == 1
+    assert "products" in calls
+
+
+def test_empty_group_after_successful_pull_is_data_unavailable(freshness, monkeypatch):
+    actor, _calls, _rows = freshness
+    backend._mark_business_freshness("inventory", __import__("time").time())
+    monkeypatch.setattr(backend, "supabase_select_rows", lambda *_args, **_kwargs: [])
+
+    result = operations.execute_business_operation(actor, "inventory.summary", {})
+
+    assert result.status == "FAILED"
+    assert result.error_code == "DATA_UNAVAILABLE"
+    assert backend._business_freshness_marker("inventory") is not None
+    assert backend._business_snapshot_age("inventory", __import__("time").time()) is None
+
+
+def test_empty_remote_group_does_not_erase_existing_local_snapshot(freshness, monkeypatch):
+    actor, _calls, _rows = freshness
+    assert _run(actor, "inventory.summary", {})["product_count"] == 1
+    monkeypatch.setattr(backend, "BUSINESS_FRESHNESS_TTL_SECONDS", -1)
+    monkeypatch.setattr(backend, "supabase_select_rows", lambda *_args, **_kwargs: [])
+
+    result = _run(actor, "inventory.summary", {})
+
+    assert result["product_count"] == 1
+    db = backend.conn()
+    try:
+        assert db.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 1
+    finally:
+        db.close()
+
+
+def test_global_bootstrap_marker_requires_local_business_data(freshness):
+    _actor, _calls, _rows = freshness
+    backend._mark_local_supabase_bootstrap_complete()
+
+    assert backend._local_supabase_bootstrap_complete() is False
+
+
+def test_first_get_repulls_when_marker_exists_but_sqlite_is_empty(freshness, monkeypatch):
+    _actor, _calls, rows = freshness
+    backend._mark_local_supabase_bootstrap_complete()
+    pull_calls = []
+
+    def successful_pull(**_kwargs):
+        pull_calls.append(True)
+        backend.sqlite_upsert_rows("products", rows["products"], "id")
+        return {"ok": True, "tables": {"products": {"status": "ok", "rows": 1}}}
+
+    monkeypatch.setattr(backend, "pull_shared_tables_from_supabase", successful_pull)
+    monkeypatch.setattr(backend, "_run_post_pull_reconciliation", lambda: None)
+    with backend._supabase_sync_lock:
+        backend._supabase_sync_state["initial_pull_attempted"] = False
+
+    with backend.app.test_request_context("/", method="GET"):
+        result = backend.maybe_pull_shared_from_supabase()
+
+    assert pull_calls == [True]
+    assert result["ok"] is True
+    assert backend._local_supabase_bootstrap_complete() is True
+
+
 def test_cold_reads_find_inventory_customers_invoices_and_orders(freshness):
     actor, _calls, _rows = freshness
     assert _run(actor, "inventory.product.search", {"query": "Avery 160"})["count"] == 1

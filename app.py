@@ -176,6 +176,12 @@ DATA_DIR = os.path.join(APP_DIR, "data")
 DB_PATH = os.path.join(DATA_DIR, "app.db")
 
 os.makedirs(DATA_DIR, exist_ok=True)
+_startup_logger.warning(
+    "STARTUP_DB path=%s exists=%s size_bytes=%d",
+    DB_PATH,
+    os.path.exists(DB_PATH),
+    os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0,
+)
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024  # 20 MB
@@ -1582,6 +1588,10 @@ ADMIN_PASSWORD_HASH = os.environ.get("ADMIN_PASSWORD_HASH", "").strip()
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "").strip()
 if not SUPABASE_SERVICE_ROLE_KEY:
     app.logger.error("Brak SUPABASE_SERVICE_ROLE_KEY; funkcje synchronizacji i zamówień klienta będą niedostępne.")
+app.logger.warning(
+    "SUPABASE_CONFIG url_present=%s service_role_present=%s anon_present=%s",
+    bool(SUPABASE_URL), bool(SUPABASE_SERVICE_ROLE_KEY), bool(SUPABASE_ANON_KEY),
+)
 if not CLIENT_ALLOWED_ORIGINS:
     app.logger.warning("CLIENT_ALLOWED_ORIGINS jest puste; przeglądarkowe żądania tworzenia zamówień będą odrzucane.")
 SUPABASE_STORAGE_BUCKET = (os.environ.get("SUPABASE_STORAGE_BUCKET") or "invoice-pdfs").strip()
@@ -1677,9 +1687,26 @@ def _local_supabase_bootstrap_complete() -> bool:
             "SELECT value FROM local_sync_state WHERE key='supabase_bootstrap_complete'"
         ).fetchone()
         c.commit()
-        return bool(row and row["value"] == "1")
+        return bool(row and row["value"] == "1" and _local_supabase_data_present(c))
     finally:
         c.close()
+
+
+def _local_supabase_data_present(db=None) -> bool:
+    """A bootstrap marker is usable only while this database still has business data."""
+    own_connection = db is None
+    db = db or conn()
+    try:
+        for table in ("products", "customers", "orders", "invoices", "china_packages"):
+            try:
+                if db.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone():
+                    return True
+            except sqlite3.Error:
+                continue
+        return False
+    finally:
+        if own_connection:
+            db.close()
 
 
 def _mark_local_supabase_bootstrap_complete():
@@ -2258,6 +2285,10 @@ BUSINESS_FRESHNESS_GROUPS = {
     "china": [("products", "id"), ("china_packages", "id"), ("china_items", "id")],
     "sales": [("orders", "id"), ("order_items", "id"), ("invoices", "id"), ("invoice_meta", "invoice_id")],
 }
+BUSINESS_FRESHNESS_DATA_TABLES = {
+    group: tuple(table for table, _conflict in specs if table != "cash_flow_settings")
+    for group, specs in BUSINESS_FRESHNESS_GROUPS.items()
+}
 BUSINESS_FRESHNESS_OPERATION_GROUP = {
     "inventory.product.search": "inventory", "inventory.product.get": "inventory", "inventory.summary": "inventory",
     "orders.search": "orders", "orders.get": "orders", "orders.summary": "orders",
@@ -2298,6 +2329,21 @@ def _mark_business_freshness(group: str, completed_at: float) -> None:
         c.close()
 
 
+def _business_group_has_local_data(group: str) -> bool:
+    """Do not let a marker turn an empty local group into a valid snapshot."""
+    c = conn()
+    try:
+        for table in BUSINESS_FRESHNESS_DATA_TABLES[group]:
+            try:
+                if c.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone():
+                    return True
+            except sqlite3.Error:
+                continue
+        return False
+    finally:
+        c.close()
+
+
 def reconcile_business_freshness_after_write(operation_name: str, _result: dict) -> None:
     """Keep only snapshots affected by the committed local order state current."""
     if operation_name == "orders.status.transition":
@@ -2325,6 +2371,8 @@ def reconcile_business_freshness_after_write(operation_name: str, _result: dict)
 
 
 def _business_snapshot_age(group: str, now_ts: float) -> float | None:
+    if not _business_group_has_local_data(group):
+        return None
     marker = _business_freshness_marker(group)
     return max(0.0, now_ts - marker) if marker is not None else None
 
@@ -2332,6 +2380,8 @@ def _business_snapshot_age(group: str, now_ts: float) -> float | None:
 def _pull_business_freshness_group(group: str) -> dict:
     specs = BUSINESS_FRESHNESS_GROUPS[group]
     fetched = {(table, conflict): supabase_select_rows(table, order_by=conflict) for table, conflict in specs}
+    if not any(fetched.values()):
+        raise RuntimeError(f"empty Supabase snapshot for group {group}")
     # Reuse the established pull helpers and only alter tables in this group.
     with _supabase_full_io_lock:
         for table, conflict in specs:
@@ -2339,6 +2389,8 @@ def _pull_business_freshness_group(group: str) -> dict:
         for table, conflict in reversed(specs):
             keys = [row.get(conflict) for row in fetched[(table, conflict)] if row.get(conflict) is not None]
             sqlite_delete_missing_rows(table, conflict, keys)
+    if not _business_group_has_local_data(group):
+        raise RuntimeError(f"empty local snapshot after Supabase pull for group {group}")
     completed_at = time.time()
     _mark_business_freshness(group, completed_at)
     return {"rows": {table: len(fetched[(table, conflict)]) for table, conflict in specs}, "completed_at": completed_at}
@@ -2382,7 +2434,8 @@ def ensure_business_operation_freshness(operation_name: str) -> dict:
             base.update({"sync_ms": round((time.perf_counter() - sync_started) * 1000, 2),
                          "freshness_check_ms": round((time.perf_counter() - started) * 1000, 2),
                          "snapshot_age_seconds": round(stale_age, 2) if stale_age is not None else None})
-            app.logger.warning("BUSINESS_OPERATION_FRESHNESS %s", json.dumps({"operation": operation_name, **base, "status": "stale" if stale_age is not None else "unavailable"}, sort_keys=True))
+            reason = f"{type(exc).__name__}: {str(exc)[:500]}"
+            app.logger.warning("BUSINESS_OPERATION_FRESHNESS %s", json.dumps({"operation": operation_name, **base, "status": "stale" if stale_age is not None else "unavailable", "reason": reason}, sort_keys=True))
             if stale_age is not None:
                 return base
             raise ControlledOperationError("DATA_UNAVAILABLE", "Dane biznesowe nie są obecnie dostępne; brak bezpiecznego lokalnego snapshotu") from exc
@@ -2544,11 +2597,20 @@ def maybe_pull_shared_from_supabase(force: bool = False):
                             already_attempted = bool(_supabase_sync_state.get("initial_pull_attempted"))
                         if not already_attempted:
                             result = pull_shared_tables_from_supabase(force=True, delete_missing=False)
-                            if result.get("ok"):
+                            if result.get("ok") and _local_supabase_data_present():
                                 _run_post_pull_reconciliation()
                                 _mark_local_supabase_bootstrap_complete()
                                 with _supabase_sync_lock:
                                     _supabase_sync_state["initial_pull_attempted"] = True
+                            elif result.get("ok"):
+                                result = {**result, "ok": False, "error": "DATA_UNAVAILABLE", "reason": "EMPTY_LOCAL_SNAPSHOT"}
+                                app.logger.error("SUPABASE_BOOTSTRAP status=unavailable reason=EMPTY_LOCAL_SNAPSHOT")
+                            else:
+                                failed_tables = sorted(name for name, state in result.get("tables", {}).items() if state.get("status") == "error")
+                                app.logger.error(
+                                    "SUPABASE_BOOTSTRAP status=unavailable reason=SYNC_FAILED failed_tables=%s",
+                                    ",".join(failed_tables) or "unknown",
+                                )
                     _perf_add("supabase_initial_bootstrap", time.perf_counter() - started)
                     return result if not already_attempted else None
             return trigger_background_supabase_pull(reason=f"GET {request.path}")
