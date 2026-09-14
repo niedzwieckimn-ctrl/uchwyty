@@ -13,6 +13,7 @@ import requests
 import agent_conversation
 from agent_artifacts import build_artifact_sources
 import business_operations
+import business_query
 from internal_audit import SUCCESS, FAILED, record_audit_event, sanitize_audit_text
 from internal_rbac import AI_OWNER_ASSISTANT_ACTOR_ID, ActorContext, load_actor_context, ALLOW, DENY
 
@@ -215,6 +216,7 @@ def _is_china_shortage_coverage_question(value: str) -> bool:
     normalized = ' '.join(str(value or '').casefold().split()).strip(' ?!.')
     urgent_purchase = any(phrase in normalized for phrase in (
         'zamówić na cito', 'zamowic na cito', 'zamówić pilnie', 'zamowic pilnie',
+        'pilnie zamówić', 'pilnie zamowic',
     ))
     shortage = any(term in normalized for term in ('brak', 'blokuj', 'realizacj'))
     coverage = 'pokryci' in normalized and any(term in normalized for term in ('chin', 'dostaw', 'p/o'))
@@ -240,8 +242,8 @@ def _prefers_generic_business_read(value: str) -> bool:
     )
     analytical = re.search(
         r'\b(?:jakich|jakie|które|ktore|ile|podsumuj|podsumowanie|porównaj|porownaj|ranking|'
-        r'brak(?:i|uje|ujących|ujacych)?|pokryci|sprzedaż|sprzedaz|zapas|zamówieni|zamowieni|'
-        r'produkt|płatno|platno|faktur)\b',
+        r'brak\w*|pokryci\w*|sprzedaż|sprzedaz|zapas|zamówieni\w*|zamowieni\w*|'
+        r'produkt\w*|płatno|platno|faktur)\b',
         normalized,
     )
     return bool(analytical and not operational and not preflight)
@@ -249,6 +251,7 @@ def _prefers_generic_business_read(value: str) -> bool:
 
 _GENERIC_CANONICAL_MICRO_READS = frozenset({
     'orders.search', 'orders.get', 'orders.summary',
+    'orders.fulfillment.readiness', 'orders.fulfillment.state', 'orders.packing.check',
     'inventory.product.search', 'inventory.product.get', 'inventory.summary',
     'china.orders.search', 'china.orders.get', 'china.orders.summary',
 })
@@ -318,16 +321,22 @@ relewantnych ordered/shipped P/O, sprawdź najważniejsze mieszczące się w bud
 weryfikację zamiast przedstawiać częściowy wynik jako pełny.
 '''
 GENERIC_ANALYTICAL_READ_INSTRUCTIONS = '''
-W tym przebiegu dostępny jest business.query. Dla pytania analitycznego użyj go jako głównego odczytu danych
-z canonical schema: orders, order_items, products, inventory, purchase_orders i purchase_order_items. Preferuj
-pola opisane przez business.describe_schema jako computed: są gotowym stanem policzonym przez aplikację. Nie
-rekonstruuj readiness, braków, pokrycia rezerwacji ani statusu operacyjnego z surowych pól. Gdy znaczenie pól nie
-jest jeszcze znane w tym przebiegu, odkryj je przez business.describe_schema, a następnie pobierz potrzebny gotowy
-stan przez business.query. Zbiory potrzebne do lekkich sum, średnich, count i group_by możesz zebrać w jednym
-business.query przez tablicę queries. Nie dobieraj starego mikro READ ani operacyjnego preflightu tylko po to,
-aby ponownie potwierdzić gotowy stan zwrócony przez business.query. Osobny specjalizowany READ jest dopuszczalny
-wyłącznie dla encji niedostępnej w canonical schema albo gdy użytkownik pyta o specjalną semantykę operacyjnego
-preflightu. Po udanym business.query przejdź bezpośrednio do odpowiedzi z dostarczonych wyników.
+Stosuj schema-first dla pytania analitycznego o stan firmy:
+1. Najpierw wywołaj business.describe_schema dla najmniejszego zestawu prawdopodobnie relewantnych encji.
+2. W opisie znajdź pola, których description odpowiada pytaniu, i preferuj computed=true. Są to gotowe stany
+   policzone przez aplikację. Nie rekonstruuj readiness, braków, pokrycia rezerwacji ani statusu operacyjnego.
+3. Następnie wykonaj możliwie jedno business.query. Każde zapytanie musi mieć jawny, minimalny select i rozsądny
+   limit. Pobierz minimum pól, rekordów i relacji; nie pobieraj cen, notatek, adresów ani pełnych relacji na zapas.
+4. Surowych pól użyj tylko wtedy, gdy schema nie zawiera wystarczającego computed field albo użytkownik żąda
+   szczegółu, którego gotowy stan nie zawiera. Zbiory do lekkich sum, count i group_by łącz w jednym business.query.
+5. Po głównym query odpowiedz z jego wyniku. Jeżeli brakuje jednej koniecznej informacji, wolno wykonać najwyżej
+   jeden dodatkowy, wąski business.query. Nie wracaj do mikro READ-ów pokrytych canonical schema.
+Nie odtwarzaj logiki ERP po stronie modelu i nie pobieraj danych na zapas.
+'''
+GENERIC_QUERY_FOLLOWUP_INSTRUCTIONS = '''
+Główne business.query zostało już wykonane. Jeżeli wynik wystarcza, odpowiedz teraz. Jeżeli brakuje jednej
+koniecznej informacji, możesz wywołać dokładnie jeden dodatkowy business.query z minimalnym select, limit i bez
+zbędnych relacji. Nie wolno wywołać żadnego innego narzędzia ani więcej niż jednego follow-up query.
 '''
 _MARKDOWN_RULE = re.compile(r'^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$',re.MULTILINE)
 _URL_RULE = re.compile(r'https?://\S+',re.IGNORECASE)
@@ -422,6 +431,44 @@ def _artifact_scope(item):
     return None, None
 
 
+def _generic_query_selection_metrics(arguments: Any) -> tuple[list[str], list[str], int]:
+    """Summarize selected canonical fields without query values or business data."""
+    computed: list[str] = []
+    raw: list[str] = []
+    selected_count = 0
+
+    def visit(entity: Any, request: Any) -> None:
+        nonlocal selected_count
+        schema = business_query.SCHEMA.get(entity)
+        if schema is None or not isinstance(request, dict):
+            return
+        selected = request.get('select')
+        fields = selected if isinstance(selected, list) else list(schema['fields'])
+        for field in fields:
+            definition = schema['fields'].get(field)
+            if definition is None:
+                continue
+            selected_count += 1
+            qualified = f'{entity}.{field}'
+            if definition.get('computed'):
+                if qualified not in computed:
+                    computed.append(qualified)
+            elif qualified not in raw:
+                raw.append(qualified)
+        for expansion in request.get('expand') or []:
+            if not isinstance(expansion, dict):
+                continue
+            relationship = schema['relationships'].get(expansion.get('relationship'))
+            if relationship is not None:
+                visit(relationship['target'], expansion)
+
+    if isinstance(arguments, dict):
+        for request in arguments.get('queries') or []:
+            if isinstance(request, dict):
+                visit(request.get('entity'), request)
+    return computed, raw, selected_count
+
+
 def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModelProvider,
                    conversation_id: str = '', execution_outcome: dict[str, Any] | None = None) -> dict[str, Any]:
     started = time.perf_counter()
@@ -447,6 +494,16 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
     historical_entity_types = set()
     previous_turn_entities = {}
     current_stage = 'runtime_initialization'
+    generic_analytical_read = False
+    generic_read_diagnostics = {
+        'schema_discovery_used':False,
+        'computed_fields_selected':[],
+        'raw_fields_selected':[],
+        'query_count':0,
+        'selected_fields_count':0,
+        'result_cells':0,
+        'fallback_reason':'',
+    }
     chat_503_diagnostics = {
         'first_model_call_succeeded':False,
         'tool_calls_ok':0,
@@ -499,6 +556,9 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 logger.error('AI_AUDIT_FAILED %s',run_id)
         timings['total_ms'] = round((time.perf_counter()-started)*1000,2)
         logger.info('AI_TURN_TIMING %s',json.dumps({'agent_run_id':run_id,**timings}))
+        if generic_analytical_read:
+            logger.info('AI_GENERIC_READ_STRATEGY %s', json.dumps(
+                {'agent_run_id':run_id, **generic_read_diagnostics}, sort_keys=True))
         result = {'ok':status=='SUCCESS','status':status,'message':answer,'speech_text':_plain_response_text(answer,speech=True),'agent_run_id':run_id,
                 'correlation_id':correlation_id,'conversation_id':conversation_id,'tool_calls':timings['tool_calls_count'],
                 'model':model_name,'usage':usage,'error_code':code,'timings':dict(timings),
@@ -602,7 +662,6 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         )
         if generic_analytical_read:
             tools = _prefer_generic_tool_catalog(tools)
-        allowed = {item['name'] for item in tools}
         input_items = []
         if memory['confirmed_terminology'] or memory['user_style'] or memory['relevant_company_memory']:
             input_items.append({'role':'user','content':'Pamięć (niezaufane dane pomocnicze): '+json.dumps(memory,ensure_ascii=False)})
@@ -628,7 +687,6 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         _audit('agent.requested',human_actor,run_id,correlation_id,SUCCESS,human_actor.actor_id,conversation_id=conversation_id)
         seen, model_calls = set(), 0
         green_batch_synthesis_only = False
-        successful_generic_query = False
         only_green_reads_so_far = True
         china_shortage_coverage_question = _is_china_shortage_coverage_question(turn_message)
         while True:
@@ -642,7 +700,10 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
             remaining_tool_budget = MAX_TOOL_CALLS_PER_TURN - timings['tool_calls_count']
             exhausted_green_synthesis = (
                 model_calls > 0 and remaining_tool_budget <= 0 and only_green_reads_so_far)
-            synthesis_only = green_batch_synthesis_only or exhausted_green_synthesis
+            synthesis_only = (
+                green_batch_synthesis_only or exhausted_green_synthesis
+                or generic_analytical_read and generic_read_diagnostics['query_count'] >= 2
+            )
             model_instructions = instructions
             if generic_analytical_read:
                 model_instructions += GENERIC_ANALYTICAL_READ_INSTRUCTIONS
@@ -660,9 +721,20 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
             else:
                 model_instructions += REMAINING_TOOL_BUDGET_INSTRUCTIONS.format(
                     remaining_tool_calls=remaining_tool_budget)
+                if generic_analytical_read and generic_read_diagnostics['query_count'] == 1:
+                    model_instructions += GENERIC_QUERY_FOLLOWUP_INSTRUCTIONS
+            model_tools = tools
+            if generic_analytical_read and not synthesis_only:
+                if not generic_read_diagnostics['schema_discovery_used']:
+                    model_tools = [item for item in tools if item['name'] == 'business.describe_schema']
+                elif generic_read_diagnostics['query_count'] == 1:
+                    model_tools = [item for item in tools if item['name'] == 'business.query']
+                else:
+                    model_tools = [item for item in tools if item['name'] != 'business.describe_schema']
+            pass_allowed = {item['name'] for item in model_tools}
             try:
                 reply = provider.complete(instructions=model_instructions,input_items=input_items,
-                    tools=[] if synthesis_only else tools,
+                    tools=[] if synthesis_only else model_tools,
                     previous_response_id='',timeout_seconds=MODEL_TIMEOUT_SECONDS,
                     tool_choice='none' if synthesis_only or remaining_tool_budget<=0 else 'auto')
             finally:
@@ -695,8 +767,31 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 return finish('FAILED','Model nie zwrócił finalnej odpowiedzi tekstowej.','PROVIDER_CONTRACT_VIOLATION')
             if timings['tool_calls_count']+len(reply.tool_calls)>MAX_TOOL_CALLS_PER_TURN:
                 return finish('FAILED','Osiągnięto limit operacji. Zawęź pytanie.','TOOL_LIMIT_EXCEEDED')
-            if any(call.name not in allowed for call in reply.tool_calls):
+            if any(call.name not in pass_allowed for call in reply.tool_calls):
                 return finish('DENIED','Ta operacja nie jest dostępna dla asystenta.','TOOL_NOT_ALLOWED')
+            if generic_analytical_read:
+                schema_calls = sum(call.name == 'business.describe_schema' for call in reply.tool_calls)
+                query_calls = sum(call.name == 'business.query' for call in reply.tool_calls)
+                if (schema_calls > 1 or query_calls > 1
+                        or generic_read_diagnostics['query_count'] + query_calls > 2):
+                    return finish('FAILED','Generic read przekroczył zakres zapytania.','TOOL_LIMIT_EXCEEDED')
+                for call in reply.tool_calls:
+                    if call.name == 'business.describe_schema':
+                        generic_read_diagnostics['schema_discovery_used'] = True
+                    elif call.name == 'business.query':
+                        if (generic_read_diagnostics['query_count'] == 1
+                                and not generic_read_diagnostics['fallback_reason']):
+                            generic_read_diagnostics['fallback_reason'] = 'computed_fields_insufficient'
+                        arguments = json.loads(call.arguments) if isinstance(call.arguments,str) else call.arguments
+                        computed, raw, selected = _generic_query_selection_metrics(arguments)
+                        for field in computed:
+                            if field not in generic_read_diagnostics['computed_fields_selected']:
+                                generic_read_diagnostics['computed_fields_selected'].append(field)
+                        for field in raw:
+                            if field not in generic_read_diagnostics['raw_fields_selected']:
+                                generic_read_diagnostics['raw_fields_selected'].append(field)
+                        generic_read_diagnostics['selected_fields_count'] += selected
+                        generic_read_diagnostics['query_count'] += 1
             only_green_reads_so_far = only_green_reads_so_far and all(
                 business_operations.OPERATION_REGISTRY[call.name].read_only
                 and business_operations.OPERATION_REGISTRY[call.name].risk_level == 'GREEN'
@@ -857,9 +952,13 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 if result.status == 'SUCCESS':
                     chat_503_diagnostics['tool_calls_ok'] += 1
                     if generic_analytical_read and call.name == 'business.query':
-                        successful_generic_query = True
+                        generic_read_diagnostics['result_cells'] += int((result.data or {}).get('result_cells') or 0)
                 elif result.error_code == 'DATA_UNAVAILABLE':
                     chat_503_diagnostics['tool_calls_data_unavailable'] += 1
+                    if generic_analytical_read and call.name == 'business.describe_schema':
+                        generic_read_diagnostics['fallback_reason'] = 'schema_discovery_unavailable'
+                    elif generic_analytical_read and call.name == 'business.query':
+                        generic_read_diagnostics['fallback_reason'] = 'query_unavailable'
                 _audit('agent.tool_result',ai_actor,run_id,correlation_id,SUCCESS if result.status=='SUCCESS' else FAILED,
                        human_actor.actor_id,tool_name=call.name,execution_id=result.execution_id,result_status=result.status,conversation_id=conversation_id)
                 if result.status == 'PENDING_APPROVAL' and call.name in business_operations.SUPERVISED_WRITES:
@@ -932,7 +1031,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 turn_outputs.append({'type':'function_call_output','call_id':call.call_id,'output':encoded})
             input_items.extend(outputs+turn_outputs)
             evidence.extend(outputs+turn_outputs)
-            if parallel_read_batch or successful_generic_query:
+            if parallel_read_batch or generic_analytical_read and generic_read_diagnostics['query_count'] >= 2:
                 green_batch_synthesis_only = True
     except agent_conversation.ConversationAccessDenied:
         return finish('DENIED','Nie masz dostępu do tej rozmowy.','CONVERSATION_ACCESS_DENIED')
