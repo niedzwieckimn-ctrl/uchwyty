@@ -1,4 +1,6 @@
 from datetime import datetime
+import threading
+import time
 
 import pytest
 
@@ -176,3 +178,61 @@ def test_new_readiness_preserves_data_unavailable_on_cold_failure(freshness, mon
     monkeypatch.setattr(backend, "supabase_select_rows", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("offline")))
     result = operations.execute_business_operation(actor, "orders.fulfillment.readiness", {})
     assert result.status == "FAILED" and result.error_code == "DATA_UNAVAILABLE"
+
+
+def test_sync_and_runtime_writers_wait_outside_sqlite_instead_of_raising_locked(freshness):
+    first = backend.conn()
+    first.execute("CREATE TABLE IF NOT EXISTS local_sync_state(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at TEXT NOT NULL)")
+    first.commit()
+    first.execute("BEGIN IMMEDIATE")
+    first.execute("INSERT INTO local_sync_state(key,value,updated_at) VALUES(?,?,?)",
+                  ("held-sync", "1", NOW))
+    attempted = threading.Event()
+    finished = threading.Event()
+    errors = []
+
+    def runtime_writer():
+        db = backend.conn()
+        try:
+            db.execute("PRAGMA busy_timeout=1")
+            attempted.set()
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("INSERT INTO local_sync_state(key,value,updated_at) VALUES(?,?,?)",
+                       ("runtime-history", "1", NOW))
+            db.commit()
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            db.close()
+            finished.set()
+
+    worker = threading.Thread(target=runtime_writer)
+    worker.start()
+    assert attempted.wait(1)
+    time.sleep(0.03)
+    assert not finished.is_set()
+    first.commit()
+    first.close()
+    worker.join(1)
+
+    assert finished.is_set() and errors == []
+    db = backend.conn()
+    assert db.execute("SELECT value FROM local_sync_state WHERE key='runtime-history'").fetchone()[0] == "1"
+    db.close()
+
+
+def test_supabase_fetch_happens_without_sqlite_write_lock(freshness, monkeypatch):
+    _actor, _calls, rows = freshness
+    lock_was_free = []
+
+    def select(table, order_by="id", **_kwargs):
+        acquired = backend._sqlite_write_lock.acquire(blocking=False)
+        lock_was_free.append(acquired)
+        if acquired:
+            backend._sqlite_write_lock.release()
+        return [dict(row) for row in rows.get(table, [])]
+
+    monkeypatch.setattr(backend, "supabase_select_rows", select)
+    backend._pull_business_freshness_group("china")
+
+    assert lock_was_free and all(lock_was_free)

@@ -299,9 +299,118 @@ def build_public_url(path: str) -> str:
 # =========================
 # DB
 # =========================
+_sqlite_write_lock = threading.RLock()
+_SQLITE_WRITE_PREFIXES = frozenset({
+    "ALTER", "ANALYZE", "ATTACH", "BEGIN", "CREATE", "DELETE", "DETACH",
+    "DROP", "INSERT", "REINDEX", "REPLACE", "UPDATE", "VACUUM",
+})
+
+
+def _sqlite_statement_writes(sql) -> bool:
+    statement = str(sql or "").lstrip()
+    while statement.startswith("--"):
+        statement = statement.partition("\n")[2].lstrip()
+    prefix = statement.partition(" ")[0].partition("\n")[0].upper()
+    return prefix in _SQLITE_WRITE_PREFIXES
+
+
+class _SerializedWriteCursor(sqlite3.Cursor):
+    def execute(self, sql, parameters=()):
+        connection = self.connection
+        connection._before_sql(sql)
+        try:
+            result = super().execute(sql, parameters)
+        finally:
+            connection._release_write_lock_if_idle()
+        return result
+
+    def executemany(self, sql, seq_of_parameters):
+        connection = self.connection
+        connection._before_sql(sql)
+        try:
+            result = super().executemany(sql, seq_of_parameters)
+        finally:
+            connection._release_write_lock_if_idle()
+        return result
+
+    def executescript(self, sql_script):
+        connection = self.connection
+        connection._before_sql(sql_script)
+        try:
+            result = super().executescript(sql_script)
+        finally:
+            connection._release_write_lock_if_idle()
+        return result
+
+
+class _SerializedWriteConnection(sqlite3.Connection):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._write_lock_held = False
+
+    def _before_sql(self, sql):
+        if _sqlite_statement_writes(sql) and not self._write_lock_held:
+            _sqlite_write_lock.acquire()
+            self._write_lock_held = True
+
+    def _release_write_lock_if_idle(self):
+        if self._write_lock_held and not self.in_transaction:
+            self._write_lock_held = False
+            _sqlite_write_lock.release()
+
+    def _release_write_lock(self):
+        if self._write_lock_held:
+            self._write_lock_held = False
+            _sqlite_write_lock.release()
+
+    def cursor(self, factory=None):
+        return super().cursor(factory or _SerializedWriteCursor)
+
+    def execute(self, sql, parameters=()):
+        self._before_sql(sql)
+        try:
+            result = super().execute(sql, parameters)
+        finally:
+            self._release_write_lock_if_idle()
+        return result
+
+    def executemany(self, sql, seq_of_parameters):
+        self._before_sql(sql)
+        try:
+            result = super().executemany(sql, seq_of_parameters)
+        finally:
+            self._release_write_lock_if_idle()
+        return result
+
+    def executescript(self, sql_script):
+        self._before_sql(sql_script)
+        try:
+            result = super().executescript(sql_script)
+        finally:
+            self._release_write_lock_if_idle()
+        return result
+
+    def commit(self):
+        try:
+            return super().commit()
+        finally:
+            self._release_write_lock()
+
+    def rollback(self):
+        try:
+            return super().rollback()
+        finally:
+            self._release_write_lock()
+
+    def close(self):
+        try:
+            return super().close()
+        finally:
+            self._release_write_lock()
+
 
 def conn():
-    c = sqlite3.connect(DB_PATH)
+    c = sqlite3.connect(DB_PATH, factory=_SerializedWriteConnection)
     c.row_factory = sqlite3.Row
     return c
 
