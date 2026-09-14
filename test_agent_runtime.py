@@ -466,7 +466,7 @@ def test_real_adapter_uses_env_config_and_safe_responses_contract(monkeypatch):
                               tools=[{"type": "function", "name": "inventory.product.search", "description": "search", "parameters": {"type": "object"}, "strict": True}],
                               previous_response_id="", timeout_seconds=7, tool_choice="required")
     assert reply.tool_calls[0].name == "inventory.product.search"
-    assert captured["json"]["store"] is False and captured["json"]["parallel_tool_calls"] is False
+    assert captured["json"]["store"] is False and captured["json"]["parallel_tool_calls"] is True
     assert captured["json"]["tool_choice"] == "required"
     assert "previous_response_id" not in captured["json"]
     assert captured["json"]["tools"][0]["name"] == "inventory__product__search"

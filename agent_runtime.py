@@ -1,6 +1,7 @@
 """Explicit conversation history and bounded LLM tool loop over Business Operations."""
 from __future__ import annotations
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import os
@@ -136,7 +137,7 @@ class OpenAIResponsesProvider:
             api_tools.append(item)
         payload = {
             "model": self.model, "instructions": instructions, "input": input_items,
-            "tools": api_tools, "tool_choice": tool_choice, "parallel_tool_calls": False,
+            "tools": api_tools, "tool_choice": tool_choice, "parallel_tool_calls": True,
             "store": False, "include": ["reasoning.encrypted_content"],
             "max_output_tokens": 2000,
         }
@@ -312,8 +313,15 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                    conversation_id: str = '', execution_outcome: dict[str, Any] | None = None) -> dict[str, Any]:
     started = time.perf_counter()
     run_id, correlation_id = str(uuid.uuid4()), str(uuid.uuid4())
-    timings = {'context_build_ms':0.0,'first_model_call_ms':0.0,'business_operation_ms':0.0,
-               'final_model_call_ms':0.0,'total_ms':0.0,'tool_calls_count':0}
+    timings = {
+        'acquire_turn_ms':0.0, 'memory_load_ms':0.0, 'context_history_build_ms':0.0,
+        'supabase_business_reads_ms':0.0, 'model_request_ms':0.0,
+        'tool_execution_ms':0.0, 'second_model_pass_ms':0.0,
+        'parallel_read_batch_ms':0.0, 'parallel_read_sequential_estimate_ms':0.0,
+        # Existing aggregate fields remain stable for current diagnostics/clients.
+        'context_build_ms':0.0, 'first_model_call_ms':0.0, 'business_operation_ms':0.0,
+        'final_model_call_ms':0.0, 'total_ms':0.0, 'tool_calls_count':0,
+    }
     usage = {'input_tokens':0,'output_tokens':0}
     model_name, evidence, active = '', [], False
     ai_actor = None
@@ -421,10 +429,13 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         if ai_actor is None or ai_actor.actor_type!='AI_AGENT' or 'AI_OWNER_ASSISTANT' not in ai_actor.roles:
             ai_actor = None
             return finish('FAILED','Agent AI nie jest skonfigurowany.','AI_ACTOR_UNAVAILABLE')
+        stage_started = time.perf_counter()
         conversation_id, _, _ = agent_conversation.open_conversation(human_actor,ai_actor,conversation_id)
         turn_message = message or 'Przekaż krótki, naturalny wynik decyzji.'
         agent_conversation.begin_turn(human_actor,ai_actor,conversation_id,run_id,turn_message)
         active = True
+        timings['acquire_turn_ms'] = round((time.perf_counter()-stage_started)*1000,2)
+        stage_started = time.perf_counter()
         history = agent_conversation.history_for_model(human_actor,ai_actor,conversation_id,run_id)
         last_history_user = max(
             (index for index, item in enumerate(history) if item.get('role') == 'user'),
@@ -448,7 +459,11 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         })
         import human_approval
         eligible_approvals = human_approval.pending(business_operations, conversation_id, human_actor) if message.strip() and execution_outcome is None else []
+        timings['context_history_build_ms'] = round((time.perf_counter()-stage_started)*1000,2)
+        stage_started = time.perf_counter()
         memory = agent_conversation.memory_for_model(human_actor,ai_actor,message)
+        timings['memory_load_ms'] = round((time.perf_counter()-stage_started)*1000,2)
+        stage_started = time.perf_counter()
         tools = _tool_descriptors(ai_actor,human_actor)
         allowed = {item['name'] for item in tools}
         input_items = []
@@ -470,6 +485,8 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
             input_items.extend(outcome_evidence)
             evidence.extend(outcome_evidence)
         instructions = SYSTEM_INSTRUCTIONS + '\nCzas odniesienia backendu (Europe/Warsaw): ' + business_operations._business_now().isoformat()
+        timings['context_history_build_ms'] += round((time.perf_counter()-stage_started)*1000,2)
+        timings['context_history_build_ms'] = round(timings['context_history_build_ms'],2)
         timings['context_build_ms'] = round((time.perf_counter()-started)*1000,2)
         _audit('agent.requested',human_actor,run_id,correlation_id,SUCCESS,human_actor.actor_id,conversation_id=conversation_id)
         seen, model_calls = set(), 0
@@ -485,6 +502,9 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 elapsed = round((time.perf_counter()-t)*1000,2)
                 if model_calls==0:
                     timings['first_model_call_ms'] = elapsed
+                    timings['model_request_ms'] = elapsed
+                else:
+                    timings['second_model_pass_ms'] = round(timings['second_model_pass_ms']+elapsed,2)
                 model_calls += 1
             if not isinstance(reply,ProviderResponse):
                 raise ValueError('Invalid provider response')
@@ -512,75 +532,132 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 'name':call.name.replace('.','__'),'arguments':call.arguments if isinstance(call.arguments,str) else json.dumps(call.arguments)}
                 for call in reply.tool_calls]
             turn_outputs = []
+            read_groups = [business_operations.FRESHNESS_GROUP_BY_OPERATION.get(call.name,call.name)
+                           for call in reply.tool_calls]
+            parallel_read_batch = len(reply.tool_calls) > 1 and all(
+                business_operations.OPERATION_REGISTRY[call.name].read_only
+                and business_operations.OPERATION_REGISTRY[call.name].risk_level == 'GREEN'
+                and call.name not in COUNT_SESSION_BOUND
+                for call in reply.tool_calls
+            ) and len(set(read_groups)) == len(read_groups)
+            parallel_prepared = {}
+            parallel_results = {}
+            if parallel_read_batch:
+                for call in reply.tool_calls:
+                    arguments = json.loads(call.arguments) if isinstance(call.arguments,str) else call.arguments
+                    if not isinstance(arguments,dict):
+                        raise ValueError('Tool arguments must be an object')
+                    arguments = dict(arguments)
+                    fingerprint = call.name+json.dumps(arguments,sort_keys=True,ensure_ascii=False)
+                    if fingerprint in seen:
+                        return finish('FAILED','Model powtórzył tę samą operację.','REPEATED_TOOL_CALL')
+                    seen.add(fingerprint)
+                    definition = business_operations.OPERATION_REGISTRY[call.name]
+                    current = load_actor_context(human_actor.actor_id)
+                    if current is None or current.permission_decision(definition.required_permission)==DENY:
+                        return finish('DENIED','Brak uprawnień do operacji.','PERMISSION_DENIED')
+                    parallel_prepared[call.call_id] = (arguments, definition)
+                    timings['tool_calls_count'] += 1
+                    _audit('agent.tool_selected',ai_actor,run_id,correlation_id,SUCCESS,human_actor.actor_id,
+                           tool_name=call.name,conversation_id=conversation_id)
+
+                def execute_parallel_read(call):
+                    arguments, _definition = parallel_prepared[call.call_id]
+                    operation_started = time.perf_counter()
+                    result = business_operations.execute_business_operation(
+                        ai_actor, call.name, arguments, correlation_id=correlation_id,
+                    )
+                    return result, round((time.perf_counter()-operation_started)*1000,2)
+
+                batch_started = time.perf_counter()
+                with ThreadPoolExecutor(max_workers=min(4,len(reply.tool_calls)),
+                                        thread_name_prefix='agent-green-read') as executor:
+                    futures = {call.call_id:executor.submit(execute_parallel_read,call) for call in reply.tool_calls}
+                    parallel_results = {call_id:future.result() for call_id,future in futures.items()}
+                batch_elapsed = round((time.perf_counter()-batch_started)*1000,2)
+                sequential_estimate = round(sum(item[1] for item in parallel_results.values()),2)
+                timings['parallel_read_batch_ms'] = round(timings['parallel_read_batch_ms']+batch_elapsed,2)
+                timings['parallel_read_sequential_estimate_ms'] = round(
+                    timings['parallel_read_sequential_estimate_ms']+sequential_estimate,2)
+                timings['business_operation_ms'] = round(timings['business_operation_ms']+sequential_estimate,2)
+                timings['tool_execution_ms'] = round(timings['tool_execution_ms']+batch_elapsed,2)
+                timings['supabase_business_reads_ms'] = round(
+                    timings['supabase_business_reads_ms']+batch_elapsed,2)
             for call in reply.tool_calls:
-                if call.name not in allowed:
-                    return finish('DENIED','Ta operacja nie jest dostępna dla asystenta.','TOOL_NOT_ALLOWED')
-                arguments = json.loads(call.arguments) if isinstance(call.arguments,str) else call.arguments
-                if not isinstance(arguments,dict):
-                    raise ValueError('Tool arguments must be an object')
-                arguments = dict(arguments)
-                if call.name in MEMORY_WRITES:
-                    if 'source_run_id' in arguments:
-                        return finish('DENIED','Nieprawidłowe źródło pamięci.','INVALID_MEMORY_SOURCE')
-                    arguments['source_run_id'] = run_id
-                if call.name == COUNT_SESSION_START:
-                    if 'conversation_id' in arguments or 'idempotency_key' in arguments:
-                        return finish('DENIED','Nieprawidłowe źródło sesji remanentu.','INVALID_COUNT_SESSION_SOURCE')
-                    arguments['conversation_id']=conversation_id
-                    arguments['idempotency_key']=run_id+':count-session-start'
-                if call.name in COUNT_SESSION_BOUND:
-                    if 'count_session_id' in arguments or 'conversation_id' in arguments:
-                        return finish('DENIED','Nieprawidłowe źródło sesji remanentu.','INVALID_COUNT_SESSION_SOURCE')
-                    arguments['conversation_id']=conversation_id
-                    active_count_session=business_operations.active_inventory_count_session(ai_actor,human_actor,conversation_id)
-                    if active_count_session:
-                        arguments['count_session_id']=active_count_session
-                fingerprint = call.name+json.dumps(arguments,sort_keys=True,ensure_ascii=False)
-                if fingerprint in seen:
-                    return finish('FAILED','Model powtórzył tę samą operację.','REPEATED_TOOL_CALL')
-                seen.add(fingerprint)
-                # Reload initiating human on every operation, including mid-turn permission revocation.
-                current = load_actor_context(human_actor.actor_id)
-                definition = business_operations.OPERATION_REGISTRY[call.name]
-                if not definition.read_only and call.name not in business_operations.SUPERVISED_WRITES | MEMORY_WRITES | {'approval.decide'}:
-                    return finish('DENIED','Ta operacja nie jest dostępna dla asystenta.','TOOL_NOT_ALLOWED')
-                if current is None or current.permission_decision(definition.required_permission)==DENY:
-                    return finish('DENIED','Brak uprawnień do operacji.','PERMISSION_DENIED')
-                if not definition.read_only and call.name != 'approval.decide':
-                    continued_order_scope = (
-                        bool(arguments.get('order_id'))
-                        and previous_turn_entities.get('order') == arguments.get('order_id')
-                        and not ({'order', 'customer'} & set(resolved_entities))
-                        and not re.search(r'\b(?:innego|inna|inne|inny|drugiego|druga|drugie|drugi)\b', message.casefold())
-                    )
-                    needs_fresh_scope = (
-                        bool(arguments.get('order_id')) and bool({'order', 'customer'} & historical_entity_types)
-                        and not ({'order', 'customer'} & set(resolved_entities))
-                        and not continued_order_scope
-                    ) or (
-                        bool(arguments.get('invoice_id')) and 'invoice' in historical_entity_types
-                        and 'invoice' not in resolved_entities
-                    ) or (
-                        bool(arguments.get('product_id')) and 'product' in historical_entity_types
-                        and 'product' not in resolved_entities and call.name != 'inventory.adjust'
-                    )
-                    if needs_fresh_scope:
-                        return finish('DENIED','Przed zapisem odczytaj ponownie obiekt wskazany w bieżącej wiadomości.','ENTITY_SCOPE_REQUIRED')
-                    scope_error = business_operations.validate_resolved_entity_scope(
-                        call.name, arguments, resolved_entities, ambiguous_entities,
-                    )
-                    if scope_error:
-                        return finish('DENIED', scope_error[1], scope_error[0])
-                timings['tool_calls_count'] += 1
-                _audit('agent.tool_selected',ai_actor,run_id,correlation_id,SUCCESS,human_actor.actor_id,tool_name=call.name,conversation_id=conversation_id)
-                t = time.perf_counter()
-                if call.name == 'approval.decide':
-                    with human_approval.gesture(human_actor, eligible_approvals, run_id, conversation_id):
-                        result = business_operations.execute_business_operation(human_actor, call.name, arguments, correlation_id=correlation_id)
+                if parallel_read_batch:
+                    arguments, definition = parallel_prepared[call.call_id]
+                    result, operation_elapsed = parallel_results[call.call_id]
                 else:
-                    result = business_operations.execute_business_operation(ai_actor,call.name,arguments,
-                        correlation_id=correlation_id,idempotency_key=(run_id+':'+str(timings['tool_calls_count'])) if call.name in MEMORY_WRITES else '')
-                timings['business_operation_ms'] += round((time.perf_counter()-t)*1000,2)
+                    arguments = json.loads(call.arguments) if isinstance(call.arguments,str) else call.arguments
+                    if not isinstance(arguments,dict):
+                        raise ValueError('Tool arguments must be an object')
+                    arguments = dict(arguments)
+                    if call.name in MEMORY_WRITES:
+                        if 'source_run_id' in arguments:
+                            return finish('DENIED','Nieprawidłowe źródło pamięci.','INVALID_MEMORY_SOURCE')
+                        arguments['source_run_id'] = run_id
+                    if call.name == COUNT_SESSION_START:
+                        if 'conversation_id' in arguments or 'idempotency_key' in arguments:
+                            return finish('DENIED','Nieprawidłowe źródło sesji remanentu.','INVALID_COUNT_SESSION_SOURCE')
+                        arguments['conversation_id']=conversation_id
+                        arguments['idempotency_key']=run_id+':count-session-start'
+                    if call.name in COUNT_SESSION_BOUND:
+                        if 'count_session_id' in arguments or 'conversation_id' in arguments:
+                            return finish('DENIED','Nieprawidłowe źródło sesji remanentu.','INVALID_COUNT_SESSION_SOURCE')
+                        arguments['conversation_id']=conversation_id
+                        active_count_session=business_operations.active_inventory_count_session(ai_actor,human_actor,conversation_id)
+                        if active_count_session:
+                            arguments['count_session_id']=active_count_session
+                    fingerprint = call.name+json.dumps(arguments,sort_keys=True,ensure_ascii=False)
+                    if fingerprint in seen:
+                        return finish('FAILED','Model powtórzył tę samą operację.','REPEATED_TOOL_CALL')
+                    seen.add(fingerprint)
+                    current = load_actor_context(human_actor.actor_id)
+                    definition = business_operations.OPERATION_REGISTRY[call.name]
+                    if not definition.read_only and call.name not in business_operations.SUPERVISED_WRITES | MEMORY_WRITES | {'approval.decide'}:
+                        return finish('DENIED','Ta operacja nie jest dostępna dla asystenta.','TOOL_NOT_ALLOWED')
+                    if current is None or current.permission_decision(definition.required_permission)==DENY:
+                        return finish('DENIED','Brak uprawnień do operacji.','PERMISSION_DENIED')
+                    if not definition.read_only and call.name != 'approval.decide':
+                        continued_order_scope = (
+                            bool(arguments.get('order_id'))
+                            and previous_turn_entities.get('order') == arguments.get('order_id')
+                            and not ({'order', 'customer'} & set(resolved_entities))
+                            and not re.search(r'\b(?:innego|inna|inne|inny|drugiego|druga|drugie|drugi)\b', message.casefold())
+                        )
+                        needs_fresh_scope = (
+                            bool(arguments.get('order_id')) and bool({'order', 'customer'} & historical_entity_types)
+                            and not ({'order', 'customer'} & set(resolved_entities))
+                            and not continued_order_scope
+                        ) or (
+                            bool(arguments.get('invoice_id')) and 'invoice' in historical_entity_types
+                            and 'invoice' not in resolved_entities
+                        ) or (
+                            bool(arguments.get('product_id')) and 'product' in historical_entity_types
+                            and 'product' not in resolved_entities and call.name != 'inventory.adjust'
+                        )
+                        if needs_fresh_scope:
+                            return finish('DENIED','Przed zapisem odczytaj ponownie obiekt wskazany w bieżącej wiadomości.','ENTITY_SCOPE_REQUIRED')
+                        scope_error = business_operations.validate_resolved_entity_scope(
+                            call.name, arguments, resolved_entities, ambiguous_entities,
+                        )
+                        if scope_error:
+                            return finish('DENIED', scope_error[1], scope_error[0])
+                    timings['tool_calls_count'] += 1
+                    _audit('agent.tool_selected',ai_actor,run_id,correlation_id,SUCCESS,human_actor.actor_id,tool_name=call.name,conversation_id=conversation_id)
+                    t = time.perf_counter()
+                    if call.name == 'approval.decide':
+                        with human_approval.gesture(human_actor, eligible_approvals, run_id, conversation_id):
+                            result = business_operations.execute_business_operation(human_actor, call.name, arguments, correlation_id=correlation_id)
+                    else:
+                        result = business_operations.execute_business_operation(ai_actor,call.name,arguments,
+                            correlation_id=correlation_id,idempotency_key=(run_id+':'+str(timings['tool_calls_count'])) if call.name in MEMORY_WRITES else '')
+                    operation_elapsed = round((time.perf_counter()-t)*1000,2)
+                    timings['business_operation_ms'] = round(timings['business_operation_ms']+operation_elapsed,2)
+                    timings['tool_execution_ms'] = round(timings['tool_execution_ms']+operation_elapsed,2)
+                    if definition.read_only:
+                        timings['supabase_business_reads_ms'] = round(
+                            timings['supabase_business_reads_ms']+operation_elapsed,2)
                 if call.name == 'approval.decide' and result.status == 'SUCCESS':
                     decisions.append({'approval_id': result.data['approval_id'], 'decision': result.data['decision']})
                 logger.info('AI_TOOL_EXECUTION_END %s',json.dumps({'agent_run_id':run_id,'tool_name':call.name,'status':result.status}))

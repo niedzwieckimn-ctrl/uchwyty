@@ -3,6 +3,7 @@ These tests prove history and tools reach the model, not live model comprehensio
 """
 import json
 from pathlib import Path
+import time
 import pytest
 import agent_runtime as runtime
 import agent_conversation as conversations
@@ -124,7 +125,12 @@ def test_two_model_round_trips_one_operation_and_timing_fields():
     p=runtime.FakeModelProvider([tool('inventory.product.search',{'query':'Avery 160'}),respond('24 sztuki.')])
     result=runtime.run_agent_turn(owner(),'Ile mam Avery 160?',p)
     assert len(p.calls)==2 and result['tool_calls']==1
-    assert set(result['timings'])=={'context_build_ms','first_model_call_ms','business_operation_ms','final_model_call_ms','total_ms','tool_calls_count'}
+    assert set(result['timings'])=={
+        'acquire_turn_ms','memory_load_ms','context_history_build_ms','supabase_business_reads_ms',
+        'model_request_ms','tool_execution_ms','second_model_pass_ms','parallel_read_batch_ms',
+        'parallel_read_sequential_estimate_ms','context_build_ms',
+        'first_model_call_ms','business_operation_ms','final_model_call_ms','total_ms','tool_calls_count',
+    }
     assert all(v>=0 for v in result['timings'].values())
     assert result['timings']['tool_calls_count']==1
 
@@ -137,6 +143,47 @@ def test_parallel_model_calls_are_all_returned_with_matching_outputs():
     assert result['status']=='SUCCESS' and result['tool_calls']==2
     outputs=[i for i in p.calls[-1]['input_items'] if i.get('type')=='function_call_output']
     assert [i['call_id'] for i in outputs]==['a','b']
+
+
+def test_four_independent_green_reads_use_one_parallel_batch(monkeypatch):
+    reads = [
+        ('inventory.summary', {}),
+        ('orders.summary', {'period':'today'}),
+        ('invoices.overdue', {}),
+        ('china.orders.summary', {'scope':'active'}),
+    ]
+    original = operations.execute_business_operation
+
+    def delayed_read(*args, **kwargs):
+        if args[1] in {name for name,_arguments in reads}:
+            time.sleep(0.08)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(operations, 'execute_business_operation', delayed_read)
+    sequential_provider = runtime.FakeModelProvider([
+        *[tool(name, arguments, f'seq-{index}') for index,(name,arguments) in enumerate(reads)],
+        respond('Podsumowanie gotowe.'),
+    ])
+    sequential_started = time.perf_counter()
+    sequential = runtime.run_agent_turn(owner(), 'co mam dziś do zrobienia?', sequential_provider)
+    sequential_ms = (time.perf_counter()-sequential_started)*1000
+
+    batch_calls = tuple(runtime.ToolCall(f'batch-{index}',name,json.dumps(arguments))
+                        for index,(name,arguments) in enumerate(reads))
+    batch_provider = runtime.FakeModelProvider([
+        runtime.ProviderResponse(tool_calls=batch_calls,model='fake-model'),
+        respond('Podsumowanie gotowe.'),
+    ])
+    batch_started = time.perf_counter()
+    batched = runtime.run_agent_turn(owner(), 'co mam dziś do zrobienia?', batch_provider)
+    batch_ms = (time.perf_counter()-batch_started)*1000
+
+    assert sequential['status']==batched['status']=='SUCCESS'
+    assert len(sequential_provider.calls)==5
+    assert len(batch_provider.calls)==2 and batched['tool_calls']==4
+    assert batched['timings']['parallel_read_batch_ms'] > 0
+    assert batched['timings']['parallel_read_sequential_estimate_ms'] > batched['timings']['parallel_read_batch_ms']*2
+    assert batch_ms < sequential_ms*0.7
 
 
 def test_business_failure_is_returned_to_model_for_normal_explanation(monkeypatch):
