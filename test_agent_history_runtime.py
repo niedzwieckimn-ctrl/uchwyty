@@ -452,6 +452,118 @@ def test_shortage_coverage_fetches_ordered_and_shipped_po_details_and_skips_plan
                if operation == 'china.orders.get')
 
 
+def test_generic_read_shortage_analysis_uses_one_query_then_tool_free_synthesis(monkeypatch):
+    monkeypatch.setenv('AGENT_GENERIC_READ_ENABLED', '1')
+    executed = []
+    query_payload = {'queries': [
+        {'key':'open_orders', 'entity':'orders', 'select':['id', 'number', 'status'],
+         'expand':[{'relationship':'items', 'select':['sku', 'quantity']}]},
+        {'key':'availability', 'entity':'inventory',
+         'select':['sku', 'on_hand', 'reserved', 'available', 'incoming_confirmed']},
+        {'key':'active_purchase_orders', 'entity':'purchase_orders',
+         'select':['id', 'number', 'status'],
+         'where':[{'field':'status', 'op':'in', 'value':['ordered', 'shipped', 'planned']}],
+         'expand':[{'relationship':'items', 'select':['sku', 'quantity']}]},
+    ]}
+    query_result = {'ok':True, 'results':[
+        {'key':'open_orders', 'rows':[{'number':'ZAM-1', 'status':'confirmed',
+                                      'items':[{'sku':'SKU-A', 'quantity':10}]}]},
+        {'key':'availability', 'rows':[{'sku':'SKU-A', 'on_hand':7, 'reserved':10,
+                                       'available':0, 'incoming_confirmed':5}]},
+        {'key':'active_purchase_orders', 'rows':[
+            {'number':'PO-1', 'status':'ordered', 'items':[{'sku':'SKU-A', 'quantity':3}]},
+            {'number':'PO-2', 'status':'planned', 'items':[{'sku':'SKU-A', 'quantity':100}]},
+        ]},
+    ]}
+
+    def execute(_actor, operation, arguments, **_kwargs):
+        executed.append((operation, dict(arguments)))
+        assert operation == 'business.query'
+        definition = operations.OPERATION_REGISTRY[operation]
+        return operations.OperationResult(
+            status='SUCCESS', data=query_result, operation=operation,
+            operation_version=definition.operation_version, execution_id='generic-read',
+            request_id='request', correlation_id='correlation',
+        )
+
+    def plan(kwargs):
+        names = {item['name'] for item in kwargs['tools']}
+        assert 'business.query' in names
+        assert {'orders.fulfillment.readiness', 'orders.fulfillment.state',
+                'orders.packing.check', 'shipping.capabilities'} <= names
+        assert 'orders.packing.confirm' in names
+        assert not ({'orders.search', 'orders.get', 'orders.summary',
+                     'inventory.product.search', 'inventory.product.get', 'inventory.summary',
+                     'china.orders.search', 'china.orders.get', 'china.orders.summary'} & names)
+        assert {'invoices.search', 'customers.search', 'business.sales.summary'} <= names
+        assert 'Zbierz\npotrzebne zbiory w jednym wywołaniu business.query' in kwargs['instructions']
+        assert 'Sama china.orders.search' not in kwargs['instructions']
+        return tool('business.query', query_payload, call_id='generic-query')
+
+    def synthesize(kwargs):
+        assert kwargs['tools'] == [] and kwargs['tool_choice'] == 'none'
+        outputs = [json.loads(item['output']) for item in kwargs['input_items']
+                   if item.get('type') == 'function_call_output']
+        assert outputs == [query_result]
+        assert 'Użyj wyłącznie wyników narzędzi już dostarczonych' in kwargs['instructions']
+        return respond('SKU-A — brak 3 szt. po uwzględnieniu zamówionych P/O; planned pominięto.')
+
+    monkeypatch.setattr(operations, 'execute_business_operation', execute)
+    backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([plan, synthesize])
+    client = backend.app.test_client()
+    with client.session_transaction() as session:
+        session['admin_authenticated'] = True
+        session['csrf_token'] = 'csrf'
+
+    response = client.post('/api/internal/ai/chat', json={'message':
+        'Jakich produktów brakuje mi do pokrycia zamówień klientów po uwzględnieniu tego, '
+        'co już jest zamówione w aktywnych P/O? Planned nie traktuj jako pokrycie.'})
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload['status'] == 'SUCCESS' and payload['error_code'] == ''
+    assert payload['tool_calls'] == 1
+    assert executed == [('business.query', query_payload)]
+    assert len(backend.AGENT_MODEL_PROVIDER.calls) == 2
+
+
+def test_generic_read_mode_is_not_used_for_operational_preflight(monkeypatch):
+    monkeypatch.setenv('AGENT_GENERIC_READ_ENABLED', '1')
+
+    def inspect(kwargs):
+        names = {item['name'] for item in kwargs['tools']}
+        assert {'business.query', 'orders.fulfillment.readiness',
+                'orders.fulfillment.state', 'orders.packing.check'} <= names
+        assert {'orders.search', 'orders.get', 'inventory.summary', 'china.orders.search'} <= names
+        assert 'Zbierz\npotrzebne zbiory w jednym wywołaniu business.query' not in kwargs['instructions']
+        return respond('Potrzebuję wskazania zamówienia.')
+
+    result = runtime.run_agent_turn(
+        owner(), 'Czy mogę realizować i pakować to zamówienie?',
+        runtime.FakeModelProvider([inspect]),
+    )
+    assert result['status'] == 'SUCCESS' and result['tool_calls'] == 0
+
+
+def test_daily_briefing_prefers_generic_read_catalog(monkeypatch):
+    monkeypatch.setenv('AGENT_GENERIC_READ_ENABLED', '1')
+
+    def inspect(kwargs):
+        names = {item['name'] for item in kwargs['tools']}
+        assert 'business.query' in names
+        assert not ({'orders.summary', 'inventory.summary', 'china.orders.summary'} & names)
+        assert {'invoices.overdue', 'business.sales.summary',
+                'orders.fulfillment.readiness'} <= names
+        assert 'Zbierz\npotrzebne zbiory w jednym wywołaniu business.query' in kwargs['instructions']
+        assert 'pilne wysyłki/readiness, płatności po terminie' not in kwargs['instructions']
+        return respond('Brak danych do briefingu.')
+
+    result = runtime.run_agent_turn(
+        owner(), 'Co mam dziś do zrobienia?', runtime.FakeModelProvider([inspect]),
+    )
+    assert result['status'] == 'SUCCESS' and result['tool_calls'] == 0
+
+
 def test_parallel_green_reads_keep_three_results_when_one_source_is_unavailable(monkeypatch):
     reads = [
         ('inventory.summary', {}),
