@@ -4,13 +4,13 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import json
 import re
-import sqlite3
 import uuid
 from pathlib import Path
 from internal_audit import SUCCESS, record_audit_event
 from internal_rbac import ActorContext, load_actor_context, ALLOW
 
 CONVERSATION_TTL_MINUTES = 45
+TURN_LEASE_TTL = timedelta(minutes=5)
 MAX_HISTORY_TURNS = 6
 MAX_HISTORY_BYTES = 12000
 MAX_MEMORY_BYTES = 4000
@@ -115,11 +115,12 @@ def begin_turn(human, ai, cid, run_id, message):
         db.execute('BEGIN IMMEDIATE')
         _owned(db, human, ai, cid)
         now = _utc_now()
-        db.execute('DELETE FROM internal_agent_turn_leases WHERE expires_at<=?', (_iso(now),))
-        try:
-            db.execute('INSERT INTO internal_agent_turn_leases VALUES(?,?,?)',
-                (cid, run_id, _iso(now+timedelta(minutes=5))))
-        except sqlite3.IntegrityError:
+        acquired = db.execute('''INSERT INTO internal_agent_turn_leases(conversation_id,run_id,expires_at)
+            VALUES(?,?,?) ON CONFLICT(conversation_id) DO UPDATE SET
+            run_id=excluded.run_id,expires_at=excluded.expires_at
+            WHERE internal_agent_turn_leases.expires_at<=?''',
+            (cid, run_id, _iso(now+TURN_LEASE_TTL), _iso(now)))
+        if acquired.rowcount != 1:
             raise ConversationBusy('Conversation is running')
         db.execute('INSERT INTO internal_agent_turns(run_id,conversation_id,user_text,created_at) VALUES(?,?,?,?)',
             (run_id, cid, message, _iso(now)))

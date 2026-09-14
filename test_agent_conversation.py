@@ -73,12 +73,32 @@ def test_concurrent_turn_and_reset_are_rejected():
     conversations.finish_turn(human,ai,cid,'one','hi',[])
     saved_turn(cid)
 
-def test_expired_lease_recovers_after_worker_crash():
-    human,ai=actors();cid=conversations.open_conversation(human,ai)[0]
-    conversations.begin_turn(human,ai,cid,'one','hello')
-    db=backend.conn();db.execute('UPDATE internal_agent_turn_leases SET expires_at=?',
-        ((conversations._utc_now()-timedelta(seconds=1)).isoformat(),));db.commit();db.close()
-    saved_turn(cid)
+def test_stale_lease_is_taken_over_after_worker_crash(monkeypatch):
+    human,ai=actors()
+    started=conversations._utc_now()
+    monkeypatch.setattr(conversations,'_utc_now',lambda:started)
+    cid=conversations.open_conversation(human,ai)[0]
+    conversations.begin_turn(human,ai,cid,'dead-worker','hello')
+
+    monkeypatch.setattr(conversations,'_utc_now',lambda:started+conversations.TURN_LEASE_TTL+timedelta(seconds=1))
+    conversations.begin_turn(human,ai,cid,'new-worker','retry')
+    db=backend.conn();lease=db.execute('SELECT run_id FROM internal_agent_turn_leases WHERE conversation_id=?',(cid,)).fetchone();db.close()
+    assert lease['run_id']=='new-worker'
+    conversations.finish_turn(human,ai,cid,'new-worker','recovered',[])
+
+
+def test_fresh_lease_still_blocks_takeover(monkeypatch):
+    human,ai=actors()
+    started=conversations._utc_now()
+    monkeypatch.setattr(conversations,'_utc_now',lambda:started)
+    cid=conversations.open_conversation(human,ai)[0]
+    conversations.begin_turn(human,ai,cid,'active-worker','hello')
+
+    monkeypatch.setattr(conversations,'_utc_now',lambda:started+conversations.TURN_LEASE_TTL-timedelta(seconds=1))
+    with pytest.raises(conversations.ConversationBusy):
+        conversations.begin_turn(human,ai,cid,'second-worker','retry')
+    db=backend.conn();lease=db.execute('SELECT run_id FROM internal_agent_turn_leases WHERE conversation_id=?',(cid,)).fetchone();db.close()
+    assert lease['run_id']=='active-worker'
 
 
 def test_schema_is_additive_and_repeatable():
