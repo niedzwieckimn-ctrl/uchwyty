@@ -95,11 +95,16 @@ def test_ui_has_controlled_error_mapping(client):
     assert "Sesja wygasła. Zaloguj się ponownie." in html
 
 
-def test_assistant_ui_has_supervised_approval(client):
+def test_assistant_ui_has_supervised_approval_and_push_to_talk(client):
     login(client)
     html = client.get("/ai-assistant").get_data(as_text=True)
     assert "Zmiana wymaga zatwierdzenia" in html
     assert "Zatwierdź" in html and "Odrzuć" in html
     assert "/api/internal/ai/approvals/" in html
-    assert "mikrofon" not in html.lower()
-    assert "getUserMedia" not in html
+    assert 'id="aiVoice"' in html
+    assert "getUserMedia({audio:true})" in html
+    assert "new MediaRecorder" in html
+    assert "/api/internal/ai/voice/transcribe" in html
+    assert "/api/internal/ai/voice/synthesize" in html
+    assert "playSpeech(data.speech_text)" in html
+    assert client.get('/ai-assistant').headers['Permissions-Policy'] == 'camera=(self), microphone=(self), geolocation=()'

@@ -58,6 +58,13 @@ from internal_rbac import (
     require_permission,
 )
 from agent_runtime import configure_artifact_builder, provider_from_env, reset_agent_conversation, run_agent_turn
+from voice_io import (
+    ALLOWED_AUDIO_TYPES,
+    MAX_AUDIO_BYTES,
+    MAX_SPEECH_TEXT,
+    VoiceIOError,
+    provider_from_env as voice_provider_from_env,
+)
 from agent_artifacts import build_artifacts
 from agent_conversation import (
     configure as configure_agent_conversation,
@@ -854,6 +861,7 @@ def api_external_execution_health():
 
 
 AGENT_MODEL_PROVIDER = None
+VOICE_IO_PROVIDER = None
 
 
 def existing_product_image_local_path(stored_path: str) -> str:
@@ -1201,6 +1209,43 @@ def api_internal_ai_chat():
                             conversation_id=str(payload.get("conversation_id") or ""))
     status_code = 200 if result["status"] == "SUCCESS" else 403 if result["status"] == "DENIED" else 503
     return jsonify(result), status_code
+
+
+@app.post('/api/internal/ai/voice/transcribe')
+@require_permission('inventory.read')
+def api_internal_ai_voice_transcribe():
+    if not _rate_limit('internal_ai_voice_stt', 20, 60):
+        return jsonify(ok=False, error_code='RATE_LIMITED'), 429
+    upload = request.files.get('audio')
+    content_type = (upload.content_type or '').split(';', 1)[0].lower() if upload else ''
+    if upload is None or content_type not in ALLOWED_AUDIO_TYPES:
+        return jsonify(ok=False, error_code='INVALID_AUDIO'), 400
+    audio = upload.read(MAX_AUDIO_BYTES + 1)
+    if not audio or len(audio) > MAX_AUDIO_BYTES:
+        return jsonify(ok=False, error_code='INVALID_AUDIO'), 400
+    try:
+        text = (VOICE_IO_PROVIDER or voice_provider_from_env()).transcribe(
+            audio, filename=upload.filename or 'recording.webm', content_type=content_type,
+        )
+    except VoiceIOError:
+        return jsonify(ok=False, error_code='STT_FAILED'), 503
+    return jsonify(ok=True, text=text)
+
+
+@app.post('/api/internal/ai/voice/synthesize')
+@require_permission('inventory.read')
+def api_internal_ai_voice_synthesize():
+    if not _rate_limit('internal_ai_voice_tts', 30, 60):
+        return jsonify(ok=False, error_code='RATE_LIMITED'), 429
+    payload = request.get_json(silent=True) or {}
+    text = str(payload.get('speech_text') or '').strip() if isinstance(payload, dict) else ''
+    if not text or len(text) > MAX_SPEECH_TEXT:
+        return jsonify(ok=False, error_code='INVALID_SPEECH_TEXT'), 400
+    try:
+        audio = (VOICE_IO_PROVIDER or voice_provider_from_env()).synthesize(text)
+    except VoiceIOError:
+        return jsonify(ok=False, error_code='TTS_FAILED'), 503
+    return send_file(io.BytesIO(audio.content), mimetype=audio.content_type, download_name='speech.mp3')
 
 
 @app.post("/api/internal/ai/conversation/reset")
@@ -4901,7 +4946,10 @@ def security_headers_and_csrf(response):
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
-    response.headers.setdefault("Permissions-Policy", "camera=(self), microphone=(), geolocation=()")
+    if request.endpoint == 'ai_assistant':
+        response.headers.setdefault("Permissions-Policy", "camera=(self), microphone=(self), geolocation=()")
+    else:
+        response.headers.setdefault("Permissions-Policy", "camera=(self), microphone=(), geolocation=()")
     response.headers.setdefault("Content-Security-Policy", "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://unpkg.com https://cdn.jsdelivr.net; connect-src 'self' https://*.supabase.co https://api.resend.com")
     if session.get("admin_authenticated") and response.content_type and response.content_type.startswith("text/html"):
         body = response.get_data(as_text=True)

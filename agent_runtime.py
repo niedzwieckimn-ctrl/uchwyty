@@ -232,7 +232,11 @@ def _plain_response_text(value, *, speech=False):
     if speech:
         text=_URL_RULE.sub('',text)
         text=_UUID_RULE.sub('',text)
-        text=' '.join(text.split())[:700]
+        text=' '.join(text.split())
+        sentences=re.split(r'(?<=[.!?])\s+',text)
+        text=' '.join(sentences[:2])
+        if len(text)>280:
+            text=text[:280].rsplit(' ',1)[0].rstrip(' ,;:')+'.'
     else:
         text='\n'.join(line.rstrip() for line in text.splitlines() if line.strip())[:8000]
     return text.strip()
