@@ -170,9 +170,16 @@ def test_four_independent_green_reads_use_one_parallel_batch(monkeypatch):
 
     batch_calls = tuple(runtime.ToolCall(f'batch-{index}',name,json.dumps(arguments))
                         for index,(name,arguments) in enumerate(reads))
+
+    def synthesize(kwargs):
+        assert kwargs['tool_choice'] == 'none' and kwargs['tools'] == []
+        outputs = [item for item in kwargs['input_items'] if item.get('type') == 'function_call_output']
+        assert len(outputs) == 4 and all(json.loads(item['output']).get('ok') is True for item in outputs)
+        return respond('Podsumowanie gotowe.')
+
     batch_provider = runtime.FakeModelProvider([
         runtime.ProviderResponse(tool_calls=batch_calls,model='fake-model'),
-        respond('Podsumowanie gotowe.'),
+        synthesize,
     ])
     batch_started = time.perf_counter()
     batched = runtime.run_agent_turn(owner(), 'co mam dziś do zrobienia?', batch_provider)
@@ -184,6 +191,45 @@ def test_four_independent_green_reads_use_one_parallel_batch(monkeypatch):
     assert batched['timings']['parallel_read_batch_ms'] > 0
     assert batched['timings']['parallel_read_sequential_estimate_ms'] > batched['timings']['parallel_read_batch_ms']*2
     assert batch_ms < sequential_ms*0.7
+
+
+def test_green_batch_final_synthesis_prevents_extra_tools_and_returns_http_200():
+    reads = [
+        ('inventory.summary', {}),
+        ('orders.summary', {'period':'today'}),
+        ('invoices.overdue', {}),
+        ('china.orders.summary', {'scope':'active'}),
+    ]
+    first_calls = tuple(runtime.ToolCall(f'initial-{index}', name, json.dumps(arguments))
+                        for index, (name, arguments) in enumerate(reads))
+
+    def synthesis(kwargs):
+        # With the old auto/tool-enabled pass this branch would request three more tools
+        # and trip TOOL_LIMIT_EXCEEDED after the four completed reads.
+        if kwargs['tool_choice'] == 'auto' or kwargs['tools']:
+            return runtime.ProviderResponse(tool_calls=tuple(
+                runtime.ToolCall(f'extra-{index}', 'inventory.product.search',
+                                 json.dumps({'query':f'Avery {index}'}))
+                for index in range(3)))
+        outputs = [item for item in kwargs['input_items'] if item.get('type') == 'function_call_output']
+        assert len(outputs) == 4
+        assert all(json.loads(item['output']).get('ok') is True for item in outputs)
+        return respond('Finalne podsumowanie na podstawie czterech wykonanych odczytów.')
+
+    backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([
+        runtime.ProviderResponse(tool_calls=first_calls, model='fake-model'), synthesis,
+    ])
+    client = backend.app.test_client()
+    with client.session_transaction() as session:
+        session['admin_authenticated'] = True
+        session['csrf_token'] = 'csrf'
+
+    response = client.post('/api/internal/ai/chat', json={'message':'co mam dziś do zrobienia?'})
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload['status'] == 'SUCCESS' and payload['tool_calls'] == 4
+    assert payload['message'] == 'Finalne podsumowanie na podstawie czterech wykonanych odczytów.'
 
 
 def test_parallel_green_reads_keep_three_results_when_one_source_is_unavailable(monkeypatch):

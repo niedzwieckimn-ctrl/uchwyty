@@ -508,6 +508,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         timings['context_build_ms'] = round((time.perf_counter()-started)*1000,2)
         _audit('agent.requested',human_actor,run_id,correlation_id,SUCCESS,human_actor.actor_id,conversation_id=conversation_id)
         seen, model_calls = set(), 0
+        green_batch_synthesis_only = False
         while True:
             current_stage = 'model_context_check'
             if len(json.dumps(input_items,ensure_ascii=False).encode())>MAX_MODEL_CONTEXT_BYTES:
@@ -517,9 +518,10 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
             if model_calls > 0:
                 chat_503_diagnostics['final_model_call_started'] = True
             try:
-                reply = provider.complete(instructions=instructions,input_items=input_items,tools=tools,
+                reply = provider.complete(instructions=instructions,input_items=input_items,
+                    tools=[] if green_batch_synthesis_only else tools,
                     previous_response_id='',timeout_seconds=MODEL_TIMEOUT_SECONDS,
-                    tool_choice='none' if timings['tool_calls_count']>=MAX_TOOL_CALLS_PER_TURN else 'auto')
+                    tool_choice='none' if green_batch_synthesis_only or timings['tool_calls_count']>=MAX_TOOL_CALLS_PER_TURN else 'auto')
             finally:
                 elapsed = round((time.perf_counter()-t)*1000,2)
                 if model_calls==0:
@@ -546,6 +548,8 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 logger.info('AI_FINAL_RESPONSE %s',json.dumps({'agent_run_id':run_id,'model':model_name}))
                 return finish('SUCCESS',reply.text)
             current_stage = 'tool_call_validation'
+            if green_batch_synthesis_only:
+                return finish('FAILED','Model nie zwrócił finalnej odpowiedzi tekstowej.','PROVIDER_CONTRACT_VIOLATION')
             if timings['tool_calls_count']+len(reply.tool_calls)>MAX_TOOL_CALLS_PER_TURN:
                 return finish('FAILED','Osiągnięto limit operacji. Zawęź pytanie.','TOOL_LIMIT_EXCEEDED')
             if any(call.name not in allowed for call in reply.tool_calls):
@@ -779,6 +783,8 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 turn_outputs.append({'type':'function_call_output','call_id':call.call_id,'output':encoded})
             input_items.extend(outputs+turn_outputs)
             evidence.extend(outputs+turn_outputs)
+            if parallel_read_batch:
+                green_batch_synthesis_only = True
     except agent_conversation.ConversationAccessDenied:
         return finish('DENIED','Nie masz dostępu do tej rozmowy.','CONVERSATION_ACCESS_DENIED')
     except agent_conversation.ConversationBusy:
