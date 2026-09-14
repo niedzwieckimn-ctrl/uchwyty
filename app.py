@@ -24,6 +24,7 @@ from decimal import Decimal, ROUND_HALF_UP
 
 _STARTUP_STARTED = time.monotonic()
 _startup_logger = logging.getLogger("app.startup")
+_ai_chat_logger = logging.getLogger("app.ai_chat")
 
 
 def _startup_step(name: str) -> None:
@@ -1202,12 +1203,33 @@ def api_internal_ai_chat():
                        message="Nieprawidłowy format żądania."), 400
     try:
         provider = AGENT_MODEL_PROVIDER or provider_from_env()
-    except Exception:
+    except Exception as exc:
+        _ai_chat_logger.error("AI_CHAT_503 %s", json.dumps({
+            "stage":"provider_initialization", "reason":"MODEL_NOT_CONFIGURED",
+            "exception_type":type(exc).__name__, "agent_run_id":"", "conversation_id":"",
+            "first_model_call_succeeded":False, "tool_calls_ok":0,
+            "tool_calls_data_unavailable":0, "final_model_call_started":False,
+            "final_model_call_succeeded":False,
+        }, sort_keys=True))
         return jsonify(ok=False, status="FAILED", error_code="MODEL_NOT_CONFIGURED",
                        message="Model asystenta nie jest jeszcze skonfigurowany."), 503
     result = run_agent_turn(current_actor_context(), payload.get("message", ""), provider,
                             conversation_id=str(payload.get("conversation_id") or ""))
     status_code = 200 if result["status"] == "SUCCESS" else 403 if result["status"] == "DENIED" else 503
+    diagnostics = result.pop('_chat_503_diagnostics', {})
+    if status_code == 503:
+        _ai_chat_logger.error("AI_CHAT_503 %s", json.dumps({
+            "stage":diagnostics.get("stage") or "agent_runtime",
+            "reason":result.get("error_code") or "UNKNOWN",
+            "exception_type":diagnostics.get("exception_type"),
+            "agent_run_id":result.get("agent_run_id") or "",
+            "conversation_id":result.get("conversation_id") or "",
+            "first_model_call_succeeded":bool(diagnostics.get("first_model_call_succeeded")),
+            "tool_calls_ok":int(diagnostics.get("tool_calls_ok") or 0),
+            "tool_calls_data_unavailable":int(diagnostics.get("tool_calls_data_unavailable") or 0),
+            "final_model_call_started":bool(diagnostics.get("final_model_call_started")),
+            "final_model_call_succeeded":bool(diagnostics.get("final_model_call_succeeded")),
+        }, sort_keys=True))
     return jsonify(result), status_code
 
 

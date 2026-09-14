@@ -333,9 +333,18 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
     ambiguous_entities = set()
     historical_entity_types = set()
     previous_turn_entities = {}
+    current_stage = 'runtime_initialization'
+    chat_503_diagnostics = {
+        'first_model_call_succeeded':False,
+        'tool_calls_ok':0,
+        'tool_calls_data_unavailable':0,
+        'final_model_call_started':False,
+        'final_model_call_succeeded':False,
+        'exception_type':None,
+    }
 
     def _finish(status, answer, code=''):
-        nonlocal active
+        nonlocal active, current_stage
         if any(item.get('type') == 'inventory_count_card' for item in artifacts):
             artifacts[:] = [item for item in artifacts if item.get('type') != 'product_card']
         # Security redaction only: never parse business claims or language.
@@ -351,7 +360,9 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                          'output':json.dumps(artifact_sources,ensure_ascii=False,separators=(',',':'))},
                     ]
                 agent_conversation.finish_turn(human_actor,ai_actor,conversation_id,run_id,answer,evidence)
-            except Exception:
+            except Exception as exc:
+                current_stage = 'history_save'
+                chat_503_diagnostics['exception_type'] = type(exc).__name__
                 try:
                     agent_conversation.release_turn(human_actor, ai_actor, conversation_id, run_id)
                 except Exception:
@@ -367,23 +378,29 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 _audit('agent.completed' if status=='SUCCESS' else 'agent.failed', ai_actor,run_id,correlation_id,
                        SUCCESS if status=='SUCCESS' else FAILED,human_actor.actor_id,
                        conversation_id=conversation_id,error_code=code,**timings)
-            except Exception:
+            except Exception as exc:
+                current_stage = 'audit_save'
+                chat_503_diagnostics['exception_type'] = type(exc).__name__
                 status, code = 'FAILED', 'AUDIT_FAILED'
                 answer = 'Nie udało się zapisać audytu odpowiedzi.'
                 logger.error('AI_AUDIT_FAILED %s',run_id)
         timings['total_ms'] = round((time.perf_counter()-started)*1000,2)
         logger.info('AI_TURN_TIMING %s',json.dumps({'agent_run_id':run_id,**timings}))
-        return {'ok':status=='SUCCESS','status':status,'message':answer,'speech_text':_plain_response_text(answer,speech=True),'agent_run_id':run_id,
+        result = {'ok':status=='SUCCESS','status':status,'message':answer,'speech_text':_plain_response_text(answer,speech=True),'agent_run_id':run_id,
                 'correlation_id':correlation_id,'conversation_id':conversation_id,'tool_calls':timings['tool_calls_count'],
                 'model':model_name,'usage':usage,'error_code':code,'timings':dict(timings),
                 'artifacts':artifacts, 'approvals':pending_approvals,
                 'pending_approvals':pending_approvals, 'decisions': decisions}
+        if status != 'SUCCESS':
+            result['_chat_503_diagnostics'] = {'stage':current_stage, **chat_503_diagnostics}
+        return result
 
     def finish(status, answer, code=''):
         nonlocal active
         try:
             return _finish(status, answer, code)
-        except Exception:
+        except Exception as exc:
+            chat_503_diagnostics['exception_type'] = type(exc).__name__
             logger.exception('AI_TURN_FINALIZATION_FAILED %s', run_id)
             timings['total_ms'] = round((time.perf_counter()-started)*1000,2)
             return {'ok': False, 'status': 'FAILED', 'message': 'Nie udało się teraz pobrać odpowiedzi.',
@@ -392,7 +409,8 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                     'tool_calls': timings['tool_calls_count'], 'model': model_name, 'usage': usage,
                     'error_code': 'TURN_FINALIZATION_FAILED', 'timings': dict(timings),
                     'artifacts': [], 'approvals': pending_approvals,
-                    'pending_approvals': pending_approvals, 'decisions': decisions}
+                    'pending_approvals': pending_approvals, 'decisions': decisions,
+                    '_chat_503_diagnostics': {'stage':'turn_finalization', **chat_503_diagnostics}}
         finally:
             if active:
                 try:
@@ -491,9 +509,13 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         _audit('agent.requested',human_actor,run_id,correlation_id,SUCCESS,human_actor.actor_id,conversation_id=conversation_id)
         seen, model_calls = set(), 0
         while True:
+            current_stage = 'model_context_check'
             if len(json.dumps(input_items,ensure_ascii=False).encode())>MAX_MODEL_CONTEXT_BYTES:
                 return finish('FAILED','Rozmowa przekroczyła limit kontekstu; zawęź pytanie.','CONTEXT_LIMIT_EXCEEDED')
             t = time.perf_counter()
+            current_stage = 'first_model_call' if model_calls == 0 else 'final_model_call'
+            if model_calls > 0:
+                chat_503_diagnostics['final_model_call_started'] = True
             try:
                 reply = provider.complete(instructions=instructions,input_items=input_items,tools=tools,
                     previous_response_id='',timeout_seconds=MODEL_TIMEOUT_SECONDS,
@@ -508,10 +530,14 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 model_calls += 1
             if not isinstance(reply,ProviderResponse):
                 raise ValueError('Invalid provider response')
+            if model_calls == 1:
+                chat_503_diagnostics['first_model_call_succeeded'] = True
             model_name = _safe_text(reply.model,128)
             usage['input_tokens'] += reply.input_tokens
             usage['output_tokens'] += reply.output_tokens
             if not reply.tool_calls:
+                if model_calls > 1:
+                    chat_503_diagnostics['final_model_call_succeeded'] = True
                 timings['final_model_call_ms'] = elapsed if model_calls>1 else 0.0
                 if len(reply.text)>8000:
                     return finish('FAILED','Odpowiedź przekroczyła limit długości.','RESPONSE_TOO_LARGE')
@@ -519,6 +545,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                     return finish('FAILED','Model nie zwrócił odpowiedzi.','PROVIDER_CONTRACT_VIOLATION')
                 logger.info('AI_FINAL_RESPONSE %s',json.dumps({'agent_run_id':run_id,'model':model_name}))
                 return finish('SUCCESS',reply.text)
+            current_stage = 'tool_call_validation'
             if timings['tool_calls_count']+len(reply.tool_calls)>MAX_TOOL_CALLS_PER_TURN:
                 return finish('FAILED','Osiągnięto limit operacji. Zawęź pytanie.','TOOL_LIMIT_EXCEEDED')
             if any(call.name not in allowed for call in reply.tool_calls):
@@ -532,6 +559,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 'name':call.name.replace('.','__'),'arguments':call.arguments if isinstance(call.arguments,str) else json.dumps(call.arguments)}
                 for call in reply.tool_calls]
             turn_outputs = []
+            current_stage = 'tool_execution'
             read_groups = [business_operations.FRESHNESS_GROUP_BY_OPERATION.get(call.name,call.name)
                            for call in reply.tool_calls]
             parallel_read_batch = len(reply.tool_calls) > 1 and all(
@@ -675,6 +703,10 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 if call.name == 'approval.decide' and result.status == 'SUCCESS':
                     decisions.append({'approval_id': result.data['approval_id'], 'decision': result.data['decision']})
                 logger.info('AI_TOOL_EXECUTION_END %s',json.dumps({'agent_run_id':run_id,'tool_name':call.name,'status':result.status}))
+                if result.status == 'SUCCESS':
+                    chat_503_diagnostics['tool_calls_ok'] += 1
+                elif result.error_code == 'DATA_UNAVAILABLE':
+                    chat_503_diagnostics['tool_calls_data_unavailable'] += 1
                 _audit('agent.tool_result',ai_actor,run_id,correlation_id,SUCCESS if result.status=='SUCCESS' else FAILED,
                        human_actor.actor_id,tool_name=call.name,execution_id=result.execution_id,result_status=result.status,conversation_id=conversation_id)
                 if result.status == 'PENDING_APPROVAL' and call.name in business_operations.SUPERVISED_WRITES:
@@ -752,6 +784,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
     except agent_conversation.ConversationBusy:
         return finish('DENIED','Ta rozmowa ma już aktywny turn. Spróbuj po jego zakończeniu.','CONVERSATION_BUSY')
     except Exception as exc:
+        chat_503_diagnostics['exception_type'] = type(exc).__name__
         logger.error('AI_RUNTIME_FAILURE %s', json.dumps({
             'agent_run_id': run_id,
             'exception_type': type(exc).__name__,

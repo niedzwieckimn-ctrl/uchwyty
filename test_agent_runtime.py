@@ -494,7 +494,7 @@ def test_provider_failure_is_diagnostic_in_log_but_endpoint_response_stays_safe(
         session["admin_authenticated"] = True
         session["csrf_token"] = "csrf"
 
-    with caplog.at_level(logging.ERROR, logger="agent_runtime"):
+    with caplog.at_level(logging.ERROR):
         response = client.post("/api/internal/ai/chat", json={"message": user_message})
 
     assert response.status_code == 503
@@ -504,14 +504,64 @@ def test_provider_failure_is_diagnostic_in_log_but_endpoint_response_stays_safe(
     encoded_response = json.dumps(payload, ensure_ascii=False)
     assert secret not in encoded_response and user_message not in encoded_response
 
-    log = caplog.text
-    assert "AI_PROVIDER_FAILURE" in log
-    assert '"exception_type": "HTTPError"' in log
-    assert '"http_status": 400' in log
-    assert '"api_error_code": "model_not_found"' in log
-    assert '"model": "configured-test-model"' in log
-    assert '"stage": "request"' in log
-    assert '"safe_message": "OpenAI API zwróciło błąd HTTP 400."' in log
-    assert secret not in log and user_message not in log
-    assert "Authorization" not in log and "unsafe transport detail" not in log
+    provider_log = '\n'.join(record.message for record in caplog.records
+                             if record.message.startswith('AI_PROVIDER_FAILURE'))
+    chat_503_log = '\n'.join(record.message for record in caplog.records
+                             if record.message.startswith('AI_CHAT_503'))
+    assert "AI_PROVIDER_FAILURE" in provider_log
+    assert chat_503_log.count("AI_CHAT_503") == 1
+    assert '"stage": "first_model_call"' in chat_503_log
+    assert '"reason": "MODEL_FAILED"' in chat_503_log
+    assert '"exception_type": "HTTPError"' in chat_503_log
+    assert '"first_model_call_succeeded": false' in chat_503_log
+    assert '"tool_calls_ok": 0' in chat_503_log
+    assert '"tool_calls_data_unavailable": 0' in chat_503_log
+    assert '"final_model_call_started": false' in chat_503_log
+    assert '"final_model_call_succeeded": false' in chat_503_log
+    assert '"http_status": 400' in provider_log
+    assert '"api_error_code": "model_not_found"' in provider_log
+    assert '"model": "configured-test-model"' in provider_log
+    assert '"stage": "request"' in provider_log
+    assert '"safe_message": "OpenAI API zwróciło błąd HTTP 400."' in provider_log
+    diagnostic_log = provider_log + chat_503_log
+    assert secret not in diagnostic_log and user_message not in diagnostic_log
+    assert "Authorization" not in diagnostic_log and "unsafe transport detail" not in diagnostic_log
+
+
+def test_chat_503_diagnostic_reports_partial_tools_and_failed_final_model(monkeypatch, caplog):
+    original = operations._HANDLERS['invoices.overdue']
+
+    def unavailable(*_args, **_kwargs):
+        raise operations.ControlledOperationError(
+            'DATA_UNAVAILABLE', 'Dane faktur są chwilowo niedostępne')
+
+    monkeypatch.setitem(operations._HANDLERS, 'invoices.overdue', unavailable)
+    backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([
+        runtime.ProviderResponse(tool_calls=(
+            runtime.ToolCall('inventory', 'inventory.summary', '{}'),
+            runtime.ToolCall('invoices', 'invoices.overdue', '{}'),
+        ), model='fake-model'),
+        TimeoutError('final provider timeout'),
+    ])
+    client = backend.app.test_client()
+    with client.session_transaction() as session:
+        session['admin_authenticated'] = True
+        session['csrf_token'] = 'csrf'
+
+    with caplog.at_level(logging.ERROR):
+        response = client.post('/api/internal/ai/chat', json={'message':'Podsumuj sytuację.'})
+
+    monkeypatch.setitem(operations._HANDLERS, 'invoices.overdue', original)
+    assert response.status_code == 503
+    records = [record.message for record in caplog.records if record.message.startswith('AI_CHAT_503')]
+    assert len(records) == 1
+    diagnostic = records[0]
+    assert '"stage": "final_model_call"' in diagnostic
+    assert '"reason": "MODEL_FAILED"' in diagnostic
+    assert '"exception_type": "TimeoutError"' in diagnostic
+    assert '"first_model_call_succeeded": true' in diagnostic
+    assert '"tool_calls_ok": 1' in diagnostic
+    assert '"tool_calls_data_unavailable": 1' in diagnostic
+    assert '"final_model_call_started": true' in diagnostic
+    assert '"final_model_call_succeeded": false' in diagnostic
 
