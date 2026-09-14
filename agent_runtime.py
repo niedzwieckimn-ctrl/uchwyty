@@ -240,6 +240,16 @@ bez powtórzeń i bez propozycji dalszej pomocy. Użyj dokładnie tej kolejnośc
 4. Pozostałe ważne rzeczy
 Jeżeli wyniki nie potwierdzają pokrycia konkretnego SKU dostawą z Chin, zaznacz to jednym krótkim zdaniem.
 '''
+FIRST_PASS_PLANNING_INSTRUCTIONS = '''
+W pierwszej odpowiedzi planującej możesz zwrócić maksymalnie {tool_limit} wywołań narzędzi, czyli limit runtime dla
+całego turnu. Jeśli pełny zakres wymaga większej liczby operacji, wybierz najważniejsze niezależne GREEN READS
+mieszczące się w limicie. Nie obchodź limitu przez tekstowe imitowanie wywołań narzędzi.
+'''
+DAILY_BRIEFING_PLANNING_INSTRUCTIONS = '''
+Dla briefingu „co mam dziś zrobić?” wybieraj w tej kolejności: pilne wysyłki/readiness, płatności po terminie,
+braki w zamówieniach, aktywne P/O i pokrycie braków, a następnie ranking zapasów lub pozostałe ważne rzeczy.
+Cały plan musi mieścić się w podanym limicie.
+'''
 _MARKDOWN_RULE = re.compile(r'^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$',re.MULTILINE)
 _URL_RULE = re.compile(r'https?://\S+',re.IGNORECASE)
 _UUID_RULE = re.compile(r'\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b',re.IGNORECASE)
@@ -542,7 +552,12 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
             if model_calls > 0:
                 chat_503_diagnostics['final_model_call_started'] = True
             model_instructions = instructions
-            if green_batch_synthesis_only:
+            if model_calls == 0:
+                model_instructions += FIRST_PASS_PLANNING_INSTRUCTIONS.format(
+                    tool_limit=MAX_TOOL_CALLS_PER_TURN)
+                if _is_daily_work_briefing(turn_message):
+                    model_instructions += DAILY_BRIEFING_PLANNING_INSTRUCTIONS
+            elif green_batch_synthesis_only:
                 model_instructions += FINAL_GREEN_SYNTHESIS_INSTRUCTIONS
                 if _is_daily_work_briefing(turn_message):
                     model_instructions += DAILY_BRIEFING_SYNTHESIS_INSTRUCTIONS

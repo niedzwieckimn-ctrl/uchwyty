@@ -243,6 +243,46 @@ def test_green_batch_final_synthesis_prevents_extra_tools_and_returns_http_200()
     assert 'Sprawdzam jeszcze' not in payload['message']
 
 
+def test_first_planning_pass_bounds_wide_briefing_and_returns_http_200():
+    reads = (
+        ('orders.fulfillment.readiness', {}),
+        ('invoices.overdue', {}),
+        ('orders.summary', {'period':'today'}),
+        ('china.orders.summary', {'scope':'active'}),
+        ('inventory.replenishment.ranking', {}),
+    )
+
+    def planning(kwargs):
+        assert kwargs['tool_choice'] == 'auto' and kwargs['tools']
+        instructions = kwargs['instructions']
+        assert 'maksymalnie 6 wywołań narzędzi' in instructions
+        assert 'pilne wysyłki/readiness, płatności po terminie' in instructions
+        assert 'aktywne P/O i pokrycie braków' in instructions
+        return runtime.ProviderResponse(tool_calls=tuple(
+            runtime.ToolCall(f'briefing-{index}', name, json.dumps(arguments))
+            for index, (name, arguments) in enumerate(reads)
+        ), model='fake-model')
+
+    def synthesis(kwargs):
+        assert kwargs['tool_choice'] == 'none' and kwargs['tools'] == []
+        outputs = [item for item in kwargs['input_items'] if item.get('type') == 'function_call_output']
+        assert len(outputs) == 5
+        return respond('1. Pilne wysyłki\n- Jedno zamówienie wymaga działania.\n2. Płatności po terminie\n- Jedna zaległa faktura.\n3. Braki wymagające działania\n- Sprawdzono pokrycie dostawami.\n4. Pozostałe ważne rzeczy\n- Ranking zapasów uwzględniony.')
+
+    backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([planning, synthesis])
+    client = backend.app.test_client()
+    with client.session_transaction() as session:
+        session['admin_authenticated'] = True
+        session['csrf_token'] = 'csrf'
+
+    response = client.post('/api/internal/ai/chat', json={'message':'co mam dziś do zrobienia?'})
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload['status'] == 'SUCCESS' and payload['tool_calls'] == 5
+    assert 'Ranking zapasów uwzględniony.' in payload['message']
+
+
 def test_parallel_green_reads_keep_three_results_when_one_source_is_unavailable(monkeypatch):
     reads = [
         ('inventory.summary', {}),
