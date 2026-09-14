@@ -1,8 +1,34 @@
 import json
+from pathlib import Path
+import sqlite3
 
+import agent_conversation
 import agent_runtime as runtime
 import app as backend
+import internal_rbac
 from test_agent_runtime import isolated, owner, respond, tool
+
+
+def test_normal_init_migrates_existing_sqlite_without_memory_table(tmp_path, monkeypatch):
+    database = tmp_path / 'existing-without-memory.db'
+    db = sqlite3.connect(database)
+    internal_rbac.initialize_schema(db)
+    base_sql = (Path(__file__).parent / 'migrations' / 'agent_runtime_history.sql').read_text(encoding='utf-8')
+    db.executescript(base_sql)
+    assert db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='internal_agent_memory'").fetchone() is None
+    db.close()
+
+    monkeypatch.setattr(backend, 'DB_PATH', str(database))
+    monkeypatch.setattr(backend, 'supabase_enabled', lambda: False)
+    backend.init_db()
+    backend.init_db()
+
+    db = backend.conn()
+    assert db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='internal_agent_memory'").fetchone() is not None
+    db.close()
+    human = internal_rbac.load_actor_context(internal_rbac.BOOTSTRAP_OWNER_ACTOR_ID)
+    ai = internal_rbac.load_actor_context(internal_rbac.AI_OWNER_ASSISTANT_ACTOR_ID)
+    assert agent_conversation.memory_for_model(human, ai, 'test')['relevant_company_memory'] == []
 
 
 def test_confirmed_company_procedure_survives_new_conversation_via_supabase(isolated, monkeypatch):

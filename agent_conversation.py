@@ -15,6 +15,7 @@ MAX_HISTORY_TURNS = 6
 MAX_HISTORY_BYTES = 12000
 MAX_MEMORY_BYTES = 4000
 MAX_TERMS = 100
+SQLITE_MIGRATIONS = ('agent_runtime_history.sql', 'agent_durable_memory_sqlite.sql')
 _connection_factory = None
 _remote_memory_enabled = None
 _remote_memory_select = None
@@ -56,7 +57,9 @@ def _iso(value):
     return value.isoformat()
 
 def initialize_schema(db):
-    db.executescript((Path(__file__).parent / 'migrations' / 'agent_runtime_history.sql').read_text(encoding='utf-8'))
+    migrations = Path(__file__).parent / 'migrations'
+    for filename in SQLITE_MIGRATIONS:
+        db.executescript((migrations / filename).read_text(encoding='utf-8'))
     db.commit()
 
 def _audit(event, human, cid, ai_id):
