@@ -8,12 +8,13 @@ import os
 import re
 from typing import Any, Callable, Mapping
 
-from inventory_analytics import build_replenishment_analysis
+from inventory_analytics import build_replenishment_analysis, inventory_business_status
+import fulfillment_readiness
 from internal_rbac import DENY, load_actor_context
 
 
 FEATURE_FLAG = "AGENT_GENERIC_READ_ENABLED"
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 200
 MAX_SELECTED_FIELDS = 30
@@ -58,11 +59,17 @@ def _owner(actor) -> None:
         _error("PERMISSION_DENIED", "Brak uprawnienia do generic business read")
 
 
-def _field(field_type: str, *, nullable: bool = False, description: str = "") -> dict[str, Any]:
-    value = {"type": field_type, "nullable": nullable, "filterable": True,
-             "sortable": True, "aggregatable": field_type in {"integer", "number"}}
+def _field(field_type: str, *, nullable: bool = False, description: str = "",
+           computed: bool = False, source: str = "", filterable: bool = True,
+           sortable: bool = True, aggregatable: bool | None = None) -> dict[str, Any]:
+    value = {"type": field_type, "nullable": nullable, "filterable": filterable,
+             "sortable": sortable,
+             "aggregatable": field_type != "array" if aggregatable is None else aggregatable,
+             "computed": computed}
     if description:
         value["description"] = description
+    if source:
+        value["source"] = source
     return value
 
 
@@ -75,6 +82,21 @@ SCHEMA: dict[str, dict[str, Any]] = {
             "note": _field("string", nullable=True), "warehouse_issued": _field("boolean"),
             "created_at": _field("string"), "packed_at": _field("string", nullable=True),
             "shipped_at": _field("string", nullable=True),
+            "fulfillment_ready": _field(
+                "boolean", nullable=True, computed=True,
+                source="fulfillment_readiness.calculate_fulfillment_readiness",
+                description="Czy aktywne zamówienie jest kompletne z fizycznie dostępnego stanu według wspólnej logiki realizacji aplikacji.",
+            ),
+            "fulfillment_missing_items": _field(
+                "array", computed=True, filterable=False, sortable=False, aggregatable=False,
+                source="fulfillment_readiness.calculate_fulfillment_readiness",
+                description="Gotowa lista brakujących pozycji z wymaganym, dostępnym i brakującym wolumenem według logiki realizacji aplikacji.",
+            ),
+            "fulfillment_total_units": _field(
+                "integer", nullable=True, computed=True,
+                source="fulfillment_readiness.calculate_fulfillment_readiness",
+                description="Liczba jednostek pozostających do realizacji aktywnego zamówienia według wspólnego odczytu readiness.",
+            ),
         },
         "relationships": {
             "items": {"target": "order_items", "local_field": "id", "target_field": "order_id", "many": True},
@@ -110,8 +132,17 @@ SCHEMA: dict[str, dict[str, Any]] = {
             "reserved": _field("integer", description="Ilość zarezerwowana przez aktywne zamówienia."),
             "available": _field("integer", description="Stan dostępny po rezerwacjach."),
             "incoming_confirmed": _field("integer", description="Ilość w potwierdzonych aktywnych P/O według istniejącej logiki inventory."),
-            "reserved_incoming": _field("integer"),
-            "available_after_incoming": _field("integer"),
+            "reserved_incoming": _field("integer", description="Część potwierdzonego incoming przypisana do rezerwacji niepokrytych stanem fizycznym."),
+            "available_incoming": _field("integer", description="Potwierdzony incoming pozostały po pokryciu bieżących rezerwacji."),
+            "available_after_incoming": _field("integer", description="Łączna dostępność od ręki i wolny potwierdzony incoming."),
+            "coverage_status": _field(
+                "string", computed=True, source="inventory_analytics.inventory_business_status",
+                description="Gotowy status wewnętrznego magazynu: Problem oznacza rezerwacje większe niż stan fizyczny i potwierdzony incoming; Tylko w drodze, Brak, Niski stan, Zarezerwowany i OK zachowują semantykę istniejącego widoku.",
+            ),
+            "covered_by_stock_and_confirmed_incoming": _field(
+                "boolean", computed=True, source="inventory_analytics.inventory_business_status",
+                description="Czy fizyczny stan wraz z potwierdzonym incoming pokrywa wszystkie aktywne rezerwacje produktu; planned P/O nie zwiększa pokrycia.",
+            ),
         },
         "relationships": {},
     },
@@ -234,17 +265,42 @@ def _read_connection():
 
 def _inventory_rows() -> list[dict[str, Any]]:
     rows = build_replenishment_analysis(_read_connection, today=date.today())
-    return [{
-        "product_id": int(row["id"]), "sku": row.get("sku") or "",
-        "model": row.get("model"), "name": row.get("name"), "ean": row.get("ean"),
-        "on_hand": int(row.get("stock_qty") or 0),
-        "reserved": int(row.get("reserved_qty") or 0),
-        "available": int(row.get("available_qty") or 0),
-        "incoming_confirmed": int(row.get("incoming_qty") or 0),
-        "reserved_incoming": int(row.get("reserved_incoming") or 0),
-        "available_after_incoming": int(row.get("available_qty") or 0)
-            + int(row.get("available_incoming") or 0),
-    } for row in rows]
+    projected = []
+    for row in rows:
+        status = inventory_business_status(row)
+        projected.append({
+            "product_id": int(row["id"]), "sku": row.get("sku") or "",
+            "model": row.get("model"), "name": row.get("name"), "ean": row.get("ean"),
+            "on_hand": int(row.get("stock_qty") or 0),
+            "reserved": int(row.get("reserved_qty") or 0),
+            "available": int(row.get("available_qty") or 0),
+            "incoming_confirmed": int(row.get("incoming_qty") or 0),
+            "reserved_incoming": int(row.get("reserved_incoming") or 0),
+            "available_incoming": int(row.get("available_incoming") or 0),
+            "available_after_incoming": int(row.get("available_qty") or 0)
+                + int(row.get("available_incoming") or 0),
+            "coverage_status": status["status_label"],
+            "covered_by_stock_and_confirmed_incoming": status["covered_by_stock_and_confirmed_incoming"],
+        })
+    return projected
+
+
+def _order_rows() -> list[dict[str, Any]]:
+    db = _read_connection()
+    try:
+        rows = [dict(row) for row in db.execute(_BASE_SQL["orders"]).fetchall()]
+        readiness = {
+            int(item["order_id"]): item
+            for item in fulfillment_readiness.calculate_fulfillment_readiness(db)
+        }
+    finally:
+        db.close()
+    for row in rows:
+        state = readiness.get(int(row["id"]))
+        row["fulfillment_ready"] = bool(state["ready"]) if state is not None else None
+        row["fulfillment_missing_items"] = list(state.get("missing_items") or []) if state else []
+        row["fulfillment_total_units"] = int(state["total_units"]) if state is not None else None
+    return rows
 
 
 def _load_entity(entity: str, cache: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
@@ -252,6 +308,8 @@ def _load_entity(entity: str, cache: dict[str, list[dict[str, Any]]]) -> list[di
         return cache[entity]
     if entity == "inventory":
         rows = _inventory_rows()
+    elif entity == "orders":
+        rows = _order_rows()
     else:
         db = _read_connection()
         try:
@@ -323,6 +381,8 @@ def _predicates(entity: str, value: Any) -> list[dict[str, Any]]:
         if op not in OPERATORS:
             _error("QUERY_VALIDATION_FAILED", "Nieznany operator")
         definition = SCHEMA[entity]["fields"][field]
+        if not definition["filterable"]:
+            _error("FIELD_ACCESS_DENIED", "Pole nie obsługuje filtrowania")
         candidate = item.get("value")
         if op == "is_null":
             if not isinstance(candidate, bool):
@@ -376,6 +436,8 @@ def _order_spec(entity: str, value: Any) -> list[dict[str, str]]:
         if not isinstance(item, Mapping) or set(item) != {"field", "direction"}:
             _error("QUERY_VALIDATION_FAILED", "order_by ma nieprawidłową strukturę")
         field = _check_field(entity, item["field"])
+        if not SCHEMA[entity]["fields"][field]["sortable"]:
+            _error("FIELD_ACCESS_DENIED", "Pole nie obsługuje sortowania")
         if item["direction"] not in {"asc", "desc"}:
             _error("QUERY_VALIDATION_FAILED", "Nieznany kierunek sortowania")
         result.append({"field": field, "direction": item["direction"]})
@@ -413,6 +475,8 @@ def _aggregate(entity: str, rows: list[dict[str, Any]], group_by: Any, aggregate
     if not isinstance(group_by, list) or len(group_by) > 10:
         _error("QUERY_VALIDATION_FAILED", "group_by ma nieprawidłową strukturę")
     groups = [_check_field(entity, field) for field in group_by]
+    if any(not SCHEMA[entity]["fields"][field]["filterable"] for field in groups):
+        _error("FIELD_ACCESS_DENIED", "Pole nie obsługuje grupowania")
     specs = []
     for item in aggregates:
         if not isinstance(item, Mapping) or set(item) - {"function", "field", "as"}:
@@ -424,6 +488,8 @@ def _aggregate(entity: str, rows: list[dict[str, Any]], group_by: Any, aggregate
             field = None
         else:
             field = _check_field(entity, field)
+            if not SCHEMA[entity]["fields"][field]["aggregatable"]:
+                _error("FIELD_ACCESS_DENIED", "Pole nie obsługuje agregacji")
         if function in {"sum", "avg"} and SCHEMA[entity]["fields"][field]["type"] not in {"integer", "number"}:
             _error("QUERY_VALIDATION_FAILED", "Agregacja liczbowa wymaga pola number")
         specs.append((function, field, alias))

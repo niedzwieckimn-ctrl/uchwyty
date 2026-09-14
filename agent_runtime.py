@@ -319,14 +319,15 @@ weryfikację zamiast przedstawiać częściowy wynik jako pełny.
 '''
 GENERIC_ANALYTICAL_READ_INSTRUCTIONS = '''
 W tym przebiegu dostępny jest business.query. Dla pytania analitycznego użyj go jako głównego odczytu danych
-z canonical schema: orders, order_items, products, inventory, purchase_orders i purchase_order_items. Zbierz
-potrzebne zbiory w jednym wywołaniu business.query przez tablicę queries. Nie wywołuj business.describe_schema,
-jeśli użytkownik nie pyta o schemat. Nie dobieraj starego mikro READ ani operacyjnego preflightu tylko po to,
-aby ponownie potwierdzić dane zwrócone przez business.query. W pytaniach o pokrycie braków pobierz w tym samym
-business.query zamówienia z pozycjami, inventory oraz aktywne P/O z pozycjami; status planned pokaż w danych,
-ale nie traktuj go jako pokrycia. Osobny specjalizowany READ jest dopuszczalny wyłącznie dla encji niedostępnej
-w canonical schema albo gdy użytkownik pyta o specjalną semantykę operacyjnego preflightu. Po udanym
-business.query przejdź bezpośrednio do odpowiedzi z dostarczonych wyników.
+z canonical schema: orders, order_items, products, inventory, purchase_orders i purchase_order_items. Preferuj
+pola opisane przez business.describe_schema jako computed: są gotowym stanem policzonym przez aplikację. Nie
+rekonstruuj readiness, braków, pokrycia rezerwacji ani statusu operacyjnego z surowych pól. Gdy znaczenie pól nie
+jest jeszcze znane w tym przebiegu, odkryj je przez business.describe_schema, a następnie pobierz potrzebny gotowy
+stan przez business.query. Zbiory potrzebne do lekkich sum, średnich, count i group_by możesz zebrać w jednym
+business.query przez tablicę queries. Nie dobieraj starego mikro READ ani operacyjnego preflightu tylko po to,
+aby ponownie potwierdzić gotowy stan zwrócony przez business.query. Osobny specjalizowany READ jest dopuszczalny
+wyłącznie dla encji niedostępnej w canonical schema albo gdy użytkownik pyta o specjalną semantykę operacyjnego
+preflightu. Po udanym business.query przejdź bezpośrednio do odpowiedzi z dostarczonych wyników.
 '''
 _MARKDOWN_RULE = re.compile(r'^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$',re.MULTILINE)
 _URL_RULE = re.compile(r'https?://\S+',re.IGNORECASE)

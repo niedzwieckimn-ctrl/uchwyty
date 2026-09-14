@@ -66,6 +66,20 @@ def test_describe_schema_exposes_six_canonical_entities_without_storage_details(
         assert forbidden not in encoded
 
 
+def test_describe_schema_exposes_semantic_computed_business_fields(canonical):
+    result = run(canonical, "business.describe_schema", {"entities": ["orders", "inventory"]})
+    entities = {entity["name"]: {field["name"]: field for field in entity["fields"]}
+                for entity in result["entities"]}
+    ready = entities["orders"]["fulfillment_ready"]
+    missing = entities["orders"]["fulfillment_missing_items"]
+    coverage = entities["inventory"]["covered_by_stock_and_confirmed_incoming"]
+    assert ready["computed"] is True and "kompletne" in ready["description"]
+    assert ready["source"] == "fulfillment_readiness.calculate_fulfillment_readiness"
+    assert missing["computed"] is True and missing["filterable"] is False
+    assert coverage["computed"] is True and "planned P/O" in coverage["description"]
+    assert coverage["source"] == "inventory_analytics.inventory_business_status"
+
+
 def test_products_filter_limit_and_order(canonical):
     result = run(canonical, "business.query", one(
         "products", select=["id", "sku", "name"],
@@ -108,6 +122,55 @@ def test_inventory_reuses_existing_availability_and_incoming_semantics(canonical
                    "available_after_incoming": 2}
 
 
+def test_order_query_projects_existing_fulfillment_readiness_without_recalculation(canonical, monkeypatch):
+    expected_missing = [{"product_id": 1, "sku": "SKU-A", "required_quantity": 10,
+                         "available_quantity": 7, "shortage_quantity": 3}]
+    calls = []
+
+    def existing_helper(_db):
+        calls.append(True)
+        return [{"order_id": 1, "ready": False, "missing_items": expected_missing,
+                 "total_units": 10}]
+
+    monkeypatch.setattr(business_query.fulfillment_readiness,
+                        "calculate_fulfillment_readiness", existing_helper)
+    row = run(canonical, "business.query", one(
+        "orders", select=["number", "fulfillment_ready", "fulfillment_missing_items",
+                          "fulfillment_total_units"],
+        where=[{"field": "fulfillment_ready", "op": "eq", "value": False}],
+    ))["results"][0]["rows"][0]
+    assert calls == [True]
+    assert row == {"number": "ZAM-1", "fulfillment_ready": False,
+                   "fulfillment_missing_items": expected_missing,
+                   "fulfillment_total_units": 10}
+
+
+def test_coverage_question_uses_ready_business_fields_and_ignores_planned_po(canonical):
+    db = backend.conn(); now = backend.now_iso()
+    db.execute("INSERT INTO products(id,sku,model,name,archived,created_at) VALUES(3,'SKU-C','C','Gamma',0,?)", (now,))
+    db.execute("INSERT INTO stock(product_id,qty) VALUES(3,0)")
+    db.execute("""INSERT INTO order_items(id,order_id,product_id,sku,qty,unit_net_price,currency,created_at)
+                  VALUES(3,1,3,'SKU-C',4,10,'PLN',?)""", (now,))
+    db.execute("INSERT INTO china_items(id,package_id,product_id,sku,qty,created_at) VALUES(4,3,3,'SKU-C',100,?)", (now,))
+    db.commit(); db.close()
+
+    result = run(canonical, "business.query", {"queries": [
+        {"key": "blocked_orders", "entity": "orders",
+         "select": ["number", "fulfillment_ready", "fulfillment_missing_items"],
+         "where": [{"field": "fulfillment_ready", "op": "eq", "value": False}]},
+        {"key": "uncovered_products", "entity": "inventory",
+         "select": ["sku", "coverage_status", "covered_by_stock_and_confirmed_incoming"],
+         "where": [{"field": "covered_by_stock_and_confirmed_incoming", "op": "eq", "value": False}]},
+    ]})
+    datasets = {item["key"]: item["rows"] for item in result["results"]}
+    assert datasets["blocked_orders"][0]["fulfillment_ready"] is False
+    assert {item["sku"] for item in datasets["blocked_orders"][0]["fulfillment_missing_items"]} == {"SKU-A", "SKU-C"}
+    assert datasets["uncovered_products"] == [{
+        "sku": "SKU-C", "coverage_status": "Problem",
+        "covered_by_stock_and_confirmed_incoming": False,
+    }]
+
+
 def test_aggregations(canonical):
     rows = run(canonical, "business.query", one(
         "order_items", group_by=["order_id"],
@@ -116,6 +179,12 @@ def test_aggregations(canonical):
         order_by=[{"field": "order_id", "direction": "asc"}],
     ))["results"][0]["rows"]
     assert rows == [{"order_id": 1, "units": 11, "lines": 2}]
+
+    average = run(canonical, "business.query", one(
+        "order_items", group_by=["currency"],
+        aggregates=[{"function": "avg", "field": "unit_net_price", "as": "average_net"}],
+    ))["results"][0]["rows"]
+    assert average == [{"currency": "PLN", "average_net": 16.25}]
 
 
 @pytest.mark.parametrize("payload,code", [

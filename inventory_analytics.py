@@ -25,6 +25,32 @@ INCOMING_PACKAGE_STATUSES = {"ordered", "shipped", "problem"}
 CANCELLED_ORDER_STATUSES = {"cancelled", "canceled", "deleted", "usuniete", "anulowane"}
 
 
+def inventory_business_status(row: dict) -> dict:
+    """Return the existing internal-stock UI status for one analysis row."""
+    available = max(0, int(row.get("available_qty") or 0))
+    incoming = max(0, int(row.get("incoming_qty") or 0))
+    reserved = max(0, int(row.get("reserved_qty") or 0))
+    stock_qty = max(0, int(row.get("stock_qty") or 0))
+    covered = reserved <= stock_qty + incoming
+    if not covered:
+        label, css_class = "Problem", "inv-red"
+    elif available <= 0 and incoming > 0:
+        label, css_class = "Tylko w drodze", "inv-blue"
+    elif available <= 0:
+        label, css_class = "Brak", "inv-red"
+    elif available <= 5:
+        label, css_class = "Niski stan", "inv-orange"
+    elif reserved > 0:
+        label, css_class = "Zarezerwowany", "inv-orange"
+    else:
+        label, css_class = "OK", "inv-green"
+    return {
+        "status_label": label,
+        "status_class": css_class,
+        "covered_by_stock_and_confirmed_incoming": covered,
+    }
+
+
 def _text(value) -> str:
     return str(value or "").strip()
 

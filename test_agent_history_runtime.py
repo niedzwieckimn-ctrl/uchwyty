@@ -456,24 +456,18 @@ def test_generic_read_shortage_analysis_uses_one_query_then_tool_free_synthesis(
     monkeypatch.setenv('AGENT_GENERIC_READ_ENABLED', '1')
     executed = []
     query_payload = {'queries': [
-        {'key':'open_orders', 'entity':'orders', 'select':['id', 'number', 'status'],
-         'expand':[{'relationship':'items', 'select':['sku', 'quantity']}]},
-        {'key':'availability', 'entity':'inventory',
-         'select':['sku', 'on_hand', 'reserved', 'available', 'incoming_confirmed']},
-        {'key':'active_purchase_orders', 'entity':'purchase_orders',
-         'select':['id', 'number', 'status'],
-         'where':[{'field':'status', 'op':'in', 'value':['ordered', 'shipped', 'planned']}],
-         'expand':[{'relationship':'items', 'select':['sku', 'quantity']}]},
+        {'key':'blocked_orders', 'entity':'orders',
+         'select':['number', 'fulfillment_ready', 'fulfillment_missing_items'],
+         'where':[{'field':'fulfillment_ready', 'op':'eq', 'value':False}]},
+        {'key':'uncovered_products', 'entity':'inventory',
+         'select':['sku', 'coverage_status', 'covered_by_stock_and_confirmed_incoming'],
+         'where':[{'field':'covered_by_stock_and_confirmed_incoming', 'op':'eq', 'value':False}]},
     ]}
     query_result = {'ok':True, 'results':[
-        {'key':'open_orders', 'rows':[{'number':'ZAM-1', 'status':'confirmed',
-                                      'items':[{'sku':'SKU-A', 'quantity':10}]}]},
-        {'key':'availability', 'rows':[{'sku':'SKU-A', 'on_hand':7, 'reserved':10,
-                                       'available':0, 'incoming_confirmed':5}]},
-        {'key':'active_purchase_orders', 'rows':[
-            {'number':'PO-1', 'status':'ordered', 'items':[{'sku':'SKU-A', 'quantity':3}]},
-            {'number':'PO-2', 'status':'planned', 'items':[{'sku':'SKU-A', 'quantity':100}]},
-        ]},
+        {'key':'blocked_orders', 'rows':[{'number':'ZAM-1', 'fulfillment_ready':False,
+            'fulfillment_missing_items':[{'sku':'SKU-A', 'shortage_quantity':3}]}]},
+        {'key':'uncovered_products', 'rows':[{'sku':'SKU-A', 'coverage_status':'Problem',
+            'covered_by_stock_and_confirmed_incoming':False}]},
     ]}
 
     def execute(_actor, operation, arguments, **_kwargs):
@@ -496,7 +490,8 @@ def test_generic_read_shortage_analysis_uses_one_query_then_tool_free_synthesis(
                      'inventory.product.search', 'inventory.product.get', 'inventory.summary',
                      'china.orders.search', 'china.orders.get', 'china.orders.summary'} & names)
         assert {'invoices.search', 'customers.search', 'business.sales.summary'} <= names
-        assert 'Zbierz\npotrzebne zbiory w jednym wywołaniu business.query' in kwargs['instructions']
+        assert 'Preferuj\npola opisane przez business.describe_schema jako computed' in kwargs['instructions']
+        assert 'Nie\nrekonstruuj readiness, braków, pokrycia rezerwacji' in kwargs['instructions']
         assert 'Sama china.orders.search' not in kwargs['instructions']
         return tool('business.query', query_payload, call_id='generic-query')
 
@@ -535,7 +530,7 @@ def test_generic_read_mode_is_not_used_for_operational_preflight(monkeypatch):
         assert {'business.query', 'orders.fulfillment.readiness',
                 'orders.fulfillment.state', 'orders.packing.check'} <= names
         assert {'orders.search', 'orders.get', 'inventory.summary', 'china.orders.search'} <= names
-        assert 'Zbierz\npotrzebne zbiory w jednym wywołaniu business.query' not in kwargs['instructions']
+        assert 'Preferuj\npola opisane przez business.describe_schema jako computed' not in kwargs['instructions']
         return respond('Potrzebuję wskazania zamówienia.')
 
     result = runtime.run_agent_turn(
@@ -554,7 +549,7 @@ def test_daily_briefing_prefers_generic_read_catalog(monkeypatch):
         assert not ({'orders.summary', 'inventory.summary', 'china.orders.summary'} & names)
         assert {'invoices.overdue', 'business.sales.summary',
                 'orders.fulfillment.readiness'} <= names
-        assert 'Zbierz\npotrzebne zbiory w jednym wywołaniu business.query' in kwargs['instructions']
+        assert 'Preferuj\npola opisane przez business.describe_schema jako computed' in kwargs['instructions']
         assert 'pilne wysyłki/readiness, płatności po terminie' not in kwargs['instructions']
         return respond('Brak danych do briefingu.')
 
