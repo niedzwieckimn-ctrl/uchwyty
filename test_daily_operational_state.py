@@ -8,7 +8,6 @@ import business_operations as operations
 import business_query
 import daily_operational_state as daily
 import internal_rbac as rbac
-import orders_operational_state as orders_state
 
 
 NOW = datetime(2026, 9, 14, 10, 0, 0)
@@ -73,75 +72,45 @@ def operational_fixture(tmp_path, monkeypatch):
 def test_daily_state_composes_production_case_and_separates_coverage(operational_fixture):
     state = daily.build_daily_operational_state(backend.conn, current_time=NOW)
 
-    assert [item["human_label"] for item in state["ready_to_ship"]] == ["ZAM-READY"]
+    assert [item["order_number"] for item in state["ready_to_ship"]] == ["ZAM-READY"]
     assert state["overdue_payments"] == []
-    assert [(item["customer_name"], item["model"], item["quantity"])
-            for item in state["covered_order_shortages"]] == [
-                ("Firma Pokryta", "Hugo", 3),
-            ]
-    assert [(item["customer_name"], item["model"], item["quantity"])
-            for item in state["uncovered_order_shortages"]] == [
-                ("Firma Pilna", "Victor", 4),
-            ]
-    assert state["covered_order_shortages"][0]["source_state"][
-        "covered_by_stock_and_confirmed_incoming"] is True
+    assert [(item["model"], item["uncovered_qty"])
+            for item in state["uncovered_order_shortages"]] == [("Victor", 4)]
     # The 100 planned units are visible as a P/O, but the existing inventory
     # source of truth excludes them from confirmed incoming coverage.
     uncovered = state["uncovered_order_shortages"][0]
-    assert uncovered["source_state"]["confirmed_incoming_quantity"] == 0
-    assert uncovered["source_state"]["covered_by_stock_and_confirmed_incoming"] is False
-    assert [(item["human_label"], item["company_name"])
+    assert uncovered["confirmed_incoming_qty"] == 0
+    assert uncovered["fully_covered"] is False
+    assert [(item["number"], item["supplier"])
             for item in state["deliveries_requiring_attention"]] == [
                 ("PO-PROBLEM", "Dostawca X"),
             ]
-    for entries in state.values():
-        for entry in entries:
-            assert entry["entity_id"] and entry["human_label"]
-            assert entry["action_required"] and entry["urgency"] and entry["source_state"]
+    assert "covered_order_shortages" not in state
 
 
 def test_daily_state_delegates_business_rules_to_existing_helpers(monkeypatch):
     calls = []
 
-    class Result:
-        @staticmethod
-        def fetchall():
-            return []
-
     class DB:
-        def execute(self, _sql):
-            calls.append("packages")
-            return Result()
-
         def close(self):
             calls.append("close")
 
-    monkeypatch.setattr(daily, "calculate_fulfillment_readiness", lambda _db: calls.append("readiness") or [{
-        "order_id": 9, "order_number": "ZAM-9", "customer_name": "Klient",
-        "order_status": "confirmed", "ready": False,
-        "missing_items": [{"product_id": 7, "sku": "SKU-7", "model": "Model 7",
-                           "shortage_quantity": 2}],
-    }])
-    monkeypatch.setattr(daily, "cash_flow_overdue_invoices", lambda _db, current_time: calls.append("overdue") or [{
-        "id": 4, "invoice_no": "FVAT 4", "buyer_name": "Płatnik",
-        "currency": "PLN", "total_gross": 120.5, "payment_to": "2026-09-10",
-        "overdue_days": 4,
-    }])
-    monkeypatch.setattr(daily, "build_replenishment_analysis", lambda factory, today: calls.append("inventory") or [{
-        "id": 7, "incoming_qty": 2,
-    }])
-    monkeypatch.setattr(orders_state, "inventory_business_status", lambda row: calls.append("coverage") or {
-        "status_label": "Tylko w drodze",
-        "covered_by_stock_and_confirmed_incoming": True,
+    monkeypatch.setattr(daily, "build_orders_operational_state", lambda factory, current_time: calls.append("orders_state") or {
+        "orders": [],
+        "product_demand_coverage": [{"product_id": 9, "uncovered_qty": 2}],
     })
+    monkeypatch.setattr(daily, "build_deliveries_operational_state", lambda factory, current_time: calls.append("deliveries_state") or {
+        "purchase_orders": [],
+    })
+    monkeypatch.setattr(daily, "cash_flow_overdue_invoices", lambda _db, current_time: calls.append("overdue") or [{
+        "id": 4, "invoice_no": "FVAT 4", "buyer_name": "Płatnik", "currency": "PLN",
+        "total_gross": 120.5, "payment_to": "2026-09-10", "overdue_days": 4,
+    }])
 
     state = daily.build_daily_operational_state(lambda: DB(), current_time=NOW)
 
-    assert calls == ["readiness", "overdue", "packages", "close", "inventory", "coverage"]
-    assert state["uncovered_order_shortages"] == []
-    assert state["covered_order_shortages"][0]["entity_id"] == 9
-    assert state["covered_order_shortages"][0]["source_state"][
-        "covered_by_stock_and_confirmed_incoming"] is True
+    assert calls == ["orders_state", "deliveries_state", "overdue", "close"]
+    assert state["uncovered_order_shortages"][0]["product_id"] == 9
     assert state["overdue_payments"] == [{
         "entity_type": "invoice", "entity_id": 4, "human_label": "FVAT 4",
         "customer_name": "Płatnik", "quantity": None,

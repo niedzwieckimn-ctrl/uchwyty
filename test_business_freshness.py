@@ -173,6 +173,24 @@ def test_new_read_only_operations_use_narrow_freshness_groups(freshness):
     assert set(calls) == {"products", "china_packages", "china_items"}
 
 
+@pytest.mark.parametrize(("operation", "group"), [
+    ("business.orders.state", "inventory"),
+    ("business.inventory.state", "inventory"),
+    ("business.finance.state", "sales"),
+    ("business.deliveries.state", "china"),
+    ("business.daily.state", "fulfillment_workflow"),
+])
+def test_high_level_read_models_use_existing_freshness_groups(freshness, operation, group):
+    _actor, calls, _rows = freshness
+
+    result = backend.ensure_business_operation_freshness(operation)
+
+    assert result["freshness_group"] == group
+    assert set(calls) == {
+        table for table, _conflict in backend.BUSINESS_FRESHNESS_GROUPS[group]
+    }
+
+
 def test_new_readiness_preserves_data_unavailable_on_cold_failure(freshness, monkeypatch):
     actor, _calls, _rows = freshness
     monkeypatch.setattr(backend, "supabase_select_rows", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("offline")))

@@ -519,7 +519,7 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
     ),
     "business.orders.state": BusinessOperationDefinition(
         "business.orders.state", 1,
-        "Zwraca kompaktowy gotowy stan aktywnych zamówień: gotowe do wysyłki, zablokowane i ich istniejące pokrycie. Użyj dla szerokich pytań operacyjnych o zamówienia.",
+        "Zwraca kompaktowy gotowy stan aktywnych zamówień i globalne pokrycie popytu per SKU. missing_qty_against_stock to brak wobec stanu fizycznego; covered_qty to część tego braku pokryta aktywnym confirmed incoming; uncovered_qty pozostaje do pokrycia. Planned P/O jest ignorowane. Nie przydzielaj tej samej dostawy osobno do zamówień.",
         "orders.fulfillment_read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
         business_read_models.ORDERS_STATE_INPUT, business_read_models.STATE_OUTPUT,
         IDEMPOTENCY_NONE, "READ_STANDARD", True,
@@ -533,7 +533,7 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
     ),
     "business.inventory.state": BusinessOperationDefinition(
         "business.inventory.state", 1,
-        "Zwraca kompaktowy stan popytu, pokrycia, niskich stanów i priorytetów uzupełnienia. Planned P/O nie zwiększa pokrycia.",
+        "Zwraca jedną kompaktową listę produktów z gotowym pokryciem popytu. covered_qty to brak pokryty aktywnym confirmed incoming, uncovered_qty to brak nadal niepokryty, a suggested_qty jest osobną rekomendacją zakupową i NIE oznacza braku zamówień. Planned P/O nie zwiększa pokrycia.",
         "inventory.replenishment_read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
         business_read_models.INVENTORY_STATE_INPUT, business_read_models.STATE_OUTPUT,
         IDEMPOTENCY_NONE, "READ_STANDARD", True,
@@ -547,7 +547,7 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
     ),
     "business.deliveries.state": BusinessOperationDefinition(
         "business.deliveries.state", 1,
-        "Zwraca aktywne dostawy z Chin wraz z pozycjami, etapem i stanami wymagającymi uwagi. Planned jest widoczne, ale nie stanowi pokrycia.",
+        "Zwraca jedną kompaktową listę aktywnych dostaw z Chin wraz z pozycjami, etapem i flagą requires_attention. Planned jest widoczne, ale nie stanowi pokrycia popytu.",
         "purchases.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
         business_read_models.DELIVERIES_STATE_INPUT, business_read_models.STATE_OUTPUT,
         IDEMPOTENCY_NONE, "READ_STANDARD", True,

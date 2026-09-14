@@ -41,14 +41,15 @@ def build_daily_operational_state(
     orders = build_orders_operational_state(connection_factory, current_time=now)
     deliveries = build_deliveries_operational_state(connection_factory, current_time=now)
     overdue = _read_overdue(connection_factory, now)
-    state["ready_to_ship"] = orders["ready_to_ship"]
-    state["uncovered_order_shortages"] = [
-        item
-        for order in orders["blocked"]
-        for item in order.get("missing_items") or []
-        if not item["source_state"]["covered_by_stock_and_confirmed_incoming"]
+    state["ready_to_ship"] = [
+        order for order in orders["orders"] if order["fulfillment_ready"]
     ]
-    state["deliveries_requiring_attention"] = deliveries["requiring_attention"]
+    state["uncovered_order_shortages"] = [
+        item for item in orders["product_demand_coverage"] if item["uncovered_qty"] > 0
+    ]
+    state["deliveries_requiring_attention"] = [
+        item for item in deliveries["purchase_orders"] if item["requires_attention"]
+    ]
 
     for invoice in overdue:
         invoice_id = int(invoice["id"])

@@ -12,28 +12,46 @@ from inventory_analytics import (
 )
 
 
-def _entry(row: dict, status: dict, *, action: str) -> dict:
+def demand_coverage(row: dict, status: dict | None = None) -> dict:
+    """Project quantities already calculated by inventory analytics."""
+    status = status or inventory_business_status(row)
+    stock_qty = max(0, int(row.get("stock_qty") or 0))
+    reserved_qty = max(0, int(row.get("reserved_qty") or 0))
+    missing_qty = max(0, reserved_qty - stock_qty)
+    covered_qty = max(0, int(row.get("reserved_incoming") or 0))
     return {
-        "entity_type": "product",
-        "entity_id": int(row["id"]),
-        "human_label": str(row.get("model") or row.get("name") or row.get("sku") or "").strip(),
+        "missing_qty_against_stock": missing_qty,
+        "confirmed_incoming_qty": max(0, int(row.get("incoming_qty") or 0)),
+        "confirmed_incoming_used": covered_qty,
+        "covered_qty": covered_qty,
+        "uncovered_qty": max(0, missing_qty - covered_qty),
+        "fully_covered": bool(status["covered_by_stock_and_confirmed_incoming"]),
+        "planned_ignored": True,
+    }
+
+
+def product_coverage_entry(row: dict, status: dict | None = None) -> dict:
+    return {
+        "product_id": int(row["id"]),
         "sku": str(row.get("sku") or "").strip(),
         "model": str(row.get("model") or "").strip(),
+        **demand_coverage(row, status),
+    }
+
+
+def product_demand_entry(row: dict, status: dict | None = None) -> dict:
+    status = status or inventory_business_status(row)
+    return {
+        **product_coverage_entry(row, status),
         "product_name": str(row.get("name") or "").strip(),
-        "quantity": int(row.get("suggested_qty") or 0),
-        "action_required": action,
+        "stock_qty": max(0, int(row.get("stock_qty") or 0)),
+        "reserved_qty": max(0, int(row.get("reserved_qty") or 0)),
+        "available_qty": max(0, int(row.get("available_qty") or 0)),
+        "available_incoming_qty": max(0, int(row.get("available_incoming") or 0)),
+        "coverage_status": status["status_label"],
+        "suggested_qty": max(0, int(row.get("suggested_qty") or 0)),
+        "reorder_score": max(0, int(row.get("reorder_score") or 0)),
         "urgency": str(row.get("priority") or "low"),
-        "source_state": {
-            "stock_quantity": int(row.get("stock_qty") or 0),
-            "reserved_quantity": int(row.get("reserved_qty") or 0),
-            "available_quantity": int(row.get("available_qty") or 0),
-            "confirmed_incoming_quantity": int(row.get("incoming_qty") or 0),
-            "coverage_status": status["status_label"],
-            "covered_by_stock_and_confirmed_incoming": bool(
-                status["covered_by_stock_and_confirmed_incoming"]
-            ),
-            "reorder_score": int(row.get("reorder_score") or 0),
-        },
     }
 
 
@@ -41,33 +59,28 @@ def build_inventory_operational_state(
     connection_factory: Callable, *, current_time: datetime,
 ) -> dict:
     rows = build_replenishment_analysis(connection_factory, today=current_time.date())
-    sections = {
-        "uncovered_demand": [],
-        "covered_demand": [],
-        "low_or_critical": [],
-        "replenishment_priorities": [],
+    recommended_ids = {
+        int(row["id"])
+        for row in recommended_replenishments(rows, limit=max(10, len(rows)))
     }
-    prepared: dict[int, tuple[dict, dict]] = {}
+    products = []
     for row in rows:
         status = inventory_business_status(row)
-        prepared[int(row["id"])] = (row, status)
-        stock = int(row.get("stock_qty") or 0)
-        reserved = int(row.get("reserved_qty") or 0)
-        if reserved > stock:
-            target = "covered_demand" if status["covered_by_stock_and_confirmed_incoming"] else "uncovered_demand"
-            sections[target].append(_entry(
-                row, status,
-                action=("Monitoruj potwierdzoną dostawę pokrywającą popyt."
-                        if target == "covered_demand" else "Domów niepokrytą ilość produktu."),
-            ))
-        if status["status_label"] in {"Problem", "Brak", "Niski stan", "Tylko w drodze"}:
-            sections["low_or_critical"].append(_entry(
-                row, status, action="Sprawdź stan i priorytet uzupełnienia produktu.",
-            ))
-
-    for row in recommended_replenishments(rows, limit=max(10, len(rows))):
-        _, status = prepared[int(row["id"])]
-        sections["replenishment_priorities"].append(_entry(
-            row, status, action="Zamów sugerowaną ilość produktu.",
-        ))
-    return sections
+        coverage = demand_coverage(row, status)
+        low_or_critical = status["status_label"] in {
+            "Problem", "Brak", "Niski stan", "Tylko w drodze",
+        }
+        replenishment_priority = int(row["id"]) in recommended_ids
+        if not coverage["missing_qty_against_stock"] and not low_or_critical and not replenishment_priority:
+            continue
+        entry = product_demand_entry(row, status)
+        entry.update({
+            "demand_status": (
+                "covered" if coverage["missing_qty_against_stock"] and coverage["fully_covered"]
+                else "uncovered" if coverage["missing_qty_against_stock"] else "none"
+            ),
+            "low_or_critical": low_or_critical,
+            "replenishment_priority": replenishment_priority,
+        })
+        products.append(entry)
+    return {"products": products}

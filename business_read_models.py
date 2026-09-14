@@ -60,6 +60,34 @@ def enabled() -> bool:
 
 
 def _bounded(sections: dict, limit: int) -> tuple[dict, bool]:
+    if "orders" in sections and "product_demand_coverage" in sections:
+        all_orders = sections["orders"]
+        truncated = len(all_orders) > limit
+        selected_orders = []
+        remaining_shortages = limit
+        product_ids = set()
+        for original in all_orders[:limit]:
+            item = dict(original)
+            missing_items = list(item.get("missing_items") or [])
+            selected_missing = missing_items[:remaining_shortages]
+            if len(selected_missing) < len(missing_items):
+                truncated = True
+            remaining_shortages -= len(selected_missing)
+            item["missing_items"] = selected_missing
+            product_ids.update(int(row["product_id"]) for row in selected_missing)
+            selected_orders.append(item)
+        coverage = [
+            item for item in sections["product_demand_coverage"]
+            if int(item["product_id"]) in product_ids
+        ]
+        if len(coverage) > limit:
+            coverage = coverage[:limit]
+            truncated = True
+        return {
+            "orders": selected_orders,
+            "product_demand_coverage": coverage,
+        }, truncated
+
     truncated = False
     bounded = {}
     for key, value in sections.items():
@@ -68,13 +96,18 @@ def _bounded(sections: dict, limit: int) -> tuple[dict, bool]:
             continue
         truncated = truncated or len(value) > limit
         selected = []
+        remaining_nested = limit
         for item in value[:limit]:
             if isinstance(item, dict) and isinstance(item.get("items"), list):
-                truncated = truncated or len(item["items"]) > limit
-                item = {**item, "items": item["items"][:limit]}
+                selected_items = item["items"][:remaining_nested]
+                truncated = truncated or len(selected_items) < len(item["items"])
+                remaining_nested -= len(selected_items)
+                item = {**item, "items": selected_items}
             if isinstance(item, dict) and isinstance(item.get("missing_items"), list):
-                truncated = truncated or len(item["missing_items"]) > limit
-                item = {**item, "missing_items": item["missing_items"][:limit]}
+                selected_items = item["missing_items"][:remaining_nested]
+                truncated = truncated or len(selected_items) < len(item["missing_items"])
+                remaining_nested -= len(selected_items)
+                item = {**item, "missing_items": selected_items}
             selected.append(item)
         bounded[key] = selected
     return bounded, truncated

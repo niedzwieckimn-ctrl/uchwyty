@@ -2516,6 +2516,11 @@ BUSINESS_FRESHNESS_DATA_TABLES = {
 }
 BUSINESS_FRESHNESS_OPERATION_GROUP = {
     'business.query': 'inventory',
+    'business.orders.state': 'inventory',
+    'business.inventory.state': 'inventory',
+    'business.finance.state': 'sales',
+    'business.deliveries.state': 'china',
+    'business.daily.state': 'fulfillment_workflow',
     **{name: 'fulfillment_workflow' for name in ('orders.fulfillment.state','shipping.requirements.get','orders.documents.print_ready','orders.documents.adoption.preview','shipping.shipment.adoption.preview')},
     'invoices.removal.preview': 'invoice_amendment',
     "inventory.product.search": "inventory", "inventory.product.get": "inventory", "inventory.summary": "inventory",
