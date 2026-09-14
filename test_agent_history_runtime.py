@@ -283,6 +283,77 @@ def test_first_planning_pass_bounds_wide_briefing_and_returns_http_200():
     assert 'Ranking zapasów uwzględniony.' in payload['message']
 
 
+def test_remaining_budget_after_five_green_reads_allows_one_then_synthesizes_http_200():
+    first_five = tuple(runtime.ToolCall(
+        f'first-{index}', 'inventory.product.search', json.dumps({'query':f'Avery {index}'})
+    ) for index in range(5))
+
+    def remaining_one(kwargs):
+        assert kwargs['tool_choice'] == 'auto' and kwargs['tools']
+        assert 'Pozostały budżet to 1.' in kwargs['instructions']
+        assert 'maksymalnie 1 nowych wywołań narzędzi' in kwargs['instructions']
+        return runtime.ProviderResponse(tool_calls=(runtime.ToolCall(
+            'sixth', 'inventory.product.search', json.dumps({'query':'Leo'})),), model='fake-model')
+
+    def final(kwargs):
+        assert kwargs['tool_choice'] == 'none' and kwargs['tools'] == []
+        outputs = [item for item in kwargs['input_items'] if item.get('type') == 'function_call_output']
+        assert len(outputs) == 6
+        return respond('Podsumowanie powstało z sześciu wykonanych odczytów.')
+
+    backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([
+        runtime.ProviderResponse(tool_calls=first_five, model='fake-model'), remaining_one, final,
+    ])
+    client = backend.app.test_client()
+    with client.session_transaction() as session:
+        session['admin_authenticated'] = True
+        session['csrf_token'] = 'csrf'
+
+    response = client.post('/api/internal/ai/chat', json={'message':'Przygotuj szerokie podsumowanie.'})
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload['status'] == 'SUCCESS' and payload['tool_calls'] == 6
+    assert payload['message'] == 'Podsumowanie powstało z sześciu wykonanych odczytów.'
+
+
+def test_provider_exceeding_remaining_budget_still_hits_tool_limit_guard():
+    first_five = tuple(runtime.ToolCall(
+        f'first-{index}', 'inventory.product.search', json.dumps({'query':f'Avery {index}'})
+    ) for index in range(5))
+
+    def exceed_remaining(kwargs):
+        assert 'Pozostały budżet to 1.' in kwargs['instructions']
+        return runtime.ProviderResponse(tool_calls=(
+            runtime.ToolCall('sixth', 'inventory.product.search', json.dumps({'query':'Leo'})),
+            runtime.ToolCall('seventh', 'inventory.product.search', json.dumps({'query':'Andre'})),
+        ), model='fake-model')
+
+    result = runtime.run_agent_turn(owner(), 'Przygotuj szerokie podsumowanie.',
+                                    runtime.FakeModelProvider([
+                                        runtime.ProviderResponse(tool_calls=first_five, model='fake-model'),
+                                        exceed_remaining,
+                                    ]))
+
+    assert result['status'] == 'FAILED'
+    assert result['error_code'] == 'TOOL_LIMIT_EXCEEDED'
+    assert result['tool_calls'] == 5
+
+
+def test_first_pass_above_global_limit_is_still_rejected_before_execution():
+    calls = tuple(runtime.ToolCall(
+        f'call-{index}', 'inventory.product.search', json.dumps({'query':f'Avery {index}'})
+    ) for index in range(runtime.MAX_TOOL_CALLS_PER_TURN + 1))
+
+    result = runtime.run_agent_turn(owner(), 'Przygotuj szerokie podsumowanie.',
+                                    runtime.FakeModelProvider([
+                                        runtime.ProviderResponse(tool_calls=calls, model='fake-model')]))
+
+    assert result['status'] == 'FAILED'
+    assert result['error_code'] == 'TOOL_LIMIT_EXCEEDED'
+    assert result['tool_calls'] == 0
+
+
 def test_parallel_green_reads_keep_three_results_when_one_source_is_unavailable(monkeypatch):
     reads = [
         ('inventory.summary', {}),

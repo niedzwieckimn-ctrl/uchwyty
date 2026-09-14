@@ -250,6 +250,11 @@ Dla briefingu „co mam dziś zrobić?” wybieraj w tej kolejności: pilne wysy
 braki w zamówieniach, aktywne P/O i pokrycie braków, a następnie ranking zapasów lub pozostałe ważne rzeczy.
 Cały plan musi mieścić się w podanym limicie.
 '''
+REMAINING_TOOL_BUDGET_INSTRUCTIONS = '''
+W tym turnie wykorzystano już część wspólnego limitu narzędzi. Pozostały budżet to {remaining_tool_calls}.
+W tej odpowiedzi możesz zwrócić maksymalnie {remaining_tool_calls} nowych wywołań narzędzi. Nie traktuj globalnego
+limitu jako nowego budżetu dla tego passu i nie imituj wywołań narzędzi tekstowo.
+'''
 _MARKDOWN_RULE = re.compile(r'^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$',re.MULTILINE)
 _URL_RULE = re.compile(r'https?://\S+',re.IGNORECASE)
 _UUID_RULE = re.compile(r'\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b',re.IGNORECASE)
@@ -543,6 +548,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         _audit('agent.requested',human_actor,run_id,correlation_id,SUCCESS,human_actor.actor_id,conversation_id=conversation_id)
         seen, model_calls = set(), 0
         green_batch_synthesis_only = False
+        only_green_reads_so_far = True
         while True:
             current_stage = 'model_context_check'
             if len(json.dumps(input_items,ensure_ascii=False).encode())>MAX_MODEL_CONTEXT_BYTES:
@@ -551,21 +557,28 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
             current_stage = 'first_model_call' if model_calls == 0 else 'final_model_call'
             if model_calls > 0:
                 chat_503_diagnostics['final_model_call_started'] = True
+            remaining_tool_budget = MAX_TOOL_CALLS_PER_TURN - timings['tool_calls_count']
+            exhausted_green_synthesis = (
+                model_calls > 0 and remaining_tool_budget <= 0 and only_green_reads_so_far)
+            synthesis_only = green_batch_synthesis_only or exhausted_green_synthesis
             model_instructions = instructions
             if model_calls == 0:
                 model_instructions += FIRST_PASS_PLANNING_INSTRUCTIONS.format(
                     tool_limit=MAX_TOOL_CALLS_PER_TURN)
                 if _is_daily_work_briefing(turn_message):
                     model_instructions += DAILY_BRIEFING_PLANNING_INSTRUCTIONS
-            elif green_batch_synthesis_only:
+            elif synthesis_only:
                 model_instructions += FINAL_GREEN_SYNTHESIS_INSTRUCTIONS
                 if _is_daily_work_briefing(turn_message):
                     model_instructions += DAILY_BRIEFING_SYNTHESIS_INSTRUCTIONS
+            else:
+                model_instructions += REMAINING_TOOL_BUDGET_INSTRUCTIONS.format(
+                    remaining_tool_calls=remaining_tool_budget)
             try:
                 reply = provider.complete(instructions=model_instructions,input_items=input_items,
-                    tools=[] if green_batch_synthesis_only else tools,
+                    tools=[] if synthesis_only else tools,
                     previous_response_id='',timeout_seconds=MODEL_TIMEOUT_SECONDS,
-                    tool_choice='none' if green_batch_synthesis_only or timings['tool_calls_count']>=MAX_TOOL_CALLS_PER_TURN else 'auto')
+                    tool_choice='none' if synthesis_only or remaining_tool_budget<=0 else 'auto')
             finally:
                 elapsed = round((time.perf_counter()-t)*1000,2)
                 if model_calls==0:
@@ -598,6 +611,10 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 return finish('FAILED','Osiągnięto limit operacji. Zawęź pytanie.','TOOL_LIMIT_EXCEEDED')
             if any(call.name not in allowed for call in reply.tool_calls):
                 return finish('DENIED','Ta operacja nie jest dostępna dla asystenta.','TOOL_NOT_ALLOWED')
+            only_green_reads_so_far = only_green_reads_so_far and all(
+                business_operations.OPERATION_REGISTRY[call.name].read_only
+                and business_operations.OPERATION_REGISTRY[call.name].risk_level == 'GREEN'
+                for call in reply.tool_calls)
             call_ids = [call.call_id for call in reply.tool_calls]
             if any(not c for c in call_ids) or len(set(call_ids))!=len(call_ids):
                 return finish('FAILED','Nieprawidłowe wywołanie narzędzia.','PROVIDER_CONTRACT_VIOLATION')
