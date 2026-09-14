@@ -306,9 +306,22 @@ def remember_memory(data, actor, correlation_id, transaction_connection=None):
                      and (row.get('human_actor_id') or '')==actor_scope
                      and row['memory_key'].casefold()==data['memory_key'].casefold()), None)
     version = int(previous['version']) if previous else 0
-    if (previous and previous['source_run_id'] == data['source_run_id']
-            and previous['content'] == data['content']):
+    previous_terms = previous.get('relevance_terms', previous.get('relevance_terms_json', [])) if previous else []
+    try:
+        previous_terms = json.loads(previous_terms) if isinstance(previous_terms, str) else previous_terms
+    except (TypeError, ValueError, json.JSONDecodeError):
+        previous_terms = []
+    if (previous and previous['content'] == data['content']
+            and list(previous_terms or []) == data['relevance_terms']):
         _cache_memory_rows([previous])
+        with connection() as db:
+            record_audit_event('agent.memory.remembered', result=SUCCESS, actor_context=actor,
+                entity_type='agent_memory', entity_id=previous['memory_id'], correlation_id=correlation_id,
+                before_state={'content':previous['content'],'version':version},
+                after_state={'memory_key':previous['memory_key'],'category':previous['category'],'scope':previous['scope'],
+                             'content':previous['content'],'version':version,'confirmed_by_actor_id':human.actor_id,
+                             'source_run_id':data['source_run_id']}, source='agent_conversation',is_replay=True,
+                transaction_connection=db)
         return {'ok':True,'memory_key':previous['memory_key'],'version':version}
     if version != data['expected_version']:
         raise ControlledOperationError('MEMORY_VERSION_CONFLICT', 'Zasada zmieniła się; odczytaj jej aktualną wersję')
@@ -319,21 +332,48 @@ def remember_memory(data, actor, correlation_id, transaction_connection=None):
         'source_run_id':data['source_run_id'],'confirmed_by_actor_id':human.actor_id,
         'version':version+1,'updated_at':_iso(_utc_now()),
     }
+    reconciled = False
     if _remote_memory_enabled and _remote_memory_enabled():
         try:
             _remote_memory_upsert(saved)
         except Exception as exc:
-            _memory_write_failure(exc, data)
-            raise ControlledOperationError('MEMORY_STORAGE_UNAVAILABLE', 'Nie udało się zapisać pamięci firmy w Supabase') from exc
+            authoritative = []
+            try:
+                authoritative = list(_remote_memory_select())
+            except Exception:
+                pass
+            matched = next((row for row in authoritative
+                if row['category']==data['category'] and row['scope']==data['scope']
+                and (row.get('human_actor_id') or '')==actor_scope
+                and row['memory_key'].casefold()==data['memory_key'].casefold()), None)
+            matched_terms = matched.get('relevance_terms', matched.get('relevance_terms_json', [])) if matched else []
+            try:
+                matched_terms = json.loads(matched_terms) if isinstance(matched_terms, str) else matched_terms
+            except (TypeError, ValueError, json.JSONDecodeError):
+                matched_terms = []
+            if (matched and matched['content'] == data['content']
+                    and list(matched_terms or []) == data['relevance_terms']):
+                previous = matched
+                saved = dict(matched)
+                memory_id = saved['memory_id']
+                version = int(saved['version'])
+                reconciled = True
+            else:
+                _memory_write_failure(exc, data)
+                if matched:
+                    raise ControlledOperationError('MEMORY_VERSION_CONFLICT', 'Zasada zmieniła się; odczytaj jej aktualną wersję') from exc
+                raise ControlledOperationError('MEMORY_STORAGE_UNAVAILABLE', 'Nie udało się zapisać pamięci firmy w Supabase') from exc
     _cache_memory_rows([saved])
+    saved_version = int(saved['version'])
     with connection() as db:
         record_audit_event('agent.memory.remembered', result=SUCCESS, actor_context=actor,
             entity_type='agent_memory', entity_id=memory_id, correlation_id=correlation_id,
             before_state={'content':previous['content'],'version':version} if previous else None,
             after_state={'memory_key':data['memory_key'],'category':data['category'],'scope':data['scope'],
-                         'content':data['content'],'version':version+1,'confirmed_by_actor_id':human.actor_id,
-                         'source_run_id':data['source_run_id']}, source='agent_conversation',transaction_connection=db)
-    return {'ok':True,'memory_key':data['memory_key'],'version':version+1}
+                         'content':data['content'],'version':saved_version,'confirmed_by_actor_id':human.actor_id,
+                         'source_run_id':data['source_run_id']}, source='agent_conversation',is_replay=reconciled,
+                         transaction_connection=db)
+    return {'ok':True,'memory_key':data['memory_key'],'version':saved_version}
 
 
 def search_memory(data, actor, correlation_id, transaction_connection=None):

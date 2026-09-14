@@ -130,6 +130,7 @@ OPERATION_DEFINITIONS: dict[str, OperationDefinition] = {
     "external_execution.reconciled_failure": OperationDefinition("external_execution.reconciled_failure", 1, None, YELLOW, SECURITY),
     "external_execution.still_unknown": OperationDefinition("external_execution.still_unknown", 1, None, YELLOW, SECURITY),
     "agent.terminology.remembered": OperationDefinition("agent.terminology.remembered", 1, "agent.terminology.remember", GREEN, WRITE),
+    "agent.memory.remembered": OperationDefinition("agent.memory.remembered", 1, "agent.terminology.remember", GREEN, WRITE),
     "agent.requested": OperationDefinition("agent.requested", 1, None, GREEN, SECURITY),
     "agent.tool_selected": OperationDefinition("agent.tool_selected", 1, None, GREEN, SECURITY),
     "agent.tool_result": OperationDefinition("agent.tool_result", 1, None, GREEN, SECURITY),

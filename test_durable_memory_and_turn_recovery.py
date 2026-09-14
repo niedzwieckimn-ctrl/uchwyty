@@ -240,6 +240,176 @@ def test_memory_write_failure_logs_safe_http_diagnostic_and_does_not_update_cach
     db=backend.conn();assert db.execute('SELECT COUNT(*) FROM internal_agent_memory').fetchone()[0]==0;db.close()
 
 
+@pytest.mark.parametrize('failure_mode', ['semantic_conflict', 'committed_response_failure'])
+def test_failed_upsert_is_reconciled_only_when_authoritative_record_is_identical(
+        isolated, monkeypatch, failure_mode):
+    content = 'Planned P/O nie liczy się jako pokrycie braków.'
+    memory_key = 'pokrycie braków P/O'
+    existing = {
+        'memory_id':'existing-memory', 'memory_key':memory_key,
+        'category':'procedures', 'scope':'company', 'human_actor_id':'',
+        'content':content, 'relevance_terms':['__always_apply__'],
+        'source_run_id':'00000000-0000-4000-8000-000000000001',
+        'confirmed_by_actor_id':internal_rbac.BOOTSTRAP_OWNER_ACTOR_ID,
+        'version':1, 'updated_at':'2026-09-14T08:00:00+00:00',
+    }
+    remote_rows = {'existing-memory':dict(existing)} if failure_mode == 'semantic_conflict' else {}
+    select_attempts = 0
+    upsert_attempts = 0
+    monkeypatch.setattr(backend, 'supabase_enabled', lambda: True)
+
+    def select_rows(table, order_by='id', **_kwargs):
+        nonlocal select_attempts
+        assert table == 'internal_agent_memory'
+        select_attempts += 1
+        if failure_mode == 'semantic_conflict' and select_attempts <= 2:
+            raise RuntimeError('Supabase HTTP 504: lookup unavailable')
+        return list(remote_rows.values())
+
+    def upsert_rows(table, rows, on_conflict):
+        nonlocal upsert_attempts
+        assert table == 'internal_agent_memory' and on_conflict == 'memory_id'
+        upsert_attempts += 1
+        row = json.loads(json.dumps(rows[0]))
+        semantic_key = (row['category'], row['scope'], row['human_actor_id'], row['memory_key'].casefold())
+        collision = next((saved for saved in remote_rows.values()
+                          if (saved['category'], saved['scope'], saved['human_actor_id'], saved['memory_key'].casefold()) == semantic_key
+                          and saved['memory_id'] != row['memory_id']), None)
+        if upsert_attempts == 1 and failure_mode == 'semantic_conflict':
+            assert collision is not None
+            raise RuntimeError('Supabase HTTP 409: duplicate key internal_agent_memory_identity')
+        remote_rows[row['memory_id']] = row
+        if upsert_attempts == 1 and failure_mode == 'committed_response_failure':
+            raise RuntimeError('Supabase HTTP 504: response unavailable after commit')
+
+    monkeypatch.setattr(backend, 'supabase_select_rows', select_rows)
+    monkeypatch.setattr(backend, 'supabase_upsert_rows', upsert_rows)
+
+    def reconciled_result(kwargs):
+        output = json.loads(kwargs['input_items'][-1]['output'])
+        assert output['ok'] is True and output['version'] == 1
+        return respond('Zapisane.')
+
+    first = runtime.run_agent_turn(owner(), 'Zapisz tę regułę.', runtime.FakeModelProvider([
+        tool('agent.memory.remember', {
+            'memory_key':memory_key, 'category':'procedures', 'scope':'company',
+            'content':content, 'relevance_terms':['__always_apply__'],
+            'confirmed_by_user':True, 'expected_version':0,
+        }),
+        reconciled_result,
+    ]))
+    assert first['status'] == 'SUCCESS'
+    assert len(remote_rows) == 1
+    db = backend.conn()
+    assert db.execute('SELECT COUNT(*) FROM internal_agent_memory').fetchone()[0] == 1
+    assert db.execute("SELECT COUNT(*) FROM internal_audit_log WHERE operation='agent.memory.remembered'").fetchone()[0] == 1
+    db.close()
+
+    second = runtime.run_agent_turn(owner(), 'Spróbuj jeszcze raz.', runtime.FakeModelProvider([
+        tool('agent.memory.remember', {
+            'memory_key':memory_key, 'category':'procedures', 'scope':'company',
+            'content':content, 'relevance_terms':['__always_apply__'],
+            'confirmed_by_user':True, 'expected_version':0,
+        }),
+        lambda kwargs: (
+            (lambda output: (assert_memory_replay(output), respond('Zapisane.'))[1])(
+                json.loads(kwargs['input_items'][-1]['output']))
+        ),
+    ]), conversation_id=first['conversation_id'])
+
+    assert second['status'] == 'SUCCESS'
+    assert len(remote_rows) == 1
+    saved = next(iter(remote_rows.values()))
+    assert saved['version'] == 1
+    assert upsert_attempts == 1
+    db = backend.conn()
+    cached = db.execute('SELECT memory_id,version FROM internal_agent_memory').fetchone()
+    assert cached['memory_id'] == saved['memory_id'] and cached['version'] == 1
+    assert db.execute("SELECT COUNT(*) FROM internal_audit_log WHERE operation='agent.memory.remembered'").fetchone()[0] == 2
+    db.close()
+
+
+def assert_memory_replay(output):
+    assert output['ok'] is True
+    assert output['version'] == 1
+
+
+def test_first_save_identical_replay_semantic_update_and_new_conversation(isolated, monkeypatch):
+    remote_rows = {}
+    monkeypatch.setattr(backend, 'supabase_enabled', lambda: True)
+
+    def select_rows(table, order_by='id', **_kwargs):
+        assert table == 'internal_agent_memory'
+        return list(remote_rows.values())
+
+    def upsert_rows(table, rows, on_conflict):
+        assert table == 'internal_agent_memory' and on_conflict == 'memory_id'
+        for row in rows:
+            remote_rows[row['memory_id']] = json.loads(json.dumps(row))
+
+    monkeypatch.setattr(backend, 'supabase_select_rows', select_rows)
+    monkeypatch.setattr(backend, 'supabase_upsert_rows', upsert_rows)
+    key = 'zamówienia uchwytów na cito'
+    initial = 'Przy pytaniu o zamówienie uchwytów na cito uwzględnij istniejące P/O.'
+    updated = 'Przy pytaniu o zamówienie uchwytów na cito pomijaj planned i uwzględnij ordered oraz shipped.'
+    base = {
+        'memory_key':key, 'category':'procedures', 'scope':'company',
+        'relevance_terms':['__always_apply__'], 'confirmed_by_user':True,
+    }
+
+    def expect_success(version):
+        def check(kwargs):
+            output = json.loads(kwargs['input_items'][-1]['output'])
+            assert output['ok'] is True and output['version'] == version
+            return respond('Zapisane.')
+        return check
+
+    first = runtime.run_agent_turn(owner(), 'Zapisz tę regułę.', runtime.FakeModelProvider([
+        tool('agent.memory.remember', {**base, 'content':initial, 'expected_version':0}),
+        expect_success(1),
+    ]))
+    assert first['status'] == 'SUCCESS'
+    assert len(remote_rows) == 1
+    memory_id = next(iter(remote_rows))
+    db = backend.conn()
+    cached = db.execute('SELECT memory_id,content,version FROM internal_agent_memory').fetchone()
+    assert dict(cached) == {'memory_id':memory_id, 'content':initial, 'version':1}
+    assert db.execute("SELECT COUNT(*) FROM internal_audit_log WHERE operation='agent.memory.remembered'").fetchone()[0] == 1
+    db.close()
+
+    replay = runtime.run_agent_turn(owner(), 'Zapisz identyczną regułę ponownie.', runtime.FakeModelProvider([
+        tool('agent.memory.remember', {**base, 'content':initial, 'expected_version':0}),
+        expect_success(1),
+    ]), conversation_id=first['conversation_id'])
+    assert replay['status'] == 'SUCCESS'
+    assert len(remote_rows) == 1 and remote_rows[memory_id]['version'] == 1
+
+    changed = runtime.run_agent_turn(owner(), 'Zaktualizuj tę regułę.', runtime.FakeModelProvider([
+        tool('agent.memory.remember', {
+            **base, 'memory_key':key.upper(), 'content':updated, 'expected_version':1,
+        }),
+        expect_success(2),
+    ]), conversation_id=first['conversation_id'])
+    assert changed['status'] == 'SUCCESS'
+    assert len(remote_rows) == 1 and remote_rows[memory_id]['version'] == 2
+
+    db = backend.conn()
+    assert db.execute('SELECT memory_id,content,version FROM internal_agent_memory').fetchone()['memory_id'] == memory_id
+    assert db.execute("SELECT COUNT(*) FROM internal_audit_log WHERE operation='agent.memory.remembered'").fetchone()[0] == 3
+    db.execute('DELETE FROM internal_agent_memory')
+    db.commit()
+    db.close()
+
+    def visible_on_first_call(kwargs):
+        assert updated in kwargs['input_items'][0]['content']
+        return respond('Reguła została zastosowana.')
+
+    loaded = runtime.run_agent_turn(owner(), 'Co mam dziś do zrobienia?',
+                                    runtime.FakeModelProvider([visible_on_first_call]))
+    assert loaded['status'] == 'SUCCESS'
+    assert loaded['conversation_id'] != first['conversation_id']
+
+
 def test_provider_failure_releases_active_turn_and_next_turn_runs(isolated):
     failed = runtime.run_agent_turn(owner(), 'pierwszy turn',
                                     runtime.FakeModelProvider([TimeoutError('provider timeout')]))
