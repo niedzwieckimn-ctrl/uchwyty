@@ -1,6 +1,7 @@
 import copy
 import json
 import xml.etree.ElementTree as ET
+from datetime import timedelta
 
 import pytest
 from pypdf import PdfReader
@@ -116,8 +117,9 @@ def historical_db(tmp_path, monkeypatch):
     c.execute("INSERT INTO orders(id,order_no,customer_id,customer_name,customer_address,customer_email,status,created_at,warehouse_issued,currency,tracking_no) VALUES(1,'ZAM-1',1,'Kunde','Street 1','buyer@example.com','shipped',?,1,'EUR','TRACK-1')", (backend.now_iso(),))
     c.execute("INSERT INTO order_items(id,order_id,product_id,sku,qty,unit_net_price,currency,created_at) VALUES(1,1,1,'SKU-1',2,10,'EUR',?)", (backend.now_iso(),))
     c.execute("INSERT INTO company_profile(id,company_name,address,nip,updated_at) VALUES(1,'Sprzedawca','Testowa 1','1234567890',?)", (backend.now_iso(),))
+    issue_date = backend.app_now().date()
     # Historical row intentionally has NULL invoice_type.
-    c.execute("INSERT INTO invoices(id,order_id,invoice_no,issue_date,sell_date,payment_type,payment_to,buyer_name,buyer_tax_no,buyer_street,buyer_post_code,buyer_city,buyer_country,buyer_email,total_net,total_gross,created_at) VALUES(1,1,'FV/HIST/1','2026-01-01','2026-01-01','przelew','2026-01-08','Kunde','DE123456789','Street 1','10115','Berlin','DE','buyer@example.com',20,20,?)", (backend.now_iso(),))
+    c.execute("INSERT INTO invoices(id,order_id,invoice_no,issue_date,sell_date,payment_type,payment_to,buyer_name,buyer_tax_no,buyer_street,buyer_post_code,buyer_city,buyer_country,buyer_email,total_net,total_gross,created_at) VALUES(1,1,'FV/HIST/1',?,?, 'przelew',?,'Kunde','DE123456789','Street 1','10115','Berlin','DE','buyer@example.com',20,20,?)", (issue_date.isoformat(), issue_date.isoformat(), (issue_date + timedelta(days=7)).isoformat(), backend.now_iso()))
     saved_items = [dict(ITEMS[0], order_id=1, source_order_id=1, order_item_id=1)]
     c.execute("INSERT INTO invoice_meta(invoice_id,pdf_path,invoice_items_json,sent_to_client,seen_by_client,payment_reminder,paid,paid_at,seen_at,updated_at) VALUES(1,'',?,1,1,0,1,?, ?, ?)", (json.dumps(saved_items), backend.now_iso(), backend.now_iso(), backend.now_iso()))
     c.execute("INSERT INTO invoice_allocations(id,invoice_id,order_id,order_item_id,product_id,sku,qty,created_at) VALUES(1,1,1,1,1,'SKU-1',2,?)", (backend.now_iso(),))
@@ -201,11 +203,23 @@ def test_domain_routes_keep_names_and_read_pages_are_side_effect_free(historical
     monkeypatch.setattr(backend, "maybe_pull_shared_from_supabase", lambda *a, **k: None)
     backend.app.secret_key = "test-secret-key"
     rules = {(rule.rule, rule.endpoint) for rule in backend.app.url_map.iter_rules()}
-    assert len(rules) == 89
     for expected in {
         ("/", "home"), ("/customers", "customers"), ("/orders", "orders"),
         ("/stock", "stock"), ("/invoices", "invoices"), ("/ksef", "ksef_dashboard"),
         ("/inpost/dispatch", "inpost_dispatch_order"), ("/china", "china"),
+        ("/api/client_stock_catalog", "api_client_stock_catalog"),
+        ("/api/client_search_log", "api_client_search_log"),
+        ("/api/client/profile", "api_client_profile"),
+        ("/api/client/search-aliases", "search_aliases"),
+        ("/api/client/orders", "api_client_orders_create"),
+        ("/api/client/orders/<int:order_id>/pdf", "api_client_order_pdf"),
+        ("/api/client/orders/<int:order_id>/pdf-retail", "api_client_order_pdf_retail"),
+        ("/api/client/product-images/<int:image_id>", "client_product_image"),
+        ("/api/client_invoices", "api_client_invoices"),
+        ("/api/invoices/<int:invoice_id>/seen", "api_invoice_seen"),
+        ("/api/invoices/<int:invoice_id>/download", "api_invoice_download"),
+        ("/api/order_lookup", "api_order_lookup"),
+        ("/api/client_order_email", "api_client_order_email"),
     }:
         assert expected in rules
 

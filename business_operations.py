@@ -53,6 +53,7 @@ TERMINAL_STATUSES = frozenset({"SUCCESS", "FAILED", "CONFLICT", "DENIED"})
 SAFE_IDEMPOTENCY_KEY = re.compile(r"[A-Za-z0-9._:-]{1,200}")
 MAX_PRODUCT_SEARCH_RESULTS = 50
 MAX_BUSINESS_SEARCH_RESULTS = 50
+IDEMPOTENT_REPLAY_WAIT_SECONDS = 5.0
 GENERIC_READ_OPERATIONS = frozenset({"business.describe_schema", "business.query"})
 WARSAW_TZ = ZoneInfo("Europe/Warsaw")
 logger = logging.getLogger(__name__)
@@ -955,6 +956,16 @@ def _execution(execution_id: str):
         return db.execute("SELECT * FROM internal_operation_executions WHERE execution_id=?", (execution_id,)).fetchone()
     finally:
         db.close()
+
+
+def _wait_for_idempotent_result(execution_id: str):
+    """Return the stored terminal result when an identical local write is in flight."""
+    deadline = time.monotonic() + IDEMPOTENT_REPLAY_WAIT_SECONDS
+    row = _execution(execution_id)
+    while row is not None and row["status"] == "RUNNING" and time.monotonic() < deadline:
+        time.sleep(0.01)
+        row = _execution(execution_id)
+    return row
 
 
 def _idempotent_execution(definition, actor, key):
@@ -2516,6 +2527,8 @@ def execute_business_operation(
             )
             if claimed is None:
                 current = _execution(execution_id)
+                if current["status"] == "RUNNING" and definition.operation_name in LOCAL_WRITES:
+                    current = _wait_for_idempotent_result(execution_id)
                 return _result_from_row(current, status=NOOP if current["status"] == "RUNNING" else None)
             if definition.operation_name in SERVICE_WRITES:
                 executor = fulfillment_operations.execute if definition.operation_name in fulfillment_operations.WRITES else invoice_amendment.execute

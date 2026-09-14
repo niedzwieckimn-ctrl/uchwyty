@@ -125,11 +125,11 @@ def test_l_failure_rolls_back_consumption_and_write(order, monkeypatch):
     assert approval.get_request_snapshot(pending.approval_id)['status'] == 'APPROVED'
 
 
-def test_m_only_two_new_writes(order):
+def test_m_only_controlled_writes_are_exposed(order):
     descriptors = runtime._tool_descriptors(ai(), _owner())
     writes = {d['name'] for d in descriptors if not operations.OPERATION_REGISTRY[d['name']].read_only}
-    assert writes == operations.ORDER_WRITES | {runtime.MEMORY_WRITE}
-    assert not any('approve' in d['name'] for d in descriptors)
+    assert writes == operations.SUPERVISED_WRITES | runtime.MEMORY_WRITES | {'approval.decide'}
+    assert 'approval.decide' in writes
 
 
 def test_n_o_read_and_freshness(order, monkeypatch):

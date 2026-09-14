@@ -9,6 +9,7 @@ import app as backend
 import agent_conversation as conversations
 import agent_runtime as runtime
 import business_operations as operations
+import internal_approval as approvals
 import internal_rbac as rbac
 
 
@@ -282,7 +283,20 @@ def test_write_request_is_blocked_before_model_and_database_unchanged():
 
 
 @pytest.mark.parametrize("name", ["database.execute", "inventory.adjust", "internal.test.change_setting"])
-def test_invented_or_write_tool_is_denied(name):
+def test_unknown_tools_are_denied_and_inventory_adjust_remains_supervised(name):
+    if name == "inventory.adjust":
+        definition = operations.OPERATION_REGISTRY[name]
+        policy = approvals.get_policy(name, definition.operation_version)
+        ai = rbac.load_actor_context(
+            rbac.AI_OWNER_ASSISTANT_ACTOR_ID,
+            delegated_by_actor_id=rbac.BOOTSTRAP_OWNER_ACTOR_ID,
+        )
+        visible = {item["name"] for item in runtime._tool_descriptors(ai, owner())}
+        assert name in operations.SUPERVISED_WRITES and name in visible
+        assert definition.read_only is False
+        assert definition.risk_level == policy.risk_level == approvals.YELLOW
+        assert policy.requires_approval is True
+        return
     result = runtime.run_agent_turn(owner(), "Sprawdź produkt", runtime.FakeModelProvider([tool(name, {})]))
     assert result["status"] == "DENIED" and result["error_code"] == "TOOL_NOT_ALLOWED"
 

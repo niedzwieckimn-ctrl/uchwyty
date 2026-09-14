@@ -9,8 +9,21 @@ import internal_rbac as rbac
 
 @pytest.fixture(autouse=True)
 def isolated(tmp_path,monkeypatch):
+    configured_dependencies = (
+        conversations._connection_factory,
+        conversations._remote_memory_enabled,
+        conversations._remote_memory_select,
+        conversations._remote_memory_upsert,
+    )
     monkeypatch.setattr(backend,'DB_PATH',str(tmp_path/'conversation.db'))
     backend.init_db()
+    yield
+    conversations.configure(
+        configured_dependencies[0],
+        remote_memory_enabled=configured_dependencies[1],
+        remote_memory_select=configured_dependencies[2],
+        remote_memory_upsert=configured_dependencies[3],
+    )
 
 def actors():
     return (rbac.load_actor_context(rbac.BOOTSTRAP_OWNER_ACTOR_ID),rbac.load_actor_context(rbac.AI_OWNER_ASSISTANT_ACTOR_ID))
