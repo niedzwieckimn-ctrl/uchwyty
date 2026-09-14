@@ -643,23 +643,9 @@ def register_routes(context):
             per_page = 25
         rows = build_replenishment_analysis(conn, today=app_now().date(), horizon_days=60)
         all_rows = rows
+        from inventory_analytics import inventory_business_status
         for row in rows:
-            available = to_int(row.get("available_qty"), 0)
-            incoming = to_int(row.get("incoming_qty"), 0)
-            reserved = to_int(row.get("reserved_qty"), 0)
-            stock_qty = to_int(row.get("stock_qty"), 0)
-            if reserved > stock_qty + incoming:
-                row["status_label"], row["status_class"] = "Problem", "inv-red"
-            elif available <= 0 and incoming > 0:
-                row["status_label"], row["status_class"] = "Tylko w drodze", "inv-blue"
-            elif available <= 0:
-                row["status_label"], row["status_class"] = "Brak", "inv-red"
-            elif available <= 5:
-                row["status_label"], row["status_class"] = "Niski stan", "inv-orange"
-            elif reserved > 0:
-                row["status_label"], row["status_class"] = "Zarezerwowany", "inv-orange"
-            else:
-                row["status_label"], row["status_class"] = "OK", "inv-green"
+            row.update(inventory_business_status(row))
 
         counts = {
             "missing": sum(1 for r in all_rows if to_int(r.get("available_qty"), 0) == 0),
