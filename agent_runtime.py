@@ -301,7 +301,7 @@ def _prefer_generic_tool_catalog(tools):
 
 
 _INTENT_TOOL_NAMES = {
-    'daily_operational_summary': frozenset({'business.query', 'invoices.overdue'}),
+    'daily_operational_summary': frozenset({'business.query'}),
     'order_shortages': frozenset({'business.query'}),
     'order_readiness': frozenset({'business.query'}),
     'incoming_deliveries': frozenset({'business.query'}),
@@ -343,10 +343,10 @@ def _intent_read_instructions(intent: str) -> str:
     details = ''
     if intent == 'daily_operational_summary':
         details = (
-            '\nW pierwszym passie pobierz równolegle jedno business.query dla wskazanego canonical scope '
-            'oraz invoices.overdue. To jedyny wyjątek od celu jednego narzędzia, ponieważ canonical schema nie '
-            'zawiera faktur ani płatności. Ogranicz wynik do gotowych wysyłek, braków i aktywnych dostaw '
-            'wymagających uwagi; nie dodawaj ogólnego replenishment, jeśli są konkretne działania.'
+            '\nWywołaj dokładnie jedno business.query z argumentem '
+            '{"view":"daily_operational_state"}. Ten gotowy stan zawiera readiness, zaległe płatności, '
+            'braki rozdzielone według istniejącego pokrycia oraz dostawy wymagające uwagi. Nie pobieraj '
+            'surowych encji i nie przeliczaj żadnego z tych stanów.'
         )
     elif intent == 'order_shortages':
         details = (
@@ -393,13 +393,17 @@ argumentów JSON ani komunikatów protokołu modelu. Jeśli informacji nie ma w 
 lub innych kroków procesu wewnętrznego.
 '''
 DAILY_BRIEFING_SYNTHESIS_INSTRUCTIONS = '''
-To jest briefing „co mam dziś do zrobienia?”. Odpowiedz bez wstępu i zakończenia, w około 8–15 krótkich liniach,
-bez powtórzeń i bez propozycji dalszej pomocy. Użyj dokładnie tej kolejności sekcji:
-1. Pilne wysyłki
-2. Płatności po terminie
-3. Braki wymagające działania, po uwzględnieniu pokrycia dostawami z Chin
-4. Pozostałe ważne rzeczy
-Jeżeli wyniki nie potwierdzają pokrycia konkretnego SKU dostawą z Chin, zaznacz to jednym krótkim zdaniem.
+To jest briefing „co mam dziś do zrobienia?”. Korzystaj wyłącznie z gotowych wpisów daily_operational_state;
+nie licz readiness, pokrycia, zaległości ani problemów dostaw. Wybierz ważne wpisy i podaj je action-first,
+bez wstępu, zakończenia, powtórzeń i propozycji dalszej pomocy. Każda pozycja ma podawać firmę lub klienta,
+obiekt biznesowy, ilość (gdy dotyczy) i action_required. Pokazuj przede wszystkim uncovered_order_shortages;
+covered_order_shortages pomiń, chyba że są konieczne do wyjaśnienia działania.
+Użyj tej kolejności: gotowe wysyłki, płatności po terminie, niepokryte braki, dostawy wymagające uwagi,
+pozostałe pilne wyjątki. Jeśli dana sekcja stanu jest pusta, możesz ją pominąć. Jeśli cały potrzebny obszar jest
+niedostępny, napisz tylko „Brak danych o X.”. Nie używaj sformułowań o przebiegu, potwierdzaniu odczytu,
+narzędziach ani danych technicznych. Preferuj 8–15 krótkich linii.
+Jeżeli używasz sekcji, nazwij je: 1. Pilne wysyłki, 2. Płatności po terminie,
+3. Braki wymagające działania, 4. Pozostałe ważne rzeczy.
 '''
 FIRST_PASS_PLANNING_INSTRUCTIONS = '''
 W pierwszej odpowiedzi planującej możesz zwrócić maksymalnie {tool_limit} wywołań narzędzi, czyli limit runtime dla
@@ -562,6 +566,8 @@ def _generic_query_selection_metrics(arguments: Any) -> tuple[list[str], list[st
                 visit(relationship['target'], expansion)
 
     if isinstance(arguments, dict):
+        if arguments.get('view') == 'daily_operational_state':
+            return ['daily_operational_state'], [], 1
         for request in arguments.get('queries') or []:
             if isinstance(request, dict):
                 visit(request.get('entity'), request)

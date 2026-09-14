@@ -10,6 +10,7 @@ from typing import Any, Callable, Mapping
 
 from inventory_analytics import build_replenishment_analysis, inventory_business_status
 import fulfillment_readiness
+import daily_operational_state
 from internal_rbac import DENY, load_actor_context
 
 
@@ -212,7 +213,8 @@ DESCRIBE_INPUT_SCHEMA = {
 }
 
 QUERY_INPUT_SCHEMA = {
-    "type": "object", "additionalProperties": False, "required": ["queries"], "properties": {
+    "type": "object", "additionalProperties": False, "properties": {
+        "view": {"type": "string", "enum": ["daily_operational_state"]},
         "queries": {"type": "array", "minItems": 1, "maxItems": MAX_QUERIES, "items": {
             "type": "object", "additionalProperties": False, "required": ["key", "entity"],
             "properties": {
@@ -559,6 +561,17 @@ def _cell_count(value: Any) -> int:
 def query(data, actor, correlation_id="", transaction_connection=None):
     del correlation_id, transaction_connection
     _owner(actor)
+    if data.get("view") == "daily_operational_state":
+        if set(data) != {"view"}:
+            _error("QUERY_VALIDATION_FAILED", "Widoku nie można łączyć z queries")
+        state = daily_operational_state.build_daily_operational_state(_read_connection)
+        results = [{"key": "daily_operational_state", "entity": "daily_operational_state",
+                    "rows": [state], "count": 1, "matched_count": 1, "truncated": False}]
+        cells = _cell_count(results)
+        if cells > MAX_RESULT_CELLS:
+            _error("QUERY_RESULT_TOO_LARGE", "Wynik przekracza limit 5000 komórek")
+        return {"ok": True, "schema_version": SCHEMA_VERSION,
+                "results": results, "result_cells": cells}
     queries = data.get("queries")
     if not isinstance(queries, list) or not 1 <= len(queries) <= MAX_QUERIES:
         _error("QUERY_VALIDATION_FAILED", "queries musi zawierać od 1 do 6 zapytań")

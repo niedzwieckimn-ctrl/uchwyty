@@ -479,46 +479,50 @@ def test_intent_first_detects_one_primary_intent(question, intent):
 
 def test_daily_summary_uses_bounded_operational_batch_and_two_model_calls(monkeypatch, caplog):
     monkeypatch.setenv('AGENT_GENERIC_READ_ENABLED', '1')
-    query_payload = {'queries':[
-        {'key':'actionable_orders', 'entity':'orders',
-         'select':['number', 'customer_name', 'fulfillment_ready', 'fulfillment_missing_items'],
-         'limit':20},
-        {'key':'shortage_coverage', 'entity':'inventory',
-         'select':['sku', 'coverage_status', 'covered_by_stock_and_confirmed_incoming'],
-         'where':[{'field':'covered_by_stock_and_confirmed_incoming', 'op':'eq', 'value':False}],
-         'limit':20},
-        {'key':'active_deliveries', 'entity':'purchase_orders',
-         'select':['number', 'status', 'delivery_stage', 'tracking_number'],
-         'where':[{'field':'status', 'op':'in', 'value':['ordered', 'shipped']}],
-         'limit':20},
-    ]}
+    query_payload = {'view':'daily_operational_state'}
+    daily_state = {
+        'ready_to_ship':[{
+            'entity_id':1, 'human_label':'ZAM-1', 'customer_name':'MAGMAR',
+            'quantity':13, 'action_required':'Spakuj i nadaj gotowe zamówienie.',
+        }],
+        'overdue_payments':[], 'uncovered_order_shortages':[{
+            'entity_id':2, 'human_label':'ZAM-2 — Hugo', 'customer_name':'Firma Pilna',
+            'model':'Hugo', 'quantity':7, 'action_required':'Zamów brakującą ilość produktu.',
+        }],
+        'covered_order_shortages':[], 'deliveries_requiring_attention':[],
+        'other_urgent_exceptions':[],
+    }
     executed = []
 
     def execute(_actor, operation, arguments, **_kwargs):
         executed.append((operation, dict(arguments)))
-        if operation == 'business.query':
-            return _controlled_success(operation, {
-                'ok':True, 'results':[], 'result_cells':0, 'schema_version':'2'})
-        return _controlled_success(operation, {'ok':True, 'results':[]})
+        return _controlled_success(operation, {
+            'ok':True, 'results':[{'key':'daily_operational_state',
+                'entity':'daily_operational_state', 'rows':[daily_state], 'count':1,
+                'matched_count':1, 'truncated':False}],
+            'result_cells':6, 'schema_version':'2'})
 
     def plan(kwargs):
         names = {item['name'] for item in kwargs['tools']}
-        assert names == {'business.query', 'invoices.overdue'}
+        assert names == {'business.query'}
         assert 'Główna intencja READ: daily_operational_summary' in kwargs['instructions']
+        assert '{"view":"daily_operational_state"}' in kwargs['instructions']
         assert 'business.describe_schema' not in names
         assert not ({'orders.summary', 'inventory.summary', 'china.orders.summary',
                      'orders.fulfillment.readiness', 'china.orders.get',
                      'business.sales.summary'} & names)
         return runtime.ProviderResponse(tool_calls=(
             runtime.ToolCall('daily-main', 'business.query', json.dumps(query_payload)),
-            runtime.ToolCall('daily-overdue', 'invoices.overdue', '{}'),
         ), model='fake-model', input_tokens=100, output_tokens=20)
 
     def synthesize(kwargs):
         assert kwargs['tools'] == [] and kwargs['tool_choice'] == 'none'
         assert len([item for item in kwargs['input_items']
-                    if item.get('type') == 'function_call_output']) == 2
-        return respond('1. Pilne wysyłki\n- Brak.\n2. Płatności po terminie\n- Brak.',
+                    if item.get('type') == 'function_call_output']) == 1
+        assert 'MAGMAR' in json.dumps(kwargs['input_items'], ensure_ascii=False)
+        assert 'nie licz readiness' in kwargs['instructions'].lower()
+        return respond('1. MAGMAR — spakuj i nadaj ZAM-1 — 13 szt.\n'
+                       '2. Firma Pilna — zamów Hugo — 7 szt.',
                        input_tokens=40, output_tokens=15)
 
     monkeypatch.setattr(operations, 'execute_business_operation', execute)
@@ -527,15 +531,56 @@ def test_daily_summary_uses_bounded_operational_batch_and_two_model_calls(monkey
         result = runtime.run_agent_turn(owner(), 'Co mam dziś do zrobienia?', provider)
 
     assert result['status'] == 'SUCCESS'
-    assert result['tool_calls'] == 2 and len(provider.calls) == 2
-    assert {operation for operation, _arguments in executed} == {'business.query', 'invoices.overdue'}
+    assert result['tool_calls'] == 1 and len(provider.calls) == 2
+    assert executed == [('business.query', query_payload)]
+    assert not any(fragment in result['message'] for fragment in (
+        'nie można potwierdzić', 'nie potwierdzono', 'brak danych w tym odczycie', 'business.query'))
+    assert 'MAGMAR' in result['message'] and 'Firma Pilna' in result['message']
+    assert 'Hugo' in result['message'] and '7 szt.' in result['message']
     diagnostic = json.loads(next(record.message for record in caplog.records
         if record.message.startswith('AI_READ_INTENT_DIAGNOSTIC ')).split(' ', 1)[1])
     assert diagnostic['detected_intent'] == 'daily_operational_summary'
-    assert diagnostic['model_call_count'] == 2 and diagnostic['tool_call_count'] == 2
-    assert set(diagnostic['main_query_entities']) == {'orders', 'inventory', 'purchase_orders'}
+    assert diagnostic['model_call_count'] == 2 and diagnostic['tool_call_count'] == 1
+    assert diagnostic['main_query_entities'] == ['daily_operational_state']
     assert diagnostic['followup_used'] is False
     assert diagnostic['input_tokens'] == 140 and diagnostic['output_tokens'] == 35
+
+
+def test_daily_summary_empty_state_ends_with_one_short_answer_without_fallback(monkeypatch):
+    monkeypatch.setenv('AGENT_GENERIC_READ_ENABLED', '1')
+    payload = {'view':'daily_operational_state'}
+    empty_state = {key: [] for key in (
+        'ready_to_ship', 'overdue_payments', 'uncovered_order_shortages',
+        'covered_order_shortages', 'deliveries_requiring_attention',
+        'other_urgent_exceptions',
+    )}
+    executed = []
+
+    def execute(_actor, operation, arguments, **_kwargs):
+        executed.append((operation, dict(arguments)))
+        return _controlled_success(operation, {
+            'ok':True, 'results':[{'key':'daily_operational_state',
+                'entity':'daily_operational_state', 'rows':[empty_state], 'count':1,
+                'matched_count':1, 'truncated':False}],
+            'result_cells':6, 'schema_version':'2'})
+
+    def plan(_kwargs):
+        return runtime.ProviderResponse(tool_calls=(
+            runtime.ToolCall('daily-empty', 'business.query', json.dumps(payload)),
+        ), model='fake-model')
+
+    def synthesize(kwargs):
+        assert kwargs['tools'] == [] and kwargs['tool_choice'] == 'none'
+        return respond('Brak zadań wymagających działania w dostępnych obszarach.')
+
+    monkeypatch.setattr(operations, 'execute_business_operation', execute)
+    provider = runtime.FakeModelProvider([plan, synthesize])
+    result = runtime.run_agent_turn(owner(), 'Co mam dziś do zrobienia?', provider)
+
+    assert result['status'] == 'SUCCESS'
+    assert result['message'] == 'Brak zadań wymagających działania w dostępnych obszarach.'
+    assert executed == [('business.query', payload)]
+    assert len(provider.calls) == 2
 
 
 def test_order_shortages_uses_one_minimal_query_and_stops(monkeypatch):
