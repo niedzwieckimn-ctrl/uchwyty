@@ -1,5 +1,7 @@
 """Mechanically extracted Flask routes; business logic is unchanged."""
 
+from china_delivery_attention import delivery_attention_states, delivery_has_problem
+
 def register_routes(context):
     globals().update(context)
 
@@ -126,9 +128,6 @@ def register_routes(context):
         date_to = norm(request.args.get("date_to"))
         problem_only = request.args.get("problems") == "1"
 
-        def has_problem(pack):
-            return norm(pack.get("status")).lower() == "problem" or bool(norm(pack.get("tracking_error"))) or norm(pack.get("tracking_status")).lower() in {"deliveryfailure","exception","expired","failure"}
-
         filtered = []
         tracking_status_labels = {
             "notfound": "Brak danych",
@@ -157,7 +156,7 @@ def register_routes(context):
             if scope == "arrived" and norm(pack.get("status")).lower() != "arrived": continue
             if date_from and created_day < date_from: continue
             if date_to and created_day > date_to: continue
-            if problem_only and not has_problem(pack): continue
+            if problem_only and not delivery_has_problem(pack): continue
             pack["items"] = contents.get(int(pack["id"]), [])
             pack["documents"] = documents.get(int(pack["id"]), [])
             pack["item_count"] = len(pack["items"])
@@ -196,22 +195,10 @@ def register_routes(context):
         alerts = []
         alert_metrics = {"missing_tracking": 0, "long_transit": 0, "stale_tracking": 0, "missing_cost": 0}
         for p in active:
-            try: age = (now.date() - datetime.fromisoformat(norm(p.get("created_at")).replace("Z", "+00:00")).date()).days
-            except Exception: age = 0
-            status = norm(p.get("status")).lower()
-            if not norm(p.get("tracking")) and age > 5:
-                alerts.append((p, "Brak trackingu od ponad 5 dni")); alert_metrics["missing_tracking"] += 1
-            if status == "shipped" and not norm(p.get("tracking")): alerts.append((p, "Wysłana, ale bez trackingu"))
-            if status == "shipped" and age > 20:
-                alerts.append((p, f"W drodze co najmniej {age} dni")); alert_metrics["long_transit"] += 1
-            if float(p.get("cost_amount") or 0) <= 0:
-                alerts.append((p, "Brak kosztu")); alert_metrics["missing_cost"] += 1
-            if norm(p.get("tracking")) and norm(p.get("tracking_synced_at")):
-                try: stale_days = (now.date() - datetime.fromisoformat(norm(p.get("tracking_synced_at"))[:10]).date()).days
-                except Exception: stale_days = 0
-                if stale_days > 10:
-                    alerts.append((p, f"Tracking bez aktualizacji od {stale_days} dni")); alert_metrics["stale_tracking"] += 1
-            if has_problem(p): alerts.append((p, norm(p.get("tracking_error")) or "Problem trackingowy"))
+            for attention in delivery_attention_states(p, current_time=now):
+                alerts.append((p, attention["label"]))
+                if attention["metric"]:
+                    alert_metrics[attention["metric"]] += 1
 
         suppliers = sorted({norm(p.get("supplier")) for p in all_packs if norm(p.get("supplier"))})
         return render_template("china_list.html", title="Chiny (P/O)", packs=filtered, kpis=kpis,
