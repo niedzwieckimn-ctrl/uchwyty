@@ -7,7 +7,7 @@ state for every execution.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 import logging
@@ -27,6 +27,7 @@ import order_write
 import invoice_amendment
 import fulfillment_operations
 import agent_conversation
+import business_query
 import internal_approval as approvals
 from cash_flow_module import cash_flow_overdue_invoices
 from inventory_analytics import build_replenishment_analysis, recommended_replenishments
@@ -52,6 +53,7 @@ TERMINAL_STATUSES = frozenset({"SUCCESS", "FAILED", "CONFLICT", "DENIED"})
 SAFE_IDEMPOTENCY_KEY = re.compile(r"[A-Za-z0-9._:-]{1,200}")
 MAX_PRODUCT_SEARCH_RESULTS = 50
 MAX_BUSINESS_SEARCH_RESULTS = 50
+GENERIC_READ_OPERATIONS = frozenset({"business.describe_schema", "business.query"})
 WARSAW_TZ = ZoneInfo("Europe/Warsaw")
 logger = logging.getLogger(__name__)
 
@@ -61,6 +63,7 @@ _freshness_provider: Callable[[str], Mapping[str, Any]] | None = None
 _write_success_observer: Callable[[str, Mapping[str, Any]], None] | None = None
 
 FRESHNESS_GROUP_BY_OPERATION = {
+    "business.query": "inventory",
     "inventory.product.search": "inventory", "inventory.product.get": "inventory", "inventory.summary": "inventory",
     "inventory.replenishment.ranking": "inventory",
     "orders.search": "orders", "orders.get": "orders", "orders.summary": "orders",
@@ -487,6 +490,26 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
         {"type":"object","required":["ok","memory_key","version"],"properties":{"ok":{"type":"boolean"},"memory_key":{"type":"string"},"version":{"type":"integer"}}},
         IDEMPOTENCY_REQUIRED, "WRITE", False,
     ),
+    "business.describe_schema": BusinessOperationDefinition(
+        "business.describe_schema", 1,
+        "Opisuje canonical business schema dostępny dla bieżącego aktora. Nie ujawnia tabel fizycznych ani SQL.",
+        "business.generic_read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
+        business_query.DESCRIBE_INPUT_SCHEMA,
+        {"type":"object", "required":["ok","schema_version","entities"], "properties":{
+            "ok":{"type":"boolean"}, "schema_version":{"type":"string"},
+            "entities":{"type":"array", "maxItems":6}}},
+        IDEMPOTENCY_NONE, "READ_STANDARD", True,
+    ),
+    "business.query": BusinessOperationDefinition(
+        "business.query", 1,
+        "Wykonuje jeden kontrolowany read-only canonical query. Przyjmuje wyłącznie strukturalny JSON DSL; queries pozwala pobrać kilka powiązanych zestawów danych w jednym wywołaniu.",
+        "business.generic_read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
+        business_query.QUERY_INPUT_SCHEMA,
+        {"type":"object", "required":["ok","schema_version","results","result_cells"], "properties":{
+            "ok":{"type":"boolean"}, "schema_version":{"type":"string"},
+            "results":{"type":"array", "maxItems":6}, "result_cells":{"type":"integer"}}},
+        IDEMPOTENCY_NONE, "READ_STANDARD", True,
+    ),
     "inventory.product.search": BusinessOperationDefinition(
         "inventory.product.search", 1, "Wyszukuje wyłącznie produkty po SKU, modelu, wariancie lub nazwie produktu i zwraca ograniczony stan.",
         "inventory.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "SYSTEM", "AI_AGENT"}),
@@ -697,6 +720,7 @@ def configure(connection_factory: Callable[[], sqlite3.Connection]) -> None:
     global _connection_factory
     with _configuration_lock:
         _connection_factory = connection_factory
+    business_query.configure(connection_factory)
 
 
 def _factory() -> Callable[[], sqlite3.Connection]:
@@ -851,6 +875,10 @@ def _fingerprint(definition: BusinessOperationDefinition, actor: ActorContext, d
 
 
 def _entity(definition: BusinessOperationDefinition, data: Mapping[str, Any]) -> tuple[str, str, int | None]:
+    if definition.operation_name == "business.describe_schema":
+        return "business_schema", "canonical-v1", None
+    if definition.operation_name == "business.query":
+        return "business_query", "canonical-v1", None
     if definition.operation_name == 'approval.decide':
         return 'approval', data['approval_id'], None
     if definition.operation_name == 'shipping.capabilities':
@@ -2199,6 +2227,8 @@ _HANDLERS: dict[str, Callable[[Mapping[str, Any], ActorContext, str, sqlite3.Con
     "agent.terminology.remember": agent_conversation.remember_terminology,
     "agent.memory.search": agent_conversation.search_memory,
     "agent.memory.remember": agent_conversation.remember_memory,
+    "business.describe_schema": business_query.describe_schema,
+    "business.query": business_query.query,
     "inventory.product.search": _product_search,
     "inventory.product.get": _product_get,
     "inventory.summary": _inventory_summary,
@@ -2379,7 +2409,7 @@ def execute_business_operation(
         return _safe_denial(str(operation_name), 0, execution_id, actor_context, correlation, "UNKNOWN_OPERATION", "Operacja nie jest zarejestrowana")
     try:
         actor = _trusted_actor(actor_context)
-        if not definition.enabled:
+        if not definition.enabled or (definition.operation_name in GENERIC_READ_OPERATIONS and not business_query.enabled()):
             raise ControlledOperationError("OPERATION_DISABLED", "Operacja jest wyłączona", status=DENIED)
         if definition.operation_name not in _HANDLERS:
             raise ControlledOperationError("HANDLER_NOT_FOUND", "Brak bezpiecznego handlera", status=DENIED)
@@ -2533,9 +2563,12 @@ def execute_business_operation(
             if exc.error_code != "INVALID_HANDLER_OUTPUT":
                 _diagnostic_result(definition.operation_name, status=exc.status, started=handler_started,
                                    error_code=exc.error_code, stage="handler", freshness=freshness)
-            event = "business_operation.conflict" if exc.status == CONFLICT else "business_operation.failed"
-            audit_result = CONFLICT if exc.status == CONFLICT else FAILED
-            terminal = "CONFLICT" if exc.status == CONFLICT else "FAILED"
+            if definition.operation_name in GENERIC_READ_OPERATIONS and exc.status == DENIED:
+                event, audit_result, terminal = "business_operation.denied", DENIED, DENIED
+            else:
+                event = "business_operation.conflict" if exc.status == CONFLICT else "business_operation.failed"
+                audit_result = CONFLICT if exc.status == CONFLICT else FAILED
+                terminal = "CONFLICT" if exc.status == CONFLICT else "FAILED"
             row = _transition(execution_id, definition, actor, terminal, event, audit_result,
                               error_code=exc.error_code, message=exc.safe_message, completed=True)
             return _result_from_row(row)
@@ -2550,7 +2583,10 @@ def execute_business_operation(
                            freshness=freshness)
         row = _transition(execution_id, definition, actor, "SUCCESS", "business_operation.success", SUCCESS,
                           data=output, completed=True, expected_statuses=("RUNNING",))
-        return _result_from_row(row)
+        result = _result_from_row(row)
+        # The persisted execution summary is deliberately audit-sanitized and depth-bounded.
+        # Return the already validated canonical result for this request without weakening audit storage.
+        return replace(result, data=output) if definition.operation_name in GENERIC_READ_OPERATIONS else result
     except ControlledOperationError as exc:
         if 'actor' in locals() and isinstance(actor, ActorContext):
             try:
@@ -2577,7 +2613,9 @@ def list_available_operations(actor_context: ActorContext) -> list[dict[str, Any
     actor = _trusted_actor(actor_context)
     visible = []
     for definition in OPERATION_REGISTRY.values():
-        if not definition.enabled or actor.actor_type not in definition.actor_types_allowed:
+        if (not definition.enabled
+                or definition.operation_name in GENERIC_READ_OPERATIONS and not business_query.enabled()
+                or actor.actor_type not in definition.actor_types_allowed):
             continue
         if actor.permission_decision(definition.required_permission) == PERMISSION_DENY:
             continue

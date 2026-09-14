@@ -37,6 +37,7 @@ BOOTSTRAP_OWNER_DISPLAY_NAME = "Bootstrap Owner"
 
 
 PERMISSIONS = {
+    "business.generic_read": "Uniwersalny odczyt canonical business schema",
     "shipping.prepare": "Zapis danych paczki",
     "orders.internal_note.add": "Dodawanie wewnętrznych notatek zamówienia",
     "agent.terminology.remember": "Zapis potwierdzonej terminologii firmy",
@@ -256,6 +257,7 @@ ROLE_PERMISSION_DECISIONS = {
         approval={"purchases.manage", "purchases.costs"},
     ),
     "AI_OWNER_ASSISTANT": _decisions(approval={"orders.change_status", "inventory.adjust", "packing.confirm", "invoices.reverse", "invoices.publish", "shipping.create", "shipping.request_pickup", "orders.update"}, allow={
+        "business.generic_read",
         "shipping.prepare", "shipping.label_read",
         "orders.internal_note.add",
         "agent.terminology.remember",
