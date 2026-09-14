@@ -1,4 +1,5 @@
 import json
+import logging
 from pathlib import Path
 import sqlite3
 
@@ -93,6 +94,43 @@ def test_confirmed_company_procedure_survives_new_conversation_via_supabase(isol
     db = backend.conn()
     assert db.execute('SELECT COUNT(*) FROM internal_agent_memory').fetchone()[0] == 2
     db.close()
+
+
+def test_memory_write_failure_logs_safe_http_diagnostic_and_does_not_update_cache(isolated, monkeypatch, caplog):
+    private_content = 'Poufna treść preferencji'
+    calls = []
+    monkeypatch.setattr(backend, 'supabase_enabled', lambda: True)
+    monkeypatch.setattr(backend, 'supabase_select_rows', lambda *_args, **_kwargs: [])
+
+    def fail_upsert(*_args, **_kwargs):
+        calls.append(True)
+        try:
+            from urllib.error import HTTPError
+            raise HTTPError('https://example.invalid', 409, 'foreign key '+private_content, {}, None)
+        except HTTPError as cause:
+            raise RuntimeError('Supabase HTTP 409: foreign key '+private_content) from cause
+
+    monkeypatch.setattr(backend, 'supabase_upsert_rows', fail_upsert)
+    monkeypatch.setattr(agent_conversation, '_remote_memory_enabled', lambda: True)
+    monkeypatch.setattr(agent_conversation, '_remote_memory_select', lambda: [])
+    monkeypatch.setattr(agent_conversation, '_remote_memory_upsert', lambda row: fail_upsert(row))
+    with caplog.at_level(logging.ERROR, logger='agent_conversation'):
+        result = runtime.run_agent_turn(owner(), 'Zapamiętaj regułę.', runtime.FakeModelProvider([
+            tool('agent.memory.remember', {
+                'memory_key':'reguła prywatna','category':'work_preferences','scope':'company',
+                'content':private_content,'relevance_terms':['reguła'],
+                'confirmed_by_user':True,'expected_version':0,
+            }),
+            respond('Nie udało się zapisać reguły.'),
+        ]))
+    assert result['status']=='SUCCESS'
+    assert calls, result
+    assert 'MEMORY_WRITE_FAILURE' in caplog.text, result
+    assert '"stage": "supabase_authoritative_write"' in caplog.text
+    assert '"exception_type": "RuntimeError"' in caplog.text
+    assert '"supabase_http_status": 409' in caplog.text
+    assert private_content not in caplog.text
+    db=backend.conn();assert db.execute('SELECT COUNT(*) FROM internal_agent_memory').fetchone()[0]==0;db.close()
 
 
 def test_provider_failure_releases_active_turn_and_next_turn_runs(isolated):

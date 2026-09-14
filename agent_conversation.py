@@ -3,10 +3,11 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import json
+import logging
 import re
 import uuid
 from pathlib import Path
-from internal_audit import SUCCESS, record_audit_event
+from internal_audit import SUCCESS, record_audit_event, sanitize_audit_text
 from internal_rbac import ActorContext, load_actor_context, ALLOW
 
 CONVERSATION_TTL_MINUTES = 45
@@ -20,6 +21,7 @@ _connection_factory = None
 _remote_memory_enabled = None
 _remote_memory_select = None
 _remote_memory_upsert = None
+logger = logging.getLogger(__name__)
 
 class ConversationAccessDenied(RuntimeError):
     pass
@@ -170,6 +172,30 @@ def _tokens(value):
     return {token for token in re.findall(r'(?u)\b[\w-]{3,}\b', str(value).casefold())}
 
 
+def _memory_write_failure(exc, data):
+    status = None
+    current = exc
+    while current is not None:
+        candidate = getattr(current, 'code', None) or getattr(current, 'status_code', None)
+        if isinstance(candidate, int):
+            status = candidate
+            break
+        current = getattr(current, '__cause__', None)
+    message = sanitize_audit_text(exc)
+    if status is None:
+        match = re.search(r'\bHTTP\s+(\d{3})\b', message, re.IGNORECASE)
+        status = int(match.group(1)) if match else None
+    for private_value in [data.get('content'), data.get('memory_key'), *(data.get('relevance_terms') or [])]:
+        if private_value:
+            message = message.replace(str(private_value), '[REDACTED]')
+    logger.error('MEMORY_WRITE_FAILURE %s', json.dumps({
+        'stage':'supabase_authoritative_write',
+        'exception_type':type(exc).__name__,
+        'exception_message':message[:500],
+        'supabase_http_status':status,
+    }, ensure_ascii=False, sort_keys=True))
+
+
 def _cache_memory_rows(rows):
     with connection() as db:
         for row in rows:
@@ -292,6 +318,7 @@ def remember_memory(data, actor, correlation_id, transaction_connection=None):
         try:
             _remote_memory_upsert(saved)
         except Exception as exc:
+            _memory_write_failure(exc, data)
             raise ControlledOperationError('MEMORY_STORAGE_UNAVAILABLE', 'Nie udało się zapisać pamięci firmy w Supabase') from exc
     _cache_memory_rows([saved])
     with connection() as db:
