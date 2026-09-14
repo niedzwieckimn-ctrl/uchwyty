@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import json
+import re
 import sqlite3
 import uuid
 from pathlib import Path
@@ -15,6 +16,9 @@ MAX_HISTORY_BYTES = 12000
 MAX_MEMORY_BYTES = 4000
 MAX_TERMS = 100
 _connection_factory = None
+_remote_memory_enabled = None
+_remote_memory_select = None
+_remote_memory_upsert = None
 
 class ConversationAccessDenied(RuntimeError):
     pass
@@ -22,11 +26,14 @@ class ConversationAccessDenied(RuntimeError):
 class ConversationBusy(RuntimeError):
     pass
 
-def configure(connection_factory):
-    global _connection_factory
+def configure(connection_factory, *, remote_memory_enabled=None, remote_memory_select=None, remote_memory_upsert=None):
+    global _connection_factory, _remote_memory_enabled, _remote_memory_select, _remote_memory_upsert
     if not callable(connection_factory):
         raise TypeError('connection_factory must be callable')
     _connection_factory = connection_factory
+    _remote_memory_enabled = remote_memory_enabled
+    _remote_memory_select = remote_memory_select
+    _remote_memory_upsert = remote_memory_upsert
 
 @contextmanager
 def connection():
@@ -155,20 +162,151 @@ def release_turn(human, ai, cid, run_id):
         db.execute('DELETE FROM internal_agent_turn_leases WHERE conversation_id=? AND run_id=?', (cid, run_id))
 
 
-def memory_for_model(human, ai):
+def _tokens(value):
+    return {token for token in re.findall(r'(?u)\b[\w-]{3,}\b', str(value).casefold())}
+
+
+def _cache_memory_rows(rows):
+    with connection() as db:
+        for row in rows:
+            terms = row.get('relevance_terms', row.get('relevance_terms_json', []))
+            if not isinstance(terms, str):
+                terms = json.dumps(terms, ensure_ascii=False, separators=(',', ':'))
+            db.execute('''INSERT INTO internal_agent_memory(
+                memory_id,memory_key,category,scope,human_actor_id,content,relevance_terms_json,
+                source_run_id,confirmed_by_actor_id,version,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(memory_id) DO UPDATE SET memory_key=excluded.memory_key,category=excluded.category,
+                scope=excluded.scope,human_actor_id=excluded.human_actor_id,content=excluded.content,
+                relevance_terms_json=excluded.relevance_terms_json,source_run_id=excluded.source_run_id,
+                confirmed_by_actor_id=excluded.confirmed_by_actor_id,version=excluded.version,updated_at=excluded.updated_at''',
+                (row['memory_id'],row['memory_key'],row['category'],row['scope'],row.get('human_actor_id') or '',
+                 row['content'],terms,row['source_run_id'],row['confirmed_by_actor_id'],row['version'],row['updated_at']))
+
+
+def _memory_rows():
+    remote = bool(_remote_memory_enabled and _remote_memory_enabled())
+    if remote:
+        try:
+            rows = list(_remote_memory_select())
+            _cache_memory_rows(rows)
+            return rows
+        except Exception:
+            # Preferences are advisory only. The cache keeps them available during a transient outage.
+            pass
+    with connection() as db:
+        rows = db.execute('SELECT * FROM internal_agent_memory ORDER BY updated_at DESC').fetchall()
+    return [dict(row) for row in rows]
+
+
+def _relevant_memory(rows, human, query, limit=8):
+    query_tokens = _tokens(query)
+    selected = []
+    for row in rows:
+        if row['scope'] == 'user' and (row.get('human_actor_id') or '') != human.actor_id:
+            continue
+        if row['scope'] not in {'company','user'}:
+            continue
+        raw_terms = row.get('relevance_terms', row.get('relevance_terms_json', []))
+        try:
+            terms = json.loads(raw_terms) if isinstance(raw_terms, str) else raw_terms
+        except (TypeError, ValueError, json.JSONDecodeError):
+            terms = []
+        memory_tokens = _tokens(row['memory_key']) | _tokens(row['content']) | _tokens(' '.join(terms or []))
+        overlap = len(query_tokens & memory_tokens)
+        if overlap:
+            selected.append((overlap, row))
+    selected.sort(key=lambda item: (item[0], str(item[1].get('updated_at',''))), reverse=True)
+    return [item[1] for item in selected[:limit]]
+
+
+def memory_for_model(human, ai, query=''):
     # The existing installation is single-company, one SQLite database per company.
     with connection() as db:
-        terms = db.execute('SELECT term,meaning,scope,source,version FROM internal_agent_terminology ORDER BY updated_at DESC LIMIT ?', (MAX_TERMS,)).fetchall()
+        terms = db.execute('SELECT term,meaning,scope,source,version FROM internal_agent_terminology WHERE instr(lower(?),lower(term))>0 ORDER BY updated_at DESC LIMIT ?', (query,MAX_TERMS)).fetchall()
         style = db.execute('SELECT preferences_json FROM internal_agent_user_style WHERE human_actor_id=?', (human.actor_id,)).fetchone()
-    result = {'confirmed_terminology': [], 'user_style': json.loads(style[0]) if style else {}}
+    durable = _relevant_memory(_memory_rows(), human, query)
+    result = {'confirmed_terminology': [], 'user_style': json.loads(style[0]) if style else {},
+              'relevant_company_memory': []}
     if len(json.dumps(result, ensure_ascii=False).encode()) > 1000:
         result['user_style'] = {}
+    for row in durable:
+        result['relevant_company_memory'].append(
+            {'memory_key':row['memory_key'],'category':row['category'],'scope':row['scope'],
+             'content':row['content'],'version':row['version']})
+        if len(json.dumps(result,ensure_ascii=False).encode()) > MAX_MEMORY_BYTES:
+            result['relevant_company_memory'].pop()
+            break
     for row in terms:
         candidate = dict(row)
         result['confirmed_terminology'].append(candidate)
         if len(json.dumps(result,ensure_ascii=False).encode()) > MAX_MEMORY_BYTES:
             result['confirmed_terminology'].pop(); break
     return result
+
+
+def remember_memory(data, actor, correlation_id, transaction_connection=None):
+    """Persist a confirmed work preference/procedure remotely first, then update SQLite cache."""
+    from business_operations import ControlledOperationError
+    human = load_actor_context(actor.delegated_by_actor_id)
+    if human is None or human.actor_type != 'HUMAN' or human.permission_decision('agent.terminology.remember') != ALLOW:
+        raise ControlledOperationError('PERMISSION_DENIED', 'Brak uprawnień do pamięci firmy')
+    if data['confirmed_by_user'] is not True:
+        raise ControlledOperationError('CONFIRMATION_REQUIRED', 'Zasada wymaga potwierdzenia użytkownika')
+    terms = data['relevance_terms']
+    if (not isinstance(terms, list) or not 1 <= len(terms) <= 12
+            or any(not isinstance(term, str) or not 2 <= len(term) <= 60 for term in terms)):
+        raise ControlledOperationError('INVALID_INPUT', 'Hasła relewancji mają nieprawidłową wartość')
+    with connection() as db:
+        row = db.execute('SELECT * FROM internal_agent_turns WHERE run_id=?', (data['source_run_id'],)).fetchone()
+        if row is None:
+            raise ControlledOperationError('INVALID_MEMORY_SOURCE', 'Brak źródła potwierdzenia')
+        _owned(db,human,actor,row['conversation_id'])
+        lease = db.execute('SELECT run_id FROM internal_agent_turn_leases WHERE conversation_id=?', (row['conversation_id'],)).fetchone()
+        if not lease or lease['run_id'] != data['source_run_id'] or row['assistant_text'] is not None:
+            raise ControlledOperationError('INVALID_MEMORY_SOURCE', 'Potwierdzenie nie pochodzi z aktywnego turnu')
+
+    actor_scope = human.actor_id if data['scope'] == 'user' else ''
+    rows = _memory_rows()
+    previous = next((row for row in rows if row['category']==data['category'] and row['scope']==data['scope']
+                     and (row.get('human_actor_id') or '')==actor_scope
+                     and row['memory_key'].casefold()==data['memory_key'].casefold()), None)
+    version = int(previous['version']) if previous else 0
+    if (previous and previous['source_run_id'] == data['source_run_id']
+            and previous['content'] == data['content']):
+        _cache_memory_rows([previous])
+        return {'ok':True,'memory_key':previous['memory_key'],'version':version}
+    if version != data['expected_version']:
+        raise ControlledOperationError('MEMORY_VERSION_CONFLICT', 'Zasada zmieniła się; odczytaj jej aktualną wersję')
+    memory_id = previous['memory_id'] if previous else str(uuid.uuid4())
+    saved = {
+        'memory_id':memory_id,'memory_key':data['memory_key'],'category':data['category'],'scope':data['scope'],
+        'human_actor_id':actor_scope,'content':data['content'],'relevance_terms':data['relevance_terms'],
+        'source_run_id':data['source_run_id'],'confirmed_by_actor_id':human.actor_id,
+        'version':version+1,'updated_at':_iso(_utc_now()),
+    }
+    if _remote_memory_enabled and _remote_memory_enabled():
+        try:
+            _remote_memory_upsert(saved)
+        except Exception as exc:
+            raise ControlledOperationError('MEMORY_STORAGE_UNAVAILABLE', 'Nie udało się zapisać pamięci firmy w Supabase') from exc
+    _cache_memory_rows([saved])
+    with connection() as db:
+        record_audit_event('agent.memory.remembered', result=SUCCESS, actor_context=actor,
+            entity_type='agent_memory', entity_id=memory_id, correlation_id=correlation_id,
+            before_state={'content':previous['content'],'version':version} if previous else None,
+            after_state={'memory_key':data['memory_key'],'category':data['category'],'scope':data['scope'],
+                         'content':data['content'],'version':version+1,'confirmed_by_actor_id':human.actor_id,
+                         'source_run_id':data['source_run_id']}, source='agent_conversation',transaction_connection=db)
+    return {'ok':True,'memory_key':data['memory_key'],'version':version+1}
+
+
+def search_memory(data, actor, correlation_id, transaction_connection=None):
+    human = load_actor_context(actor.delegated_by_actor_id) if actor.actor_type == 'AI_AGENT' else actor
+    rows = _relevant_memory(_memory_rows(), human, data['query'], limit=10)
+    if data.get('category'):
+        rows = [row for row in rows if row['category'] == data['category']]
+    return {'ok':True,'results':[{'memory_key':row['memory_key'],'category':row['category'],
+            'scope':row['scope'],'content':row['content'],'version':row['version']} for row in rows]}
 
 
 def remember_terminology(data, actor, correlation_id, transaction_connection=None):

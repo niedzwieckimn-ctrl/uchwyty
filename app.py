@@ -309,7 +309,12 @@ configure_business_operations(conn)
 configure_business_operations_freshness(lambda operation_name: ensure_business_operation_freshness(operation_name))
 configure_write_success_observer(lambda operation_name, result: reconcile_business_freshness_after_write(operation_name, result))
 configure_artifact_builder(lambda operation_name, result: build_business_artifacts(operation_name, result))
-configure_agent_conversation(conn)
+configure_agent_conversation(
+    conn,
+    remote_memory_enabled=lambda: supabase_enabled(),
+    remote_memory_select=lambda: supabase_select_rows('internal_agent_memory', order_by='updated_at'),
+    remote_memory_upsert=lambda row: supabase_upsert_rows('internal_agent_memory', [row], 'memory_id'),
+)
 _startup_step("business_operations_configured")
 configure_external_execution(conn)
 register_external_adapter("test", IsolatedTestAdapter())

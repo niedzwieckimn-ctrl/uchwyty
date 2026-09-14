@@ -462,6 +462,31 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
         {"type":"object","required":["ok","term","version"],"properties":{"ok":{"type":"boolean"},"term":{"type":"string"},"version":{"type":"integer"}}},
         IDEMPOTENCY_REQUIRED, "WRITE", False,
     ),
+    "agent.memory.search": BusinessOperationDefinition(
+        "agent.memory.search", 1, "Wyszukuje relewantne, potwierdzone preferencje pracy i procedury firmy.",
+        "inventory.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
+        {"type":"object","additionalProperties":False,"required":["query"],"properties":{
+            "query":{"type":"string","minLength":1,"maxLength":300},
+            "category":{"type":"string","enum":["work_preferences","procedures"]}}},
+        {"type":"object","required":["ok","results"],"properties":{"ok":{"type":"boolean"},"results":{"type":"array"}}},
+        IDEMPOTENCY_NONE, "READ_STANDARD", True,
+    ),
+    "agent.memory.remember": BusinessOperationDefinition(
+        "agent.memory.remember", 1, "Zapisuje wyłącznie jawnie potwierdzoną preferencję pracy lub procedurę. relevance_terms określają pytania, przy których wpis jest pobierany.",
+        "agent.terminology.remember", approvals.GREEN, "NONE", frozenset({"AI_AGENT"}),
+        {"type":"object","additionalProperties":False,
+         "required":["memory_key","category","scope","content","relevance_terms","confirmed_by_user","expected_version","source_run_id"],
+         "properties":{"memory_key":{"type":"string","minLength":1,"maxLength":100},
+                       "category":{"type":"string","enum":["work_preferences","procedures"]},
+                       "scope":{"type":"string","enum":["company","user"]},
+                       "content":{"type":"string","minLength":1,"maxLength":1000},
+                       "relevance_terms":{"type":"array","minItems":1,"maxItems":12,"items":{"type":"string","minLength":2,"maxLength":60}},
+                       "confirmed_by_user":{"type":"boolean"},
+                       "expected_version":{"type":"integer","minimum":0,"maximum":2147483647},
+                       "source_run_id":{"type":"string","format":"uuid","maxLength":36}}},
+        {"type":"object","required":["ok","memory_key","version"],"properties":{"ok":{"type":"boolean"},"memory_key":{"type":"string"},"version":{"type":"integer"}}},
+        IDEMPOTENCY_REQUIRED, "WRITE", False,
+    ),
     "inventory.product.search": BusinessOperationDefinition(
         "inventory.product.search", 1, "Wyszukuje wyłącznie produkty po SKU, modelu, wariancie lub nazwie produktu i zwraca ograniczony stan.",
         "inventory.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "SYSTEM", "AI_AGENT"}),
@@ -848,6 +873,10 @@ def _entity(definition: BusinessOperationDefinition, data: Mapping[str, Any]) ->
         return "agent_terminology_search", data["query"], None
     if definition.operation_name == "agent.terminology.remember":
         return "agent_terminology", data["term"], data["expected_version"]
+    if definition.operation_name == "agent.memory.search":
+        return "agent_memory_search", sanitize_audit_text(data["query"])[:120], None
+    if definition.operation_name == "agent.memory.remember":
+        return "agent_memory", data["memory_key"], data["expected_version"]
     if definition.operation_name == "inventory.product.search":
         return "product_search", sanitize_audit_text(data["query"])[:120], None
     if definition.operation_name == "inventory.product.get":
@@ -2168,6 +2197,8 @@ _HANDLERS: dict[str, Callable[[Mapping[str, Any], ActorContext, str, sqlite3.Con
     "orders.status.transition": _order_transition,
     "agent.terminology.search": agent_conversation.search_terminology,
     "agent.terminology.remember": agent_conversation.remember_terminology,
+    "agent.memory.search": agent_conversation.search_memory,
+    "agent.memory.remember": agent_conversation.remember_memory,
     "inventory.product.search": _product_search,
     "inventory.product.get": _product_get,
     "inventory.summary": _inventory_summary,
