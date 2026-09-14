@@ -562,11 +562,25 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                            tool_name=call.name,conversation_id=conversation_id)
 
                 def execute_parallel_read(call):
-                    arguments, _definition = parallel_prepared[call.call_id]
+                    arguments, definition = parallel_prepared[call.call_id]
                     operation_started = time.perf_counter()
-                    result = business_operations.execute_business_operation(
-                        ai_actor, call.name, arguments, correlation_id=correlation_id,
-                    )
+                    try:
+                        result = business_operations.execute_business_operation(
+                            ai_actor, call.name, arguments, correlation_id=correlation_id,
+                        )
+                    except Exception as exc:
+                        logger.error('AI_PARALLEL_READ_FAILURE %s', json.dumps({
+                            'agent_run_id':run_id, 'tool_name':call.name,
+                            'exception_type':type(exc).__name__,
+                        }, sort_keys=True), exc_info=True)
+                        result = business_operations.OperationResult(
+                            status='FAILED', data=None, operation=call.name,
+                            operation_version=definition.operation_version,
+                            execution_id='', request_id=ai_actor.request_id,
+                            correlation_id=correlation_id,
+                            error_code='DATA_UNAVAILABLE',
+                            safe_error_message='Dane dla tej części podsumowania są chwilowo niedostępne.',
+                        )
                     return result, round((time.perf_counter()-operation_started)*1000,2)
 
                 batch_started = time.perf_counter()

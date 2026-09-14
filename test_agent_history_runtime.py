@@ -186,6 +186,53 @@ def test_four_independent_green_reads_use_one_parallel_batch(monkeypatch):
     assert batch_ms < sequential_ms*0.7
 
 
+def test_parallel_green_reads_keep_three_results_when_one_source_is_unavailable(monkeypatch):
+    reads = [
+        ('inventory.summary', {}),
+        ('orders.summary', {'period':'today'}),
+        ('invoices.overdue', {}),
+        ('china.orders.summary', {'scope':'active'}),
+    ]
+    original = operations.execute_business_operation
+
+    def one_unavailable(*args, **kwargs):
+        if args[1] == 'invoices.overdue':
+            raise operations.ControlledOperationError(
+                'DATA_UNAVAILABLE', 'Supabase HTTP 504 Gateway Timeout')
+        return original(*args, **kwargs)
+
+    def final_from_partial_data(kwargs):
+        outputs = [item for item in kwargs['input_items'] if item.get('type') == 'function_call_output']
+        assert len(outputs) == 4
+        decoded = {item['call_id']:json.loads(item['output']) for item in outputs}
+        assert sum(value.get('ok') is True for value in decoded.values()) == 3
+        assert decoded['batch-2'] == {
+            'ok':False, 'status':'FAILED', 'error_code':'DATA_UNAVAILABLE',
+            'error':'Dane dla tej części podsumowania są chwilowo niedostępne.',
+            'partial_result':None,
+        }
+        return respond('Podsumowanie przygotowane z dostępnych danych. Nie udało się pobrać zaległych faktur.')
+
+    calls = tuple(runtime.ToolCall(f'batch-{index}', name, json.dumps(arguments))
+                  for index, (name, arguments) in enumerate(reads))
+    backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([
+        runtime.ProviderResponse(tool_calls=calls, model='fake-model'),
+        final_from_partial_data,
+    ])
+    monkeypatch.setattr(operations, 'execute_business_operation', one_unavailable)
+    client = backend.app.test_client()
+    with client.session_transaction() as session:
+        session['admin_authenticated'] = True
+        session['csrf_token'] = 'csrf'
+
+    response = client.post('/api/internal/ai/chat', json={'message':'co mam dziś do zrobienia?'})
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload['status'] == 'SUCCESS' and payload['tool_calls'] == 4
+    assert 'Nie udało się pobrać zaległych faktur.' in payload['message']
+
+
 def test_business_failure_is_returned_to_model_for_normal_explanation(monkeypatch):
     def fail(*a):raise operations.ControlledOperationError('UNAVAILABLE','Brak dostępnych danych')
     monkeypatch.setitem(operations._HANDLERS,'inventory.summary',fail)
