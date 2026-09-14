@@ -214,7 +214,14 @@ def test_green_batch_final_synthesis_prevents_extra_tools_and_returns_http_200()
         outputs = [item for item in kwargs['input_items'] if item.get('type') == 'function_call_output']
         assert len(outputs) == 4
         assert all(json.loads(item['output']).get('ok') is True for item in outputs)
-        return respond('Finalne podsumowanie na podstawie czterech wykonanych odczytów.')
+        instructions = kwargs['instructions']
+        assert 'Użyj wyłącznie wyników narzędzi już dostarczonych' in instructions
+        assert 'Nie imituj wywołania narzędzia w tekście' in instructions
+        assert '1. Pilne wysyłki' in instructions
+        assert '2. Płatności po terminie' in instructions
+        assert '3. Braki wymagające działania' in instructions
+        assert '4. Pozostałe ważne rzeczy' in instructions
+        return respond('1. Pilne wysyłki\n- Brak pilnych wysyłek.\n2. Płatności po terminie\n- Jedna zaległa faktura.\n3. Braki wymagające działania\n- Brak potwierdzenia pokrycia SKU w tym przebiegu.\n4. Pozostałe ważne rzeczy\n- Cztery odczyty uwzględnione.')
 
     backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([
         runtime.ProviderResponse(tool_calls=first_calls, model='fake-model'), synthesis,
@@ -229,7 +236,11 @@ def test_green_batch_final_synthesis_prevents_extra_tools_and_returns_http_200()
     assert response.status_code == 200
     payload = response.get_json()
     assert payload['status'] == 'SUCCESS' and payload['tool_calls'] == 4
-    assert payload['message'] == 'Finalne podsumowanie na podstawie czterech wykonanych odczytów.'
+    assert 'Cztery odczyty uwzględnione.' in payload['message']
+    assert 'to=functions' not in payload['message']
+    assert '{"id":45}' not in payload['message']
+    assert 'china.orders.get' not in payload['message']
+    assert 'Sprawdzam jeszcze' not in payload['message']
 
 
 def test_parallel_green_reads_keep_three_results_when_one_source_is_unavailable(monkeypatch):
