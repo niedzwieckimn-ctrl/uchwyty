@@ -8,7 +8,7 @@ import re
 import uuid
 from pathlib import Path
 from internal_audit import SUCCESS, record_audit_event, sanitize_audit_text
-from internal_rbac import ActorContext, load_actor_context, ALLOW
+from internal_rbac import load_actor_context, ALLOW
 
 CONVERSATION_TTL_MINUTES = 45
 TURN_LEASE_TTL = timedelta(minutes=5)

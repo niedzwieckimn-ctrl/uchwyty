@@ -13,7 +13,6 @@ import hashlib
 import json
 import sqlite3
 import threading
-import time
 from typing import Any, Callable, Mapping, Protocol
 
 import internal_approval as approvals

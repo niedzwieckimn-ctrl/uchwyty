@@ -5,7 +5,7 @@ import io
 import json
 import re
 import uuid
-from collections import Counter, defaultdict
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from difflib import get_close_matches
 from zoneinfo import ZoneInfo

@@ -131,10 +131,6 @@ def _name_for_item(item: dict) -> str:
     return _limit(" ".join(parts) or name or model or sku or "Towar", 512)
 
 
-def _sku_for_item(item: dict) -> str:
-    return _limit(item.get("sku") or item.get("model") or "", 50)
-
-
 def _strip_country_prefix(value: str) -> str:
     txt = _text(value)
     txt = re.sub(r"^(PL|POLSKA)\s*[-,]?\s+", "", txt, flags=re.IGNORECASE)

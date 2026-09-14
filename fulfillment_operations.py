@@ -400,15 +400,6 @@ def ui_write(oid):
         yield
 
 
-def guard_ui(oid):
-    c = b.conn()
-    try:
-        if c.execute('SELECT 1 FROM fulfillment_locks WHERE order_id=?', (oid,)).fetchone():
-            raise Conflict('Trwa operacja na tym zamówieniu.')
-    finally:
-        c.close()
-
-
 def release(oid, token):
     c = b.conn()
     try:

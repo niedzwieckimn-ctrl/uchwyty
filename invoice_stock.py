@@ -1,6 +1,4 @@
 """Account only invoice quantities; never issue on a courier scan."""
-import json
-
 SCHEMA='''CREATE TABLE IF NOT EXISTS invoice_stock_applied(
  invoice_id INTEGER NOT NULL,order_item_id INTEGER NOT NULL,product_id INTEGER NOT NULL,
  qty INTEGER NOT NULL CHECK(qty>=0),PRIMARY KEY(invoice_id,order_item_id))'''
