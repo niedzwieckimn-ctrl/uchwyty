@@ -494,56 +494,6 @@ def register_routes(context):
         c.close()
         return redirect(url_for("products", product_deleted=sku))
 
-        references = []
-        for table, label in (
-            ("order_items", "zamówieniach"),
-            ("china_items", "dostawach P/O"),
-            ("invoice_allocations", "fakturach"),
-        ):
-            cur.execute(f"SELECT COUNT(*) AS n FROM {table} WHERE product_id=?", (product_id,))
-            if int(cur.fetchone()["n"] or 0) > 0:
-                references.append(label)
-        if int(product["stock"] or 0) != 0:
-            references.append("stanie magazynowym")
-
-        sku = product["sku"]
-        if references:
-            c.close()
-            return redirect(url_for(
-                "products",
-                q=sku,
-                product_error="Nie można usunąć produktu, ponieważ jest używany w " + ", ".join(references) + ".",
-            ))
-
-        try:
-            if supabase_enabled():
-                supabase_delete_rows("stock", {"product_id": product_id})
-                try:
-                    supabase_delete_rows("products", {"id": product_id})
-                except Exception:
-                    cur.execute("SELECT * FROM stock WHERE product_id=?", (product_id,))
-                    stock_row = cur.fetchone()
-                    if stock_row:
-                        supabase_upsert_rows("stock", [dict(stock_row)], "product_id")
-                    raise
-                try:
-                    supabase_delete_rows("pricing_eur", {"sku": sku})
-                except Exception:
-                    # Brak osobnej ceny EUR nie może cofnąć poprawnego usunięcia
-                    # produktu. Osierocona cena nie jest widoczna bez produktu.
-                    app.logger.warning("Nie udało się usunąć ceny EUR dla SKU %s", sku, exc_info=True)
-
-            cur.execute("DELETE FROM pricing_eur WHERE sku=?", (sku,))
-            cur.execute("DELETE FROM stock WHERE product_id=?", (product_id,))
-            cur.execute("DELETE FROM products WHERE id=?", (product_id,))
-            c.commit()
-        except Exception:
-            c.rollback()
-            c.close()
-            app.logger.exception("Nie udało się bezpiecznie usunąć produktu %s", product_id)
-            return redirect(url_for("products", q=sku, product_error="Nie udało się usunąć produktu. Sprawdź synchronizację magazynu."))
-        c.close()
-        return redirect(url_for("products", product_deleted=sku))
 
 
 
