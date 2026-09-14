@@ -7,17 +7,14 @@ from typing import Callable
 from zoneinfo import ZoneInfo
 
 from cash_flow_module import cash_flow_overdue_invoices
-from china_delivery_attention import delivery_attention_states
-from fulfillment_readiness import calculate_fulfillment_readiness
-from inventory_analytics import build_replenishment_analysis
-from orders_operational_state import compose_order_actions
+from deliveries_operational_state import build_deliveries_operational_state
+from orders_operational_state import build_orders_operational_state
 
 
 STATE_KEYS = (
     "ready_to_ship",
     "overdue_payments",
     "uncovered_order_shortages",
-    "covered_order_shortages",
     "deliveries_requiring_attention",
     "other_urgent_exceptions",
 )
@@ -27,37 +24,31 @@ def _text(value) -> str:
     return str(value or "").strip()
 
 
-def _read_sources(connection_factory: Callable, current_time: datetime):
+def _read_overdue(connection_factory: Callable, current_time: datetime):
     db = connection_factory()
     try:
-        readiness = calculate_fulfillment_readiness(db)
-        overdue = cash_flow_overdue_invoices(db, current_time=current_time)
-        packages = [dict(row) for row in db.execute("""
-            SELECT cp.*, COALESCE(SUM(MAX(0, ci.qty)), 0) AS total_units
-            FROM china_packages cp
-            LEFT JOIN china_items ci ON ci.package_id=cp.id
-            WHERE LOWER(COALESCE(cp.status,'')) IN ('planned','ordered','shipped','problem')
-            GROUP BY cp.id
-            ORDER BY cp.created_at, cp.id
-        """).fetchall()]
+        return cash_flow_overdue_invoices(db, current_time=current_time)
     finally:
         db.close()
-    inventory = build_replenishment_analysis(connection_factory, today=current_time.date())
-    return readiness, overdue, packages, inventory
 
 
 def build_daily_operational_state(
     connection_factory: Callable, *, current_time: datetime | None = None,
 ) -> dict:
-    """Compose existing readiness, coverage, overdue and delivery attention states."""
+    """Compose only the existing business states that require action today."""
     now = current_time or datetime.now(ZoneInfo("Europe/Warsaw"))
-    readiness, overdue, packages, inventory = _read_sources(connection_factory, now)
     state = {key: [] for key in STATE_KEYS}
-
-    order_actions = compose_order_actions(readiness, inventory)
-    state["ready_to_ship"] = order_actions["ready_to_ship"]
-    state["covered_order_shortages"] = order_actions["covered_order_shortages"]
-    state["uncovered_order_shortages"] = order_actions["uncovered_order_shortages"]
+    orders = build_orders_operational_state(connection_factory, current_time=now)
+    deliveries = build_deliveries_operational_state(connection_factory, current_time=now)
+    overdue = _read_overdue(connection_factory, now)
+    state["ready_to_ship"] = orders["ready_to_ship"]
+    state["uncovered_order_shortages"] = [
+        item
+        for order in orders["blocked"]
+        for item in order.get("missing_items") or []
+        if not item["source_state"]["covered_by_stock_and_confirmed_incoming"]
+    ]
+    state["deliveries_requiring_attention"] = deliveries["requiring_attention"]
 
     for invoice in overdue:
         invoice_id = int(invoice["id"])
@@ -75,25 +66,6 @@ def build_daily_operational_state(
                 "payment_status": "overdue",
                 "due_date": _text(invoice.get("payment_to")),
                 "overdue_days": int(invoice.get("overdue_days") or 0),
-            },
-        })
-
-    for package in packages:
-        attention = delivery_attention_states(package, current_time=now)
-        if not attention:
-            continue
-        actions = list(dict.fromkeys(item["action_required"] for item in attention))
-        state["deliveries_requiring_attention"].append({
-            "entity_type": "purchase_order", "entity_id": int(package["id"]),
-            "human_label": _text(package.get("package_no")),
-            "company_name": _text(package.get("supplier")),
-            "quantity": int(package.get("total_units") or 0),
-            "action_required": " ".join(actions),
-            "urgency": "high" if any(item["urgency"] == "high" for item in attention) else "medium",
-            "source_state": {
-                "delivery_status": _text(package.get("status")),
-                "attention_codes": [item["code"] for item in attention],
-                "attention_labels": [item["label"] for item in attention],
             },
         })
 

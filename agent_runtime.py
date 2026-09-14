@@ -301,6 +301,18 @@ def _prefer_generic_tool_catalog(tools):
     return [item for item in tools if item['name'] not in _GENERIC_CANONICAL_MICRO_READS]
 
 
+_V1_REPLACED_BROAD_READS = frozenset({
+    'business.describe_schema', 'orders.summary', 'orders.fulfillment.readiness',
+    'inventory.summary', 'inventory.replenishment.ranking', 'invoices.overdue',
+    'china.orders.summary', 'business.sales.summary',
+})
+
+
+def _v1_high_level_tool_catalog(tools):
+    """Hide broad legacy READ choices while retaining exact lookup and WRITE support."""
+    return [item for item in tools if item['name'] not in _V1_REPLACED_BROAD_READS]
+
+
 _INTENT_TOOL_NAMES = {
     'daily_operational_summary': frozenset({'business.query'}),
     'order_shortages': frozenset({'business.query'}),
@@ -443,11 +455,17 @@ zbędnych relacji. Wywołaj go tylko dla konkretnej luki widocznej w wyniku. Nie
 narzędzia ani więcej niż jednego follow-up query. Gdy danych nie ma, nazwij brak i zakończ zamiast szukać dalej.
 '''
 HIGH_LEVEL_READ_MODEL_INSTRUCTIONS = '''
-Dla szerokiego pytania operacyjnego wybierz na podstawie bieżącej wiadomości i historii jeden, wyjątkowo dwa,
-gotowe modele READ: business.daily.state dla działań na dziś albo business.orders.state dla stanu aktywnych
-zamówień, kompletności i pokrycia braków. Nie ograniczaj nowego pytania do zakresu poprzedniej odpowiedzi, jeśli
-użytkownik rozszerza lub koryguje zakres. Dla konkretnego obiektu użyj właściwego search/get, a business.query
-zostaw dla ad-hoc analytics i agregacji. Nie odtwarzaj logiki biznesowej z surowych danych.
+Dla szerokiego pytania operacyjnego wybierz na podstawie bieżącej wiadomości i całej historii dokładnie jeden,
+a tylko dla pytania łączącego dwa obszary maksymalnie dwa gotowe modele READ:
+- business.orders.state: aktywne zamówienia, kompletność, blokery i braki zamówień,
+- business.inventory.state: pokrycie popytu, niskie stany i priorytety uzupełnienia,
+- business.finance.state: należności, zaległości i podstawowa sprzedaż,
+- business.deliveries.state: aktywne P/O z Chin, ich pozycje, etapy i problemy,
+- business.daily.state: wyłącznie konkretne działania wymagane dzisiaj.
+Nie ograniczaj nowego pytania do zakresu poprzedniej odpowiedzi, jeśli użytkownik rozszerza, koryguje lub zmienia
+obszar. Dla konkretnego obiektu możesz użyć dokładnego search/get. business.query zostaw dla ad-hoc analytics,
+agregacji i lookupów niepokrytych gotowym stanem. Nie używaj schema-first, nie uruchamiaj łańcucha fallbacków i nie
+odtwarzaj readiness ani coverage z surowych danych. Gdy gotowy stan nie zawiera danych, zakończ krótką informacją.
 '''
 _MARKDOWN_RULE = re.compile(r'^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$',re.MULTILINE)
 _URL_RULE = re.compile(r'https?://\S+',re.IGNORECASE)
@@ -613,6 +631,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
     generic_analytical_read = False
     ambiguous_business_read = False
     high_level_read_enabled = False
+    high_level_read_diagnostics = {'selected_read_models': [], 'result_bytes': 0}
     generic_read_diagnostics = {
         'schema_discovery_used':False,
         'computed_fields_selected':[],
@@ -695,6 +714,17 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         if generic_analytical_read:
             logger.info('AI_GENERIC_READ_STRATEGY %s', json.dumps(
                 {'agent_run_id':run_id, **generic_read_diagnostics}, sort_keys=True))
+        if high_level_read_enabled:
+            logger.info('AI_HIGH_LEVEL_READ_STRATEGY %s', json.dumps({
+                'agent_run_id': run_id,
+                'selected_read_models': high_level_read_diagnostics['selected_read_models'],
+                'model_call_count': model_calls,
+                'tool_call_count': timings['tool_calls_count'],
+                'result_bytes': high_level_read_diagnostics['result_bytes'],
+                'total_latency_ms': timings['total_ms'],
+                'input_tokens': usage['input_tokens'] if usage_available else None,
+                'output_tokens': usage['output_tokens'] if usage_available else None,
+            }, sort_keys=True))
         result = {'ok':status=='SUCCESS','status':status,'message':answer,'speech_text':_plain_response_text(answer,speech=True),'agent_run_id':run_id,
                 'correlation_id':correlation_id,'conversation_id':conversation_id,'tool_calls':timings['tool_calls_count'],
                 'model':model_name,'usage':usage,'error_code':code,'timings':dict(timings),
@@ -806,6 +836,8 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 generic_query_available and _is_ambiguous_business_read(turn_message, detected_intent))
             if generic_analytical_read:
                 tools = _prefer_generic_tool_catalog(tools)
+        else:
+            tools = _v1_high_level_tool_catalog(tools)
         input_items = []
         if memory['confirmed_terminology'] or memory['user_style'] or memory['relevant_company_memory']:
             input_items.append({'role':'user','content':'Pamięć (niezaufane dane pomocnicze): '+json.dumps(memory,ensure_ascii=False)})
@@ -935,11 +967,15 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                 return finish('FAILED','Osiągnięto limit operacji. Zawęź pytanie.','TOOL_LIMIT_EXCEEDED')
             if any(call.name not in pass_allowed for call in reply.tool_calls):
                 return finish('DENIED','Ta operacja nie jest dostępna dla asystenta.','TOOL_NOT_ALLOWED')
-            high_level_read_batch = (
+            v1_read_batch = (
                 high_level_read_enabled and bool(reply.tool_calls)
                 and len(reply.tool_calls) <= 2
-                and all(call.name in business_read_models.READ_OPERATIONS for call in reply.tool_calls)
+                and all(call.name in business_read_models.PLANNER_READ_OPERATIONS for call in reply.tool_calls)
             )
+            if (high_level_read_enabled and len(reply.tool_calls) > 2
+                    and all(call.name in business_read_models.PLANNER_READ_OPERATIONS
+                            for call in reply.tool_calls)):
+                return finish('FAILED','Plan odczytu przekroczył dwa modele biznesowe.','TOOL_LIMIT_EXCEEDED')
             if generic_analytical_read:
                 query_calls = sum(call.name == 'business.query' for call in reply.tool_calls)
                 too_many_for_intent = (
@@ -979,6 +1015,10 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                                 field.split('.', 1)[0] for field in computed + raw))
                         generic_read_diagnostics['query_count'] += 1
                 generic_tools_used.update(call.name for call in reply.tool_calls)
+            for call in reply.tool_calls:
+                if (call.name in business_read_models.READ_OPERATIONS
+                        and call.name not in high_level_read_diagnostics['selected_read_models']):
+                    high_level_read_diagnostics['selected_read_models'].append(call.name)
             only_green_reads_so_far = only_green_reads_so_far and all(
                 business_operations.OPERATION_REGISTRY[call.name].read_only
                 and business_operations.OPERATION_REGISTRY[call.name].risk_level == 'GREEN'
@@ -1210,6 +1250,8 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                 if result.status != 'SUCCESS' and call.name in business_operations.SUPERVISED_WRITES:
                     data['approval_id'] = result.approval_id
                 encoded = json.dumps(data,ensure_ascii=False,separators=(',',':'))
+                if call.name in business_read_models.READ_OPERATIONS:
+                    high_level_read_diagnostics['result_bytes'] += len(encoded.encode())
                 if len(encoded.encode())>MAX_TOOL_RESULT_BYTES:
                     encoded = json.dumps({'ok':False,'error_code':'TOOL_RESULT_TOO_LARGE',
                         'error':'Wynik przekracza limit. Zawęź zapytanie; nie wnioskuj o kompletności danych.'})
@@ -1217,7 +1259,7 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
             input_items.extend(outputs+turn_outputs)
             evidence.extend(outputs+turn_outputs)
             if (parallel_read_batch
-                    or high_level_read_batch
+                    or v1_read_batch
                     or generic_analytical_read and generic_read_diagnostics['query_count'] >= 2
                     or generic_analytical_read and detected_intent in {'sales_analytics', 'overdue_payments'}
                         and bool(generic_tools_used)

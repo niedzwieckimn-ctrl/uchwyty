@@ -127,5 +127,6 @@ def build_orders_operational_state(
     return {
         "ready_to_ship": actions["ready_to_ship"],
         "blocked": blocked,
-        "other_active_orders": [],
+        "active_complete": list(actions["ready_to_ship"]),
+        "active_incomplete": list(blocked),
     }

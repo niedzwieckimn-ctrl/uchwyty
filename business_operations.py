@@ -68,7 +68,9 @@ _write_success_observer: Callable[[str, Mapping[str, Any]], None] | None = None
 
 FRESHNESS_GROUP_BY_OPERATION = {
     "business.query": "inventory",
-    "business.orders.state": "operational_state", "business.daily.state": "operational_state",
+    "business.orders.state": "orders_state", "business.inventory.state": "inventory_state",
+    "business.finance.state": "finance_state", "business.deliveries.state": "deliveries_state",
+    "business.daily.state": "daily_state",
     "inventory.product.search": "inventory", "inventory.product.get": "inventory", "inventory.summary": "inventory",
     "inventory.replenishment.ranking": "inventory",
     "orders.search": "orders", "orders.get": "orders", "orders.summary": "orders",
@@ -529,6 +531,27 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
         business_read_models.DAILY_STATE_INPUT, business_read_models.STATE_OUTPUT,
         IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
+    "business.inventory.state": BusinessOperationDefinition(
+        "business.inventory.state", 1,
+        "Zwraca kompaktowy stan popytu, pokrycia, niskich stanów i priorytetów uzupełnienia. Planned P/O nie zwiększa pokrycia.",
+        "inventory.replenishment_read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
+        business_read_models.INVENTORY_STATE_INPUT, business_read_models.STATE_OUTPUT,
+        IDEMPOTENCY_NONE, "READ_STANDARD", True,
+    ),
+    "business.finance.state": BusinessOperationDefinition(
+        "business.finance.state", 1,
+        "Zwraca kompaktowy stan zaległych i bieżących należności oraz podstawowe podsumowanie sprzedaży.",
+        "invoices.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
+        business_read_models.FINANCE_STATE_INPUT, business_read_models.STATE_OUTPUT,
+        IDEMPOTENCY_NONE, "READ_STANDARD", True,
+    ),
+    "business.deliveries.state": BusinessOperationDefinition(
+        "business.deliveries.state", 1,
+        "Zwraca aktywne dostawy z Chin wraz z pozycjami, etapem i stanami wymagającymi uwagi. Planned jest widoczne, ale nie stanowi pokrycia.",
+        "purchases.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
+        business_read_models.DELIVERIES_STATE_INPUT, business_read_models.STATE_OUTPUT,
+        IDEMPOTENCY_NONE, "READ_STANDARD", True,
+    ),
     "inventory.product.search": BusinessOperationDefinition(
         "inventory.product.search", 1, "Wyszukuje wyłącznie produkty po SKU, modelu, wariancie lub nazwie produktu i zwraca ograniczony stan.",
         "inventory.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "SYSTEM", "AI_AGENT"}),
@@ -750,7 +773,7 @@ def _factory() -> Callable[[], sqlite3.Connection]:
 
 def _operation_feature_disabled(operation_name: str) -> bool:
     if operation_name in GENERIC_READ_OPERATIONS:
-        return not business_query.enabled()
+        return not (business_query.enabled() or business_read_models.enabled())
     if operation_name in HIGH_LEVEL_READ_OPERATIONS:
         return not business_read_models.enabled()
     return False
@@ -910,6 +933,12 @@ def _entity(definition: BusinessOperationDefinition, data: Mapping[str, Any]) ->
         return "orders_operational_state", str(data.get("order_id") or data.get("customer_id") or "active"), None
     if definition.operation_name == "business.daily.state":
         return "daily_operational_state", "today", None
+    if definition.operation_name == "business.inventory.state":
+        return "inventory_operational_state", "current", None
+    if definition.operation_name == "business.finance.state":
+        return "finance_operational_state", str(data.get("period") or "this_month"), None
+    if definition.operation_name == "business.deliveries.state":
+        return "deliveries_operational_state", "active", None
     if definition.operation_name == 'approval.decide':
         return 'approval', data['approval_id'], None
     if definition.operation_name == 'shipping.capabilities':
@@ -2277,6 +2306,26 @@ _HANDLERS: dict[str, Callable[[Mapping[str, Any], ActorContext, str, sqlite3.Con
         ),
     "business.daily.state": lambda data, actor, correlation_id, transaction_connection=None:
         business_read_models.daily_state(
+            data, actor, correlation_id, transaction_connection,
+            connection_factory=_factory(),
+        ),
+    "business.inventory.state": lambda data, actor, correlation_id, transaction_connection=None:
+        business_read_models.inventory_state(
+            data, actor, correlation_id, transaction_connection,
+            connection_factory=_factory(),
+        ),
+    "business.finance.state": lambda data, actor, correlation_id, transaction_connection=None:
+        business_read_models.finance_state(
+            data, actor, correlation_id, transaction_connection,
+            invoice_search=lambda query: _invoices_search(
+                query, actor, correlation_id, transaction_connection),
+            invoice_overdue=lambda query: _invoices_overdue(
+                query, actor, correlation_id, transaction_connection),
+            sales_summary=lambda query: _sales_summary(
+                query, actor, correlation_id, transaction_connection),
+        ),
+    "business.deliveries.state": lambda data, actor, correlation_id, transaction_connection=None:
+        business_read_models.deliveries_state(
             data, actor, correlation_id, transaction_connection,
             connection_factory=_factory(),
         ),
