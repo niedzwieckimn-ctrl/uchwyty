@@ -354,6 +354,104 @@ def test_first_pass_above_global_limit_is_still_rejected_before_execution():
     assert result['tool_calls'] == 0
 
 
+def test_shortage_coverage_fetches_ordered_and_shipped_po_details_and_skips_planned(monkeypatch):
+    shortages = {'ok':True, 'results':[
+        {'sku':'SKU-A', 'missing_quantity':5},
+        {'sku':'SKU-B', 'missing_quantity':4},
+        {'sku':'SKU-C', 'missing_quantity':2},
+    ], 'count':3, 'ready_count':0, 'truncated':False}
+    purchase_orders = {'ok':True, 'results':[
+        {'id':11, 'po_number':'PO-11', 'order_status':'shipped'},
+        {'id':12, 'po_number':'PO-12', 'order_status':'ordered'},
+        {'id':13, 'po_number':'PO-13', 'order_status':'planned'},
+    ], 'count':3, 'truncated':False}
+    po_details = {
+        11:{'id':11, 'order_status':'shipped', 'items':[{'sku':'SKU-A', 'quantity':5}]},
+        12:{'id':12, 'order_status':'ordered', 'items':[{'sku':'SKU-B', 'quantity':4}]},
+    }
+    executed = []
+
+    def successful(operation, data):
+        definition = operations.OPERATION_REGISTRY[operation]
+        return operations.OperationResult(
+            status='SUCCESS', data=data, operation=operation,
+            operation_version=definition.operation_version, execution_id=f'exec-{len(executed)}',
+            request_id='request', correlation_id='correlation',
+        )
+
+    def execute(_actor, operation, arguments, **_kwargs):
+        executed.append((operation, dict(arguments)))
+        if operation == 'orders.fulfillment.readiness':
+            return successful(operation, shortages)
+        if operation == 'china.orders.search':
+            assert arguments == {'active_only':True}
+            return successful(operation, purchase_orders)
+        if operation == 'china.orders.get':
+            assert arguments['id'] != 13
+            return successful(operation, {'ok':True, 'record':po_details[arguments['id']]})
+        raise AssertionError(f'unexpected operation: {operation}')
+
+    def plan_shortages(kwargs):
+        instructions = kwargs['instructions']
+        assert 'Sama china.orders.search, lista P/O ani łączna liczba sztuk nie potwierdza pokrycia SKU.' in instructions
+        assert 'Status planned całkowicie pomijaj jako pokrycie' in instructions
+        return tool('orders.fulfillment.readiness', {})
+
+    def plan_po_list(kwargs):
+        outputs = [json.loads(item['output']) for item in kwargs['input_items']
+                   if item.get('type') == 'function_call_output']
+        assert outputs[-1] == shortages
+        return tool('china.orders.search', {'active_only':True})
+
+    def plan_po_details(kwargs):
+        outputs = [json.loads(item['output']) for item in kwargs['input_items']
+                   if item.get('type') == 'function_call_output']
+        assert outputs[-1] == purchase_orders
+        assert 'Pozostały budżet to 4.' in kwargs['instructions']
+        return runtime.ProviderResponse(tool_calls=tuple(
+            runtime.ToolCall(f'po-{po_id}', 'china.orders.get', json.dumps({'id':po_id}))
+            for po_id in (11, 12)
+        ), model='fake-model')
+
+    def synthesize(kwargs):
+        outputs = [json.loads(item['output']) for item in kwargs['input_items']
+                   if item.get('type') == 'function_call_output']
+        detail_records = [item['record'] for item in outputs if item.get('record')]
+        assert {item['id'] for item in detail_records} == {11, 12}
+        coverage = {}
+        for record in detail_records:
+            for item in record['items']:
+                coverage[item['sku']] = coverage.get(item['sku'], 0) + item['quantity']
+        uncovered = {
+            row['sku']:max(row['missing_quantity'] - coverage.get(row['sku'], 0), 0)
+            for row in shortages['results']
+        }
+        assert uncovered == {'SKU-A':0, 'SKU-B':0, 'SKU-C':2}
+        return respond('SKU-C — brak 2 szt.; brak pokrycia w zamówionych lub wysłanych dostawach.')
+
+    monkeypatch.setattr(operations, 'execute_business_operation', execute)
+    backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([
+        plan_shortages, plan_po_list, plan_po_details, synthesize,
+    ])
+    client = backend.app.test_client()
+    with client.session_transaction() as session:
+        session['admin_authenticated'] = True
+        session['csrf_token'] = 'csrf'
+
+    response = client.post('/api/internal/ai/chat', json={
+        'message':'Które produkty blokują realizację zamówień i nie mają pokrycia w dostawach z Chin?',
+    })
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload['status'] == 'SUCCESS' and payload['tool_calls'] == 4
+    assert payload['message'].startswith('SKU-C — brak 2 szt.')
+    assert [arguments['id'] for operation, arguments in executed
+            if operation == 'china.orders.get'] == [11, 12]
+    assert all(arguments.get('id') != 13 for operation, arguments in executed
+               if operation == 'china.orders.get')
+
+
 def test_parallel_green_reads_keep_three_results_when_one_source_is_unavailable(monkeypatch):
     reads = [
         ('inventory.summary', {}),

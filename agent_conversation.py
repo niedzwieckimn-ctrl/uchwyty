@@ -16,6 +16,7 @@ MAX_HISTORY_TURNS = 6
 MAX_HISTORY_BYTES = 12000
 MAX_MEMORY_BYTES = 4000
 MAX_TERMS = 100
+ALWAYS_APPLY_RELEVANCE_TERM = '__always_apply__'
 SQLITE_MIGRATIONS = ('agent_runtime_history.sql', 'agent_durable_memory_sqlite.sql')
 _connection_factory = None
 _remote_memory_enabled = None
@@ -241,12 +242,16 @@ def _relevant_memory(rows, human, query, limit=8):
             terms = json.loads(raw_terms) if isinstance(raw_terms, str) else raw_terms
         except (TypeError, ValueError, json.JSONDecodeError):
             terms = []
+        always_apply = any(
+            str(term).casefold() == ALWAYS_APPLY_RELEVANCE_TERM
+            for term in (terms or [])
+        )
         memory_tokens = _tokens(row['memory_key']) | _tokens(row['content']) | _tokens(' '.join(terms or []))
         overlap = len(query_tokens & memory_tokens)
-        if overlap:
-            selected.append((overlap, row))
-    selected.sort(key=lambda item: (item[0], str(item[1].get('updated_at',''))), reverse=True)
-    return [item[1] for item in selected[:limit]]
+        if always_apply or overlap:
+            selected.append((always_apply, overlap, row))
+    selected.sort(key=lambda item: (item[0], item[1], str(item[2].get('updated_at',''))), reverse=True)
+    return [item[2] for item in selected[:limit]]
 
 
 def memory_for_model(human, ai, query=''):
