@@ -223,10 +223,47 @@ def _is_china_shortage_coverage_question(value: str) -> bool:
     return urgent_purchase or (shortage and coverage)
 
 
-def _prefers_generic_business_read(value: str) -> bool:
+def _detect_read_intent(value: str) -> str:
+    """Choose one primary read intent without another model round-trip."""
     normalized = ' '.join(str(value or '').casefold().split()).strip(' ?!.')
-    if _is_daily_work_briefing(normalized) or _is_china_shortage_coverage_question(normalized):
-        return True
+    if _is_daily_work_briefing(normalized):
+        return 'daily_operational_summary'
+    if re.search(r'\b(?:sprzedał\w*|sprzedal\w*|sprzedaż\w*|sprzedaz\w*|obr[oó]t\w*|przych[oó]d\w*)\b', normalized):
+        return 'sales_analytics'
+    if re.search(r'\b(?:zaległ\w*|zalegl\w*|po terminie|przeterminowan\w*)\b', normalized) and re.search(
+            r'\b(?:płatno\w*|platno\w*|faktur\w*|należno\w*|nalezno\w*)\b', normalized):
+        return 'overdue_payments'
+    if _is_china_shortage_coverage_question(normalized) or (
+            re.search(r'\b(?:brak\w*|blokuj\w*|pokryci\w*)\b', normalized)
+            and re.search(r'\b(?:zam[oó]wieni\w*|towar\w*|produkt\w*|dostaw\w*|p/o)\b', normalized)):
+        return 'order_shortages'
+    if re.search(r'\b(?:gotow\w*|readiness|komplet\w*)\b', normalized) and re.search(
+            r'\b(?:zam[oó]wieni\w*|wysył\w*|wysyl\w*|realizacj\w*|pakow\w*)\b', normalized):
+        return 'order_readiness'
+    if re.search(r'\b(?:dostaw\w*|p/o|purchase order|zam[oó]wieni\w* z chin|chiny|chinach)\b', normalized):
+        return 'incoming_deliveries'
+    if re.search(r'\b(?:magazyn\w*|zapas\w*|stan\w*|dostępn\w*|dostepn\w*|inventory)\b', normalized):
+        return 'inventory_status'
+    if re.search(r'\b(?:klient\w*|kontrahent\w*)\b', normalized):
+        return 'customer_lookup'
+    if re.search(r'\b(?:faktur\w*|invoice)\b', normalized):
+        return 'invoice_lookup'
+    if re.search(r'\b(?:produkt\w*|sku|ean|model\w*|uchwyt\w*)\b', normalized):
+        return 'product_lookup'
+    return 'ambiguous'
+
+
+_GENERIC_QUERY_INTENTS = frozenset({
+    'daily_operational_summary', 'order_shortages', 'order_readiness',
+    'incoming_deliveries', 'inventory_status', 'sales_analytics', 'overdue_payments',
+})
+
+
+def _prefers_generic_business_read(value: str, intent: str = '') -> bool:
+    normalized = ' '.join(str(value or '').casefold().split()).strip(' ?!.')
+    intent = intent or _detect_read_intent(normalized)
+    if intent not in _GENERIC_QUERY_INTENTS:
+        return False
     operational = re.search(
         r'\b(?:realizuj|realizujemy|pakuj|spakuj|wystaw|utwórz|dodaj|zmień|usun|usuń|anuluj|'
         r'nadaj|zamów kuriera|zamow kuriera|zatwierdź|zatwierdzam|odrzuć|odrzucam|wydrukuj|'
@@ -234,19 +271,21 @@ def _prefers_generic_business_read(value: str) -> bool:
         normalized,
     )
     preflight = re.search(
-        r'\b(?:preflight|readiness|gotowość|gotowosc|czy (?:mogę|moge|można|mozna) '
+        r'\b(?:preflight|readiness|czy (?:mogę|moge|można|mozna) '
         r'(?:realizować|realizowac|pakować|pakowac|wysłać|wyslac|nadać|nadac)|'
-        r'wymagania wysyłki|shipping requirements|shipping capabilities|ksef|gotowe do wysyłki|'
-        r'gotowe do realizacji|kompletne do wysyłki|kompletność zamówienia|kompletnosc zamowienia)\b',
+        r'wymagania wysyłki|shipping requirements|shipping capabilities|ksef)\b',
         normalized,
     )
-    analytical = re.search(
-        r'\b(?:jakich|jakie|które|ktore|ile|podsumuj|podsumowanie|porównaj|porownaj|ranking|'
-        r'brak\w*|pokryci\w*|sprzedaż|sprzedaz|zapas|zamówieni\w*|zamowieni\w*|'
-        r'produkt\w*|płatno|platno|faktur)\b',
-        normalized,
-    )
-    return bool(analytical and not operational and not preflight)
+    return not operational and not preflight
+
+
+def _is_ambiguous_business_read(value: str, intent: str = '') -> bool:
+    normalized = ' '.join(str(value or '').casefold().split()).strip(' ?!.')
+    if (intent or _detect_read_intent(normalized)) != 'ambiguous':
+        return False
+    return bool(re.fullmatch(
+        r'(?:(?:sprawdź|sprawdz|pokaż|pokaz|podsumuj|przeanalizuj)(?: (?:sytuacj\w*|dane))?'
+        r'|co (?:się|sie) dzieje)', normalized))
 
 
 _GENERIC_CANONICAL_MICRO_READS = frozenset({
@@ -259,6 +298,78 @@ _GENERIC_CANONICAL_MICRO_READS = frozenset({
 
 def _prefer_generic_tool_catalog(tools):
     return [item for item in tools if item['name'] not in _GENERIC_CANONICAL_MICRO_READS]
+
+
+_INTENT_TOOL_NAMES = {
+    'daily_operational_summary': frozenset({'business.query', 'invoices.overdue'}),
+    'order_shortages': frozenset({'business.query'}),
+    'order_readiness': frozenset({'business.query'}),
+    'incoming_deliveries': frozenset({'business.query'}),
+    'inventory_status': frozenset({'business.query'}),
+    # Canonical schema has no invoices/payments and cannot multiply item quantity by unit price.
+    # These existing controlled reads preserve data quality without widening the schema.
+    'sales_analytics': frozenset({'business.sales.summary'}),
+    'overdue_payments': frozenset({'invoices.overdue'}),
+}
+
+
+_INTENT_CANONICAL_SCOPE = {
+    'daily_operational_summary': {
+        'orders': ('number', 'customer_name', 'fulfillment_ready', 'fulfillment_missing_items'),
+        'inventory': ('sku', 'coverage_status', 'covered_by_stock_and_confirmed_incoming'),
+        'purchase_orders': ('number', 'status', 'delivery_stage', 'tracking_number'),
+    },
+    'order_shortages': {
+        'orders': ('number', 'customer_name', 'fulfillment_ready', 'fulfillment_missing_items'),
+        'inventory': ('sku', 'coverage_status', 'covered_by_stock_and_confirmed_incoming'),
+    },
+    'order_readiness': {
+        'orders': ('number', 'customer_name', 'fulfillment_ready', 'fulfillment_missing_items'),
+    },
+    'incoming_deliveries': {
+        'purchase_orders': ('number', 'supplier', 'status', 'delivery_stage', 'tracking_number'),
+    },
+    'inventory_status': {
+        'inventory': ('sku', 'model', 'available', 'coverage_status',
+                      'covered_by_stock_and_confirmed_incoming'),
+    },
+}
+
+
+def _intent_read_instructions(intent: str) -> str:
+    scope = _INTENT_CANONICAL_SCOPE.get(intent, {})
+    scope_text = '; '.join(
+        f"{entity}: {', '.join(fields)}" for entity, fields in scope.items())
+    details = ''
+    if intent == 'daily_operational_summary':
+        details = (
+            '\nW pierwszym passie pobierz równolegle jedno business.query dla wskazanego canonical scope '
+            'oraz invoices.overdue. To jedyny wyjątek od celu jednego narzędzia, ponieważ canonical schema nie '
+            'zawiera faktur ani płatności. Ogranicz wynik do gotowych wysyłek, braków i aktywnych dostaw '
+            'wymagających uwagi; nie dodawaj ogólnego replenishment, jeśli są konkretne działania.'
+        )
+    elif intent == 'order_shortages':
+        details = (
+            '\nDo pokrycia użyj gotowego covered_by_stock_and_confirmed_incoming/coverage_status. '
+            'Zgodnie z istniejącą semantyką tego pola planned P/O nie stanowi pokrycia; nie pobieraj '
+            'china.orders.get i nie przeliczaj P/O po stronie modelu.'
+        )
+    elif intent == 'sales_analytics':
+        details = (
+            '\nUżyj wyłącznie business.sales.summary z najwęższym okresem odpowiadającym pytaniu. '
+            'Canonical schema nie zawiera gotowej wartości sprzedaży, więc nie licz jej z surowych cen pozycji.'
+        )
+    elif intent == 'overdue_payments':
+        details = '\nUżyj wyłącznie invoices.overdue z najwęższym filtrem wynikającym z pytania.'
+    return f'''
+Główna intencja READ: {intent}.
+Nie rozszerzaj pytania na inne obszary firmy. Zaplanuj najmniejszy odczyt potrzebny do odpowiedzi.
+Dozwolony canonical scope: {scope_text or 'brak — użyj wskazanego kontrolowanego READ'}.
+W business.query wybierz tylko potrzebne encje, pola i relacje, z jawnym małym limitem. Preferuj gotowe pola
+computed i nie odtwarzaj logiki ERP. Nie wywołuj business.describe_schema: wystarczający zakres podano powyżej.
+Po trafnym wyniku odpowiedz. Jeden wąski follow-up jest dozwolony wyłącznie dla jednej konkretnej luki
+ujawnionej przez pierwszy wynik; nie używaj mikro READ-u ani fallbacku.{details}
+'''
 
 
 
@@ -320,23 +431,11 @@ Nie wymagaj od użytkownika osobnego polecenia pobrania zawartości dostaw. Jeś
 relewantnych ordered/shipped P/O, sprawdź najważniejsze mieszczące się w budżecie i jawnie zaznacz niepełną
 weryfikację zamiast przedstawiać częściowy wynik jako pełny.
 '''
-GENERIC_ANALYTICAL_READ_INSTRUCTIONS = '''
-Stosuj schema-first dla pytania analitycznego o stan firmy:
-1. Najpierw wywołaj business.describe_schema dla najmniejszego zestawu prawdopodobnie relewantnych encji.
-2. W opisie znajdź pola, których description odpowiada pytaniu, i preferuj computed=true. Są to gotowe stany
-   policzone przez aplikację. Nie rekonstruuj readiness, braków, pokrycia rezerwacji ani statusu operacyjnego.
-3. Następnie wykonaj możliwie jedno business.query. Każde zapytanie musi mieć jawny, minimalny select i rozsądny
-   limit. Pobierz minimum pól, rekordów i relacji; nie pobieraj cen, notatek, adresów ani pełnych relacji na zapas.
-4. Surowych pól użyj tylko wtedy, gdy schema nie zawiera wystarczającego computed field albo użytkownik żąda
-   szczegółu, którego gotowy stan nie zawiera. Zbiory do lekkich sum, count i group_by łącz w jednym business.query.
-5. Po głównym query odpowiedz z jego wyniku. Jeżeli brakuje jednej koniecznej informacji, wolno wykonać najwyżej
-   jeden dodatkowy, wąski business.query. Nie wracaj do mikro READ-ów pokrytych canonical schema.
-Nie odtwarzaj logiki ERP po stronie modelu i nie pobieraj danych na zapas.
-'''
 GENERIC_QUERY_FOLLOWUP_INSTRUCTIONS = '''
 Główne business.query zostało już wykonane. Jeżeli wynik wystarcza, odpowiedz teraz. Jeżeli brakuje jednej
 koniecznej informacji, możesz wywołać dokładnie jeden dodatkowy business.query z minimalnym select, limit i bez
-zbędnych relacji. Nie wolno wywołać żadnego innego narzędzia ani więcej niż jednego follow-up query.
+zbędnych relacji. Wywołaj go tylko dla konkretnej luki widocznej w wyniku. Nie wolno wywołać żadnego innego
+narzędzia ani więcej niż jednego follow-up query. Gdy danych nie ma, nazwij brak i zakończ zamiast szukać dalej.
 '''
 _MARKDOWN_RULE = re.compile(r'^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$',re.MULTILINE)
 _URL_RULE = re.compile(r'https?://\S+',re.IGNORECASE)
@@ -483,6 +582,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         'final_model_call_ms':0.0, 'total_ms':0.0, 'tool_calls_count':0,
     }
     usage = {'input_tokens':0,'output_tokens':0}
+    usage_available = False
     model_name, evidence, active = '', [], False
     ai_actor = None
     pending_approvals = []
@@ -494,7 +594,10 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
     historical_entity_types = set()
     previous_turn_entities = {}
     current_stage = 'runtime_initialization'
+    detected_intent = _detect_read_intent(message)
+    model_calls = 0
     generic_analytical_read = False
+    ambiguous_business_read = False
     generic_read_diagnostics = {
         'schema_discovery_used':False,
         'computed_fields_selected':[],
@@ -503,6 +606,10 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         'selected_fields_count':0,
         'result_cells':0,
         'fallback_reason':'',
+        'main_query_fields':[],
+        'main_query_entities':[],
+        'followup_used':False,
+        'followup_reason':'',
     }
     chat_503_diagnostics = {
         'first_model_call_succeeded':False,
@@ -556,6 +663,20 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 logger.error('AI_AUDIT_FAILED %s',run_id)
         timings['total_ms'] = round((time.perf_counter()-started)*1000,2)
         logger.info('AI_TURN_TIMING %s',json.dumps({'agent_run_id':run_id,**timings}))
+        logger.info('AI_READ_INTENT_DIAGNOSTIC %s', json.dumps({
+            'agent_run_id':run_id,
+            'detected_intent':detected_intent,
+            'model_call_count':model_calls,
+            'tool_call_count':timings['tool_calls_count'],
+            'main_query_fields':generic_read_diagnostics['main_query_fields'],
+            'main_query_entities':generic_read_diagnostics['main_query_entities'],
+            'followup_used':generic_read_diagnostics['followup_used'],
+            'followup_reason':generic_read_diagnostics['followup_reason'],
+            'input_tokens':usage['input_tokens'] if usage_available else None,
+            'output_tokens':usage['output_tokens'] if usage_available else None,
+            'total_latency_ms':timings['total_ms'],
+            'tool_latency_ms':timings['tool_execution_ms'],
+        }, sort_keys=True))
         if generic_analytical_read:
             logger.info('AI_GENERIC_READ_STRATEGY %s', json.dumps(
                 {'agent_run_id':run_id, **generic_read_diagnostics}, sort_keys=True))
@@ -656,10 +777,13 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         timings['memory_load_ms'] = round((time.perf_counter()-stage_started)*1000,2)
         stage_started = time.perf_counter()
         tools = _tool_descriptors(ai_actor,human_actor)
+        generic_query_available = any(item['name'] == 'business.query' for item in tools)
         generic_analytical_read = (
-            _prefers_generic_business_read(turn_message)
-            and any(item['name'] == 'business.query' for item in tools)
+            _prefers_generic_business_read(turn_message, detected_intent)
+            and generic_query_available
         )
+        ambiguous_business_read = (
+            generic_query_available and _is_ambiguous_business_read(turn_message, detected_intent))
         if generic_analytical_read:
             tools = _prefer_generic_tool_catalog(tools)
         input_items = []
@@ -685,7 +809,8 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         timings['context_history_build_ms'] = round(timings['context_history_build_ms'],2)
         timings['context_build_ms'] = round((time.perf_counter()-started)*1000,2)
         _audit('agent.requested',human_actor,run_id,correlation_id,SUCCESS,human_actor.actor_id,conversation_id=conversation_id)
-        seen, model_calls = set(), 0
+        seen = set()
+        generic_tools_used = set()
         green_batch_synthesis_only = False
         only_green_reads_so_far = True
         china_shortage_coverage_question = _is_china_shortage_coverage_question(turn_message)
@@ -703,10 +828,19 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
             synthesis_only = (
                 green_batch_synthesis_only or exhausted_green_synthesis
                 or generic_analytical_read and generic_read_diagnostics['query_count'] >= 2
+                or generic_analytical_read and detected_intent in {'sales_analytics', 'overdue_payments'}
+                    and bool(generic_tools_used)
+                or generic_analytical_read and detected_intent == 'daily_operational_summary'
+                    and len(generic_tools_used) >= len(_INTENT_TOOL_NAMES[detected_intent])
             )
             model_instructions = instructions
             if generic_analytical_read:
-                model_instructions += GENERIC_ANALYTICAL_READ_INSTRUCTIONS
+                model_instructions += _intent_read_instructions(detected_intent)
+            elif ambiguous_business_read:
+                model_instructions += '''
+Pytanie biznesowe jest niejednoznaczne. Nie uruchamiaj narzędzi i nie rozszerzaj zakresu na całą firmę.
+Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chce sprawdzić.
+'''
             elif china_shortage_coverage_question:
                 model_instructions += CHINA_SHORTAGE_COVERAGE_INSTRUCTIONS
             if model_calls == 0:
@@ -724,13 +858,18 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 if generic_analytical_read and generic_read_diagnostics['query_count'] == 1:
                     model_instructions += GENERIC_QUERY_FOLLOWUP_INSTRUCTIONS
             model_tools = tools
-            if generic_analytical_read and not synthesis_only:
-                if not generic_read_diagnostics['schema_discovery_used']:
-                    model_tools = [item for item in tools if item['name'] == 'business.describe_schema']
+            if ambiguous_business_read:
+                model_tools = []
+            elif generic_analytical_read and not synthesis_only:
+                if not generic_tools_used:
+                    allowed_names = _INTENT_TOOL_NAMES.get(detected_intent, frozenset())
+                elif detected_intent == 'daily_operational_summary':
+                    allowed_names = _INTENT_TOOL_NAMES[detected_intent] - generic_tools_used
                 elif generic_read_diagnostics['query_count'] == 1:
-                    model_tools = [item for item in tools if item['name'] == 'business.query']
+                    allowed_names = frozenset({'business.query'})
                 else:
-                    model_tools = [item for item in tools if item['name'] != 'business.describe_schema']
+                    allowed_names = frozenset()
+                model_tools = [item for item in tools if item['name'] in allowed_names]
             pass_allowed = {item['name'] for item in model_tools}
             try:
                 reply = provider.complete(instructions=model_instructions,input_items=input_items,
@@ -750,6 +889,8 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
             if model_calls == 1:
                 chat_503_diagnostics['first_model_call_succeeded'] = True
             model_name = _safe_text(reply.model,128)
+            if reply.input_tokens or reply.output_tokens:
+                usage_available = True
             usage['input_tokens'] += reply.input_tokens
             usage['output_tokens'] += reply.output_tokens
             if not reply.tool_calls:
@@ -770,15 +911,26 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
             if any(call.name not in pass_allowed for call in reply.tool_calls):
                 return finish('DENIED','Ta operacja nie jest dostępna dla asystenta.','TOOL_NOT_ALLOWED')
             if generic_analytical_read:
-                schema_calls = sum(call.name == 'business.describe_schema' for call in reply.tool_calls)
                 query_calls = sum(call.name == 'business.query' for call in reply.tool_calls)
-                if (schema_calls > 1 or query_calls > 1
+                too_many_for_intent = (
+                    detected_intent != 'daily_operational_summary' and len(reply.tool_calls) > 1
+                    or bool(generic_tools_used) and len(reply.tool_calls) > 1
+                    or detected_intent == 'daily_operational_summary'
+                        and len({call.name for call in reply.tool_calls}) != len(reply.tool_calls)
+                )
+                if (too_many_for_intent or query_calls > 1
                         or generic_read_diagnostics['query_count'] + query_calls > 2):
                     return finish('FAILED','Generic read przekroczył zakres zapytania.','TOOL_LIMIT_EXCEEDED')
+                is_followup = bool(generic_tools_used)
+                if is_followup:
+                    generic_read_diagnostics['followup_used'] = True
+                    if detected_intent == 'daily_operational_summary':
+                        missing = sorted(call.name for call in reply.tool_calls)
+                        generic_read_diagnostics['followup_reason'] = 'missing_daily_source:' + ','.join(missing)
+                    else:
+                        generic_read_diagnostics['followup_reason'] = 'specific_gap_after_main_query'
                 for call in reply.tool_calls:
-                    if call.name == 'business.describe_schema':
-                        generic_read_diagnostics['schema_discovery_used'] = True
-                    elif call.name == 'business.query':
+                    if call.name == 'business.query':
                         if (generic_read_diagnostics['query_count'] == 1
                                 and not generic_read_diagnostics['fallback_reason']):
                             generic_read_diagnostics['fallback_reason'] = 'computed_fields_insufficient'
@@ -791,7 +943,12 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                             if field not in generic_read_diagnostics['raw_fields_selected']:
                                 generic_read_diagnostics['raw_fields_selected'].append(field)
                         generic_read_diagnostics['selected_fields_count'] += selected
+                        if generic_read_diagnostics['query_count'] == 0:
+                            generic_read_diagnostics['main_query_fields'] = computed + raw
+                            generic_read_diagnostics['main_query_entities'] = list(dict.fromkeys(
+                                field.split('.', 1)[0] for field in computed + raw))
                         generic_read_diagnostics['query_count'] += 1
+                generic_tools_used.update(call.name for call in reply.tool_calls)
             only_green_reads_so_far = only_green_reads_so_far and all(
                 business_operations.OPERATION_REGISTRY[call.name].read_only
                 and business_operations.OPERATION_REGISTRY[call.name].risk_level == 'GREEN'
@@ -955,9 +1112,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                         generic_read_diagnostics['result_cells'] += int((result.data or {}).get('result_cells') or 0)
                 elif result.error_code == 'DATA_UNAVAILABLE':
                     chat_503_diagnostics['tool_calls_data_unavailable'] += 1
-                    if generic_analytical_read and call.name == 'business.describe_schema':
-                        generic_read_diagnostics['fallback_reason'] = 'schema_discovery_unavailable'
-                    elif generic_analytical_read and call.name == 'business.query':
+                    if generic_analytical_read and call.name == 'business.query':
                         generic_read_diagnostics['fallback_reason'] = 'query_unavailable'
                 _audit('agent.tool_result',ai_actor,run_id,correlation_id,SUCCESS if result.status=='SUCCESS' else FAILED,
                        human_actor.actor_id,tool_name=call.name,execution_id=result.execution_id,result_status=result.status,conversation_id=conversation_id)
@@ -1031,7 +1186,12 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 turn_outputs.append({'type':'function_call_output','call_id':call.call_id,'output':encoded})
             input_items.extend(outputs+turn_outputs)
             evidence.extend(outputs+turn_outputs)
-            if parallel_read_batch or generic_analytical_read and generic_read_diagnostics['query_count'] >= 2:
+            if (parallel_read_batch
+                    or generic_analytical_read and generic_read_diagnostics['query_count'] >= 2
+                    or generic_analytical_read and detected_intent in {'sales_analytics', 'overdue_payments'}
+                        and bool(generic_tools_used)
+                    or generic_analytical_read and detected_intent == 'daily_operational_summary'
+                        and len(generic_tools_used) >= len(_INTENT_TOOL_NAMES[detected_intent])):
                 green_batch_synthesis_only = True
     except agent_conversation.ConversationAccessDenied:
         return finish('DENIED','Nie masz dostępu do tej rozmowy.','CONVERSATION_ACCESS_DENIED')

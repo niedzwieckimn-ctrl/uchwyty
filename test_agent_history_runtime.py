@@ -452,265 +452,274 @@ def test_shortage_coverage_fetches_ordered_and_shipped_po_details_and_skips_plan
                if operation == 'china.orders.get')
 
 
-def test_generic_read_shortage_analysis_is_schema_first_and_uses_one_minimal_query(monkeypatch):
+def _controlled_success(operation, data):
+    definition = operations.OPERATION_REGISTRY[operation]
+    return operations.OperationResult(
+        status='SUCCESS', data=data, operation=operation,
+        operation_version=definition.operation_version, execution_id='intent-read',
+        request_id='request', correlation_id='correlation',
+    )
+
+
+@pytest.mark.parametrize(('question', 'intent'), [
+    ('Co mam dziś do zrobienia?', 'daily_operational_summary'),
+    ('Które zamówienia blokuje brak towaru?', 'order_shortages'),
+    ('Które zamówienia są gotowe do wysyłki?', 'order_readiness'),
+    ('Które faktury są po terminie?', 'overdue_payments'),
+    ('Jakie dostawy z Chin są aktywne?', 'incoming_deliveries'),
+    ('Jaki jest stan magazynu?', 'inventory_status'),
+    ('Ile sprzedałem w tym miesiącu?', 'sales_analytics'),
+    ('Znajdź klienta Magmar', 'customer_lookup'),
+    ('Znajdź produkt CH011', 'product_lookup'),
+    ('Pokaż fakturę FVAT 1', 'invoice_lookup'),
+])
+def test_intent_first_detects_one_primary_intent(question, intent):
+    assert runtime._detect_read_intent(question) == intent
+
+
+def test_daily_summary_uses_bounded_operational_batch_and_two_model_calls(monkeypatch, caplog):
     monkeypatch.setenv('AGENT_GENERIC_READ_ENABLED', '1')
-    executed = []
-    schema_payload = {'entities':['orders', 'inventory']}
-    schema_result = {'ok':True, 'schema_version':'2', 'entities':[
-        {'name':'orders', 'fields':[
-            {'name':'number', 'computed':False},
-            {'name':'fulfillment_ready', 'computed':True},
-            {'name':'fulfillment_missing_items', 'computed':True},
-        ], 'relationships':[]},
-        {'name':'inventory', 'fields':[
-            {'name':'sku', 'computed':False},
-            {'name':'coverage_status', 'computed':True},
-            {'name':'covered_by_stock_and_confirmed_incoming', 'computed':True},
-        ], 'relationships':[]},
-    ]}
-    query_payload = {'queries': [
-        {'key':'blocked_orders', 'entity':'orders',
-         'select':['number', 'fulfillment_ready', 'fulfillment_missing_items'],
-         'where':[{'field':'fulfillment_ready', 'op':'eq', 'value':False}], 'limit':20},
-        {'key':'uncovered_products', 'entity':'inventory',
+    query_payload = {'queries':[
+        {'key':'actionable_orders', 'entity':'orders',
+         'select':['number', 'customer_name', 'fulfillment_ready', 'fulfillment_missing_items'],
+         'limit':20},
+        {'key':'shortage_coverage', 'entity':'inventory',
          'select':['sku', 'coverage_status', 'covered_by_stock_and_confirmed_incoming'],
-         'where':[{'field':'covered_by_stock_and_confirmed_incoming', 'op':'eq', 'value':False}], 'limit':20},
+         'where':[{'field':'covered_by_stock_and_confirmed_incoming', 'op':'eq', 'value':False}],
+         'limit':20},
+        {'key':'active_deliveries', 'entity':'purchase_orders',
+         'select':['number', 'status', 'delivery_stage', 'tracking_number'],
+         'where':[{'field':'status', 'op':'in', 'value':['ordered', 'shipped']}],
+         'limit':20},
     ]}
-    query_result = {'ok':True, 'schema_version':'2', 'results':[
-        {'key':'blocked_orders', 'rows':[{'number':'ZAM-1', 'fulfillment_ready':False,
-            'fulfillment_missing_items':[{'sku':'SKU-A', 'shortage_quantity':3}]}]},
-        {'key':'uncovered_products', 'rows':[{'sku':'SKU-A', 'coverage_status':'Problem',
-            'covered_by_stock_and_confirmed_incoming':False}]},
-    ], 'result_cells':12}
+    executed = []
 
     def execute(_actor, operation, arguments, **_kwargs):
         executed.append((operation, dict(arguments)))
-        definition = operations.OPERATION_REGISTRY[operation]
-        data = schema_result if operation == 'business.describe_schema' else query_result
-        return operations.OperationResult(
-            status='SUCCESS', data=data, operation=operation,
-            operation_version=definition.operation_version, execution_id='generic-read',
-            request_id='request', correlation_id='correlation',
-        )
-
-    def discover(kwargs):
-        names = {item['name'] for item in kwargs['tools']}
-        assert names == {'business.describe_schema'}
-        assert 'Najpierw wywołaj business.describe_schema' in kwargs['instructions']
-        assert 'preferuj computed=true' in kwargs['instructions']
-        assert 'Sama china.orders.search' not in kwargs['instructions']
-        return tool('business.describe_schema', schema_payload, call_id='schema-discovery')
+        if operation == 'business.query':
+            return _controlled_success(operation, {
+                'ok':True, 'results':[], 'result_cells':0, 'schema_version':'2'})
+        return _controlled_success(operation, {'ok':True, 'results':[]})
 
     def plan(kwargs):
         names = {item['name'] for item in kwargs['tools']}
-        assert 'business.query' in names
-        assert not ({'orders.search', 'orders.get', 'orders.summary',
-                     'orders.fulfillment.readiness', 'orders.fulfillment.state', 'orders.packing.check',
-                     'inventory.product.search', 'inventory.product.get', 'inventory.summary',
-                     'china.orders.search', 'china.orders.get', 'china.orders.summary'} & names)
-        outputs = [json.loads(item['output']) for item in kwargs['input_items']
-                   if item.get('type') == 'function_call_output']
-        assert outputs == [schema_result]
-        return tool('business.query', query_payload, call_id='generic-query')
+        assert names == {'business.query', 'invoices.overdue'}
+        assert 'Główna intencja READ: daily_operational_summary' in kwargs['instructions']
+        assert 'business.describe_schema' not in names
+        assert not ({'orders.summary', 'inventory.summary', 'china.orders.summary',
+                     'orders.fulfillment.readiness', 'china.orders.get',
+                     'business.sales.summary'} & names)
+        return runtime.ProviderResponse(tool_calls=(
+            runtime.ToolCall('daily-main', 'business.query', json.dumps(query_payload)),
+            runtime.ToolCall('daily-overdue', 'invoices.overdue', '{}'),
+        ), model='fake-model', input_tokens=100, output_tokens=20)
 
     def synthesize(kwargs):
-        assert {item['name'] for item in kwargs['tools']} == {'business.query'}
-        assert kwargs['tool_choice'] == 'auto'
-        outputs = [json.loads(item['output']) for item in kwargs['input_items']
-                   if item.get('type') == 'function_call_output']
-        assert outputs == [schema_result, query_result]
-        assert 'Główne business.query zostało już wykonane' in kwargs['instructions']
-        return respond('SKU-A — brak 3 szt. po uwzględnieniu zamówionych P/O; planned pominięto.')
+        assert kwargs['tools'] == [] and kwargs['tool_choice'] == 'none'
+        assert len([item for item in kwargs['input_items']
+                    if item.get('type') == 'function_call_output']) == 2
+        return respond('1. Pilne wysyłki\n- Brak.\n2. Płatności po terminie\n- Brak.',
+                       input_tokens=40, output_tokens=15)
 
     monkeypatch.setattr(operations, 'execute_business_operation', execute)
-    backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([discover, plan, synthesize])
-    client = backend.app.test_client()
-    with client.session_transaction() as session:
-        session['admin_authenticated'] = True
-        session['csrf_token'] = 'csrf'
+    provider = runtime.FakeModelProvider([plan, synthesize])
+    with caplog.at_level('INFO', logger='agent_runtime'):
+        result = runtime.run_agent_turn(owner(), 'Co mam dziś do zrobienia?', provider)
 
-    response = client.post('/api/internal/ai/chat', json={'message':
-        'Sprawdź czy wszystkie zamówienia mają pokrycie w produktach i podaj co muszę pilnie zamówić.'})
+    assert result['status'] == 'SUCCESS'
+    assert result['tool_calls'] == 2 and len(provider.calls) == 2
+    assert {operation for operation, _arguments in executed} == {'business.query', 'invoices.overdue'}
+    diagnostic = json.loads(next(record.message for record in caplog.records
+        if record.message.startswith('AI_READ_INTENT_DIAGNOSTIC ')).split(' ', 1)[1])
+    assert diagnostic['detected_intent'] == 'daily_operational_summary'
+    assert diagnostic['model_call_count'] == 2 and diagnostic['tool_call_count'] == 2
+    assert set(diagnostic['main_query_entities']) == {'orders', 'inventory', 'purchase_orders'}
+    assert diagnostic['followup_used'] is False
+    assert diagnostic['input_tokens'] == 140 and diagnostic['output_tokens'] == 35
 
-    assert response.status_code == 200
-    payload = response.get_json()
-    assert payload['status'] == 'SUCCESS' and payload['error_code'] == ''
-    assert payload['tool_calls'] == 2
-    assert executed == [('business.describe_schema', schema_payload), ('business.query', query_payload)]
-    assert len(backend.AGENT_MODEL_PROVIDER.calls) == 3
 
-
-def test_blocked_orders_question_uses_computed_order_state_in_one_query(monkeypatch):
+def test_order_shortages_uses_one_minimal_query_and_stops(monkeypatch):
     monkeypatch.setenv('AGENT_GENERIC_READ_ENABLED', '1')
-    schema_payload = {'entities':['orders']}
     query_payload = {'queries':[{
         'key':'blocked_orders', 'entity':'orders',
         'select':['number', 'fulfillment_ready', 'fulfillment_missing_items'],
         'where':[{'field':'fulfillment_ready', 'op':'eq', 'value':False}], 'limit':20,
     }]}
-    schema_result = {'ok':True, 'schema_version':'2', 'entities':[]}
-    query_result = {'ok':True, 'schema_version':'2', 'results':[
-        {'key':'blocked_orders', 'rows':[{'number':'ZAM-1', 'fulfillment_ready':False,
-          'fulfillment_missing_items':[{'sku':'SKU-A', 'shortage_quantity':1}]}]},
-    ], 'result_cells':7}
     executed = []
 
     def execute(_actor, operation, arguments, **_kwargs):
         executed.append((operation, dict(arguments)))
-        definition = operations.OPERATION_REGISTRY[operation]
-        data = schema_result if operation == 'business.describe_schema' else query_result
-        return operations.OperationResult(
-            status='SUCCESS', data=data, operation=operation,
-            operation_version=definition.operation_version, execution_id='generic-read',
-            request_id='request', correlation_id='correlation',
-        )
+        return _controlled_success(operation, {'ok':True, 'results':[
+            {'key':'blocked_orders', 'rows':[{'number':'ZAM-1', 'fulfillment_ready':False,
+             'fulfillment_missing_items':[{'sku':'SKU-A', 'shortage_quantity':1}]}]}],
+             'result_cells':7})
 
-    def discover(kwargs):
-        return tool('business.describe_schema', schema_payload, call_id='blocked-schema')
-
-    def query(kwargs):
-        names = {item['name'] for item in kwargs['tools']}
-        assert 'business.query' in names
-        assert not ({'orders.fulfillment.readiness', 'orders.fulfillment.state',
-                     'orders.search', 'orders.get'} & names)
-        return tool('business.query', query_payload, call_id='blocked-query')
+    def plan(kwargs):
+        assert {item['name'] for item in kwargs['tools']} == {'business.query'}
+        assert 'Główna intencja READ: order_shortages' in kwargs['instructions']
+        assert 'china.orders.get' not in {item['name'] for item in kwargs['tools']}
+        return tool('business.query', query_payload, call_id='shortages-main')
 
     def synthesize(kwargs):
         assert {item['name'] for item in kwargs['tools']} == {'business.query'}
-        return respond('ZAM-1 jest zablokowane przez brak 1 szt. SKU-A.')
+        assert 'Główne business.query zostało już wykonane' in kwargs['instructions']
+        return respond('ZAM-1 blokuje brak 1 szt. SKU-A.')
 
     monkeypatch.setattr(operations, 'execute_business_operation', execute)
-    provider = runtime.FakeModelProvider([discover, query, synthesize])
+    provider = runtime.FakeModelProvider([plan, synthesize])
     result = runtime.run_agent_turn(
         owner(), 'Które zamówienia są zablokowane przez brak towaru?', provider)
 
-    assert result['status'] == 'SUCCESS' and result['tool_calls'] == 2
-    assert executed == [
-        ('business.describe_schema', schema_payload), ('business.query', query_payload)]
-    assert len(provider.calls) == 3
+    assert result['status'] == 'SUCCESS' and result['tool_calls'] == 1
+    assert executed == [('business.query', query_payload)]
+    assert len(provider.calls) == 2
 
 
-def test_generic_read_allows_only_one_narrow_followup_and_logs_strategy(monkeypatch, caplog):
+def test_shortage_coverage_uses_computed_state_and_never_china_get(monkeypatch):
     monkeypatch.setenv('AGENT_GENERIC_READ_ENABLED', '1')
-    schema_payload = {'entities':['orders', 'inventory']}
-    schema_result = {'ok':True, 'schema_version':'2', 'entities':[]}
+    query_payload = {'queries':[{
+        'key':'uncovered', 'entity':'inventory',
+        'select':['sku', 'coverage_status', 'covered_by_stock_and_confirmed_incoming'],
+        'where':[{'field':'covered_by_stock_and_confirmed_incoming', 'op':'eq', 'value':False}],
+        'limit':20,
+    }]}
+    executed = []
+
+    def execute(_actor, operation, arguments, **_kwargs):
+        executed.append(operation)
+        return _controlled_success(operation, {'ok':True, 'results':[
+            {'key':'uncovered', 'rows':[{'sku':'SKU-C', 'coverage_status':'Problem',
+              'covered_by_stock_and_confirmed_incoming':False}]}], 'result_cells':5})
+
+    def plan(kwargs):
+        names = {item['name'] for item in kwargs['tools']}
+        assert names == {'business.query'}
+        assert 'planned P/O nie stanowi pokrycia' in kwargs['instructions']
+        return tool('business.query', query_payload, call_id='coverage-main')
+
+    monkeypatch.setattr(operations, 'execute_business_operation', execute)
+    provider = runtime.FakeModelProvider([plan, respond('SKU-C nie ma potwierdzonego pokrycia.')])
+    result = runtime.run_agent_turn(
+        owner(), 'Sprawdź pokrycie braków aktywnymi dostawami z Chin.', provider)
+
+    assert result['status'] == 'SUCCESS' and executed == ['business.query']
+    assert all('china.orders.get' not in {item['name'] for item in call['tools']}
+               for call in provider.calls)
+
+
+def test_sales_intent_uses_one_accurate_controlled_aggregate_read(monkeypatch):
+    monkeypatch.setenv('AGENT_GENERIC_READ_ENABLED', '1')
+    executed = []
+
+    def execute(_actor, operation, arguments, **_kwargs):
+        executed.append((operation, dict(arguments)))
+        return _controlled_success(operation, {
+            'period':arguments, 'currencies':[{'currency':'PLN', 'orders_total_net':12000}]})
+
+    def plan(kwargs):
+        assert {item['name'] for item in kwargs['tools']} == {'business.sales.summary'}
+        assert 'Główna intencja READ: sales_analytics' in kwargs['instructions']
+        return tool('business.sales.summary', {'period':'month'}, call_id='sales-main')
+
+    def synthesize(kwargs):
+        assert kwargs['tools'] == [] and kwargs['tool_choice'] == 'none'
+        return respond('W tym miesiącu sprzedaż netto wyniosła 12 000 zł.')
+
+    monkeypatch.setattr(operations, 'execute_business_operation', execute)
+    provider = runtime.FakeModelProvider([plan, synthesize])
+    result = runtime.run_agent_turn(owner(), 'Ile sprzedałem w tym miesiącu?', provider)
+
+    assert result['status'] == 'SUCCESS' and result['tool_calls'] == 1
+    assert len(provider.calls) == 2
+    assert executed == [('business.sales.summary', {'period':'month'})]
+
+
+def test_ambiguous_business_question_cannot_expand_to_company_wide_search(monkeypatch, caplog):
+    monkeypatch.setenv('AGENT_GENERIC_READ_ENABLED', '1')
+    def clarify(kwargs):
+        assert kwargs['tools'] == [] and kwargs['tool_choice'] == 'auto'
+        assert 'Pytanie biznesowe jest niejednoznaczne' in kwargs['instructions']
+        return respond('Który obszar mam sprawdzić: zamówienia, magazyn czy płatności?')
+
+    provider = runtime.FakeModelProvider([clarify])
+    with caplog.at_level('INFO', logger='agent_runtime'):
+        result = runtime.run_agent_turn(owner(), 'Sprawdź sytuację.', provider)
+
+    assert result['status'] == 'SUCCESS' and result['tool_calls'] == 0
+    diagnostic = json.loads(next(record.message for record in caplog.records
+        if record.message.startswith('AI_READ_INTENT_DIAGNOSTIC ')).split(' ', 1)[1])
+    assert diagnostic['detected_intent'] == 'ambiguous'
+    assert diagnostic['input_tokens'] is None and diagnostic['output_tokens'] is None
+
+
+def test_one_precise_followup_is_allowed_then_forces_synthesis(monkeypatch, caplog):
+    monkeypatch.setenv('AGENT_GENERIC_READ_ENABLED', '1')
     first_query = {'queries':[{
         'key':'blocked_orders', 'entity':'orders',
         'select':['number', 'fulfillment_ready', 'fulfillment_missing_items'],
         'where':[{'field':'fulfillment_ready', 'op':'eq', 'value':False}], 'limit':20,
     }]}
     followup_query = {'queries':[{
-        'key':'uncovered_inventory', 'entity':'inventory',
+        'key':'coverage_for_missing_skus', 'entity':'inventory',
         'select':['sku', 'coverage_status', 'covered_by_stock_and_confirmed_incoming'],
-        'where':[{'field':'covered_by_stock_and_confirmed_incoming', 'op':'eq', 'value':False}], 'limit':20,
+        'where':[{'field':'sku', 'op':'in', 'value':['SKU-A']}], 'limit':1,
     }]}
-    first_result = {'ok':True, 'schema_version':'2', 'results':[
-        {'key':'blocked_orders', 'rows':[{'number':'ZAM-1', 'fulfillment_ready':False,
-          'fulfillment_missing_items':[{'sku':'SKU-A', 'shortage_quantity':3}]}]},
-    ], 'result_cells':7}
-    followup_result = {'ok':True, 'schema_version':'2', 'results':[
-        {'key':'uncovered_inventory', 'rows':[{'sku':'SKU-A', 'coverage_status':'Problem',
-          'covered_by_stock_and_confirmed_incoming':False}]},
-    ], 'result_cells':5}
     executed = []
 
     def execute(_actor, operation, arguments, **_kwargs):
-        executed.append((operation, dict(arguments)))
-        definition = operations.OPERATION_REGISTRY[operation]
-        if operation == 'business.describe_schema':
-            data = schema_result
-        else:
-            data = first_result if arguments == first_query else followup_result
-        return operations.OperationResult(
-            status='SUCCESS', data=data, operation=operation,
-            operation_version=definition.operation_version, execution_id='generic-read',
-            request_id='request', correlation_id='correlation',
-        )
+        executed.append(dict(arguments))
+        data = {'ok':True, 'results':[], 'result_cells':3 if arguments == first_query else 2}
+        return _controlled_success(operation, data)
 
-    def discover(kwargs):
-        assert {item['name'] for item in kwargs['tools']} == {'business.describe_schema'}
-        return tool('business.describe_schema', schema_payload, call_id='schema')
+    def first(kwargs):
+        return tool('business.query', first_query, call_id='main-query')
 
-    def plan(kwargs):
-        assert 'business.query' in {item['name'] for item in kwargs['tools']}
-        return tool('business.query', first_query, call_id='query-one')
-
-    def narrow_followup(kwargs):
+    def followup(kwargs):
         assert {item['name'] for item in kwargs['tools']} == {'business.query'}
-        assert 'dokładnie jeden dodatkowy business.query' in kwargs['instructions']
-        return tool('business.query', followup_query, call_id='query-two')
+        assert 'jednej konkretnej luki' in kwargs['instructions']
+        return tool('business.query', followup_query, call_id='narrow-query')
 
-    def synthesize(kwargs):
+    def final(kwargs):
         assert kwargs['tools'] == [] and kwargs['tool_choice'] == 'none'
-        return respond('ZAM-1 blokuje SKU-A; po uwzględnieniu potwierdzonych dostaw nadal brakuje 3 szt.')
+        return respond('Brakuje danych o pokryciu SKU-A; pozostałe dane są kompletne.')
 
     monkeypatch.setattr(operations, 'execute_business_operation', execute)
-    provider = runtime.FakeModelProvider([discover, plan, narrow_followup, synthesize])
+    provider = runtime.FakeModelProvider([first, followup, final])
     with caplog.at_level('INFO', logger='agent_runtime'):
         result = runtime.run_agent_turn(
-            owner(), 'Które zamówienia są zablokowane przez brak towaru?', provider)
-
-    assert result['status'] == 'SUCCESS' and result['tool_calls'] == 3
-    assert executed == [
-        ('business.describe_schema', schema_payload),
-        ('business.query', first_query),
-        ('business.query', followup_query),
-    ]
-    assert len(provider.calls) == 4
-    message = next(record.message for record in caplog.records
-                   if record.message.startswith('AI_GENERIC_READ_STRATEGY '))
-    diagnostic = json.loads(message.split(' ', 1)[1])
-    assert {key:diagnostic[key] for key in (
-        'schema_discovery_used', 'computed_fields_selected', 'raw_fields_selected',
-        'query_count', 'selected_fields_count', 'result_cells', 'fallback_reason',
-    )} == {
-        'schema_discovery_used':True,
-        'computed_fields_selected':['orders.fulfillment_ready', 'orders.fulfillment_missing_items',
-                                    'inventory.coverage_status',
-                                    'inventory.covered_by_stock_and_confirmed_incoming'],
-        'raw_fields_selected':['orders.number', 'inventory.sku'],
-        'query_count':2, 'selected_fields_count':6,
-        'result_cells':12, 'fallback_reason':'computed_fields_insufficient',
-    }
-    assert 'ZAM-1' not in message and 'SKU-A' not in message
-
-
-def test_generic_read_sales_aggregation_remains_available(monkeypatch):
-    monkeypatch.setenv('AGENT_GENERIC_READ_ENABLED', '1')
-    schema_payload = {'entities':['orders']}
-    query_payload = {'queries':[{
-        'key':'monthly_sales', 'entity':'orders', 'select':['id'],
-        'where':[{'field':'created_at', 'op':'starts_with', 'value':'2026-09'}],
-        'aggregates':[{'function':'count', 'field':None, 'as':'orders_count'}], 'limit':1,
-    }]}
-    schema_result = {'ok':True, 'schema_version':'2', 'entities':[]}
-    query_result = {'ok':True, 'schema_version':'2', 'results':[
-        {'key':'monthly_sales', 'rows':[{'orders_count':12}], 'count':1,
-         'matched_count':12, 'truncated':False},
-    ], 'result_cells':6}
-
-    def execute(_actor, operation, arguments, **_kwargs):
-        definition = operations.OPERATION_REGISTRY[operation]
-        data = schema_result if operation == 'business.describe_schema' else query_result
-        return operations.OperationResult(
-            status='SUCCESS', data=data, operation=operation,
-            operation_version=definition.operation_version, execution_id='generic-read',
-            request_id='request', correlation_id='correlation',
-        )
-
-    provider = runtime.FakeModelProvider([
-        lambda kwargs: tool('business.describe_schema', schema_payload, call_id='sales-schema'),
-        lambda kwargs: tool('business.query', query_payload, call_id='sales-query'),
-        lambda kwargs: respond('W tym miesiącu zarejestrowano 12 zamówień.'),
-    ])
-    monkeypatch.setattr(operations, 'execute_business_operation', execute)
-    result = runtime.run_agent_turn(owner(), 'Ile sprzedałem w tym miesiącu?', provider)
+            owner(), 'Które zamówienia blokuje brak towaru?', provider)
 
     assert result['status'] == 'SUCCESS' and result['tool_calls'] == 2
-    assert len(provider.calls) == 3
-    assert {item['name'] for item in provider.calls[0]['tools']} == {'business.describe_schema'}
-    assert 'business.query' in {item['name'] for item in provider.calls[1]['tools']}
-    assert {item['name'] for item in provider.calls[2]['tools']} == {'business.query'}
+    assert executed == [first_query, followup_query] and len(provider.calls) == 3
+    diagnostic = json.loads(next(record.message for record in caplog.records
+        if record.message.startswith('AI_READ_INTENT_DIAGNOSTIC ')).split(' ', 1)[1])
+    assert diagnostic['followup_used'] is True
+    assert diagnostic['followup_reason'] == 'specific_gap_after_main_query'
+
+
+def test_no_data_stops_after_main_query_without_fallback(monkeypatch):
+    monkeypatch.setenv('AGENT_GENERIC_READ_ENABLED', '1')
+    query_payload = {'queries':[{
+        'key':'blocked_orders', 'entity':'orders',
+        'select':['number', 'fulfillment_ready'],
+        'where':[{'field':'fulfillment_ready', 'op':'eq', 'value':False}], 'limit':20,
+    }]}
+    executed = []
+
+    def execute(_actor, operation, arguments, **_kwargs):
+        executed.append(operation)
+        return _controlled_success(operation, {'ok':True, 'results':[], 'result_cells':0})
+
+    monkeypatch.setattr(operations, 'execute_business_operation', execute)
+    provider = runtime.FakeModelProvider([
+        tool('business.query', query_payload, call_id='empty-main'),
+        respond('Brak danych o gotowości zamówień w tym przebiegu.'),
+    ])
+    result = runtime.run_agent_turn(
+        owner(), 'Które zamówienia są zablokowane przez brak towaru?', provider)
+
+    assert result['status'] == 'SUCCESS' and result['tool_calls'] == 1
+    assert executed == ['business.query'] and len(provider.calls) == 2
 
 
 def test_generic_read_mode_is_not_used_for_operational_preflight(monkeypatch):
@@ -721,7 +730,7 @@ def test_generic_read_mode_is_not_used_for_operational_preflight(monkeypatch):
         assert {'business.query', 'orders.fulfillment.readiness',
                 'orders.fulfillment.state', 'orders.packing.check'} <= names
         assert {'orders.search', 'orders.get', 'inventory.summary', 'china.orders.search'} <= names
-        assert 'Preferuj\npola opisane przez business.describe_schema jako computed' not in kwargs['instructions']
+        assert 'Główna intencja READ:' not in kwargs['instructions']
         return respond('Potrzebuję wskazania zamówienia.')
 
     result = runtime.run_agent_turn(
@@ -729,30 +738,6 @@ def test_generic_read_mode_is_not_used_for_operational_preflight(monkeypatch):
         runtime.FakeModelProvider([inspect]),
     )
     assert result['status'] == 'SUCCESS' and result['tool_calls'] == 0
-
-
-def test_daily_briefing_prefers_generic_read_catalog(monkeypatch):
-    monkeypatch.setenv('AGENT_GENERIC_READ_ENABLED', '1')
-
-    def discover(kwargs):
-        assert {item['name'] for item in kwargs['tools']} == {'business.describe_schema'}
-        return tool('business.describe_schema', {'entities':['orders', 'inventory']}, call_id='briefing-schema')
-
-    def inspect(kwargs):
-        names = {item['name'] for item in kwargs['tools']}
-        assert 'business.query' in names
-        assert not ({'orders.summary', 'inventory.summary', 'china.orders.summary'} & names)
-        assert not ({'orders.fulfillment.readiness', 'orders.fulfillment.state',
-                     'orders.packing.check'} & names)
-        assert {'invoices.overdue', 'business.sales.summary'} <= names
-        assert 'preferuj computed=true' in kwargs['instructions']
-        assert 'pilne wysyłki/readiness, płatności po terminie' not in kwargs['instructions']
-        return respond('Brak danych do briefingu.')
-
-    result = runtime.run_agent_turn(
-        owner(), 'Co mam dziś do zrobienia?', runtime.FakeModelProvider([discover, inspect]),
-    )
-    assert result['status'] == 'SUCCESS' and result['tool_calls'] == 1
 
 
 def test_parallel_green_reads_keep_three_results_when_one_source_is_unavailable(monkeypatch):
