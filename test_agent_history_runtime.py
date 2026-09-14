@@ -583,6 +583,123 @@ def test_daily_summary_empty_state_ends_with_one_short_answer_without_fallback(m
     assert len(provider.calls) == 2
 
 
+def test_high_level_read_models_allow_natural_followup_to_change_scope(monkeypatch):
+    monkeypatch.setenv('AGENT_HIGH_LEVEL_READ_MODELS_ENABLED', '1')
+    executed = []
+
+    def execute(_actor, operation, arguments, **_kwargs):
+        executed.append((operation, dict(arguments)))
+        sections = ({'ready_to_ship':[], 'overdue_payments':[],
+                     'uncovered_order_shortages':[], 'covered_order_shortages':[],
+                     'deliveries_requiring_attention':[], 'other_urgent_exceptions':[]}
+                    if operation == 'business.daily.state'
+                    else {'ready_to_ship':[], 'blocked':[], 'other_active_orders':[]})
+        return _controlled_success(operation, {
+            'ok':True, 'read_model':'daily_state' if operation.endswith('daily.state') else 'orders_state',
+            'as_of':'2026-09-14T10:00:00+02:00', 'complete':True,
+            'truncated':False, 'sections':sections,
+        })
+
+    def first_plan(kwargs):
+        names = {item['name'] for item in kwargs['tools']}
+        assert {'business.daily.state', 'business.orders.state'} <= names
+        assert 'wybierz na podstawie bieżącej wiadomości i historii' in kwargs['instructions']
+        return tool('business.daily.state', {}, 'daily-state')
+
+    def first_synthesis(kwargs):
+        assert kwargs['tools'] == [] and kwargs['tool_choice'] == 'none'
+        return respond('Dzisiaj nie ma pilnych działań.')
+
+    monkeypatch.setattr(operations, 'execute_business_operation', execute)
+    first_provider = runtime.FakeModelProvider([first_plan, first_synthesis])
+    first = runtime.run_agent_turn(owner(), 'co mam dziś do zrobienia?', first_provider)
+    assert first['status'] == 'SUCCESS' and first['tool_calls'] == 1
+
+    def followup_plan(kwargs):
+        names = {item['name'] for item in kwargs['tools']}
+        assert {'business.daily.state', 'business.orders.state'} <= names
+        messages = [(item['role'], item['content']) for item in kwargs['input_items']
+                    if item.get('role') in {'user', 'assistant'}]
+        assert messages[-3:] == [
+            ('user', 'co mam dziś do zrobienia?'),
+            ('assistant', 'Dzisiaj nie ma pilnych działań.'),
+            ('user', 'a inne zamówienia mają komplet?'),
+        ]
+        return tool('business.orders.state', {}, 'orders-state')
+
+    def followup_synthesis(kwargs):
+        assert kwargs['tools'] == [] and kwargs['tool_choice'] == 'none'
+        return respond('Wszystkie aktywne zamówienia mają komplet.')
+
+    followup_provider = runtime.FakeModelProvider([followup_plan, followup_synthesis])
+    followup = runtime.run_agent_turn(
+        owner(), 'a inne zamówienia mają komplet?', followup_provider,
+        conversation_id=first['conversation_id'])
+
+    assert followup['status'] == 'SUCCESS' and followup['tool_calls'] == 1
+    assert executed == [('business.daily.state', {}), ('business.orders.state', {})]
+
+
+def test_high_level_read_models_do_not_block_natural_scope_correction(monkeypatch):
+    monkeypatch.setenv('AGENT_HIGH_LEVEL_READ_MODELS_ENABLED', '1')
+    executed = []
+
+    def execute(_actor, operation, arguments, **_kwargs):
+        executed.append(operation)
+        return _controlled_success(operation, {
+            'ok':True, 'read_model':'orders_state',
+            'as_of':'2026-09-14T10:00:00+02:00', 'complete':True,
+            'truncated':False,
+            'sections':{'ready_to_ship':[], 'blocked':[], 'other_active_orders':[]},
+        })
+
+    def plan(kwargs):
+        assert kwargs['tool_choice'] == 'auto'
+        assert {'business.daily.state', 'business.orders.state'} <= {
+            item['name'] for item in kwargs['tools']}
+        return tool('business.orders.state', {}, 'corrected-orders-state')
+
+    monkeypatch.setattr(operations, 'execute_business_operation', execute)
+    provider = runtime.FakeModelProvider([plan, respond('Pokazuję wszystkie aktywne zamówienia.')])
+    result = runtime.run_agent_turn(owner(), 'nie chodzi mi tylko o dzisiejsze', provider)
+
+    assert result['status'] == 'SUCCESS'
+    assert executed == ['business.orders.state']
+    assert provider.calls[1]['tools'] == [] and provider.calls[1]['tool_choice'] == 'none'
+
+
+@pytest.mark.parametrize(('question', 'operation'), [
+    ('co jest niepokryte dostawami?', 'business.orders.state'),
+    ('jakie mam zaległe faktury?', 'invoices.overdue'),
+    ('ile sprzedałem w tym miesiącu?', 'business.sales.summary'),
+])
+def test_high_level_catalog_leaves_model_free_to_choose_correct_read(question, operation, monkeypatch):
+    monkeypatch.setenv('AGENT_HIGH_LEVEL_READ_MODELS_ENABLED', '1')
+    executed = []
+
+    def execute(_actor, selected, arguments, **_kwargs):
+        executed.append(selected)
+        if selected == 'business.orders.state':
+            return _controlled_success(selected, {
+                'ok':True, 'read_model':'orders_state', 'as_of':'2026-09-14T10:00:00+02:00',
+                'complete':True, 'truncated':False,
+                'sections':{'ready_to_ship':[], 'blocked':[], 'other_active_orders':[]},
+            })
+        return _controlled_success(selected, {'ok':True})
+
+    def plan(kwargs):
+        names = {item['name'] for item in kwargs['tools']}
+        assert operation in names
+        assert {'business.daily.state', 'business.orders.state'} <= names
+        return tool(operation, {})
+
+    monkeypatch.setattr(operations, 'execute_business_operation', execute)
+    provider = runtime.FakeModelProvider([plan, respond('Gotowy wynik biznesowy.')])
+    result = runtime.run_agent_turn(owner(), question, provider)
+
+    assert result['status'] == 'SUCCESS' and executed == [operation]
+
+
 def test_order_shortages_uses_one_minimal_query_and_stops(monkeypatch):
     monkeypatch.setenv('AGENT_GENERIC_READ_ENABLED', '1')
     query_payload = {'queries':[{

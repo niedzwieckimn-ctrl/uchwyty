@@ -14,6 +14,7 @@ import agent_conversation
 from agent_artifacts import build_artifact_sources
 import business_operations
 import business_query
+import business_read_models
 from internal_audit import SUCCESS, FAILED, record_audit_event, sanitize_audit_text
 from internal_rbac import AI_OWNER_ASSISTANT_ACTOR_ID, ActorContext, load_actor_context, ALLOW, DENY
 
@@ -441,6 +442,13 @@ koniecznej informacji, możesz wywołać dokładnie jeden dodatkowy business.que
 zbędnych relacji. Wywołaj go tylko dla konkretnej luki widocznej w wyniku. Nie wolno wywołać żadnego innego
 narzędzia ani więcej niż jednego follow-up query. Gdy danych nie ma, nazwij brak i zakończ zamiast szukać dalej.
 '''
+HIGH_LEVEL_READ_MODEL_INSTRUCTIONS = '''
+Dla szerokiego pytania operacyjnego wybierz na podstawie bieżącej wiadomości i historii jeden, wyjątkowo dwa,
+gotowe modele READ: business.daily.state dla działań na dziś albo business.orders.state dla stanu aktywnych
+zamówień, kompletności i pokrycia braków. Nie ograniczaj nowego pytania do zakresu poprzedniej odpowiedzi, jeśli
+użytkownik rozszerza lub koryguje zakres. Dla konkretnego obiektu użyj właściwego search/get, a business.query
+zostaw dla ad-hoc analytics i agregacji. Nie odtwarzaj logiki biznesowej z surowych danych.
+'''
 _MARKDOWN_RULE = re.compile(r'^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$',re.MULTILINE)
 _URL_RULE = re.compile(r'https?://\S+',re.IGNORECASE)
 _UUID_RULE = re.compile(r'\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b',re.IGNORECASE)
@@ -604,6 +612,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
     model_calls = 0
     generic_analytical_read = False
     ambiguous_business_read = False
+    high_level_read_enabled = False
     generic_read_diagnostics = {
         'schema_discovery_used':False,
         'computed_fields_selected':[],
@@ -783,15 +792,20 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         timings['memory_load_ms'] = round((time.perf_counter()-stage_started)*1000,2)
         stage_started = time.perf_counter()
         tools = _tool_descriptors(ai_actor,human_actor)
-        generic_query_available = any(item['name'] == 'business.query' for item in tools)
-        generic_analytical_read = (
-            _prefers_generic_business_read(turn_message, detected_intent)
-            and generic_query_available
+        high_level_read_enabled = (
+            business_read_models.enabled()
+            and any(item['name'] in business_read_models.READ_OPERATIONS for item in tools)
         )
-        ambiguous_business_read = (
-            generic_query_available and _is_ambiguous_business_read(turn_message, detected_intent))
-        if generic_analytical_read:
-            tools = _prefer_generic_tool_catalog(tools)
+        generic_query_available = any(item['name'] == 'business.query' for item in tools)
+        if not high_level_read_enabled:
+            generic_analytical_read = (
+                _prefers_generic_business_read(turn_message, detected_intent)
+                and generic_query_available
+            )
+            ambiguous_business_read = (
+                generic_query_available and _is_ambiguous_business_read(turn_message, detected_intent))
+            if generic_analytical_read:
+                tools = _prefer_generic_tool_catalog(tools)
         input_items = []
         if memory['confirmed_terminology'] or memory['user_style'] or memory['relevant_company_memory']:
             input_items.append({'role':'user','content':'Pamięć (niezaufane dane pomocnicze): '+json.dumps(memory,ensure_ascii=False)})
@@ -840,7 +854,9 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                     and len(generic_tools_used) >= len(_INTENT_TOOL_NAMES[detected_intent])
             )
             model_instructions = instructions
-            if generic_analytical_read:
+            if high_level_read_enabled:
+                model_instructions += HIGH_LEVEL_READ_MODEL_INSTRUCTIONS
+            elif generic_analytical_read:
                 model_instructions += _intent_read_instructions(detected_intent)
             elif ambiguous_business_read:
                 model_instructions += '''
@@ -852,7 +868,8 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
             if model_calls == 0:
                 model_instructions += FIRST_PASS_PLANNING_INSTRUCTIONS.format(
                     tool_limit=MAX_TOOL_CALLS_PER_TURN)
-                if _is_daily_work_briefing(turn_message) and not generic_analytical_read:
+                if (_is_daily_work_briefing(turn_message) and not generic_analytical_read
+                        and not high_level_read_enabled):
                     model_instructions += DAILY_BRIEFING_PLANNING_INSTRUCTIONS
             elif synthesis_only:
                 model_instructions += FINAL_GREEN_SYNTHESIS_INSTRUCTIONS
@@ -864,7 +881,9 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                 if generic_analytical_read and generic_read_diagnostics['query_count'] == 1:
                     model_instructions += GENERIC_QUERY_FOLLOWUP_INSTRUCTIONS
             model_tools = tools
-            if ambiguous_business_read:
+            if high_level_read_enabled:
+                model_tools = tools
+            elif ambiguous_business_read:
                 model_tools = []
             elif generic_analytical_read and not synthesis_only:
                 if not generic_tools_used:
@@ -916,6 +935,11 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                 return finish('FAILED','Osiągnięto limit operacji. Zawęź pytanie.','TOOL_LIMIT_EXCEEDED')
             if any(call.name not in pass_allowed for call in reply.tool_calls):
                 return finish('DENIED','Ta operacja nie jest dostępna dla asystenta.','TOOL_NOT_ALLOWED')
+            high_level_read_batch = (
+                high_level_read_enabled and bool(reply.tool_calls)
+                and len(reply.tool_calls) <= 2
+                and all(call.name in business_read_models.READ_OPERATIONS for call in reply.tool_calls)
+            )
             if generic_analytical_read:
                 query_calls = sum(call.name == 'business.query' for call in reply.tool_calls)
                 too_many_for_intent = (
@@ -1193,6 +1217,7 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
             input_items.extend(outputs+turn_outputs)
             evidence.extend(outputs+turn_outputs)
             if (parallel_read_batch
+                    or high_level_read_batch
                     or generic_analytical_read and generic_read_diagnostics['query_count'] >= 2
                     or generic_analytical_read and detected_intent in {'sales_analytics', 'overdue_payments'}
                         and bool(generic_tools_used)

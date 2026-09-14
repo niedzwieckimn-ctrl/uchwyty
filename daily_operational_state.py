@@ -9,7 +9,8 @@ from zoneinfo import ZoneInfo
 from cash_flow_module import cash_flow_overdue_invoices
 from china_delivery_attention import delivery_attention_states
 from fulfillment_readiness import calculate_fulfillment_readiness
-from inventory_analytics import build_replenishment_analysis, inventory_business_status
+from inventory_analytics import build_replenishment_analysis
+from orders_operational_state import compose_order_actions
 
 
 STATE_KEYS = (
@@ -53,65 +54,10 @@ def build_daily_operational_state(
     readiness, overdue, packages, inventory = _read_sources(connection_factory, now)
     state = {key: [] for key in STATE_KEYS}
 
-    coverage_by_product = {}
-    for row in inventory:
-        product_id = int(row.get("id") or 0)
-        if product_id:
-            coverage_by_product[product_id] = (row, inventory_business_status(row))
-
-    for order in readiness:
-        order_id = int(order["order_id"])
-        order_number = _text(order.get("order_number"))
-        customer_name = _text(order.get("customer_name"))
-        if order.get("ready"):
-            packed = _text(order.get("order_status")).lower() == "packed"
-            state["ready_to_ship"].append({
-                "entity_type": "order", "entity_id": order_id,
-                "human_label": order_number, "customer_name": customer_name,
-                "quantity": int(order.get("total_units") or 0),
-                "action_required": (
-                    "Nadaj gotowe zamówienie." if packed
-                    else "Spakuj i nadaj gotowe zamówienie."
-                ),
-                "urgency": "high",
-                "source_state": {
-                    "fulfillment_ready": True,
-                    "order_status": _text(order.get("order_status")),
-                },
-            })
-            continue
-
-        for shortage in order.get("missing_items") or []:
-            product_id = int(shortage.get("product_id") or 0)
-            inventory_row, coverage = coverage_by_product.get(product_id, ({}, {
-                "status_label": "Brak danych", "covered_by_stock_and_confirmed_incoming": False,
-            }))
-            covered = bool(coverage["covered_by_stock_and_confirmed_incoming"])
-            quantity = int(shortage.get("shortage_quantity") or 0)
-            sku = _text(shortage.get("sku"))
-            model = _text(shortage.get("model"))
-            product_name = _text(shortage.get("name"))
-            product_label = model or product_name or sku
-            entry = {
-                "entity_type": "order_shortage", "entity_id": order_id,
-                "human_label": f"{order_number} — {product_label}",
-                "order_number": order_number, "customer_name": customer_name,
-                "product_id": product_id, "sku": sku, "model": model,
-                "product_name": product_name, "quantity": quantity,
-                "action_required": (
-                    "Monitoruj potwierdzoną dostawę pokrywającą brak."
-                    if covered else "Zamów brakującą ilość produktu."
-                ),
-                "urgency": "medium" if covered else "high",
-                "source_state": {
-                    "fulfillment_ready": False,
-                    "coverage_status": coverage["status_label"],
-                    "covered_by_stock_and_confirmed_incoming": covered,
-                    "confirmed_incoming_quantity": int(inventory_row.get("incoming_qty") or 0),
-                },
-            }
-            target = "covered_order_shortages" if covered else "uncovered_order_shortages"
-            state[target].append(entry)
+    order_actions = compose_order_actions(readiness, inventory)
+    state["ready_to_ship"] = order_actions["ready_to_ship"]
+    state["covered_order_shortages"] = order_actions["covered_order_shortages"]
+    state["uncovered_order_shortages"] = order_actions["uncovered_order_shortages"]
 
     for invoice in overdue:
         invoice_id = int(invoice["id"])

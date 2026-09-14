@@ -28,6 +28,7 @@ import invoice_amendment
 import fulfillment_operations
 import agent_conversation
 import business_query
+import business_read_models
 import internal_approval as approvals
 from cash_flow_module import cash_flow_overdue_invoices
 from inventory_analytics import build_replenishment_analysis, recommended_replenishments
@@ -55,6 +56,8 @@ MAX_PRODUCT_SEARCH_RESULTS = 50
 MAX_BUSINESS_SEARCH_RESULTS = 50
 IDEMPOTENT_REPLAY_WAIT_SECONDS = 5.0
 GENERIC_READ_OPERATIONS = frozenset({"business.describe_schema", "business.query"})
+HIGH_LEVEL_READ_OPERATIONS = business_read_models.READ_OPERATIONS
+DIRECT_READ_RESULT_OPERATIONS = GENERIC_READ_OPERATIONS | HIGH_LEVEL_READ_OPERATIONS
 WARSAW_TZ = ZoneInfo("Europe/Warsaw")
 logger = logging.getLogger(__name__)
 
@@ -65,6 +68,7 @@ _write_success_observer: Callable[[str, Mapping[str, Any]], None] | None = None
 
 FRESHNESS_GROUP_BY_OPERATION = {
     "business.query": "inventory",
+    "business.orders.state": "operational_state", "business.daily.state": "operational_state",
     "inventory.product.search": "inventory", "inventory.product.get": "inventory", "inventory.summary": "inventory",
     "inventory.replenishment.ranking": "inventory",
     "orders.search": "orders", "orders.get": "orders", "orders.summary": "orders",
@@ -511,6 +515,20 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
             "results":{"type":"array", "maxItems":6}, "result_cells":{"type":"integer"}}},
         IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
+    "business.orders.state": BusinessOperationDefinition(
+        "business.orders.state", 1,
+        "Zwraca kompaktowy gotowy stan aktywnych zamówień: gotowe do wysyłki, zablokowane i ich istniejące pokrycie. Użyj dla szerokich pytań operacyjnych o zamówienia.",
+        "orders.fulfillment_read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
+        business_read_models.ORDERS_STATE_INPUT, business_read_models.STATE_OUTPUT,
+        IDEMPOTENCY_NONE, "READ_STANDARD", True,
+    ),
+    "business.daily.state": BusinessOperationDefinition(
+        "business.daily.state", 1,
+        "Zwraca kompaktową listę działań wymaganych dziś: wysyłki, płatności, niepokryte braki i dostawy wymagające uwagi.",
+        "business.generic_read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
+        business_read_models.DAILY_STATE_INPUT, business_read_models.STATE_OUTPUT,
+        IDEMPOTENCY_NONE, "READ_STANDARD", True,
+    ),
     "inventory.product.search": BusinessOperationDefinition(
         "inventory.product.search", 1, "Wyszukuje wyłącznie produkty po SKU, modelu, wariancie lub nazwie produktu i zwraca ograniczony stan.",
         "inventory.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "SYSTEM", "AI_AGENT"}),
@@ -730,6 +748,14 @@ def _factory() -> Callable[[], sqlite3.Connection]:
     return _connection_factory
 
 
+def _operation_feature_disabled(operation_name: str) -> bool:
+    if operation_name in GENERIC_READ_OPERATIONS:
+        return not business_query.enabled()
+    if operation_name in HIGH_LEVEL_READ_OPERATIONS:
+        return not business_read_models.enabled()
+    return False
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
@@ -880,6 +906,10 @@ def _entity(definition: BusinessOperationDefinition, data: Mapping[str, Any]) ->
         return "business_schema", "canonical-v1", None
     if definition.operation_name == "business.query":
         return "business_query", "canonical-v1", None
+    if definition.operation_name == "business.orders.state":
+        return "orders_operational_state", str(data.get("order_id") or data.get("customer_id") or "active"), None
+    if definition.operation_name == "business.daily.state":
+        return "daily_operational_state", "today", None
     if definition.operation_name == 'approval.decide':
         return 'approval', data['approval_id'], None
     if definition.operation_name == 'shipping.capabilities':
@@ -2240,6 +2270,16 @@ _HANDLERS: dict[str, Callable[[Mapping[str, Any], ActorContext, str, sqlite3.Con
     "agent.memory.remember": agent_conversation.remember_memory,
     "business.describe_schema": business_query.describe_schema,
     "business.query": business_query.query,
+    "business.orders.state": lambda data, actor, correlation_id, transaction_connection=None:
+        business_read_models.orders_state(
+            data, actor, correlation_id, transaction_connection,
+            connection_factory=_factory(),
+        ),
+    "business.daily.state": lambda data, actor, correlation_id, transaction_connection=None:
+        business_read_models.daily_state(
+            data, actor, correlation_id, transaction_connection,
+            connection_factory=_factory(),
+        ),
     "inventory.product.search": _product_search,
     "inventory.product.get": _product_get,
     "inventory.summary": _inventory_summary,
@@ -2420,7 +2460,7 @@ def execute_business_operation(
         return _safe_denial(str(operation_name), 0, execution_id, actor_context, correlation, "UNKNOWN_OPERATION", "Operacja nie jest zarejestrowana")
     try:
         actor = _trusted_actor(actor_context)
-        if not definition.enabled or (definition.operation_name in GENERIC_READ_OPERATIONS and not business_query.enabled()):
+        if not definition.enabled or _operation_feature_disabled(definition.operation_name):
             raise ControlledOperationError("OPERATION_DISABLED", "Operacja jest wyłączona", status=DENIED)
         if definition.operation_name not in _HANDLERS:
             raise ControlledOperationError("HANDLER_NOT_FOUND", "Brak bezpiecznego handlera", status=DENIED)
@@ -2576,7 +2616,7 @@ def execute_business_operation(
             if exc.error_code != "INVALID_HANDLER_OUTPUT":
                 _diagnostic_result(definition.operation_name, status=exc.status, started=handler_started,
                                    error_code=exc.error_code, stage="handler", freshness=freshness)
-            if definition.operation_name in GENERIC_READ_OPERATIONS and exc.status == DENIED:
+            if definition.operation_name in DIRECT_READ_RESULT_OPERATIONS and exc.status == DENIED:
                 event, audit_result, terminal = "business_operation.denied", DENIED, DENIED
             else:
                 event = "business_operation.conflict" if exc.status == CONFLICT else "business_operation.failed"
@@ -2599,7 +2639,7 @@ def execute_business_operation(
         result = _result_from_row(row)
         # The persisted execution summary is deliberately audit-sanitized and depth-bounded.
         # Return the already validated canonical result for this request without weakening audit storage.
-        return replace(result, data=output) if definition.operation_name in GENERIC_READ_OPERATIONS else result
+        return replace(result, data=output) if definition.operation_name in DIRECT_READ_RESULT_OPERATIONS else result
     except ControlledOperationError as exc:
         if 'actor' in locals() and isinstance(actor, ActorContext):
             try:
@@ -2627,7 +2667,7 @@ def list_available_operations(actor_context: ActorContext) -> list[dict[str, Any
     visible = []
     for definition in OPERATION_REGISTRY.values():
         if (not definition.enabled
-                or definition.operation_name in GENERIC_READ_OPERATIONS and not business_query.enabled()
+                or _operation_feature_disabled(definition.operation_name)
                 or actor.actor_type not in definition.actor_types_allowed):
             continue
         if actor.permission_decision(definition.required_permission) == PERMISSION_DENY:

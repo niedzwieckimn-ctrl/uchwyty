@@ -8,6 +8,7 @@ import business_operations as operations
 import business_query
 import daily_operational_state as daily
 import internal_rbac as rbac
+import orders_operational_state as orders_state
 
 
 NOW = datetime(2026, 9, 14, 10, 0, 0)
@@ -129,7 +130,7 @@ def test_daily_state_delegates_business_rules_to_existing_helpers(monkeypatch):
     monkeypatch.setattr(daily, "build_replenishment_analysis", lambda factory, today: calls.append("inventory") or [{
         "id": 7, "incoming_qty": 2,
     }])
-    monkeypatch.setattr(daily, "inventory_business_status", lambda row: calls.append("coverage") or {
+    monkeypatch.setattr(orders_state, "inventory_business_status", lambda row: calls.append("coverage") or {
         "status_label": "Tylko w drodze",
         "covered_by_stock_and_confirmed_incoming": True,
     })

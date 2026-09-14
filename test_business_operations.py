@@ -115,7 +115,7 @@ def test_registry_is_closed_and_contains_required_contracts(isolated):
         'invoices.removal.preview', 'invoices.remove', 'approval.decide',
         "orders.summary", "agent.terminology.search", "agent.terminology.remember",
         "agent.memory.search", "agent.memory.remember",
-        "business.describe_schema", "business.query",
+        "business.describe_schema", "business.query", "business.orders.state", "business.daily.state",
             "inventory.product.get", "inventory.product.search", "inventory.summary", "inventory.replenishment.ranking",
         "orders.search", "orders.get", "orders.fulfillment.readiness", "invoices.search", "invoices.get", "invoices.overdue",
         "customers.search", "customers.get", "china.orders.summary", "china.orders.search", "china.orders.get", "business.sales.summary",
