@@ -567,7 +567,7 @@ def test_tts_request_preserves_explicit_then_env_configuration(
     assert calls[0]['json'] == {
         'model': expected_model, 'voice': expected_voice,
         'instructions': expected_instructions, 'response_format': 'mp3',
-        'input': 'Masz 1 sztukę produktu Cerne 128 be be. Na półce jest 11 sztuk.',
+        'input': 'Masz jedną sztukę produktu Cerne sto dwadzieścia osiem be be. Na półce jest jedenaście sztuk.',
     }
 
 
@@ -601,6 +601,47 @@ def test_tts_endpoint_logs_and_uses_actual_provider_voice_before_env(isolated, m
     assert len(logged) == 1
     assert logged[0]['voice'] == 'cedar' and logged[0]['model'] == provider.tts_model
     assert 'Masz 11' not in caplog.text
+
+
+def test_tts_number_normalization_does_not_change_chat_or_saved_history(isolated, monkeypatch):
+    text = 'Winstor 192 AB. Masz 108 sztuk.'
+    query = 'Sprawdź Winstor 192 AB.'
+    backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([
+        respond(text + '<speech_text>' + text + '</speech_text>')])
+    test_client = client()
+    chat = test_client.post('/api/internal/ai/chat', json={'message': query})
+    assert chat.status_code == 200
+    result = chat.get_json()
+    assert result['message'].encode('utf-8') == text.encode('utf-8')
+    assert result['speech_text'].encode('utf-8') == text.encode('utf-8')
+    chat_bytes = chat.data
+
+    def history():
+        db = backend.conn()
+        try:
+            return [tuple(row) for row in db.execute(
+                'SELECT * FROM internal_agent_turns WHERE conversation_id=? ORDER BY turn_id',
+                (result['conversation_id'],)).fetchall()]
+        finally:
+            db.close()
+
+    before = history()
+    assert before
+    assert query in str(before) and text in str(before)
+    calls = []
+    audio = StubTranscriptionResponse(status=200)
+    audio.content = b'provider-mp3'
+    monkeypatch.setattr(voice_io.requests, 'post',
+                        lambda url, **kwargs: calls.append(kwargs['json']) or audio)
+    monkeypatch.setattr(backend, 'VOICE_IO_PROVIDER', voice_io.OpenAIVoiceIOProvider(
+        api_key='test-secret', tts_model='gpt-4o-mini-tts', voice='cedar'))
+    tts = test_client.post('/api/internal/ai/voice/synthesize', json={'speech_text': result['speech_text']})
+    assert tts.status_code == 200 and tts.data == audio.content
+    assert len(calls) == 1
+    assert calls[0]['input'] == 'Winstor sto dziewięćdziesiąt dwa a be. Masz sto osiem sztuk.'
+    assert history() == before
+    assert chat.data == chat_bytes
+    assert result['message'] == result['speech_text'] == text
 
 
 def test_tts_legacy_models_do_not_receive_unsupported_instructions(isolated, monkeypatch):

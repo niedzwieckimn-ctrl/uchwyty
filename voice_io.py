@@ -36,8 +36,9 @@ ALLOWED_AUDIO_TYPES = frozenset({
 _SPOKEN_URL = re.compile(r'https?://\S+', re.IGNORECASE)
 _SPOKEN_TECHNICAL = re.compile(
     r'(?i)\b(?:approval_id|operation_id|execution_id|correlation_id|pending_approval|json)\b')
-_TTS_ABBREVIATION = re.compile(r'(?<![A-Z0-9])(BB|BN|MB|BLK)(?![A-Z0-9])')
+_TTS_ABBREVIATION = re.compile(r'\b(AB|BB|BN|MB|BLK)\b')
 _TTS_ABBREVIATIONS = {
+    'AB': 'a be',
     'BB': 'be be',
     'BN': 'be en',
     'MB': 'em be',
@@ -45,9 +46,132 @@ _TTS_ABBREVIATIONS = {
 }
 
 
+_TTS_SMALL = (
+    'zero', 'jeden', 'dwa', 'trzy', 'cztery',
+    'pięć', 'sześć', 'siedem', 'osiem', 'dziewięć',
+    'dziesięć', 'jedenaście', 'dwanaście', 'trzynaście', 'czternaście',
+    'piętnaście', 'szesnaście', 'siedemnaście', 'osiemnaście', 'dziewiętnaście',
+)
+
+
+_TTS_TENS = (
+    '', '', 'dwadzieścia', 'trzydzieści', 'czterdzieści',
+    'pięćdziesiąt', 'sześćdziesiąt', 'siedemdziesiąt', 'osiemdziesiąt', 'dziewięćdziesiąt',
+)
+_TTS_HUNDREDS = (
+    '', 'sto', 'dwieście', 'trzysta', 'czterysta',
+    'pięćset', 'sześćset', 'siedemset', 'osiemset', 'dziewięćset',
+)
+
+
+# Protect whole technical fragments before expanding numbers or colour codes.
+# A labelled identifier clause is left intact up to a sentence/list boundary.
+_TTS_PROTECTED = re.compile(r'''
+    https?://\S+ | [\w.+-]+@[\w.-]+\.[A-Za-z]{2,} | \x60[^\x60]*\x60
+    | (?<!\w)[\#@][A-Za-z0-9_]+
+    | \b(?i:numer(?:u|em)?|nr|identyfikator(?:a|em)?|id|sku|uuid|ksef|nip|regon|
+        pesel|iban|ean|gtin|awb|tracking|telefon(?:u)?|tel|kod(?:u)?|
+        fvat|fv|faktur(?:a|y|\u0119|ze)|zam\u00f3wieni(?:e|a|u)|data|dnia|rok|roku|
+        [a-z][a-z0-9_]*_(?:id|no|number|key|code|uuid|version))
+        \b\.?(?:[^;.!?\n,]|[.,](?=[0-9]))*
+    | (?<!\w)[0-9]{1,2}\s+(?i:stycznia|lutego|marca|kwietnia|maja|czerwca|
+        lipca|sierpnia|wrze\u015bnia|pa\u017adziernika|listopada|grudnia)
+        (?:,?\s+[0-9]{4})?\b
+    | (?<!\w)[0-9]{1,2}\s+[IVX]{1,4}\s+[0-9]{4}\b
+    | (?<!\w)[0-9]{4}\s*(?i:r\.|rok(?:u)?\b)
+    | (?<!\w)(?:\+[0-9]{1,3}\s*)?\([0-9]{2,3}\)\s*[0-9]+(?:[\ -]+[0-9]+)*
+    | (?<!\w)[+\u2212-]?[0-9]+(?:[\ \u00a0\u202f-]+[0-9]+)+(?:[.,][0-9]+)?(?!\w)
+    | (?<!\w)(?=[\w,./\\:-]*[^\W\d_])\w+(?:[,./\\:-]\w+)+(?!\w)
+    | (?<!\w)[\w]+(?:[-/\\.:][\w]+)+(?!\w)
+    | \b(?=\w*[0-9])(?=\w*[^\W\d])\w+\b
+    | (?<!\w)[0-9]+,[0-9]+(?!\w)(?!\s*(?:z\u0142|PLN)\b)
+''', re.VERBOSE)
+_TTS_NUMBER = re.compile(r'''
+    (?<![\w/\\.,:+-])
+    (?P<sign>[-+\u2212]?)(?P<whole>0|[1-9][0-9]{0,5})
+    (?:(?:,(?P<fraction>[0-9]{1,2}))?(?P<currency>\s*(?:z\u0142|PLN)\b))?
+    (?![\w]|[.,:/\\-][0-9])
+''', re.VERBOSE)
+
+
+def _tts_plural(number, singular, few, many):
+    if number == 1:
+        return singular
+    return few if 2 <= number % 10 <= 4 and not 12 <= number % 100 <= 14 else many
+
+
+def _tts_integer(number):
+    """Polish cardinal form for an unsigned, bounded spoken quantity."""
+    if number < 20:
+        return _TTS_SMALL[number]
+    if number >= 1000:
+        thousands, remainder = divmod(number, 1000)
+        prefix = ('tysiąc' if thousands == 1 else
+                  _tts_integer(thousands) + ' ' + _tts_plural(thousands, 'tysiąc', 'tysiące', 'tysięcy'))
+        return prefix + (' ' + _tts_integer(remainder) if remainder else '')
+    hundreds, remainder = divmod(number, 100)
+    parts = [_TTS_HUNDREDS[hundreds]] if hundreds else []
+    if remainder:
+        if remainder < 20:
+            parts.append(_TTS_SMALL[remainder])
+        else:
+            tens, units = divmod(remainder, 10)
+            parts.append(_TTS_TENS[tens])
+            if units:
+                parts.append(_TTS_SMALL[units])
+    return ' '.join(parts)
+
+
 def normalize_tts_text(text: str) -> str:
-    """Expand selected Polish business abbreviations only in the provider input."""
-    return _TTS_ABBREVIATION.sub(lambda match: _TTS_ABBREVIATIONS[match.group(1)], str(text))
+    """Naturalize only the provider input; preserve technical fragments verbatim."""
+    source = str(text)
+    # Expanding an otherwise valid input must not exceed the Speech API limit.
+    # Keep a token's original spelling if it no longer fits; never truncate text.
+    remaining_chars = max(0, 4096 - len(source))
+
+    def fit(original, spoken):
+        nonlocal remaining_chars
+        extra = len(spoken) - len(original)
+        if extra > remaining_chars:
+            return original
+        remaining_chars -= extra
+        return spoken
+
+    def spoken_fragment(fragment):
+        def number_words(match):
+            number = int(match['whole'])
+            words = _tts_integer(number)
+            if match['currency']:
+                words += ' ' + _tts_plural(number, 'złoty', 'złote', 'złotych')
+                if match['fraction'] is not None:
+                    cents = int(match['fraction'].ljust(2, '0'))
+                    words += (' ' + _tts_integer(cents) + ' '
+                              + _tts_plural(cents, 'grosz', 'grosze', 'groszy'))
+            else:
+                # Match the existing noun; never rewrite the sentence or product.
+                suffix = fragment[match.end():]
+                if number == 1 and re.match(r'\s+sztuk\u0119\b', suffix):
+                    words = 'jedną'
+                elif number == 1 and re.match(r'\s+sztuka\b', suffix):
+                    words = 'jedna'
+                elif number % 10 == 2 and number % 100 != 12 and re.match(r'\s+sztuki\b', suffix):
+                    words = words[:-3] + 'dwie'
+            sign = match['sign']
+            spoken = ('minus ' if sign in ('-', '−') else 'plus ' if sign == '+' else '') + words
+            return fit(match.group(), spoken)
+
+        fragment = _TTS_NUMBER.sub(number_words, fragment)
+        return _TTS_ABBREVIATION.sub(
+            lambda match: fit(match.group(), _TTS_ABBREVIATIONS[match.group(1)]), fragment)
+
+    parts = []
+    position = 0
+    for protected in _TTS_PROTECTED.finditer(source):
+        parts.append(spoken_fragment(source[position:protected.start()]))
+        parts.append(protected.group())
+        position = protected.end()
+    parts.append(spoken_fragment(source[position:]))
+    return ''.join(parts)
 
 
 def compact_speech_text(final_text, *, existing_speech_text='', user_message='',
