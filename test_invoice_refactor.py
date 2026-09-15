@@ -7,9 +7,11 @@ import pytest
 from pypdf import PdfReader
 
 import app as backend
+import invoice_numbering
 from invoice_types import resolve_invoice_type
 import ksef_foreign
 from ksef_module import FA3_NS, validate_fa3_xml
+import routes.invoices as invoice_routes
 
 
 COMPANY = {
@@ -20,6 +22,102 @@ ITEMS = [{
     "name": "Uchwyt", "model": "M1", "sku": "SKU-1", "qty": 2,
     "net_price": 10, "line_value_net": 20, "vat_rate": 0, "currency": "EUR",
 }]
+
+
+@pytest.fixture()
+def numbering_db(tmp_path, monkeypatch):
+    monkeypatch.setattr(backend, "DB_PATH", str(tmp_path / "numbering.db"))
+    monkeypatch.setattr(backend, "supabase_enabled", lambda: False)
+    backend.init_db()
+    db = backend.conn()
+    db.execute(
+        "INSERT INTO orders(id,order_no,customer_name,status,created_at) VALUES(1,'ZAM-NUM','Test','new',?)",
+        (backend.now_iso(),),
+    )
+    db.commit()
+    db.close()
+    return tmp_path
+
+
+def _store_number(number, *, invoice_id=None):
+    db = backend.conn()
+    columns = "id,order_id," if invoice_id is not None else "order_id,"
+    placeholders = "?,?," if invoice_id is not None else "?,"
+    values = (invoice_id, 1) if invoice_id is not None else (1,)
+    db.execute(
+        f"INSERT INTO invoices({columns}invoice_no,issue_date,sell_date,payment_type,total_net,total_gross,created_at) "
+        f"VALUES({placeholders}?,?,?,?,?,?,?)",
+        values + (number, "2026-09-15", "2026-09-15", "przelew", 0, 0, backend.now_iso()),
+    )
+    db.commit()
+    db.close()
+
+
+@pytest.mark.parametrize(("used", "expected"), [
+    ([1, 2, 3], 4),
+    ([1, 2, 5], 6),
+    ([1, 2, 5, 9], 10),
+])
+def test_next_invoice_number_uses_highest_sequence_not_record_count(numbering_db, used, expected):
+    for sequence in used:
+        _store_number(f"FVAT {sequence}/09/2026")
+    assert invoice_numbering.preview(backend, "2026-09-15") == f"FVAT {expected}/09/2026"
+
+
+def test_deleted_highest_invoice_number_is_not_reused(numbering_db):
+    for sequence in (1, 2, 5):
+        _store_number(f"FVAT {sequence}/09/2026")
+    db = backend.conn()
+    db.execute("DELETE FROM invoices WHERE invoice_no='FVAT 5/09/2026'")
+    db.commit()
+    db.close()
+    assert invoice_numbering.preview(backend, "2026-09-15") == "FVAT 6/09/2026"
+
+
+def test_manual_standard_number_is_exact_and_advances_next_auto_number(numbering_db):
+    number = invoice_numbering.reserve(
+        backend, "2026-09-15", "FVAT 20/09/2026", manual=True,
+    )
+    assert number == "FVAT 20/09/2026"
+    _store_number(number)
+    db = backend.conn()
+    assert db.execute("SELECT invoice_no FROM invoices").fetchone()[0] == "FVAT 20/09/2026"
+    db.close()
+    assert invoice_numbering.reserve(backend, "2026-09-15") == "FVAT 21/09/2026"
+
+
+def test_duplicate_manual_number_is_rejected_without_second_invoice(numbering_db):
+    _store_number("FVAT 20/09/2026")
+    with pytest.raises(ValueError, match="już wykorzystany"):
+        invoice_numbering.reserve(
+            backend, "2026-09-15", "FVAT 20/09/2026", manual=True,
+        )
+    db = backend.conn()
+    assert db.execute("SELECT COUNT(*) FROM invoices").fetchone()[0] == 1
+    db.close()
+
+
+def test_manual_standard_number_is_sent_to_supabase_as_exact_claim(numbering_db, monkeypatch):
+    captured = {}
+
+    def rpc(path, method="GET", payload=None, **_kwargs):
+        captured.update(path=path, method=method, payload=payload)
+        return payload["p_custom"]
+
+    monkeypatch.setattr(backend, "supabase_enabled", lambda: True)
+    monkeypatch.setattr(backend, "supabase_request", rpc)
+    assert invoice_numbering.reserve(
+        backend, "2026-09-15", "FVAT 20/09/2026", manual=True,
+    ) == "FVAT 20/09/2026"
+    assert captured == {
+        "path": "/rest/v1/rpc/reserve_invoice_number",
+        "method": "POST",
+        "payload": {
+            "p_period": "09/2026",
+            "p_custom": "FVAT 20/09/2026",
+            "p_requested_min": 0,
+        },
+    }
 
 
 def foreign_invoice(kind="wdt"):
@@ -139,6 +237,128 @@ def protected_snapshot():
         result[table] = [tuple(row) for row in c.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall()]
     c.close()
     return result
+
+
+def _invoice_edit_form(invoice_no):
+    return {
+        "csrf_token": "test",
+        "invoice_no": invoice_no,
+        "issue_date": "2026-09-15",
+        "sell_date": "2026-09-15",
+        "payment_type": "przelew",
+        "payment_to": "2026-09-22",
+        "buyer_name": "Kunde",
+        "buyer_tax_no": "DE123456789",
+        "buyer_address": "Street 1\n10115 Berlin",
+        "buyer_country": "DE",
+        "buyer_email": "buyer@example.com",
+        "buyer_phone": "",
+        "invoice_type": "wdt",
+        "currency": "EUR",
+        "invoice_qty_1": "2",
+    }
+
+
+def _invoice_create_form(invoice_no, *, manual="1"):
+    data = _invoice_edit_form(invoice_no)
+    data.update({
+        "place": "Kotuszów",
+        "discount_percent": "0",
+        "invoice_no_manual": manual,
+        "suggested_invoice_no": "FVAT 1/09/2026",
+        "submit_action": "invoice",
+        "invoice_qty_2": "1",
+    })
+    data.pop("invoice_qty_1")
+    return data
+
+
+def _invoice_edit_client(monkeypatch):
+    monkeypatch.setattr(backend.app, "secret_key", "invoice-number-test")
+    monkeypatch.setattr(invoice_routes, "resume_invoice_job", lambda _invoice_id: None)
+    monkeypatch.setattr(invoice_routes, "reconcile_orders_after_invoice_change", lambda _order_ids: None)
+    client = backend.app.test_client()
+    with client.session_transaction() as session:
+        session["admin_authenticated"] = True
+        session["csrf_token"] = "test"
+    return client
+
+
+def test_manual_number_from_invoice_form_is_saved_exactly(historical_db, monkeypatch):
+    db = backend.conn()
+    db.execute(
+        "INSERT INTO orders(id,order_no,customer_id,customer_name,customer_address,customer_email,status,created_at,currency) "
+        "VALUES(2,'ZAM-2',1,'Kunde','Street 1','buyer@example.com','new',?,'EUR')",
+        (backend.now_iso(),),
+    )
+    db.execute(
+        "INSERT INTO order_items(id,order_id,product_id,sku,qty,unit_net_price,currency,created_at) "
+        "VALUES(2,2,1,'SKU-1',1,10,'EUR',?)",
+        (backend.now_iso(),),
+    )
+    db.commit()
+    db.close()
+    client = _invoice_edit_client(monkeypatch)
+    monkeypatch.setattr(invoice_routes, "finalize_fully_invoiced_orders", lambda _order_ids: ([], []))
+
+    page = client.get("/orders/2/invoice").get_data(as_text=True)
+    assert 'name="invoice_no_manual" value="0"' in page
+    assert "document.getElementById('invoice_no_manual').value='1'" in page
+
+    response = client.post(
+        "/orders/2/invoice", data=_invoice_create_form("FVAT 20/09/2026"),
+    )
+    assert response.status_code == 302
+    db = backend.conn()
+    saved = db.execute("SELECT invoice_no FROM invoices WHERE order_id=2").fetchone()
+    db.close()
+    assert saved[0] == "FVAT 20/09/2026"
+
+
+def test_pdf_and_ksef_use_invoice_number_stored_on_record(historical_db):
+    stored_number = "FVAT 20/09/2026"
+    db = backend.conn()
+    db.execute("UPDATE invoices SET invoice_no=? WHERE id=1", (stored_number,))
+    db.commit()
+    order = db.execute("SELECT * FROM orders WHERE id=1").fetchone()
+    db.close()
+
+    invoice = backend.load_invoice_with_meta(1)
+    items = backend.invoice_items_from_saved_json(1)
+    pdf_path, _net, _gross = backend.generate_order_invoice_pdf(
+        order, items, backend.invoice_meta_payload(invoice),
+    )
+    pdf_text = "\n".join(page.extract_text() or "" for page in PdfReader(pdf_path).pages)
+    assert stored_number in pdf_text
+
+    ksef_invoice, company, ksef_items, problems = backend.build_invoice_ksef_payload(1)
+    assert problems == []
+    root, namespaces = xml_values(backend.build_ksef_draft_xml(ksef_invoice, company, ksef_items))
+    assert root.findtext(".//f:P_2", namespaces=namespaces) == stored_number
+
+
+def test_edit_without_number_change_preserves_own_number(historical_db, monkeypatch):
+    client = _invoice_edit_client(monkeypatch)
+    response = client.post("/invoices/1/edit", data=_invoice_edit_form("FV/HIST/1"))
+    assert response.status_code == 302
+    assert backend.load_invoice_with_meta(1)["invoice_no"] == "FV/HIST/1"
+
+
+def test_allowed_manual_invoice_edit_is_exact_and_not_overwritten(historical_db, monkeypatch):
+    client = _invoice_edit_client(monkeypatch)
+    response = client.post("/invoices/1/edit", data=_invoice_edit_form("FVAT 20/09/2026"))
+    assert response.status_code == 302
+    assert backend.load_invoice_with_meta(1)["invoice_no"] == "FVAT 20/09/2026"
+    assert invoice_numbering.preview(backend, "2026-09-15") == "FVAT 21/09/2026"
+
+
+def test_duplicate_manual_invoice_edit_is_clear_and_does_not_save(historical_db, monkeypatch):
+    _store_number("FVAT 20/09/2026", invoice_id=2)
+    client = _invoice_edit_client(monkeypatch)
+    response = client.post("/invoices/1/edit", data=_invoice_edit_form("FVAT 20/09/2026"))
+    assert response.status_code == 200
+    assert "Faktura o takim numerze już istnieje" in response.get_data(as_text=True)
+    assert backend.load_invoice_with_meta(1)["invoice_no"] == "FV/HIST/1"
 
 
 def test_historical_pdf_generation_preserves_stock_status_and_links(historical_db):
