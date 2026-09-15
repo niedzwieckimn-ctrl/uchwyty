@@ -404,13 +404,21 @@ class _SerializedWriteConnection(sqlite3.Connection):
         try:
             return super().commit()
         finally:
-            self._release_write_lock()
+            self._release_write_lock_if_idle()
 
     def rollback(self):
         try:
             return super().rollback()
         finally:
-            self._release_write_lock()
+            self._release_write_lock_if_idle()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            # sqlite3's C context manager bypasses the Python commit/rollback
+            # overrides. Release only after its transaction has actually ended.
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self._release_write_lock_if_idle()
 
     def close(self):
         try:
@@ -2568,41 +2576,46 @@ def sqlite_upsert_rows(table: str, rows: list, conflict_col: str):
         sql = f"INSERT INTO {table}({','.join(usable_cols)}) VALUES({placeholders}) ON CONFLICT({conflict_col}) DO NOTHING"
 
     c = conn()
-    cur = c.cursor()
-    cnt = 0
-    for row in rows:
-        values = [row.get(col) for col in usable_cols]
-        cur.execute(sql, values)
-        cnt += 1
-    c.commit()
-    c.close()
-    return cnt
+    try:
+        cur = c.cursor()
+        cnt = 0
+        for row in rows:
+            values = [row.get(col) for col in usable_cols]
+            cur.execute(sql, values)
+            cnt += 1
+        c.commit()
+        return cnt
+    finally:
+        # close rolls back any unfinished batch, including on BaseException,
+        # and releases the process write lock on this same owning thread.
+        c.close()
 
 
 def sqlite_delete_missing_rows(table: str, conflict_col: str, remote_keys: list):
     c = conn()
-    cur = c.cursor()
-    if not remote_keys:
-        cur.execute(f"DELETE FROM {table}")
-        deleted = cur.rowcount if cur.rowcount is not None else 0
-        c.commit()
-        c.close()
-        return deleted
+    try:
+        cur = c.cursor()
+        if not remote_keys:
+            cur.execute(f"DELETE FROM {table}")
+            deleted = cur.rowcount if cur.rowcount is not None else 0
+            c.commit()
+            return deleted
 
-    cur.execute(f"SELECT {conflict_col} FROM {table}")
-    local_keys = [r[0] for r in cur.fetchall()]
-    remote_set = {str(x) for x in remote_keys}
-    to_delete = [x for x in local_keys if str(x) not in remote_set]
-    deleted = 0
-    if to_delete:
-        for i in range(0, len(to_delete), 800):
-            pack = to_delete[i:i+800]
-            ph = ",".join(["?"] * len(pack))
-            cur.execute(f"DELETE FROM {table} WHERE {conflict_col} IN ({ph})", tuple(pack))
-            deleted += cur.rowcount if cur.rowcount is not None else 0
-    c.commit()
-    c.close()
-    return deleted
+        cur.execute(f"SELECT {conflict_col} FROM {table}")
+        local_keys = [r[0] for r in cur.fetchall()]
+        remote_set = {str(x) for x in remote_keys}
+        to_delete = [x for x in local_keys if str(x) not in remote_set]
+        deleted = 0
+        if to_delete:
+            for i in range(0, len(to_delete), 800):
+                pack = to_delete[i:i+800]
+                ph = ",".join(["?"] * len(pack))
+                cur.execute(f"DELETE FROM {table} WHERE {conflict_col} IN ({ph})", tuple(pack))
+                deleted += cur.rowcount if cur.rowcount is not None else 0
+        c.commit()
+        return deleted
+    finally:
+        c.close()
 
 
 # Business reads deliberately use narrow source groups.  A marker records a
