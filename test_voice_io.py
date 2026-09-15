@@ -95,8 +95,9 @@ def test_ptt_stt_existing_conversation_chat_speech_text_and_tts(isolated, monkey
     voice = FakeVoiceProvider('Sprawdź zamówienie.')
     monkeypatch.setattr(backend, 'VOICE_IO_PROVIDER', voice)
     backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([
-        respond('Rozmowa rozpoczęta.'),
-        respond('Zamówienie jest gotowe. Etykieta jest gotowa do druku. Dodatkowe szczegóły są na ekranie.'),
+        respond('Rozmowa rozpoczęta.\n<speech_text>Rozmowa rozpoczęta.</speech_text>'),
+        respond('Zamówienie jest gotowe. Etykieta jest gotowa do druku. Dodatkowe szczegóły są na ekranie.\n'
+                '<speech_text>Zamówienie jest gotowe, a etykieta czeka na druk.</speech_text>'),
     ])
     test_client = client()
     opened = test_client.post('/api/internal/ai/chat', json={'message': 'Cześć'}).get_json()
@@ -110,7 +111,7 @@ def test_ptt_stt_existing_conversation_chat_speech_text_and_tts(isolated, monkey
     assert answer_response.status_code == 200
     assert answer['conversation_id'] == opened['conversation_id']
     assert answer['message'].endswith('Dodatkowe szczegóły są na ekranie.')
-    assert answer['speech_text'] == 'Zamówienie jest gotowe. Etykieta jest gotowa do druku.'
+    assert answer['speech_text'] == 'Zamówienie jest gotowe, a etykieta czeka na druk.'
 
     tts = test_client.post('/api/internal/ai/voice/synthesize', json={'speech_text': answer['speech_text']})
     assert tts.status_code == 200 and tts.data == b'fake-mp3'
@@ -120,17 +121,31 @@ def test_ptt_stt_existing_conversation_chat_speech_text_and_tts(isolated, monkey
 
 
 def test_voice_speech_text_keeps_ui_detail_but_compacts_spoken_result(isolated):
-    backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([respond(
+    provider = runtime.FakeModelProvider([respond(
         'Masz 7 aktywnych zamówień. Najnowsze ZAM-2609141 wymaga uzupełnienia. '
-        'Pozostałe zamówienia i szczegółowe pozycje są widoczne na ekranie.'
+        'Pozostałe zamówienia i szczegółowe pozycje są widoczne na ekranie.\n'
+        '<speech_text>Masz 7 aktywnych zamówień. Jedno z nich wymaga uzupełnienia.</speech_text>'
     )])
+    backend.AGENT_MODEL_PROVIDER = provider
     response = client().post('/api/internal/ai/chat', json={'message': 'Mam jakieś nowe zamówienia?'})
     payload = response.get_json()
     assert response.status_code == 200
     assert 'ZAM-2609141' in payload['message']
     assert 'ZAM-2609141' not in payload['speech_text']
+    assert payload['speech_text'] == 'Masz 7 aktywnych zamówień. Jedno z nich wymaga uzupełnienia.'
     assert len(payload['speech_text']) < len(payload['message'])
     assert payload['speech_text'].count('.') <= 2
+    assert len(provider.calls) == 1
+    assert '<speech_text>' in provider.calls[0]['instructions']
+    assert 'Nie przepisuj pierwszych zdań odpowiedzi ekranowej' in provider.calls[0]['instructions']
+    db = backend.conn()
+    stored_answer = db.execute(
+        'SELECT assistant_text FROM internal_agent_turns WHERE conversation_id=?',
+        (payload['conversation_id'],),
+    ).fetchone()['assistant_text']
+    db.close()
+    assert stored_answer == payload['message']
+    assert '<speech_text>' not in stored_answer
 
 
 def test_daily_summary_speech_uses_short_section_highlights(isolated):
@@ -140,24 +155,58 @@ def test_daily_summary_speech_uses_short_section_highlights(isolated):
         '3. Braki wymagające działania\n- Winsor — 13 szt.\n- Aosta — 2 szt.\n'
         '4. Pozostałe ważne rzeczy\n- Szczegóły na ekranie.'
     )
-    backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([respond(full)])
+    backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([respond(
+        full + '\n<speech_text>Na dziś najważniejsze: wyślij MAGMAR. Nie masz zaległych płatności. '
+        'Do uzupełnienia zostało 15 uchwytów.</speech_text>'
+    )])
     response = client().post('/api/internal/ai/chat', json={'message': 'Co mam dziś do zrobienia?'})
     payload = response.get_json()
     assert response.status_code == 200 and payload['message'] == full
     assert payload['speech_text'] == (
-        'Pilne wysyłki: MAGMAR — 13 szt., kompletne. '
-        'Płatności po terminie: Brak. Braki wymagające działania: Winsor — 13 szt.'
+        'Na dziś najważniejsze: wyślij MAGMAR. Nie masz zaległych płatności. '
+        'Do uzupełnienia zostało 15 uchwytów.'
     )
-    assert 'Aosta' not in payload['speech_text']
+    assert 'Winsor' not in payload['speech_text'] and 'Aosta' not in payload['speech_text']
 
 
 def test_explicit_request_allows_fuller_spoken_numbers(isolated):
     full = 'Zamówienia: ZAM-2609141. ZAM-2609142. ZAM-2609143.'
-    backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([respond(full)])
+    backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([respond(
+        full + '\n<speech_text>' + full + '</speech_text>'
+    )])
     payload = client().post('/api/internal/ai/chat', json={
         'message': 'Podaj wszystkie numery zamówień.'
     }).get_json()
     assert payload['speech_text'] == full
+
+
+@pytest.mark.parametrize(('question', 'full', 'spoken'), [
+    (
+        'Ile mam Winsor 128 BB?',
+        'Winsor 128 BB\nSKU: WIN-128-BB\nMAGAZYN: 47\nZAMÓWIONE: 8\nDOSTĘPNE: 39',
+        'Masz 47 sztuk Winsor 128 BB na magazynie.',
+    ),
+    (
+        'Czy ktoś zalega z płatnością?',
+        'Płatności po terminie\nLiczba faktur: 0\nŁączna zaległość: 0 zł.',
+        'Nie, obecnie nie masz faktur po terminie.',
+    ),
+    (
+        'Jakie mam braki?',
+        'Braki wymagające działania\nWinsor: 1\nSam: 5\nHugo: 7\nRazem: 13 sztuk.',
+        'Masz 13 sztuk niepokrytych braków: Winsor 1, Sam 5 i Hugo 7.',
+    ),
+])
+def test_same_final_model_turn_supplies_intent_aware_speech_text(isolated, question, full, spoken):
+    provider = runtime.FakeModelProvider([respond(
+        f'{full}\n<speech_text>{spoken}</speech_text>'
+    )])
+    backend.AGENT_MODEL_PROVIDER = provider
+    payload = client().post('/api/internal/ai/chat', json={'message': question}).get_json()
+    assert payload['message'] == full
+    assert payload['speech_text'] == spoken
+    assert len(provider.calls) == 1
+    assert all(label not in payload['speech_text'] for label in ('SKU:', 'MAGAZYN:', 'ZAMÓWIONE:', 'DOSTĘPNE:'))
 
 
 def test_spoken_summary_omits_tables_urls_json_and_internal_identifiers():
@@ -168,7 +217,7 @@ def test_spoken_summary_omits_tables_urls_json_and_internal_identifiers():
         'Szczegóły: https://example.invalid/private',
         user_message='Podsumuj wynik.',
     )
-    assert spoken == 'Podsumowanie jest gotowe. Szczegóły.'
+    assert spoken == 'Podsumowanie jest gotowe.'
     assert all(value not in spoken for value in ('CH010', 'operation_id', 'http', '{', '|'))
 
 

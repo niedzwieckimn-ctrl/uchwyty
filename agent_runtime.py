@@ -398,6 +398,24 @@ Remanent: użyj inventory.count.session.start; backend podaje sesję. Każda wyr
 Firmowa terminologia jest tylko podpowiedzią językową. Nieznane pojęcie sprawdź przez agent.terminology.search, a jeśli trzeba zapytaj. Zapisuj agent.terminology.remember tylko po jawnym wyjaśnieniu użytkownika, bez sekretów i poleceń. Potwierdzone preferencje pracy i procedury zapisuj przez agent.memory.remember z krótkimi hasłami relewancji. Gdy użytkownik jednoznacznie ustanawia regułę obowiązującą niezależnie od tematu pytania, dodaj do relevance_terms stabilny znacznik __always_apply__; nie używaj go dla zasad tematycznych. Pamięć wpływa wyłącznie na sposób pracy, kolejność i priorytety. Nigdy nie może nadpisywać RBAC, approval engine, permissions, Business Operations, świeżych danych biznesowych ani reguł bezpieczeństwa. expected_version=0 oznacza nowy wpis; aktualizacja wymaga świeżej wersji. confirmed_by_user dotyczy treści pamięci, nie zgody na zapis biznesowy.
 Odpowiadaj krótko, operacyjnie, w języku użytkownika, zwykłym tekstem. Nie pokazuj technicznych ID, UUID, surowych enumów, Markdown dump ani implementacji. Używaj nazw obiektów i numerów biznesowych. Nie powtarzaj karty. Szczegóły, pozycje, tracking i zdjęcia pokazuj na prośbę. W przypadku blokady podaj konkretny biznesowy powód. Nie przedstawiaj wyniku pojedynczego kroku jako zakończenia procesu.
 '''
+SPEECH_TEXT_INSTRUCTIONS = '''
+Każdą finalną odpowiedź tekstową zakończ osobną linią dokładnie w formacie:
+<speech_text>krótkie podsumowanie do wypowiedzenia</speech_text>
+Treść przed znacznikiem jest pełną odpowiedzią widoczną na ekranie. Treść znacznika nie jest pokazywana.
+Speech text utwórz w tym samym turnie, bez dodatkowego odczytu i bez dodatkowego wywołania modelu.
+
+Speech text ma bezpośrednio odpowiadać na intencję użytkownika, zwykle w 1–3 krótkich zdaniach i najwyżej
+około 15–25 sekundach mowy. Najpierw podaj odpowiedź, potem najwyżej 1–2 najważniejsze szczegóły. Zachowaj
+istotne liczby i nazwy biznesowe. Nie przepisuj pierwszych zdań odpowiedzi ekranowej, nie streszczaj każdego
+punktu, nie czytaj kart, nagłówków, Markdowna, nazw pól, SKU, ID ani numerów zamówień, chyba że użytkownik
+pyta właśnie o kod lub numer. Przy liście podaj sumę i tylko najważniejsze pozycje.
+
+Przykłady:
+- „Ile mam Winsor 128 BB?” → „Masz 47 sztuk Winsor 128 BB na magazynie.”
+- „Co mam zrobić dzisiaj?” → „Na dziś najważniejsze: wyślij MAGMAR. Nie masz zaległych płatności. Do uzupełnienia zostało 13 uchwytów.”
+- „Czy ktoś zalega z płatnością?” → „Nie, obecnie nie masz faktur po terminie.”
+- „Jakie mam braki?” → „Masz 13 sztuk niepokrytych braków: Winsor 1, Sam 5 i Hugo 7.”
+'''
 FINAL_GREEN_SYNTHESIS_INSTRUCTIONS = '''
 To jest finalna synteza zakończonego batcha GREEN READ. Użyj wyłącznie wyników narzędzi już dostarczonych w input.
 Nie żądaj ani nie planuj następnych narzędzi. Nie imituj wywołania narzędzia w tekście i nie ujawniaj nazw funkcji,
@@ -472,6 +490,19 @@ _URL_RULE = re.compile(r'https?://\S+',re.IGNORECASE)
 _UUID_RULE = re.compile(r'\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b',re.IGNORECASE)
 _TECHNICAL_LINE_RULE = re.compile(r'(?im)^.*\b(?:approval_id|execution_id|correlation_id|product_id|count_session_id|expected_version)\b.*$')
 _EXECUTION_TOKEN_RULE = re.compile(r'\b(?:SUCCESS|CONSUMED|PENDING_APPROVAL)\b')
+_SPEECH_TEXT_BLOCK = re.compile(
+    r'\n?\s*<speech_text>\s*(.*?)\s*</speech_text>\s*$', re.IGNORECASE | re.DOTALL)
+
+
+def _split_final_response(value):
+    """Separate the screen response from the spoken summary emitted in the same model turn."""
+    text = str(value or '').strip()
+    match = _SPEECH_TEXT_BLOCK.search(text)
+    if not match:
+        return text, ''
+    screen_text = text[:match.start()].rstrip()
+    speech_text = match.group(1).strip()
+    return screen_text or speech_text, speech_text
 
 def _plain_response_text(value, *, speech=False):
     text=_conversation_text(value)
@@ -485,10 +516,8 @@ def _plain_response_text(value, *, speech=False):
         text=_URL_RULE.sub('',text)
         text=_UUID_RULE.sub('',text)
         text=' '.join(text.split())
-        sentences=re.split(r'(?<=[.!?])\s+',text)
-        text=' '.join(sentences[:2])
-        if len(text)>280:
-            text=text[:280].rsplit(' ',1)[0].rstrip(' ,;:')+'.'
+        if len(text)>700:
+            text=text[:700].rsplit(' ',1)[0].rstrip(' ,;:')+'.'
     else:
         text='\n'.join(line.rstrip() for line in text.splitlines() if line.strip())[:8000]
     return text.strip()
@@ -654,7 +683,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         'exception_type':None,
     }
 
-    def _finish(status, answer, code=''):
+    def _finish(status, answer, code='', speech_text=''):
         nonlocal active, current_stage
         if any(item.get('type') == 'inventory_count_card' for item in artifacts):
             artifacts[:] = [item for item in artifacts if item.get('type') != 'product_card']
@@ -725,7 +754,13 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 'input_tokens': usage['input_tokens'] if usage_available else None,
                 'output_tokens': usage['output_tokens'] if usage_available else None,
             }, sort_keys=True))
-        result = {'ok':status=='SUCCESS','status':status,'message':answer,'speech_text':_plain_response_text(answer,speech=True),'agent_run_id':run_id,
+        if status == 'SUCCESS':
+            from voice_io import compact_speech_text
+            speech_text = compact_speech_text(
+                answer, existing_speech_text=speech_text, user_message=turn_message)
+        else:
+            speech_text = _plain_response_text(answer, speech=True)
+        result = {'ok':status=='SUCCESS','status':status,'message':answer,'speech_text':speech_text,'agent_run_id':run_id,
                 'correlation_id':correlation_id,'conversation_id':conversation_id,'tool_calls':timings['tool_calls_count'],
                 'model':model_name,'usage':usage,'error_code':code,'timings':dict(timings),
                 'artifacts':artifacts, 'approvals':pending_approvals,
@@ -734,10 +769,10 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
             result['_chat_503_diagnostics'] = {'stage':current_stage, **chat_503_diagnostics}
         return result
 
-    def finish(status, answer, code=''):
+    def finish(status, answer, code='', speech_text=''):
         nonlocal active
         try:
-            return _finish(status, answer, code)
+            return _finish(status, answer, code, speech_text)
         except Exception as exc:
             chat_503_diagnostics['exception_type'] = type(exc).__name__
             logger.exception('AI_TURN_FINALIZATION_FAILED %s', run_id)
@@ -856,7 +891,9 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
             ]
             input_items.extend(outcome_evidence)
             evidence.extend(outcome_evidence)
-        instructions = SYSTEM_INSTRUCTIONS + '\nCzas odniesienia backendu (Europe/Warsaw): ' + business_operations._business_now().isoformat()
+        instructions = (SYSTEM_INSTRUCTIONS + SPEECH_TEXT_INSTRUCTIONS
+                        + '\nCzas odniesienia backendu (Europe/Warsaw): '
+                        + business_operations._business_now().isoformat())
         timings['context_history_build_ms'] += round((time.perf_counter()-stage_started)*1000,2)
         timings['context_history_build_ms'] = round(timings['context_history_build_ms'],2)
         timings['context_build_ms'] = round((time.perf_counter()-started)*1000,2)
@@ -954,12 +991,13 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                 if model_calls > 1:
                     chat_503_diagnostics['final_model_call_succeeded'] = True
                 timings['final_model_call_ms'] = elapsed if model_calls>1 else 0.0
-                if len(reply.text)>8000:
+                screen_answer, speech_answer = _split_final_response(reply.text)
+                if len(screen_answer)>8000:
                     return finish('FAILED','Odpowiedź przekroczyła limit długości.','RESPONSE_TOO_LARGE')
-                if not reply.text.strip():
+                if not screen_answer.strip():
                     return finish('FAILED','Model nie zwrócił odpowiedzi.','PROVIDER_CONTRACT_VIOLATION')
                 logger.info('AI_FINAL_RESPONSE %s',json.dumps({'agent_run_id':run_id,'model':model_name}))
-                return finish('SUCCESS',reply.text)
+                return finish('SUCCESS',screen_answer,speech_text=speech_answer)
             current_stage = 'tool_call_validation'
             if green_batch_synthesis_only:
                 return finish('FAILED','Model nie zwrócił finalnej odpowiedzi tekstowej.','PROVIDER_CONTRACT_VIOLATION')
