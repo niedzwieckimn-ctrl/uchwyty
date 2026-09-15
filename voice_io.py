@@ -16,7 +16,12 @@ ALLOWED_AUDIO_TYPES = frozenset({
 
 
 class VoiceIOError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, error_code: str = 'STT_FAILED',
+                 stage: str = 'provider', http_status: int | None = None):
+        super().__init__(message)
+        self.error_code = error_code
+        self.stage = stage
+        self.http_status = http_status
 
 
 @dataclass(frozen=True)
@@ -37,7 +42,8 @@ class OpenAIVoiceIOProvider:
         self.tts_model = tts_model or os.environ.get('AI_TTS_MODEL', 'gpt-4o-mini-tts')
         self.voice = voice or os.environ.get('AI_TTS_VOICE', 'alloy')
         if not self.api_key:
-            raise VoiceIOError('Voice provider is not configured')
+            raise VoiceIOError('Voice provider is not configured',
+                               error_code='VOICE_NOT_CONFIGURED', stage='configuration')
 
     @staticmethod
     def _raise_for_status(response, stage: str) -> None:
@@ -45,7 +51,9 @@ class OpenAIVoiceIOProvider:
             response.raise_for_status()
         except requests.RequestException as exc:
             status = getattr(response, 'status_code', None)
-            raise VoiceIOError(f'{stage} provider HTTP {status or "error"}') from exc
+            raise VoiceIOError(f'{stage} provider HTTP {status or "error"}',
+                               error_code=f'{stage}_PROVIDER_HTTP_ERROR',
+                               stage='provider_response', http_status=status) from exc
 
     def transcribe(self, audio: bytes, *, filename: str, content_type: str) -> str:
         try:
@@ -56,15 +64,25 @@ class OpenAIVoiceIOProvider:
                 data={'model': self.stt_model},
                 timeout=60,
             )
+        except requests.Timeout as exc:
+            raise VoiceIOError('STT provider timed out', error_code='STT_TIMEOUT',
+                               stage='provider_request') from exc
         except requests.RequestException as exc:
-            raise VoiceIOError('STT provider unavailable') from exc
+            raise VoiceIOError('STT provider unavailable', error_code='STT_NETWORK_ERROR',
+                               stage='provider_request') from exc
         self._raise_for_status(response, 'STT')
         try:
-            text = str(response.json().get('text') or '').strip()
+            data = response.json()
         except (TypeError, ValueError) as exc:
-            raise VoiceIOError('Invalid STT response') from exc
+            raise VoiceIOError('Invalid STT response', error_code='STT_INVALID_RESPONSE',
+                               stage='provider_response') from exc
+        if not isinstance(data, dict) or not isinstance(data.get('text'), str):
+            raise VoiceIOError('Invalid STT response', error_code='STT_INVALID_RESPONSE',
+                               stage='provider_response')
+        text = data['text'].strip()
         if not text:
-            raise VoiceIOError('Empty transcription')
+            raise VoiceIOError('Empty transcription', error_code='STT_EMPTY_TRANSCRIPT',
+                               stage='provider_response')
         return text
 
     def synthesize(self, text: str) -> SynthesizedAudio:

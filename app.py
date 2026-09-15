@@ -1345,21 +1345,56 @@ def api_internal_ai_chat():
 @app.post('/api/internal/ai/voice/transcribe')
 @require_permission('inventory.read')
 def api_internal_ai_voice_transcribe():
+    started = time.perf_counter()
+    content_type = ''
+    audio_size = 0
+
+    def diagnostic(event, stage, *, status=None, error_code='', provider_status=None):
+        payload = {
+            'stage': stage, 'mime_type': content_type if content_type in ALLOWED_AUDIO_TYPES else '',
+            'blob_size': audio_size, 'http_status': status,
+            'latency_ms': round((time.perf_counter() - started) * 1000, 2),
+            'error_code': error_code,
+        }
+        if provider_status is not None:
+            payload['provider_http_status'] = provider_status
+        app.logger.log(logging.WARNING if error_code else logging.INFO,
+                       '%s %s', event, json.dumps(payload, sort_keys=True))
+
+    def failure(code, status, stage='upload_validation', provider_status=None):
+        diagnostic('VOICE_STT_ERROR', stage, status=status, error_code=code,
+                   provider_status=provider_status)
+        return jsonify(ok=False, error_code=code), status
+
+    diagnostic('VOICE_STT_REQUEST_START', 'upload')
     if not _rate_limit('internal_ai_voice_stt', 20, 60):
-        return jsonify(ok=False, error_code='RATE_LIMITED'), 429
+        return failure('RATE_LIMITED', 429)
     upload = request.files.get('audio')
-    content_type = (upload.content_type or '').split(';', 1)[0].lower() if upload else ''
-    if upload is None or content_type not in ALLOWED_AUDIO_TYPES:
-        return jsonify(ok=False, error_code='INVALID_AUDIO'), 400
+    content_type = (upload.content_type or '').split(';', 1)[0].strip().lower() if upload else ''
+    if upload is None:
+        return failure('MISSING_AUDIO', 400)
+    if content_type not in ALLOWED_AUDIO_TYPES:
+        return failure('UNSUPPORTED_AUDIO_TYPE', 400)
     audio = upload.read(MAX_AUDIO_BYTES + 1)
-    if not audio or len(audio) > MAX_AUDIO_BYTES:
-        return jsonify(ok=False, error_code='INVALID_AUDIO'), 400
+    audio_size = len(audio)
+    if not audio:
+        return failure('EMPTY_AUDIO', 400)
+    if audio_size > MAX_AUDIO_BYTES:
+        return failure('AUDIO_TOO_LARGE', 400)
     try:
         text = (VOICE_IO_PROVIDER or voice_provider_from_env()).transcribe(
             audio, filename=upload.filename or 'recording.webm', content_type=content_type,
         )
-    except VoiceIOError:
-        return jsonify(ok=False, error_code='STT_FAILED'), 503
+        if not isinstance(text, str):
+            return failure('STT_INVALID_RESPONSE', 503, 'provider_response')
+        text = text.strip()
+        if not text:
+            return failure('STT_EMPTY_TRANSCRIPT', 503, 'provider_response')
+    except VoiceIOError as exc:
+        return failure(exc.error_code, 503, exc.stage, exc.http_status)
+    except Exception:
+        return failure('STT_BACKEND_ERROR', 503, 'provider')
+    diagnostic('VOICE_STT_RESPONSE', 'complete', status=200)
     return jsonify(ok=True, text=text)
 
 
