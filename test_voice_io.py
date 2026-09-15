@@ -259,8 +259,31 @@ def test_stt_adapter_sends_multipart_and_returns_only_transcript(isolated, monke
     url, request = calls[0]
     assert url == 'https://api.openai.com/v1/audio/transcriptions'
     assert request['files'] == {'file': ('recording.webm', b'audio-bytes', 'audio/webm')}
-    assert request['data'] == {'model': 'test-stt-model'}
+    assert request['data'] == {
+        'model': 'test-stt-model',
+        'language': 'pl',
+        'prompt': voice_io.STT_CONTEXT_PROMPT,
+    }
+    assert 'polsku' in request['data']['prompt']
+    assert 'nazwy produktów i firm' in request['data']['prompt']
+    assert 'numery zamówień' in request['data']['prompt']
+    assert 'kody SKU' in request['data']['prompt']
     assert request['headers']['Authorization'] == 'Bearer test-secret'
+
+
+@pytest.mark.parametrize('transcript', [
+    'co mogę zrobić dzisiaj?',
+    'jakie mam zaległe faktury?',
+    'mam na półce Cerne 128 BB jedną sztukę',
+    'sprawdź CH010-BB-128168',
+    'sprawdź zamówienie ZAM-2609141',
+])
+def test_stt_adapter_preserves_polish_business_transcript(isolated, monkeypatch, transcript):
+    monkeypatch.setattr(voice_io.requests, 'post',
+                        lambda *args, **kwargs: StubTranscriptionResponse({'text': transcript}))
+    provider = voice_io.OpenAIVoiceIOProvider(api_key='test-secret')
+    assert provider.transcribe(b'audio', filename='recording.webm',
+                               content_type='audio/webm') == transcript
 
 
 @pytest.mark.parametrize('failure,expected_code', [
@@ -313,9 +336,13 @@ def test_stt_provider_failures_have_safe_diagnostics(isolated, monkeypatch, capl
     assert failures[0]['http_status'] == 503
     if failure == 'http':
         assert failures[0]['provider_http_status'] == 429
-    allowed = {'stage', 'mime_type', 'blob_size', 'duration_ms', 'http_status', 'latency_ms', 'error_code', 'provider_http_status'}
+    allowed = {'stage', 'mime_type', 'blob_size', 'duration_ms', 'http_status', 'latency_ms',
+               'error_code', 'provider_http_status', 'language', 'stt_model'}
     for event in events:
-        assert set(json.loads(event.split(' ', 1)[1])) <= allowed
+        payload = json.loads(event.split(' ', 1)[1])
+        assert set(payload) <= allowed
+        assert payload['language'] == 'pl'
+        assert payload['stt_model'] == voice_io.DEFAULT_STT_MODEL
     assert secret not in '\n'.join(events)
     assert 'webm-audio' not in '\n'.join(events)
 
@@ -331,6 +358,9 @@ def test_successful_stt_diagnostics_exclude_transcript_and_audio(isolated, monke
     completed = [json.loads(event.split(' ', 1)[1]) for event in events if event.startswith('VOICE_STT_RESPONSE ')]
     assert len(completed) == 1
     assert completed[0]['http_status'] == 200
+    assert completed[0]['provider_http_status'] == 200
+    assert completed[0]['language'] == 'pl'
+    assert completed[0]['stt_model'] == voice_io.DEFAULT_STT_MODEL
     assert completed[0]['blob_size'] == len(b'webm-audio')
     assert completed[0]['mime_type'] == 'audio/webm'
     assert transcript not in '\n'.join(events)

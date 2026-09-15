@@ -10,6 +10,13 @@ import requests
 
 MAX_AUDIO_BYTES = 10 * 1024 * 1024
 MAX_SPEECH_TEXT = 700
+DEFAULT_STT_MODEL = 'gpt-4o-mini-transcribe'
+STT_LANGUAGE = 'pl'
+STT_CONTEXT_PROMPT = (
+    'Dokładnie transkrybuj mowę po polsku w aplikacji biznesowej. '
+    'Zachowaj nazwy produktów i firm, numery zamówień oraz kody SKU, '
+    'w tym litery, cyfry i łączniki, dokładnie tak, jak zostały wypowiedziane.'
+)
 ALLOWED_AUDIO_TYPES = frozenset({
     'audio/webm', 'audio/ogg', 'audio/mp4', 'audio/mpeg', 'audio/wav', 'audio/x-wav',
 })
@@ -38,7 +45,7 @@ class VoiceIOProvider(Protocol):
 class OpenAIVoiceIOProvider:
     def __init__(self, *, api_key: str = '', stt_model: str = '', tts_model: str = '', voice: str = ''):
         self.api_key = api_key or os.environ.get('OPENAI_API_KEY', '')
-        self.stt_model = stt_model or os.environ.get('AI_STT_MODEL', 'gpt-4o-mini-transcribe')
+        self.stt_model = stt_model or os.environ.get('AI_STT_MODEL', DEFAULT_STT_MODEL)
         self.tts_model = tts_model or os.environ.get('AI_TTS_MODEL', 'gpt-4o-mini-tts')
         self.voice = voice or os.environ.get('AI_TTS_VOICE', 'alloy')
         if not self.api_key:
@@ -61,7 +68,11 @@ class OpenAIVoiceIOProvider:
                 'https://api.openai.com/v1/audio/transcriptions',
                 headers={'Authorization': f'Bearer {self.api_key}'},
                 files={'file': (filename or 'recording.webm', audio, content_type)},
-                data={'model': self.stt_model},
+                data={
+                    'model': self.stt_model,
+                    'language': STT_LANGUAGE,
+                    'prompt': STT_CONTEXT_PROMPT,
+                },
                 timeout=60,
             )
         except requests.Timeout as exc:

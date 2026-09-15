@@ -61,8 +61,10 @@ from internal_rbac import (
 from agent_runtime import configure_artifact_builder, provider_from_env, reset_agent_conversation, run_agent_turn
 from voice_io import (
     ALLOWED_AUDIO_TYPES,
+    DEFAULT_STT_MODEL,
     MAX_AUDIO_BYTES,
     MAX_SPEECH_TEXT,
+    STT_LANGUAGE,
     VoiceIOError,
     provider_from_env as voice_provider_from_env,
 )
@@ -1348,16 +1350,17 @@ def api_internal_ai_voice_transcribe():
     started = time.perf_counter()
     content_type = ''
     audio_size = 0
+    stt_model = (getattr(VOICE_IO_PROVIDER, 'stt_model', '')
+                 or os.environ.get('AI_STT_MODEL', DEFAULT_STT_MODEL))
 
     def diagnostic(event, stage, *, status=None, error_code='', provider_status=None):
         payload = {
             'stage': stage, 'mime_type': content_type if content_type in ALLOWED_AUDIO_TYPES else '',
             'blob_size': audio_size, 'http_status': status,
             'latency_ms': round((time.perf_counter() - started) * 1000, 2),
-            'error_code': error_code,
+            'error_code': error_code, 'language': STT_LANGUAGE, 'stt_model': stt_model,
+            'provider_http_status': provider_status,
         }
-        if provider_status is not None:
-            payload['provider_http_status'] = provider_status
         app.logger.log(logging.WARNING if error_code else logging.INFO,
                        '%s %s', event, json.dumps(payload, sort_keys=True))
 
@@ -1394,7 +1397,7 @@ def api_internal_ai_voice_transcribe():
         return failure(exc.error_code, 503, exc.stage, exc.http_status)
     except Exception:
         return failure('STT_BACKEND_ERROR', 503, 'provider')
-    diagnostic('VOICE_STT_RESPONSE', 'complete', status=200)
+    diagnostic('VOICE_STT_RESPONSE', 'complete', status=200, provider_status=200)
     return jsonify(ok=True, text=text)
 
 
