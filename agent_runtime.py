@@ -15,6 +15,7 @@ from agent_artifacts import build_artifact_sources
 import business_operations
 import business_query
 import business_read_models
+from agent_streaming import DisplayTextFilter, StreamCancelled
 from internal_audit import SUCCESS, FAILED, record_audit_event, sanitize_audit_text
 from internal_rbac import AI_OWNER_ASSISTANT_ACTOR_ID, ActorContext, load_actor_context, ALLOW, DENY
 
@@ -126,6 +127,10 @@ class OpenAIResponsesProvider:
             raise RuntimeError("Brak konfiguracji AI_OWNER_MODEL")
         if not self.api_key:
             raise RuntimeError("Brak konfiguracji OPENAI_API_KEY")
+
+    def complete_stream(self, **kwargs):
+        from agent_streaming_provider import stream_response
+        return stream_response(self, **kwargs)
 
     def complete(self, *, instructions, input_items, tools, previous_response_id, timeout_seconds,
                  tool_choice="auto"):
@@ -673,8 +678,24 @@ def _generic_query_selection_metrics(arguments: Any) -> tuple[list[str], list[st
 
 
 def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModelProvider,
-                   conversation_id: str = '', execution_outcome: dict[str, Any] | None = None) -> dict[str, Any]:
+                   conversation_id: str = '', execution_outcome: dict[str, Any] | None = None,
+                   *, emit=None, cancelled=None, stream_trace=None) -> dict[str, Any]:
     started = time.perf_counter()
+    stream_enabled = emit is not None and callable(getattr(provider, 'complete_stream', None))
+    display_started = False
+
+    def check_cancelled():
+        if cancelled is not None and cancelled():
+            raise StreamCancelled('Agent stream cancelled')
+
+    def display_emit(event, data):
+        nonlocal display_started
+        if cancelled is not None and cancelled():
+            return
+        if stream_trace is not None:
+            stream_trace.mark('first_display_delta')
+        display_started = True
+        emit(event, data)
     run_id, correlation_id = str(uuid.uuid4()), str(uuid.uuid4())
     timings = {
         'acquire_turn_ms':0.0, 'memory_load_ms':0.0, 'context_history_build_ms':0.0,
@@ -841,7 +862,14 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
     def finish(status, answer, code='', speech_text='', voice_response_mode='adaptive'):
         nonlocal active
         try:
-            return _finish(status, answer, code, speech_text, voice_response_mode)
+            result = _finish(status, answer, code, speech_text, voice_response_mode)
+            if stream_trace is not None and result['status'] == 'SUCCESS':
+                stream_trace.mark('final_response_available')
+            # Buffered final passes and older/custom providers return their
+            # existing answer. Never turn a finalization failure into a delta.
+            if emit is not None and result['status'] == 'SUCCESS' and not display_started:
+                display_emit('display_delta', {'delta': result['message']})
+            return result
         except Exception as exc:
             chat_503_diagnostics['exception_type'] = type(exc).__name__
             logger.exception('AI_TURN_FINALIZATION_FAILED %s', run_id)
@@ -974,6 +1002,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         only_green_reads_so_far = True
         china_shortage_coverage_question = _is_china_shortage_coverage_question(turn_message)
         while True:
+            check_cancelled()
             current_stage = 'model_context_check'
             if len(json.dumps(input_items,ensure_ascii=False).encode())>MAX_MODEL_CONTEXT_BYTES:
                 return finish('FAILED','Rozmowa przekroczyła limit kontekstu; zawęź pytanie.','CONTEXT_LIMIT_EXCEEDED')
@@ -1035,11 +1064,25 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                     allowed_names = frozenset()
                 model_tools = [item for item in tools if item['name'] in allowed_names]
             pass_allowed = {item['name'] for item in model_tools}
+            final_pass = synthesis_only or remaining_tool_budget <= 0 or not model_tools
+            display_filter = (
+                DisplayTextFilter(display_emit, _plain_response_text)
+                if stream_enabled and final_pass else None
+            )
+            if stream_trace is not None:
+                stream_trace.mark('first_model_request')
             try:
-                reply = provider.complete(instructions=model_instructions,input_items=input_items,
-                    tools=[] if synthesis_only else model_tools,
-                    previous_response_id='',timeout_seconds=MODEL_TIMEOUT_SECONDS,
-                    tool_choice='none' if synthesis_only or remaining_tool_budget<=0 else 'auto')
+                model_kwargs = dict(instructions=model_instructions, input_items=input_items,
+                    tools=[] if synthesis_only else model_tools, previous_response_id='',
+                    timeout_seconds=MODEL_TIMEOUT_SECONDS,
+                    tool_choice='none' if synthesis_only or remaining_tool_budget <= 0 else 'auto')
+                if stream_enabled and final_pass:
+                    reply = provider.complete_stream(**model_kwargs, on_delta=display_filter.feed,
+                                                     cancelled=cancelled)
+                else:
+                    # A tools-enabled response can contain both text and tool
+                    # calls. Its entire output stays internal until completed.
+                    reply = provider.complete(**model_kwargs)
             finally:
                 elapsed = round((time.perf_counter()-t)*1000,2)
                 if model_calls==0:
@@ -1058,6 +1101,11 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
             usage['input_tokens'] += reply.input_tokens
             usage['output_tokens'] += reply.output_tokens
             if not reply.tool_calls:
+                # This is the final answer, even if finality was not known before
+                # complete(). Keep it verbatim through the existing finalization;
+                # streaming must never trigger a second model generation.
+                if stream_trace is not None:
+                    stream_trace.mark('final_model_done')
                 if model_calls > 1:
                     chat_503_diagnostics['final_model_call_succeeded'] = True
                 timings['final_model_call_ms'] = elapsed if model_calls>1 else 0.0
@@ -1066,10 +1114,15 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                     return finish('FAILED','Odpowiedź przekroczyła limit długości.','RESPONSE_TOO_LARGE')
                 if not screen_answer.strip():
                     return finish('FAILED','Model nie zwrócił odpowiedzi.','PROVIDER_CONTRACT_VIOLATION')
+                if display_filter is not None:
+                    display_filter.finish(screen_answer)
                 logger.info('AI_FINAL_RESPONSE %s',json.dumps({'agent_run_id':run_id,'model':model_name}))
                 return finish('SUCCESS',screen_answer,speech_text=speech_answer,
                               voice_response_mode=voice_response_mode)
             current_stage = 'tool_call_validation'
+            check_cancelled()
+            if stream_enabled and final_pass:
+                return finish('FAILED','Model nie zwrócił finalnej odpowiedzi tekstowej.','PROVIDER_CONTRACT_VIOLATION')
             if green_batch_synthesis_only:
                 return finish('FAILED','Model nie zwrócił finalnej odpowiedzi tekstowej.','PROVIDER_CONTRACT_VIOLATION')
             if timings['tool_calls_count']+len(reply.tool_calls)>MAX_TOOL_CALLS_PER_TURN:
@@ -1212,6 +1265,7 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                     arguments, definition = parallel_prepared[call.call_id]
                     result, operation_elapsed = parallel_results[call.call_id]
                 else:
+                    check_cancelled()
                     arguments = json.loads(call.arguments) if isinstance(call.arguments,str) else call.arguments
                     if not isinstance(arguments,dict):
                         raise ValueError('Tool arguments must be an object')
@@ -1330,6 +1384,7 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                             return finish('DENIED', scope_error[1], scope_error[0])
                     timings['tool_calls_count'] += 1
                     _audit('agent.tool_selected',ai_actor,run_id,correlation_id,SUCCESS,human_actor.actor_id,tool_name=call.name,conversation_id=conversation_id)
+                    check_cancelled()
                     t = time.perf_counter()
                     if call.name == 'approval.decide':
                         with human_approval.gesture(human_actor, eligible_approvals, run_id, conversation_id):
@@ -1441,6 +1496,8 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                     or generic_analytical_read and detected_intent == 'daily_operational_summary'
                         and len(generic_tools_used) >= len(_INTENT_TOOL_NAMES[detected_intent])):
                 green_batch_synthesis_only = True
+    except StreamCancelled:
+        return finish('FAILED','Odbiór odpowiedzi został przerwany. Wykonane operacje pozostają zapisane.', 'TURN_CANCELLED')
     except agent_conversation.ConversationAccessDenied:
         return finish('DENIED','Nie masz dostępu do tej rozmowy.','CONVERSATION_ACCESS_DENIED')
     except agent_conversation.ConversationBusy:

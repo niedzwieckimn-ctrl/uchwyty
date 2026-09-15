@@ -47,6 +47,7 @@ from flask import (
     send_file, abort
 )
 from flask import render_template, render_template_string
+from agent_streaming import StreamTrace, sse_response
 from werkzeug.exceptions import HTTPException
 from jinja2 import ChoiceLoader, DictLoader, FileSystemLoader
 from werkzeug.security import check_password_hash
@@ -1251,6 +1252,7 @@ def _approval_execution_outcome(approval_id: str) -> dict:
 @app.post('/api/internal/ai/approvals/<approval_id>/<decision>')
 @require_permission('approvals.decide')
 def api_ai_approval_decide(approval_id, decision):
+    request_received = time.perf_counter()
     import business_operations
     import internal_approval
     from internal_rbac import load_actor_context
@@ -1300,6 +1302,23 @@ def api_ai_approval_decide(approval_id, decision):
         if conversation_id:
             try:
                 provider = AGENT_MODEL_PROVIDER or provider_from_env()
+                if _agent_stream_requested():
+                    trace = StreamTrace(request_received)
+
+                    def run_followup(emit, cancelled, stream_trace):
+                        return run_agent_turn(human, '', provider, conversation_id=conversation_id,
+                            execution_outcome=outcome, emit=emit, cancelled=cancelled,
+                            stream_trace=stream_trace)
+
+                    def finalize_followup(model_result):
+                        model_result, http_status = _finalize_ai_chat_result(model_result, '')
+                        response.update(model_status=model_result['status'],
+                            message=model_result['message'], speech_text=model_result.get('speech_text', ''),
+                            voice_response_mode=model_result.get('voice_response_mode', 'adaptive'),
+                            conversation_id=model_result['conversation_id'])
+                        return response, http_status
+
+                    return sse_response(run_followup, finalize_followup, trace=trace)
                 model_result = run_agent_turn(
                     human, '', provider, conversation_id=conversation_id,
                     execution_outcome=outcome,
@@ -1321,6 +1340,7 @@ def api_ai_approval_decide(approval_id, decision):
 @require_permission("inventory.read")
 def api_internal_ai_chat():
     """Internal text-only AI runtime with supervised order writes. Request identity fields are ignored."""
+    request_received = time.perf_counter()
     if not _rate_limit("internal_ai_chat", 30, 60):
         return jsonify(ok=False, status="DENIED", error_code="RATE_LIMITED",
                        message="Zbyt wiele żądań do asystenta."), 429
@@ -1340,12 +1360,33 @@ def api_internal_ai_chat():
         }, sort_keys=True))
         return jsonify(ok=False, status="FAILED", error_code="MODEL_NOT_CONFIGURED",
                        message="Model asystenta nie jest jeszcze skonfigurowany."), 503
-    result = run_agent_turn(current_actor_context(), payload.get("message", ""), provider,
-                            conversation_id=str(payload.get("conversation_id") or ""))
+    human = current_actor_context()
+    message = payload.get('message', '')
+    conversation_id = str(payload.get('conversation_id') or '')
+    if _agent_stream_requested():
+        def run(emit, cancelled, trace):
+            return run_agent_turn(human, message, provider, conversation_id=conversation_id,
+                                  emit=emit, cancelled=cancelled, stream_trace=trace)
+        return sse_response(run, lambda result: _finalize_ai_chat_result(result, message),
+                            trace=StreamTrace(request_received))
+    result = run_agent_turn(human, message, provider, conversation_id=conversation_id)
+    result, status_code = _finalize_ai_chat_result(result, message)
+    return jsonify(result), status_code
+
+
+def _agent_stream_requested():
+    # Explicit content negotiation keeps old clients/approval consumers on JSON.
+    # A transport-only rollback switch does not change the model or business flow.
+    enabled = os.environ.get('AI_TEXT_STREAMING_ENABLED', '1').lower() not in {'0', 'false', 'no', 'off'}
+    return enabled and request.accept_mimetypes['text/event-stream'] > request.accept_mimetypes['application/json']
+
+
+def _finalize_ai_chat_result(result, user_message):
+    """Identical result preparation for JSON and SSE, after runtime finalization."""
     if result.get('status') == 'SUCCESS':
         result['speech_text'] = compact_speech_text(
             result.get('message', ''), existing_speech_text=result.get('speech_text', ''),
-            user_message=payload.get('message', ''),
+            user_message=user_message,
             voice_response_mode=result.get('voice_response_mode', 'adaptive'),
         )
         app.logger.info('VOICE_SPEECH_TEXT_READY %s', json.dumps({
@@ -1368,7 +1409,7 @@ def api_internal_ai_chat():
             "final_model_call_started":bool(diagnostics.get("final_model_call_started")),
             "final_model_call_succeeded":bool(diagnostics.get("final_model_call_succeeded")),
         }, sort_keys=True))
-    return jsonify(result), status_code
+    return result, status_code
 
 
 @app.after_request
