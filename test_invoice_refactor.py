@@ -64,14 +64,26 @@ def test_next_invoice_number_uses_highest_sequence_not_record_count(numbering_db
     assert invoice_numbering.preview(backend, "2026-09-15") == f"FVAT {expected}/09/2026"
 
 
-def test_deleted_highest_invoice_number_is_not_reused(numbering_db):
+def test_deleted_draft_number_is_reusable(numbering_db):
     for sequence in (1, 2, 5):
         _store_number(f"FVAT {sequence}/09/2026")
     db = backend.conn()
     db.execute("DELETE FROM invoices WHERE invoice_no='FVAT 5/09/2026'")
     db.commit()
     db.close()
-    assert invoice_numbering.preview(backend, "2026-09-15") == "FVAT 6/09/2026"
+    assert invoice_numbering.preview(backend, "2026-09-15") == "FVAT 5/09/2026"
+
+
+def test_legacy_permanent_claim_history_is_removed_on_upgrade(numbering_db):
+    db = backend.conn()
+    db.execute("CREATE TRIGGER retain_invoice_number AFTER INSERT ON invoices BEGIN SELECT 1; END")
+    db.execute("INSERT OR REPLACE INTO invoice_number_claims VALUES('FVAT 99/09/2026',?)", (backend.now_iso(),))
+    db.execute("INSERT OR REPLACE INTO invoice_number_counters VALUES('09/2026',99)")
+    invoice_numbering.initialize(db)
+    db.commit()
+    assert db.execute("SELECT COUNT(*) FROM invoice_number_claims").fetchone()[0] == 0
+    db.close()
+    assert invoice_numbering.preview(backend, "2026-09-15") == "FVAT 1/09/2026"
 
 
 def test_manual_standard_number_is_exact_and_advances_next_auto_number(numbering_db):
@@ -84,6 +96,78 @@ def test_manual_standard_number_is_exact_and_advances_next_auto_number(numbering
     assert db.execute("SELECT invoice_no FROM invoices").fetchone()[0] == "FVAT 20/09/2026"
     db.close()
     assert invoice_numbering.reserve(backend, "2026-09-15") == "FVAT 21/09/2026"
+
+
+def test_cursor_five_allocates_six(numbering_db):
+    for sequence in range(1, 6):
+        _store_number(f"FVAT {sequence}/09/2026")
+    assert invoice_numbering.preview(backend, "2026-09-15") == "FVAT 6/09/2026"
+
+
+def test_deleted_automatic_draft_releases_its_number(numbering_db):
+    for sequence in range(1, 6):
+        _store_number(f"FVAT {sequence}/09/2026")
+    number = invoice_numbering.reserve(backend, "2026-09-15")
+    assert number == "FVAT 6/09/2026"
+    _store_number(number)
+    db = backend.conn()
+    db.execute("DELETE FROM invoices WHERE invoice_no=?", (number,))
+    db.commit()
+    db.close()
+    assert invoice_numbering.preview(backend, "2026-09-15") == number
+
+
+def test_lower_manual_cursor_scans_to_first_free_number(numbering_db):
+    _store_number("FVAT 3/09/2026", invoice_id=1)
+    _store_number("FVAT 5/09/2026", invoice_id=2)
+    selected = invoice_numbering.reserve_manual_change(
+        backend, "FVAT 3/09/2026", "FVAT 4/09/2026", "2026-09-15",
+    )
+    db = backend.conn()
+    db.execute("UPDATE invoices SET invoice_no=? WHERE id=1", (selected,))
+    db.commit()
+    db.close()
+    assert invoice_numbering.preview(backend, "2026-09-15") == "FVAT 6/09/2026"
+
+
+def test_manual_ten_makes_eleven_next(numbering_db):
+    number = invoice_numbering.reserve(backend, "2026-09-15", "FVAT 10/09/2026", manual=True)
+    _store_number(number)
+    assert invoice_numbering.preview(backend, "2026-09-15") == "FVAT 11/09/2026"
+
+
+def test_free_lower_manual_number_is_allowed_despite_higher_numbers(numbering_db):
+    _store_number("FVAT 3/09/2026")
+    _store_number("FVAT 8/09/2026")
+    assert invoice_numbering.reserve(
+        backend, "2026-09-15", "FVAT 4/09/2026", manual=True,
+    ) == "FVAT 4/09/2026"
+
+
+def test_final_ksef_number_remains_claimed_after_direct_invoice_delete(numbering_db):
+    _store_number("FVAT 6/09/2026", invoice_id=6)
+    db = backend.conn()
+    db.execute(
+        "INSERT INTO ksef_documents(invoice_id,status,ksef_number,sent_at,updated_at) VALUES(6,'accepted','KSEF-6',?,?)",
+        (backend.now_iso(), backend.now_iso()),
+    )
+    db.execute("UPDATE invoices SET buyer_name='Finalny klient' WHERE id=6")
+    assert db.execute(
+        "SELECT 1 FROM invoice_number_claims WHERE invoice_no='FVAT 6/09/2026'"
+    ).fetchone()
+    # Simulate an out-of-band deletion. The normal route rejects this earlier.
+    db.execute("PRAGMA foreign_keys=OFF")
+    db.execute("DELETE FROM invoices WHERE id=6")
+    db.commit()
+    claim = db.execute(
+        "SELECT 1 FROM invoice_number_claims WHERE invoice_no='FVAT 6/09/2026'"
+    ).fetchone()
+    db.close()
+    assert claim
+    with pytest.raises(ValueError, match="już wykorzystany"):
+        invoice_numbering.reserve(
+            backend, "2026-09-15", "FVAT 6/09/2026", manual=True,
+        )
 
 
 def test_duplicate_manual_number_is_rejected_without_second_invoice(numbering_db):

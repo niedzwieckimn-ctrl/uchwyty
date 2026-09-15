@@ -59,17 +59,16 @@ def test_preflight_closed_order_never_creates_approval(flow):
     c = b.conn(); assert c.execute('SELECT COUNT(*) FROM internal_approval_requests').fetchone()[0] == 0; c.close()
 
 
-def test_number_gap_deleted_highest_and_parallel_reservations(flow):
+def test_deleted_draft_number_returns_and_parallel_reservations_stay_unique(flow):
     docs()
     c = b.conn()
     c.execute("UPDATE invoices SET invoice_no='FVAT 8/09/2026'")
     invoice_numbering.initialize(c)
     c.commit(); c.close()
-    assert invoice_numbering.reserve(b, '2026-09-13') == 'FVAT 9/09/2026'
     c = b.conn(); c.execute('DELETE FROM invoices'); c.commit(); c.close()
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(lambda _: invoice_numbering.reserve(b, '2026-09-13'), range(2)))
-    assert set(results) == {'FVAT 10/09/2026', 'FVAT 11/09/2026'}
+    assert set(results) == {'FVAT 8/09/2026', 'FVAT 9/09/2026'}
 
 
 def test_partial_invoice_outcome_and_retry(flow, monkeypatch):
