@@ -31,9 +31,9 @@
     </div>
   </div>
   <div class="ai-compose">
-    <form id="aiForm" class="ai-form">
+    <form id="aiForm" class="ai-form" method="post">
       <textarea id="aiInput" class="ai-input" maxlength="2000" rows="1" placeholder="Wpisz pytanie..." aria-label="Wiadomość do Asystenta AI" required></textarea>
-      <button id="aiVoice" class="btn ai-voice" type="button" aria-label="Przytrzymaj, aby mówić" aria-pressed="false">🎙</button>
+      <button id="aiVoice" class="btn ai-voice" type="button" aria-label="Rozpocznij nagrywanie" aria-pressed="false">🎙</button>
       <button id="aiSend" class="btn primary ai-send" type="submit">Wyślij</button>
     </form>
     <p class="ai-note">Asystent może dodawać notatki wewnętrzne. Zmiana statusu wymaga zatwierdzenia.<span id="aiVoiceStatus" class="ai-voice-status" role="status">Voice: gotowy</span></p>
@@ -54,7 +54,10 @@
   let busy = false;
   let conversationId = '';
   let voiceState = 'ready';
-  let pointerHeld = false;
+  let captureGeneration = 0;
+  let recordingStarted = 0;
+  let recordingCancelled = false;
+  let sttController = null;
   let recorder = null;
   let recordingStream = null;
   let audioChunks = [];
@@ -63,8 +66,9 @@
   let ttsController = null;
 
   const voiceLabels = {
-    ready:'Voice: gotowy', recording:'Voice: nagrywanie…', transcribing:'Voice: transkrypcja…',
-    agent:'Voice: agent pracuje…', playing:'Voice: odtwarzanie…', error:'Voice: błąd'
+    ready:'Voice: gotowy', recording:'Voice: słucham...', requesting:'Voice: przetwarzam...',
+    transcribing:'Voice: przetwarzam...', agent:'Voice: przetwarzam...',
+    playing:'Voice: odtwarzanie…', error:'Voice: błąd'
   };
 
   function setVoiceState(state) {
@@ -73,8 +77,22 @@
     voiceButton.classList.toggle('recording', state === 'recording');
     voiceButton.classList.toggle('playing', state === 'playing');
     voiceButton.setAttribute('aria-pressed', state === 'recording' ? 'true' : 'false');
-    voiceButton.textContent = state === 'playing' ? '■' : '🎙';
-    voiceButton.setAttribute('aria-label', state === 'playing' ? 'Zatrzymaj odtwarzanie' : 'Przytrzymaj, aby mówić');
+    voiceButton.textContent = ['playing','recording'].includes(state) ? '■' : '🎙';
+    voiceButton.setAttribute('aria-label', state === 'playing' ? 'Zatrzymaj odtwarzanie'
+      : state === 'recording' ? 'Zatrzymaj nagrywanie' : 'Rozpocznij nagrywanie');
+  }
+
+  function voiceDiagnostic(event, details) {
+    // Only technical metadata: never log audio, transcripts, headers or exception messages.
+    const entry = {};
+    for (const key of ['stage','mime_type','blob_size','duration_ms','http_status','latency_ms','error_code']) {
+      if (details[key] !== undefined) entry[key] = details[key];
+    }
+    console.info(event, entry);
+  }
+
+  function voiceError(code) {
+    return Object.assign(new Error(), {voiceCode:code});
   }
 
   function releaseRecordingStream() {
@@ -332,53 +350,130 @@
   }
 
   async function transcribeRecording() {
+    if (recordingCancelled) { audioChunks = []; releaseRecordingStream(); return; }
     setVoiceState('transcribing');
-    const mimeType = recorder?.mimeType || 'audio/webm';
+    const generation = captureGeneration;
+    const mimeType = recorder.mimeType;
     const audio = new Blob(audioChunks, {type:mimeType});
+    const details = {mime_type:mimeType, blob_size:audio.size,
+      duration_ms:Math.round(performance.now() - recordingStarted)};
     audioChunks = [];
     releaseRecordingStream();
-    const body = new FormData();
-    body.append('audio', audio, mimeType.includes('ogg') ? 'recording.ogg' : 'recording.webm');
-    const csrf = form.querySelector('input[name="csrf_token"]')?.value || '';
+    voiceDiagnostic('VOICE_BLOB_READY', {stage:'blob', ...details});
+    let stage = 'blob';
+    let httpStatus;
+    let started = performance.now();
+    const controller = new AbortController();
+    sttController = controller;
     try {
+      if (!audio.size) throw voiceError('EMPTY_AUDIO');
+      const extension = {'audio/webm':'webm', 'audio/mp4':'mp4', 'audio/ogg':'ogg'}[mimeType.split(';')[0]];
+      if (!extension) throw voiceError('UNSUPPORTED_AUDIO_TYPE');
+      const body = new FormData();
+      body.append('audio', audio, `recording.${extension}`);
+      const csrf = form.querySelector('input[name="csrf_token"]')?.value || '';
+      stage = 'csrf';
+      if (!csrf) throw voiceError('CSRF_TOKEN_MISSING');
+      stage = 'stt_request';
+      started = performance.now();
+      voiceDiagnostic('VOICE_STT_REQUEST_START', {stage, ...details});
       const response = await fetch('/api/internal/ai/voice/transcribe', {
-        method:'POST', credentials:'same-origin', headers:{'X-CSRF-Token':csrf}, body
+        method:'POST', credentials:'same-origin', headers:{'X-CSRF-Token':csrf}, body, signal:controller.signal
       });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok || typeof data.text !== 'string' || !data.text.trim()) throw new Error('stt');
+      httpStatus = response.status;
+      stage = 'stt_response';
+      voiceDiagnostic('VOICE_STT_RESPONSE', {stage, ...details, http_status:httpStatus,
+        latency_ms:Math.round(performance.now() - started)});
+      let data;
+      try { data = await response.json(); }
+      catch (_) { throw voiceError(response.ok ? 'STT_INVALID_RESPONSE' : `HTTP_${httpStatus}`); }
+      if (!response.ok || data?.ok === false) {
+        throw voiceError(/^[A-Z0-9_]{1,64}$/.test(data?.error_code || '') ? data.error_code : `HTTP_${httpStatus}`);
+      }
+      if (typeof data?.text !== 'string') throw voiceError('STT_INVALID_RESPONSE');
+      if (!data.text.trim()) throw voiceError('STT_EMPTY_TRANSCRIPT');
+      if (generation !== captureGeneration) return;
       input.value = data.text.trim();
       await submitMessage(input.value, true);
-    } catch (_error) {
+    } catch (error) {
+      if (controller.signal.aborted || generation !== captureGeneration) return;
+      voiceDiagnostic('VOICE_STT_ERROR', {stage, ...details, http_status:httpStatus,
+        latency_ms:Math.round(performance.now() - started), error_code:error.voiceCode || 'STT_NETWORK_ERROR'});
       setVoiceState('error');
       input.disabled = false;
       input.focus();
+    } finally {
+      if (sttController === controller) sttController = null;
     }
   }
 
-  async function startRecording(event) {
-    event.preventDefault();
-    if (voiceState === 'playing') { stopSpeech(); return; }
+  async function startRecording() {
     if (busy || !['ready','error'].includes(voiceState)) return;
-    pointerHeld = true;
+    const generation = ++captureGeneration;
+    const started = performance.now();
+    let stage = 'capture_support';
+    voiceDiagnostic('VOICE_CAPTURE_START', {stage});
+    setVoiceState('requesting');
     try {
-      recordingStream = await navigator.mediaDevices.getUserMedia({audio:true});
-      if (!pointerHeld) { releaseRecordingStream(); return; }
-      const preferred = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : '';
-      recorder = preferred ? new MediaRecorder(recordingStream, {mimeType:preferred}) : new MediaRecorder(recordingStream);
+      if (!navigator.mediaDevices?.getUserMedia) throw voiceError('MICROPHONE_UNAVAILABLE');
+      if (typeof MediaRecorder === 'undefined' || typeof MediaRecorder.isTypeSupported !== 'function') {
+        throw voiceError('MEDIA_RECORDER_UNSUPPORTED');
+      }
+      const preferred = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4']
+        .find(type => MediaRecorder.isTypeSupported(type));
+      if (!preferred) throw voiceError('UNSUPPORTED_AUDIO_TYPE');
+      stage = 'microphone_permission';
+      const stream = await navigator.mediaDevices.getUserMedia({audio:true});
+      if (generation !== captureGeneration) { stream.getTracks().forEach(track => track.stop()); return; }
+      recordingStream = stream;
+      stage = 'audio_tracks';
+      if (!stream.getAudioTracks().some(track => track.readyState === 'live')) throw voiceError('NO_AUDIO_TRACKS');
+      stage = 'recorder_start';
+      recorder = new MediaRecorder(recordingStream, {mimeType:preferred});
+      recordingCancelled = false;
       audioChunks = [];
-      recorder.addEventListener('dataavailable', item => { if (item.data.size) audioChunks.push(item.data); });
-      recorder.addEventListener('stop', transcribeRecording, {once:true});
+      recorder.addEventListener('dataavailable', item => {
+        if (generation === captureGeneration && item.data.size) audioChunks.push(item.data);
+      });
+      recorder.addEventListener('stop', () => {
+        if (generation === captureGeneration) transcribeRecording();
+      }, {once:true});
+      recorder.addEventListener('error', () => {
+        if (generation !== captureGeneration) return;
+        recordingCancelled = true;
+        releaseRecordingStream();
+        voiceDiagnostic('VOICE_STT_ERROR', {stage:'recording', error_code:'MEDIA_RECORDER_ERROR'});
+        setVoiceState('error');
+      }, {once:true});
       recorder.start();
+      recordingStarted = performance.now();
       setVoiceState('recording');
-    } catch (_error) {
+      voiceDiagnostic('VOICE_CAPTURE_READY', {stage:'recording', mime_type:recorder.mimeType,
+        latency_ms:Math.round(performance.now() - started)});
+    } catch (error) {
+      if (generation !== captureGeneration) return;
       releaseRecordingStream();
+      const captureErrors = {NotAllowedError:'MICROPHONE_PERMISSION_DENIED', SecurityError:'MICROPHONE_PERMISSION_DENIED',
+        NotFoundError:'MICROPHONE_NOT_FOUND', NotReadableError:'MICROPHONE_UNREADABLE', AbortError:'MICROPHONE_ABORTED'};
+      voiceDiagnostic('VOICE_STT_ERROR', {stage, latency_ms:Math.round(performance.now() - started),
+        error_code:error.voiceCode || captureErrors[error.name] || 'VOICE_CAPTURE_FAILED'});
       setVoiceState('error');
     }
   }
 
-  function stopRecording() {
-    pointerHeld = false;
-    if (recorder && recorder.state === 'recording') recorder.stop();
+  function stopRecording(cancel = false) {
+    if (cancel) {
+      captureGeneration += 1;
+      recordingCancelled = true;
+      if (sttController) sttController.abort();
+    }
+    if (recorder && recorder.state === 'recording') {
+      voiceDiagnostic('VOICE_CAPTURE_STOP', {stage:'recording', mime_type:recorder.mimeType,
+        duration_ms:Math.round(performance.now() - recordingStarted)});
+      if (!cancel) setVoiceState('transcribing');
+      recorder.stop();
+    }
+    if (cancel) releaseRecordingStream();
   }
 
   form.addEventListener('submit', event => {
@@ -392,9 +487,11 @@
     }
   });
   examples.forEach(button => button.addEventListener('click', () => submitMessage(button.textContent || '')));
-  voiceButton.addEventListener('pointerdown', startRecording);
-  window.addEventListener('pointerup', stopRecording);
-  window.addEventListener('pointercancel', stopRecording);
+  voiceButton.addEventListener('click', () => {
+    if (voiceState === 'playing') stopSpeech();
+    else if (voiceState === 'recording') stopRecording();
+    else startRecording();
+  });
   newConversation.addEventListener('click', async () => {
     if (busy) return;
     if (conversationId) {
@@ -405,7 +502,7 @@
     }
     conversationId = '';
     stopSpeech();
-    stopRecording();
+    stopRecording(true);
     messages.querySelectorAll('.ai-message').forEach(node => node.remove());
     if (empty) empty.hidden = false;
     input.focus();
