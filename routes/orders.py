@@ -615,6 +615,11 @@ def register_routes(context):
         cur.execute("""
           SELECT oi.*, p.model, p.ean, p.name,
                  COALESCE(s.qty, 0) AS stock_qty,
+                 MAX(0, oi.qty - COALESCE((
+                    SELECT SUM(ia.qty)
+                    FROM invoice_allocations ia
+                    WHERE ia.order_item_id=oi.id
+                 ), 0)) AS remaining_qty,
                  COALESCE(oi.unit_net_price, pr.net_price, 0) AS net_price,
                  COALESCE(oi.unit_gross_price, pr.gross_price, 0) AS gross_price,
                  COALESCE(oi.currency, ord.currency, 'PLN') AS currency,
@@ -650,17 +655,41 @@ def register_routes(context):
                     conn, today=app_now().date(), horizon_days=60
                 )
             }
+            current_reserved = {}
+            for item in items:
+                product_id = int(item["product_id"])
+                current_reserved[product_id] = (
+                    current_reserved.get(product_id, 0)
+                    + int(item.get("remaining_qty") or 0)
+                )
             pool_available = {
-                product_id: int(row.get("available_qty") or 0)
+                product_id: max(
+                    0,
+                    int(row.get("stock_qty") or 0)
+                    - max(
+                        0,
+                        int(row.get("reserved_qty") or 0)
+                        - current_reserved.get(product_id, 0),
+                    ),
+                )
                 for product_id, row in availability.items()
             }
             pool_delivery = {
-                product_id: int(row.get("available_incoming") or 0)
+                product_id: max(
+                    0,
+                    int(row.get("incoming_qty") or 0)
+                    - max(
+                        0,
+                        int(row.get("reserved_qty") or 0)
+                        - current_reserved.get(product_id, 0)
+                        - int(row.get("stock_qty") or 0),
+                    ),
+                )
                 for product_id, row in availability.items()
             }
             for it in items:
                 product_id = int(it["product_id"])
-                need = int(it["qty"])
+                need = int(it.get("remaining_qty") or 0)
                 available_now = pool_available.get(product_id, 0)
                 from_stock = min(available_now, need)
                 pool_available[product_id] = available_now - from_stock
