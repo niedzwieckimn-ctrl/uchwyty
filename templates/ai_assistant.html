@@ -100,7 +100,8 @@
     recordingStream = null;
   }
 
-  function stopSpeech() {
+  function stopSpeech(reason = 'stopped') {
+    const hadPlayback = Boolean(ttsController || playingAudio || playingUrl);
     if (ttsController) ttsController.abort();
     ttsController = null;
     if (playingAudio) {
@@ -111,30 +112,45 @@
     if (playingUrl) URL.revokeObjectURL(playingUrl);
     playingUrl = '';
     setVoiceState('ready');
+    if (hadPlayback) voiceDiagnostic(reason === 'ended' ? 'VOICE_TTS_ENDED' : 'VOICE_TTS_STOP',
+      {stage:reason});
   }
 
-  async function playSpeech(speechText) {
+  async function playSpeech(speechText, voiceRoundtripStarted = 0) {
     if (!speechText) return;
-    stopSpeech();
+    stopSpeech('replaced');
     setVoiceState('playing');
     const controller = new AbortController();
     ttsController = controller;
+    const started = performance.now();
+    let httpStatus;
+    voiceDiagnostic('VOICE_TTS_REQUEST_START', {stage:'tts_request'});
     try {
       const response = await fetch('/api/internal/ai/voice/synthesize', {
         method:'POST', credentials:'same-origin', headers:{'Content-Type':'application/json'},
         body:JSON.stringify({speech_text:speechText}), signal:controller.signal
       });
-      if (!response.ok) throw new Error('tts');
+      httpStatus = response.status;
+      if (!response.ok) throw voiceError(`HTTP_${httpStatus}`);
       const blob = await response.blob();
+      voiceDiagnostic('VOICE_TTS_RESPONSE', {stage:'tts_response', http_status:httpStatus,
+        latency_ms:Math.round(performance.now() - started)});
       if (controller.signal.aborted || ttsController !== controller) return;
       playingUrl = URL.createObjectURL(blob);
       playingAudio = new Audio(playingUrl);
-      playingAudio.addEventListener('ended', stopSpeech, {once:true});
-      playingAudio.addEventListener('error', () => { stopSpeech(); setVoiceState('error'); }, {once:true});
+      playingAudio.addEventListener('ended', () => stopSpeech('ended'), {once:true});
+      playingAudio.addEventListener('error', () => {
+        voiceDiagnostic('VOICE_TTS_ERROR', {stage:'playback', error_code:'TTS_PLAYBACK_FAILED'});
+        stopSpeech('error'); setVoiceState('error');
+      }, {once:true});
       await playingAudio.play();
-    } catch (_error) {
+      if (voiceRoundtripStarted) voiceDiagnostic('VOICE_ROUNDTRIP_COMPLETE', {stage:'playback_started',
+        latency_ms:Math.round(performance.now() - voiceRoundtripStarted)});
+    } catch (error) {
       if (controller.signal.aborted) return;
-      stopSpeech();
+      voiceDiagnostic('VOICE_TTS_ERROR', {stage:'tts_request', http_status:httpStatus,
+        latency_ms:Math.round(performance.now() - started), error_code:error.voiceCode || 'TTS_FAILED'});
+      stopSpeech('error');
       setVoiceState('error');
     }
   }
@@ -245,7 +261,7 @@
     return 'Nie udało się teraz pobrać odpowiedzi. Spróbuj ponownie.';
   }
 
-  async function submitMessage(text, fromVoice = false) {
+  async function submitMessage(text, fromVoice = false, voiceRoundtripStarted = 0) {
     const message = text.trim();
     if (!message || busy) return;
     busy = true;
@@ -258,6 +274,7 @@
     const loading = addMessage('assistant', 'Asystent sprawdza dane...', 'ai-loading');
     const controller = new AbortController();
     const timer = window.setTimeout(() => controller.abort(), 120000);
+    const agentStarted = performance.now();
     try {
       const response = await fetch('/api/internal/ai/chat', {
         method: 'POST',
@@ -267,6 +284,8 @@
         signal: controller.signal
       });
       const data = await response.json().catch(() => ({}));
+      if (fromVoice) voiceDiagnostic('VOICE_AGENT_RESPONSE', {stage:'agent_response',
+        http_status:response.status, latency_ms:Math.round(performance.now() - agentStarted)});
       if (typeof data.conversation_id === 'string') conversationId = data.conversation_id;
       loading.remove();
       for (const decision of data.decisions || []) {
@@ -332,7 +351,7 @@
         const answer = addMessage('assistant', typeof data.message === 'string' ? data.message : 'Nie udało się odczytać odpowiedzi. Spróbuj ponownie.', '');
         renderArtifacts(answer, data.artifacts);
         if (fromVoice && typeof data.speech_text === 'string' && data.speech_text.trim()) {
-          playSpeech(data.speech_text);
+          playSpeech(data.speech_text, voiceRoundtripStarted);
         }
       }
     } catch (_error) {
@@ -371,6 +390,7 @@
       if (!extension) throw voiceError('UNSUPPORTED_AUDIO_TYPE');
       const body = new FormData();
       body.append('audio', audio, `recording.${extension}`);
+      body.append('capture_duration_ms', String(details.duration_ms));
       const csrf = form.querySelector('input[name="csrf_token"]')?.value || '';
       stage = 'csrf';
       if (!csrf) throw voiceError('CSRF_TOKEN_MISSING');
@@ -394,7 +414,7 @@
       if (!data.text.trim()) throw voiceError('STT_EMPTY_TRANSCRIPT');
       if (generation !== captureGeneration) return;
       input.value = data.text.trim();
-      await submitMessage(input.value, true);
+      await submitMessage(input.value, true, recordingStarted);
     } catch (error) {
       if (controller.signal.aborted || generation !== captureGeneration) return;
       voiceDiagnostic('VOICE_STT_ERROR', {stage, ...details, http_status:httpStatus,
