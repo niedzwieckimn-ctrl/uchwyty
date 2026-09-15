@@ -16,8 +16,9 @@ def order_view_db(tmp_path, monkeypatch):
 @pytest.mark.parametrize(
     ("stock_qty", "shows_shortage"),
     [
-        (7, False),  # stock 7 - reserved 1 = available 6
-        (1, True),   # stock 1 - reserved 1 = available 0
+        (7, False),
+        (1, False),  # this order owns its reservation
+        (0, True),
     ],
 )
 def test_order_view_uses_available_stock(order_view_db, stock_qty, shows_shortage):

@@ -15,6 +15,7 @@ from test_invoice_refactor import (
 
 def _add_invoice_order():
     db = backend.conn()
+    db.execute("UPDATE stock SET qty=8 WHERE product_id=1")
     db.execute(
         "INSERT INTO orders(id,order_no,customer_id,customer_name,customer_address,customer_email,status,created_at,currency) "
         "VALUES(99,'ZAM-99',1,'Kunde','Street 1','buyer@example.com','new',?,'EUR')",
@@ -22,7 +23,7 @@ def _add_invoice_order():
     )
     db.execute(
         "INSERT INTO order_items(id,order_id,product_id,sku,qty,unit_net_price,currency,created_at) "
-        "VALUES(99,99,1,'SKU-1',1,10,'EUR',?)",
+        "VALUES(99,99,1,'SKU-1',7,10,'EUR',?)",
         (backend.now_iso(),),
     )
     db.commit()
@@ -59,7 +60,7 @@ def test_invoice_post_finishes_without_500_and_keeps_number_guard(
 
     form = _invoice_create_form('FVAT 30/09/2026')
     form.pop('invoice_qty_2')
-    form['invoice_qty_99'] = '1'
+    form['invoice_qty_99'] = '7'
     response = client.post('/orders/99/invoice', data=form)
     assert response.status_code == 302
     db = backend.conn()
