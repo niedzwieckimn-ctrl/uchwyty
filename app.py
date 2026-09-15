@@ -5229,7 +5229,7 @@ def security_headers_and_csrf(response):
         response.headers.setdefault("Permissions-Policy", "camera=(self), microphone=(self), geolocation=()")
     else:
         response.headers.setdefault("Permissions-Policy", "camera=(self), microphone=(), geolocation=()")
-    response.headers.setdefault("Content-Security-Policy", "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://unpkg.com https://cdn.jsdelivr.net; connect-src 'self' https://*.supabase.co https://api.resend.com")
+    response.headers.setdefault("Content-Security-Policy", "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://unpkg.com https://cdn.jsdelivr.net; connect-src 'self' https://*.supabase.co https://api.resend.com")
     if session.get("admin_authenticated") and response.content_type and response.content_type.startswith("text/html"):
         body = response.get_data(as_text=True)
         token = session.get("csrf_token", "")

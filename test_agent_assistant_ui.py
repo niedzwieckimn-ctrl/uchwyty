@@ -97,7 +97,8 @@ def test_ui_has_controlled_error_mapping(client):
 
 def test_assistant_ui_has_supervised_approval_and_push_to_talk(client):
     login(client)
-    html = client.get("/ai-assistant").get_data(as_text=True)
+    response = client.get("/ai-assistant")
+    html = response.get_data(as_text=True)
     assert "Zmiana wymaga zatwierdzenia" in html
     assert "Zatwierdź" in html and "Odrzuć" in html
     assert "/api/internal/ai/approvals/" in html
@@ -106,5 +107,8 @@ def test_assistant_ui_has_supervised_approval_and_push_to_talk(client):
     assert "new MediaRecorder" in html
     assert "/api/internal/ai/voice/transcribe" in html
     assert "/api/internal/ai/voice/synthesize" in html
-    assert "playSpeech(data.speech_text, trace)" in html
-    assert client.get('/ai-assistant').headers['Permissions-Policy'] == 'camera=(self), microphone=(self), geolocation=()'
+    assert "playSpeech(data.speech_text, voiceRoundtripStarted)" in html
+    assert 'id="aiVoiceDebug"' in html
+    assert "console.info(event, JSON.stringify(entry))" in html
+    assert response.headers['Permissions-Policy'] == 'camera=(self), microphone=(self), geolocation=()'
+    assert "media-src 'self' blob:" in response.headers['Content-Security-Policy']

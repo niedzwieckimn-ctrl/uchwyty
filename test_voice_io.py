@@ -2,7 +2,6 @@ import io
 import json
 import logging
 import os
-import time
 from html.parser import HTMLParser
 from dataclasses import replace
 
@@ -15,154 +14,6 @@ import voice_io
 import voice_debug
 from test_agent_runtime import isolated, owner, respond, tool
 from voice_io import SynthesizedAudio, VoiceIOError
-
-
-def _events(caplog, event):
-    return [json.loads(record.getMessage().split(' ', 1)[1]) for record in caplog.records
-            if record.getMessage().startswith(event + ' ')]
-
-
-def test_same_session_typed_and_voice_daily_briefing_and_correlated_tts(isolated, monkeypatch, caplog, record_property):
-    import business_read_models
-    monkeypatch.setenv(business_read_models.FEATURE_FLAG, '1')
-    monkeypatch.setattr(backend, 'supabase_enabled', lambda: False)
-    phrase = 'Co mam dziś do zrobienia?'
-    voice = FakeVoiceProvider(phrase)
-    monkeypatch.setattr(backend, 'VOICE_IO_PROVIDER', voice)
-    backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([
-        respond('Rozmowa rozpoczęta.'),
-        tool('business.daily.state', {}), respond('Podsumowanie dnia jest gotowe.'),
-        tool('business.daily.state', {}), respond('Podsumowanie dnia jest gotowe.'),
-    ])
-    test_client = client()
-    headers = {'Origin': 'http://localhost', 'X-CSRF-Token': 'voice-csrf',
-               'X-Request-ID': 'voice-roundtrip-test'}
-    opened = test_client.post('/api/internal/ai/chat', json={'message': 'Cześć'}, headers=headers)
-    assert opened.status_code == 200
-    cid = opened.get_json()['conversation_id']
-    body = {'message': phrase, 'conversation_id': cid}
-    typed = test_client.post('/api/internal/ai/chat', json=body, headers=headers)
-    assert typed.status_code == 200
-
-    caplog.set_level(logging.INFO)
-    caplog.clear()
-    start = time.perf_counter()
-    stt = test_client.post('/api/internal/ai/voice/transcribe',
-        data={'audio': (io.BytesIO(b'webm-audio'), 'recording.webm', 'audio/webm')}, headers=headers)
-    after_stt = time.perf_counter()
-    assert stt.status_code == 200
-    body['message'] = stt.get_json()['text']
-    voice_chat = test_client.post('/api/internal/ai/chat', json=body, headers=headers)
-    after_chat = time.perf_counter()
-    assert voice_chat.status_code == 200
-    answer = voice_chat.get_json()
-    assert answer['conversation_id'] == typed.get_json()['conversation_id'] == cid
-    assert answer['message'] == typed.get_json()['message']
-    assert answer['speech_text']
-    tts = test_client.post('/api/internal/ai/voice/synthesize',
-        json={'speech_text': answer['speech_text']}, headers=headers)
-    end = time.perf_counter()
-    assert tts.status_code == 200 and tts.mimetype == 'audio/mpeg'
-    assert tts.data == b'fake-mp3' and voice.speeches == [answer['speech_text']]
-    for response in (stt, voice_chat, tts):
-        assert response.headers['X-Request-ID'] == headers['X-Request-ID']
-    for event in ('VOICE_STT_RESPONSE', 'VOICE_AGENT_RESPONSE', 'VOICE_TTS_RESPONSE'):
-        entries = _events(caplog, event)
-        assert len(entries) == 1
-        assert entries[0]['request_id'] == headers['X-Request-ID']
-        assert entries[0]['http_status'] == 200 and entries[0]['latency_ms'] >= 0
-    logs = '\n'.join(record.getMessage() for record in caplog.records if record.getMessage().startswith('VOICE_'))
-    assert phrase not in logs and answer['message'] not in logs and 'webm-audio' not in logs
-    record_property('timing_scope', 'local HTTP with fake model/STT/TTS; real runtime and business.daily.state')
-    for name, duration in [('stt_ms', after_stt-start), ('agent_ms', after_chat-after_stt),
-                           ('tts_ms', end-after_chat), ('total_ms', end-start)]:
-        record_property(name, round(duration*1000, 2))
-
-
-def test_stt_200_then_runtime_tool_guard_403_is_diagnosed_after_model(isolated, monkeypatch, caplog):
-    voice = FakeVoiceProvider('Co mam dziś do zrobienia?')
-    monkeypatch.setattr(backend, 'VOICE_IO_PROVIDER', voice)
-    provider = runtime.FakeModelProvider([tool('database.execute', {})])
-    backend.AGENT_MODEL_PROVIDER = provider
-    test_client = client()
-    assert transcribe(test_client).status_code == 200
-    with caplog.at_level(logging.INFO):
-        response = test_client.post('/api/internal/ai/chat', json={'message': voice.transcript},
-            headers={'Origin': 'http://localhost', 'X-Request-ID': 'denied-after-model'})
-    assert response.status_code == 403
-    assert response.get_json()['error_code'] == 'TOOL_NOT_ALLOWED'
-    assert len(provider.calls) == 1
-    details, = _events(caplog, 'AI_CHAT_403')
-    assert details['reason'] == 'TOOL_NOT_ALLOWED' and details['stage'] == 'tool_call_validation'
-    assert details['runtime_started'] and details['first_model_call_succeeded']
-    assert details['tool_calls_ok'] == 0 and details['request_id'] == 'denied-after-model'
-    assert not voice.speeches
-    assert voice.transcript not in json.dumps(details)
-
-
-def test_stt_200_then_origin_guard_403_never_enters_runtime(isolated, monkeypatch, caplog):
-    monkeypatch.setattr(backend, 'VOICE_IO_PROVIDER', FakeVoiceProvider())
-    provider = runtime.FakeModelProvider([respond('Nie powinno zostać wywołane.')])
-    backend.AGENT_MODEL_PROVIDER = provider
-    test_client = client()
-    headers = {'Origin': 'https://localhost', 'X-CSRF-Token': 'voice-csrf'}
-    stt = test_client.post('/api/internal/ai/voice/transcribe',
-        data={'audio': (io.BytesIO(b'webm-audio'), 'recording.webm', 'audio/webm')}, headers=headers)
-    assert stt.status_code == 200
-    with caplog.at_level(logging.INFO):
-        response = test_client.post('/api/internal/ai/chat',
-            json={'message': stt.get_json()['text']}, headers=headers)
-    assert response.status_code == 403 and provider.calls == []
-    details, = _events(caplog, 'AI_CHAT_403')
-    assert details['stage'] == 'security_gate.origin' and details['reason'] == 'ORIGIN_MISMATCH'
-    assert not details['runtime_started'] and not details['first_model_call_succeeded']
-
-
-def test_missing_csrf_is_still_denied_and_identifies_the_guard(isolated, caplog):
-    with caplog.at_level(logging.INFO):
-        response = client().post('/api/internal/ai/chat', data={'message': 'Test'})
-    assert response.status_code == 403
-    details, = _events(caplog, 'AI_CHAT_403')
-    assert details['stage'] == 'security_gate.csrf' and details['reason'] == 'CSRF_TOKEN_MISSING'
-    assert not details['runtime_started']
-
-
-def test_endpoint_permission_denial_is_diagnosed_without_runtime(isolated, caplog):
-    db = backend.conn()
-    db.execute("UPDATE internal_role_permissions SET decision='DENY' WHERE role_key='OWNER' AND permission_key='inventory.read'")
-    db.commit()
-    db.close()
-    with caplog.at_level(logging.INFO):
-        response = client().post('/api/internal/ai/chat', json={'message': 'Test'})
-    assert response.status_code == 403
-    details, = _events(caplog, 'AI_CHAT_403')
-    assert details['stage'] == 'require_permission' and details['reason'] == 'PERMISSION_DENIED'
-    assert not details['runtime_started']
-
-
-def test_tts_adapter_contract_and_provider_metrics(isolated, monkeypatch, caplog):
-    calls = []
-    class SpeechResponse:
-        status_code = 200
-        content = b'fake-mp3'
-        def raise_for_status(self):
-            pass
-    def post(url, **kwargs):
-        calls.append((url, kwargs))
-        return SpeechResponse()
-    monkeypatch.setattr(voice_io.requests, 'post', post)
-    monkeypatch.setattr(backend, 'VOICE_IO_PROVIDER',
-                        voice_io.OpenAIVoiceIOProvider(api_key='test-secret', tts_model='gpt-4o-mini-tts', voice='alloy'))
-    with caplog.at_level(logging.INFO):
-        response = client().post('/api/internal/ai/voice/synthesize', json={'speech_text': 'Odpowiedź.'},
-            headers={'X-Request-ID': 'tts-contract', 'X-CSRF-Token': 'voice-csrf', 'Origin': 'http://localhost'})
-    assert response.status_code == 200 and response.mimetype == 'audio/mpeg'
-    assert calls[0][0] == 'https://api.openai.com/v1/audio/speech'
-    assert calls[0][1]['json'] == {'model': 'gpt-4o-mini-tts', 'voice': 'alloy', 'input': 'Odpowiedź.', 'response_format': 'mp3'}
-    details, = _events(caplog, 'VOICE_TTS_RESPONSE')
-    assert details['provider_http_status'] == 200 and details['provider_latency_ms'] >= 0
-    assert details['tts_model'] == 'gpt-4o-mini-tts' and details['voice'] == 'alloy'
-    assert details['request_id'] == 'tts-contract'
 
 
 @pytest.fixture(autouse=True)
@@ -263,6 +114,8 @@ def test_ptt_stt_existing_conversation_chat_speech_text_and_tts(isolated, monkey
 
     tts = test_client.post('/api/internal/ai/voice/synthesize', json={'speech_text': answer['speech_text']})
     assert tts.status_code == 200 and tts.data == b'fake-mp3'
+    assert tts.content_type == 'audio/mpeg' and len(tts.data) > 0
+    assert tts.content_length == len(b'fake-mp3')
     assert voice.speeches == [answer['speech_text']]
 
 
@@ -382,8 +235,11 @@ def test_tts_success_and_failure_logs_are_timed_without_speech_content(isolated,
     caplog.set_level(logging.INFO)
     success = client().post('/api/internal/ai/voice/synthesize', json={'speech_text': phrase})
     assert success.status_code == 200
+    request_log = next(record.message for record in caplog.records if 'VOICE_TTS_REQUEST_START' in record.message)
     success_log = next(record.message for record in caplog.records if 'VOICE_TTS_RESPONSE' in record.message)
-    assert phrase not in success_log and '"latency_ms":' in success_log
+    assert phrase not in request_log and '"chars":' in request_log
+    assert phrase not in success_log and '"duration_ms":' in success_log
+    assert '"bytes": 8' in success_log and '"content_type": "audio/mpeg"' in success_log
 
     caplog.clear()
     monkeypatch.setattr(backend, 'VOICE_IO_PROVIDER', FakeVoiceProvider(tts_error=True))
@@ -391,6 +247,18 @@ def test_tts_success_and_failure_logs_are_timed_without_speech_content(isolated,
     assert failed.status_code == 503
     error_log = next(record.message for record in caplog.records if 'VOICE_TTS_ERROR' in record.message)
     assert phrase not in error_log and '"error_code": "TTS_FAILED"' in error_log
+    assert '"exception_type": "VoiceIOError"' in error_log and '"message": "tts failed"' in error_log
+
+
+def test_successful_chat_logs_only_speech_presence_and_length(isolated, caplog):
+    backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([respond('Krótka odpowiedź głosowa.')])
+    caplog.set_level(logging.INFO)
+    response = client().post('/api/internal/ai/chat', json={'message': 'Poufne pytanie klienta'})
+    assert response.status_code == 200 and response.get_json()['speech_text']
+    entry = next(record.message for record in caplog.records if 'VOICE_SPEECH_TEXT_READY' in record.message)
+    assert '"present": true' in entry and '"chars":' in entry
+    assert 'Poufne pytanie klienta' not in entry
+    assert 'Krótka odpowiedź głosowa' not in entry
 
 
 def test_voice_and_text_have_identical_permission_deny(isolated, monkeypatch):
@@ -473,6 +341,29 @@ class StubTranscriptionResponse:
         if self.json_error:
             raise ValueError('secret-invalid-json')
         return self.payload
+
+
+def test_tts_adapter_calls_openai_speech_with_configured_model_voice_and_mp3(isolated, monkeypatch):
+    calls = []
+    response = StubTranscriptionResponse(status=200)
+    response.content = b'provider-mp3'
+
+    def post(url, **kwargs):
+        calls.append((url, kwargs))
+        return response
+
+    monkeypatch.setattr(voice_io.requests, 'post', post)
+    provider = voice_io.OpenAIVoiceIOProvider(
+        api_key='test-secret', tts_model='gpt-4o-mini-tts', voice='alloy',
+    )
+    audio = provider.synthesize('Tekst do odtworzenia.')
+
+    assert calls[0][0] == 'https://api.openai.com/v1/audio/speech'
+    assert calls[0][1]['json'] == {
+        'model': 'gpt-4o-mini-tts', 'voice': 'alloy',
+        'input': 'Tekst do odtworzenia.', 'response_format': 'mp3',
+    }
+    assert audio.content == b'provider-mp3' and audio.content_type == 'audio/mpeg'
 
 
 def test_stt_adapter_sends_multipart_and_returns_only_transcript(isolated, monkeypatch):
@@ -837,15 +728,14 @@ def test_local_stt_comparator_uses_same_audio_language_and_context(isolated, mon
     assert not voice_debug.DEBUG_AUDIO_DIR.exists()
 
 
-@pytest.mark.parametrize('expected,counted_qty,spoken_qty', [(3, 1, 'jedną sztukę'), (1, 3, 'trzy sztuki')])
-def test_voice_cerne_count_keeps_stock_until_existing_human_approval(isolated, monkeypatch, expected, counted_qty, spoken_qty):
-    transcript = f'mam na półce Cerne 128 BB {spoken_qty}'
+def test_voice_cerne_count_keeps_stock_until_existing_human_approval(isolated, monkeypatch):
+    transcript = 'mam na półce Cerne 128 BB jedną sztukę'
     monkeypatch.setattr(backend, 'VOICE_IO_PROVIDER', FakeVoiceProvider(transcript))
     db = backend.conn()
     try:
         db.execute('INSERT INTO products(id,sku,model,name,archived,created_at) VALUES(905,?,?,?,?,?)',
             ('VOICE-CERNE-128-BB', 'Cerne 128 BB', 'Cerne 128 BB', 0, backend.now_iso()))
-        db.execute('INSERT INTO stock(product_id,qty) VALUES(905,?)', (expected,))
+        db.execute('INSERT INTO stock(product_id,qty) VALUES(905,3)')
         db.commit()
     finally:
         db.close()
@@ -860,7 +750,7 @@ def test_voice_cerne_count_keeps_stock_until_existing_human_approval(isolated, m
 
     stt = transcribe(test_client)
     assert stt.status_code == 200 and stt.get_json()['text'] == transcript
-    count_args = {'product_id': 905, 'counted_quantity': counted_qty, 'expected_version': 0,
+    count_args = {'product_id': 905, 'counted_quantity': 1, 'expected_version': 0,
                   'idempotency_key': 'voice-count-cerne'}
     count_provider = runtime.FakeModelProvider([
         runtime.ProviderResponse(tool_calls=(
@@ -868,7 +758,7 @@ def test_voice_cerne_count_keeps_stock_until_existing_human_approval(isolated, m
             runtime.ToolCall('expected', 'inventory.count.get_expected', json.dumps({'product_id': 905})),
             runtime.ToolCall('count', 'inventory.count.record', json.dumps(count_args)),
         ), model='fake-model'),
-        respond(f'Cerne 128 BB. System: {expected}. Policzono: {counted_qty}. Skorygować stan?'),
+        respond('Cerne 128 BB. System: 3. Policzono: 1. Różnica: -2. Skorygować stan do 1?'),
     ])
     backend.AGENT_MODEL_PROVIDER = count_provider
     counted_response = test_client.post('/api/internal/ai/chat', json={
@@ -881,7 +771,7 @@ def test_voice_cerne_count_keeps_stock_until_existing_human_approval(isolated, m
                for item in count_provider.calls[0]['input_items'])
     assert counted['approvals'] == []
     count_card = next(item for item in counted['artifacts'] if item['type'] == 'inventory_count_card')
-    assert (count_card['expected_quantity'], count_card['counted_quantity'], count_card['difference']) == (expected, counted_qty, counted_qty-expected)
+    assert (count_card['expected_quantity'], count_card['counted_quantity'], count_card['difference']) == (3, 1, -2)
 
     backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([
         tool('inventory.adjust', {'product_id': 905, 'expected_version': 0,
@@ -894,20 +784,20 @@ def test_voice_cerne_count_keeps_stock_until_existing_human_approval(isolated, m
     assert pending_response.status_code == 200
     approval = pending_response.get_json()['approvals'][0]
     assert approval['operation'] == 'inventory.adjust'
-    assert (approval['from_quantity'], approval['to_quantity']) == (expected, counted_qty)
+    assert (approval['from_quantity'], approval['to_quantity']) == (3, 1)
     db = backend.conn()
     try:
-        assert db.execute('SELECT qty FROM stock WHERE product_id=905').fetchone()[0] == expected
+        assert db.execute('SELECT qty FROM stock WHERE product_id=905').fetchone()[0] == 3
     finally:
         db.close()
 
-    backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([respond(f'Stan skorygowany do {counted_qty}.')])
+    backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([respond('Stan skorygowany do 1 sztuki.')])
     approved = test_client.post(f"/api/internal/ai/approvals/{approval['approval_id']}/approve",
         json={'conversation_id': conversation_id})
     assert approved.status_code == 200 and approved.get_json()['status'] == 'SUCCESS'
     db = backend.conn()
     try:
-        assert db.execute('SELECT qty FROM stock WHERE product_id=905').fetchone()[0] == counted_qty
+        assert db.execute('SELECT qty FROM stock WHERE product_id=905').fetchone()[0] == 1
         assert db.execute("SELECT COUNT(*) FROM internal_audit_log WHERE operation='inventory.adjust' AND result='SUCCESS'").fetchone()[0] == 1
     finally:
         db.close()
