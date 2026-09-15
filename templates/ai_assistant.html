@@ -7,7 +7,7 @@
   .ai-empty{margin:auto;max-width:720px;text-align:center;padding:28px}.ai-empty-icon{width:62px;height:62px;margin:0 auto 16px;border-radius:20px;display:grid;place-items:center;background:#eef3ff;color:var(--blue);font-size:28px}.ai-empty h2{font-size:22px;margin-bottom:7px}.ai-examples{display:flex;justify-content:center;flex-wrap:wrap;gap:9px;margin-top:22px}.ai-example{border:1px solid #dfe5f2;background:#fafbff;color:#40506d;border-radius:999px;padding:9px 14px;font:inherit;font-size:13px;cursor:pointer}.ai-example:hover{border-color:#aebdec;background:#f3f6ff}
   .ai-message{display:flex;gap:10px;max-width:min(780px,88%)}.ai-message.user{align-self:flex-end;flex-direction:row-reverse}.ai-avatar{width:34px;height:34px;flex:0 0 34px;border-radius:12px;display:grid;place-items:center;background:#edf2ff;color:var(--blue);font-weight:800;font-size:12px}.ai-message.user .ai-avatar{background:var(--navy);color:#fff}.ai-bubble{padding:12px 15px;border-radius:17px 17px 17px 5px;background:#f2f5fb;border:1px solid #e6eaf2;white-space:pre-wrap;overflow-wrap:anywhere}.ai-message.user .ai-bubble{border:0;border-radius:17px 17px 5px 17px;background:linear-gradient(135deg,var(--blue),var(--blue2));color:#fff}.ai-message.error .ai-bubble{background:#fff3f4;border-color:#ffd9de;color:#a92d41}.ai-loading .ai-bubble{color:var(--muted)}
   .ai-artifacts{display:grid;gap:10px;margin-top:12px;white-space:normal}.ai-artifact{padding:13px;border:1px solid #dce3f0;border-radius:14px;background:#fff;color:var(--ink)}.ai-artifact h3{font-size:15px;margin:0 0 10px}.ai-artifact-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px 14px;font-size:12px}.ai-artifact-grid span{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.04em}.ai-artifact-items{margin-top:10px;display:grid;gap:5px}.ai-artifact-item{display:flex;justify-content:space-between;gap:12px;padding-top:5px;border-top:1px solid #edf0f5;font-size:12px}.ai-artifact-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:11px}.ai-product-image{display:block;max-width:100%;max-height:260px;margin:auto;border-radius:11px;object-fit:contain}.ai-document{display:flex;align-items:center;justify-content:space-between;gap:12px}.ai-document h3{margin:0}
-  .ai-compose{padding:17px 20px;border-top:1px solid var(--line);background:#fff}.ai-form{display:grid;grid-template-columns:1fr auto auto;gap:10px;align-items:end}.ai-input{min-height:48px;max-height:150px;resize:none}.ai-send{height:48px;min-width:112px}.ai-send:disabled,.ai-example:disabled{opacity:.55;cursor:not-allowed;transform:none}.ai-voice{height:48px;min-width:54px;font-size:20px}.ai-voice.recording{background:#b4233c;color:#fff}.ai-voice.playing{background:var(--navy);color:#fff}.ai-voice-status{display:inline-block;min-width:90px;margin-left:8px}.ai-replay-voice{margin-left:8px;padding:4px 9px;font-size:11px}.ai-note{margin:8px 3px 0;color:var(--muted);font-size:11px}
+  .ai-compose{padding:17px 20px;border-top:1px solid var(--line);background:#fff}.ai-form{display:grid;grid-template-columns:1fr auto auto;gap:10px;align-items:end}.ai-input{min-height:48px;max-height:150px;resize:none}.ai-send{height:48px;min-width:112px}.ai-send:disabled,.ai-example:disabled{opacity:.55;cursor:not-allowed;transform:none}.ai-voice{height:48px;min-width:54px;font-size:20px}.ai-voice.recording{background:#b4233c;color:#fff}.ai-voice.playing{background:var(--navy);color:#fff}.ai-voice-status{display:inline-block;min-width:90px;margin-left:8px}.ai-replay-voice{margin-left:8px;padding:4px 9px;font-size:11px}.ai-note{margin:8px 3px 0;color:var(--muted);font-size:11px}.ai-voice-debug{display:block;margin-top:3px;font:10px/1.35 ui-monospace,SFMono-Regular,Consolas,monospace;color:#8792a8;overflow-wrap:anywhere}
   @media(max-width:680px){.ai-card{height:calc(100vh - 125px);min-height:460px}.ai-messages{padding:18px 14px}.ai-message{max-width:95%}.ai-compose{padding:13px}.ai-form{grid-template-columns:1fr auto}.ai-input{grid-column:1/-1}.ai-send{width:100%}.ai-empty{padding:15px}.ai-artifact-grid{grid-template-columns:1fr}}
 </style>
 
@@ -36,7 +36,7 @@
       <button id="aiVoice" class="btn ai-voice" type="button" aria-label="Rozpocznij nagrywanie" aria-pressed="false">🎙</button>
       <button id="aiSend" class="btn primary ai-send" type="submit">Wyślij</button>
     </form>
-    <p class="ai-note">Asystent może dodawać notatki wewnętrzne. Zmiana statusu wymaga zatwierdzenia.<span id="aiVoiceStatus" class="ai-voice-status" role="status">Voice: gotowy</span><button id="aiReplayVoice" class="btn ai-replay-voice" type="button" hidden disabled>Odtwórz odpowiedź</button></p>
+    <p class="ai-note">Asystent może dodawać notatki wewnętrzne. Zmiana statusu wymaga zatwierdzenia.<span id="aiVoiceStatus" class="ai-voice-status" role="status">Voice: gotowy</span><button id="aiReplayVoice" class="btn ai-replay-voice" type="button" hidden disabled>Odtwórz odpowiedź</button><span id="aiVoiceDebug" class="ai-voice-debug" aria-live="polite">blob=— | type=— | play=— | event=— | duration=— | time=— | ready=— | network=— | error=— | muted=— | volume=—</span></p>
   </div>
 </section>
 
@@ -52,6 +52,7 @@
   const voiceButton = document.getElementById('aiVoice');
   const voiceStatus = document.getElementById('aiVoiceStatus');
   const replayVoiceButton = document.getElementById('aiReplayVoice');
+  const voiceDebug = document.getElementById('aiVoiceDebug');
   let busy = false;
   let conversationId = '';
   let voiceState = 'ready';
@@ -69,6 +70,10 @@
   let playingBlobSize = 0;
   let playingBlobType = '';
   let ttsController = null;
+  const voiceDebugState = {
+    blob:'—', type:'—', play:'—', event:'—', duration:'—', time:'—',
+    ready:'—', network:'—', error:'—', muted:'—', volume:'—'
+  };
 
   const voiceLabels = {
     ready:'Voice: gotowy', recording:'Voice: słucham...', requesting:'Voice: przetwarzam...',
@@ -96,10 +101,28 @@
     for (const key of ['stage','mime_type','blob_size','blob_type','content_type','content_length',
       'duration_ms','http_status','latency_ms','error_code','error_name','error_message',
       'object_url_present','object_url_revoked','handler_invoked','audio_src','ready_state',
-      'network_state','audio_error_code','audio_error_message','audio_duration','muted','volume']) {
+      'network_state','audio_error_code','audio_error_message','audio_duration','current_time','muted','volume']) {
       if (details[key] !== undefined) entry[key] = details[key];
     }
-    console.info(event, entry);
+    console.info(event, JSON.stringify(entry));
+    if (entry.blob_size !== undefined) voiceDebugState.blob = `${entry.blob_size}B`;
+    if (entry.blob_type) voiceDebugState.type = entry.blob_type;
+    if (entry.audio_duration !== undefined && entry.audio_duration !== null) {
+      voiceDebugState.duration = Number(entry.audio_duration).toFixed(2);
+    }
+    if (entry.current_time !== undefined && entry.current_time !== null) {
+      voiceDebugState.time = Number(entry.current_time).toFixed(2);
+    }
+    if (entry.ready_state !== undefined && entry.ready_state !== null) voiceDebugState.ready = String(entry.ready_state);
+    if (entry.network_state !== undefined && entry.network_state !== null) voiceDebugState.network = String(entry.network_state);
+    if (entry.audio_error_code) voiceDebugState.error = `${entry.audio_error_code}:${entry.audio_error_message || ''}`;
+    else if (entry.error_name) voiceDebugState.error = `${entry.error_name}:${entry.error_message || ''}`;
+    if (entry.muted !== undefined) voiceDebugState.muted = String(entry.muted);
+    if (entry.volume !== undefined && entry.volume !== null) voiceDebugState.volume = String(entry.volume);
+    if (event === 'VOICE_PLAYBACK_SUCCESS' || event === 'VOICE_MANUAL_PLAYBACK_SUCCESS') voiceDebugState.play = 'resolve';
+    if (event === 'VOICE_PLAYBACK_ERROR' || event === 'VOICE_MANUAL_PLAYBACK_ERROR') voiceDebugState.play = 'reject';
+    voiceDebugState.event = event.replace(/^VOICE_/, '').toLowerCase();
+    voiceDebug.textContent = `blob=${voiceDebugState.blob} | type=${voiceDebugState.type} | play=${voiceDebugState.play} | event=${voiceDebugState.event} | duration=${voiceDebugState.duration} | time=${voiceDebugState.time} | ready=${voiceDebugState.ready} | network=${voiceDebugState.network} | error=${voiceDebugState.error} | muted=${voiceDebugState.muted} | volume=${voiceDebugState.volume}`;
   }
 
   function voiceError(code) {
@@ -125,6 +148,7 @@
       audio_error_code:Number.isFinite(audio?.error?.code) ? audio.error.code : null,
       audio_error_message:typeof audio?.error?.message === 'string' ? audio.error.message : '',
       audio_duration:Number.isFinite(audio?.duration) ? audio.duration : null,
+      current_time:Number.isFinite(audio?.currentTime) ? audio.currentTime : null,
       muted:Boolean(audio?.muted),
       volume:Number.isFinite(audio?.volume) ? audio.volume : null,
     };
@@ -190,7 +214,7 @@
     }, error => playbackRejected(error, manual, audio));
   }
 
-  function createPlaybackAudio(url) {
+  function createPlaybackAudio(url, manual = false) {
     const audio = new Audio(url);
     audio.preload = 'auto';
     audio.muted = false;
@@ -201,14 +225,32 @@
     audio.addEventListener('canplay', () => {
       if (playingAudio === audio) voiceDiagnostic('VOICE_PLAYBACK_CANPLAY', {stage:'playback', ...audioSnapshot(audio)});
     });
+    audio.addEventListener('playing', () => {
+      if (playingAudio === audio) voiceDiagnostic('VOICE_PLAYBACK_PLAYING', {stage:'playback', ...audioSnapshot(audio)});
+    });
+    audio.addEventListener('pause', () => {
+      if (playingAudio === audio) voiceDiagnostic('VOICE_PLAYBACK_PAUSE', {stage:'playback', ...audioSnapshot(audio)});
+    });
+    audio.addEventListener('stalled', () => {
+      if (playingAudio === audio) voiceDiagnostic('VOICE_PLAYBACK_STALLED', {stage:'playback', ...audioSnapshot(audio)});
+    });
+    audio.addEventListener('abort', () => {
+      if (playingAudio === audio) voiceDiagnostic('VOICE_PLAYBACK_ABORT', {stage:'playback', ...audioSnapshot(audio)});
+    });
+    audio.addEventListener('timeupdate', () => {
+      if (playingAudio === audio) voiceDiagnostic('VOICE_PLAYBACK_TIME', {stage:'playback', ...audioSnapshot(audio)});
+    });
     audio.addEventListener('ended', () => {
-      if (playingAudio === audio) stopSpeech('ended');
+      if (playingAudio === audio) {
+        voiceDiagnostic('VOICE_PLAYBACK_ENDED', {stage:'playback', ...audioSnapshot(audio)});
+        stopSpeech('ended');
+      }
     }, {once:true});
     audio.addEventListener('error', () => {
       if (playingAudio !== audio || voiceState === 'playback_error') return;
       const mediaError = audio.error;
       playbackRejected(Object.assign(new Error(mediaError?.message || 'Audio decode failed.'),
-        {name:'MediaError'}), false, audio);
+        {name:'MediaError'}), manual, audio);
     }, {once:true});
     return audio;
   }
@@ -631,7 +673,7 @@
     if (playingAudio) playingAudio.pause();
     // A browser may keep a media element whose autoplay attempt was rejected in
     // an unusable state. The click creates a fresh element from the same URL.
-    playingAudio = createPlaybackAudio(playingUrl);
+    playingAudio = createPlaybackAudio(playingUrl, true);
     voiceDiagnostic('VOICE_MANUAL_PLAYBACK_CLICK', {stage:'playback', handler_invoked:true,
       blob_size:playingBlobSize, blob_type:playingBlobType, ...audioSnapshot()});
     startPlayback(true);
