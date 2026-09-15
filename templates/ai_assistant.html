@@ -63,7 +63,9 @@
   let recordingStream = null;
   let audioChunks = [];
   let playingAudio = null;
+  let playingBlob = null;
   let playingUrl = '';
+  let playingUrlRevoked = false;
   let playingBlobSize = 0;
   let playingBlobType = '';
   let ttsController = null;
@@ -91,8 +93,10 @@
   function voiceDiagnostic(event, details) {
     // Only technical metadata: never log audio, transcripts or headers.
     const entry = {};
-    for (const key of ['stage','mime_type','blob_size','blob_type','duration_ms','http_status',
-      'latency_ms','error_code','error_name','error_message']) {
+    for (const key of ['stage','mime_type','blob_size','blob_type','content_type','content_length',
+      'duration_ms','http_status','latency_ms','error_code','error_name','error_message',
+      'object_url_present','object_url_revoked','handler_invoked','audio_src','ready_state',
+      'network_state','audio_error_code','audio_error_message','audio_duration','muted','volume']) {
       if (details[key] !== undefined) entry[key] = details[key];
     }
     console.info(event, entry);
@@ -112,6 +116,20 @@
     replayVoiceButton.disabled = !available;
   }
 
+  function audioSnapshot(audio = playingAudio) {
+    return {
+      object_url_present:Boolean(playingUrl), object_url_revoked:playingUrlRevoked,
+      audio_src:typeof audio?.src === 'string' ? audio.src : '',
+      ready_state:Number.isFinite(audio?.readyState) ? audio.readyState : null,
+      network_state:Number.isFinite(audio?.networkState) ? audio.networkState : null,
+      audio_error_code:Number.isFinite(audio?.error?.code) ? audio.error.code : null,
+      audio_error_message:typeof audio?.error?.message === 'string' ? audio.error.message : '',
+      audio_duration:Number.isFinite(audio?.duration) ? audio.duration : null,
+      muted:Boolean(audio?.muted),
+      volume:Number.isFinite(audio?.volume) ? audio.volume : null,
+    };
+  }
+
   function stopSpeech(reason = 'stopped') {
     const hadPlayback = Boolean(ttsController || playingAudio || playingUrl);
     if (ttsController) ttsController.abort();
@@ -121,7 +139,13 @@
       playingAudio.currentTime = 0;
       playingAudio = null;
     }
-    if (playingUrl) URL.revokeObjectURL(playingUrl);
+    if (playingUrl && !playingUrlRevoked) {
+      voiceDiagnostic('VOICE_OBJECT_URL_REVOKE', {stage:reason,
+        object_url_present:true, object_url_revoked:false});
+      URL.revokeObjectURL(playingUrl);
+      playingUrlRevoked = true;
+    }
+    playingBlob = null;
     playingUrl = '';
     playingBlobSize = 0;
     playingBlobType = '';
@@ -131,25 +155,62 @@
       {stage:reason});
   }
 
-  async function startPlayback() {
-    if (!playingAudio || !playingBlobSize) return false;
+  function playbackRejected(error, manual, audio) {
+    if (playingAudio !== audio) return false;
+    const errorName = typeof error?.name === 'string' && error.name ? error.name : 'Error';
+    const errorMessage = typeof error?.message === 'string' ? error.message : '';
+    voiceDiagnostic(manual ? 'VOICE_MANUAL_PLAYBACK_ERROR' : 'VOICE_PLAYBACK_ERROR', {
+      stage:'playback', error_name:errorName, error_message:errorMessage, ...audioSnapshot(audio),
+    });
+    setVoiceState('playback_error');
+    setReplayAvailable(true);
+    return false;
+  }
+
+  function startPlayback(manual = false) {
+    const audio = playingAudio;
+    if (!audio || !playingBlobSize || !playingUrl || playingUrlRevoked) return Promise.resolve(false);
     voiceDiagnostic('VOICE_PLAYBACK_START', {stage:'playback', blob_size:playingBlobSize,
-      blob_type:playingBlobType});
+      blob_type:playingBlobType, handler_invoked:manual, ...audioSnapshot(audio)});
+    let playbackPromise;
     try {
-      await playingAudio.play();
+      // This call stays synchronous with the manual click handler. Only its
+      // returned promise is observed asynchronously.
+      playbackPromise = audio.play();
+    } catch (error) {
+      return Promise.resolve(playbackRejected(error, manual, audio));
+    }
+    return Promise.resolve(playbackPromise).then(() => {
+      if (playingAudio !== audio) return false;
       setReplayAvailable(false);
       setVoiceState('playing');
-      voiceDiagnostic('VOICE_PLAYBACK_SUCCESS', {stage:'playback'});
+      voiceDiagnostic(manual ? 'VOICE_MANUAL_PLAYBACK_SUCCESS' : 'VOICE_PLAYBACK_SUCCESS',
+        {stage:'playback', ...audioSnapshot(audio)});
       return true;
-    } catch (error) {
-      const errorName = typeof error?.name === 'string' && error.name ? error.name : 'Error';
-      const errorMessage = typeof error?.message === 'string' ? error.message : '';
-      voiceDiagnostic('VOICE_PLAYBACK_ERROR', {stage:'playback', error_name:errorName,
-        error_message:errorMessage});
-      setVoiceState('playback_error');
-      setReplayAvailable(true);
-      return false;
-    }
+    }, error => playbackRejected(error, manual, audio));
+  }
+
+  function createPlaybackAudio(url) {
+    const audio = new Audio(url);
+    audio.preload = 'auto';
+    audio.muted = false;
+    audio.volume = 1;
+    audio.addEventListener('loadedmetadata', () => {
+      if (playingAudio === audio) voiceDiagnostic('VOICE_PLAYBACK_METADATA', {stage:'playback', ...audioSnapshot(audio)});
+    });
+    audio.addEventListener('canplay', () => {
+      if (playingAudio === audio) voiceDiagnostic('VOICE_PLAYBACK_CANPLAY', {stage:'playback', ...audioSnapshot(audio)});
+    });
+    audio.addEventListener('ended', () => {
+      if (playingAudio === audio) stopSpeech('ended');
+    }, {once:true});
+    audio.addEventListener('error', () => {
+      if (playingAudio !== audio || voiceState === 'playback_error') return;
+      const mediaError = audio.error;
+      playbackRejected(Object.assign(new Error(mediaError?.message || 'Audio decode failed.'),
+        {name:'MediaError'}), false, audio);
+    }, {once:true});
+    return audio;
   }
 
   async function playSpeech(speechText, voiceRoundtripStarted = 0) {
@@ -167,27 +228,26 @@
         body:JSON.stringify({speech_text:speechText}), signal:controller.signal
       });
       httpStatus = response.status;
+      const contentType = response.headers?.get?.('Content-Type') || '';
+      const contentLength = response.headers?.get?.('Content-Length') || '';
       if (!response.ok) throw voiceError(`HTTP_${httpStatus}`);
       const blob = await response.blob();
       voiceDiagnostic('VOICE_TTS_RESPONSE', {stage:'tts_response', http_status:httpStatus,
+        content_type:contentType, content_length:contentLength,
         blob_size:blob.size, blob_type:blob.type,
         latency_ms:Math.round(performance.now() - started)});
       if (!blob.size) throw voiceError('TTS_EMPTY_AUDIO');
       if (blob.type !== 'audio/mpeg') throw voiceError('TTS_UNSUPPORTED_AUDIO');
       if (controller.signal.aborted || ttsController !== controller) return;
       ttsController = null;
-      playingUrl = URL.createObjectURL(blob);
+      playingBlob = blob;
+      playingUrl = URL.createObjectURL(playingBlob);
+      playingUrlRevoked = false;
       playingBlobSize = blob.size;
       playingBlobType = blob.type;
-      playingAudio = new Audio(playingUrl);
-      playingAudio.addEventListener('ended', () => stopSpeech('ended'), {once:true});
-      playingAudio.addEventListener('error', () => {
-        if (voiceState === 'playback_error') return;
-        voiceDiagnostic('VOICE_PLAYBACK_ERROR', {stage:'playback', error_name:'MediaError',
-          error_message:'Audio element reported an unsupported or unreadable source.'});
-        setVoiceState('playback_error');
-        setReplayAvailable(true);
-      }, {once:true});
+      voiceDiagnostic('VOICE_OBJECT_URL_READY', {stage:'playback', object_url_present:Boolean(playingUrl),
+        object_url_revoked:playingUrlRevoked, blob_size:playingBlobSize, blob_type:playingBlobType});
+      playingAudio = createPlaybackAudio(playingUrl);
       const played = await startPlayback();
       if (played && voiceRoundtripStarted) voiceDiagnostic('VOICE_ROUNDTRIP_COMPLETE', {stage:'playback_started',
         latency_ms:Math.round(performance.now() - voiceRoundtripStarted)});
@@ -560,7 +620,22 @@
     else if (voiceState === 'recording') stopRecording();
     else startRecording();
   });
-  replayVoiceButton.addEventListener('click', () => startPlayback());
+  replayVoiceButton.addEventListener('click', () => {
+    if (!playingBlob || !playingUrl || playingUrlRevoked) {
+      voiceDiagnostic('VOICE_MANUAL_PLAYBACK_ERROR', {stage:'playback', handler_invoked:true,
+        error_name:'InvalidStateError', error_message:'Prepared audio URL is unavailable.',
+        ...audioSnapshot()});
+      setVoiceState('playback_error');
+      return;
+    }
+    if (playingAudio) playingAudio.pause();
+    // A browser may keep a media element whose autoplay attempt was rejected in
+    // an unusable state. The click creates a fresh element from the same URL.
+    playingAudio = createPlaybackAudio(playingUrl);
+    voiceDiagnostic('VOICE_MANUAL_PLAYBACK_CLICK', {stage:'playback', handler_invoked:true,
+      blob_size:playingBlobSize, blob_type:playingBlobType, ...audioSnapshot()});
+    startPlayback(true);
+  });
   newConversation.addEventListener('click', async () => {
     if (busy) return;
     if (conversationId) {
