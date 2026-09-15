@@ -203,11 +203,14 @@ def register_routes(context):
         if request.args.get("deleted") == "1":
             msg = "Faktura zostaĹ‚a usuniÄ™ta."
 
+        suggested_invoice_no = ""
+        manual_invoice_no = False
         if request.method == "GET":
             order_currency = normalize_order_currency(o["currency"])
             auto_type, order_currency, auto_country = automatic_invoice_tax_context(dict(o), buyer_tax_no, "")
+            suggested_invoice_no = next_invoice_no(default_issue)
             data = {
-                "invoice_no": next_invoice_no(default_issue),
+                "invoice_no": suggested_invoice_no,
                 "place": "Kotuszów",
                 "issue_date": default_issue,
                 "sell_date": default_issue,
@@ -229,6 +232,16 @@ def register_routes(context):
                 "buyer_name", "buyer_tax_no", "buyer_address", "buyer_country",
                 "buyer_email", "buyer_phone", "discount_percent", "invoice_type", "currency"
             ]}
+            suggested_invoice_no = norm(request.form.get("suggested_invoice_no"))
+            manual_marker = norm(request.form.get("invoice_no_manual"))
+            if manual_marker in {"0", "1"}:
+                manual_invoice_no = manual_marker == "1"
+            else:
+                # Direct/server-side submissions have no browser dirty marker;
+                # a supplied number is therefore an explicit manual request.
+                manual_invoice_no = bool(data["invoice_no"]) and (
+                    not suggested_invoice_no or data["invoice_no"] != suggested_invoice_no
+                )
             order_currency = normalize_order_currency(o["currency"])
             auto_type, auto_currency, auto_country = automatic_invoice_tax_context(dict(o), data.get("buyer_tax_no"), data.get("buyer_country"))
             # Zwykły flow jest całkowicie automatyczny: zamówienie z cennika UE
@@ -242,7 +255,7 @@ def register_routes(context):
             data["buyer_street"] = st
             data["buyer_post_code"] = pc
             data["buyer_city"] = city
-            if not data["invoice_no"]:
+            if not data["invoice_no"] and not manual_invoice_no:
                 data["invoice_no"] = next_invoice_no(data["issue_date"] or default_issue)
             if not data["issue_date"]:
                 data["issue_date"] = default_issue
@@ -346,13 +359,19 @@ def register_routes(context):
             # Allocate only on an actual valid issue request, not on GET.
             if invoice_items and not msg:
                 import invoice_numbering, sys
-                data['invoice_no'] = invoice_numbering.reserve(sys.modules.get('app') or sys.modules['__main__'], data['issue_date'], data['invoice_no'])
-            existing_invoice_id = invoice_no_exists(data["invoice_no"])
+                try:
+                    data['invoice_no'] = invoice_numbering.reserve(
+                        sys.modules.get('app') or sys.modules['__main__'], data['issue_date'],
+                        data['invoice_no'], manual=manual_invoice_no,
+                    )
+                except ValueError as exc:
+                    msg = str(exc)
+            existing_invoice_id = invoice_no_exists(data["invoice_no"]) if not msg else 0
             if existing_invoice_id:
                 msg = f"Faktura o takim numerze już istnieje! Numer: {data['invoice_no']}. Wybierz inny numer faktury."
             elif not invoice_items and not msg:
                 msg = "Faktura musi zawieraÄ‡ co najmniej jednÄ… pozycjÄ™."
-            elif invoice_items:
+            elif invoice_items and not msg:
                 pdf_path, total_net, total_gross = generate_order_invoice_pdf(o, invoice_items, data)
                 packing_pdf_path = generate_invoice_packing_list_pdf(o, invoice_items, data, pdf_path)
                 c = conn()
@@ -443,6 +462,8 @@ def register_routes(context):
             <form method="post" class="row">
               <input type="hidden" name="invoice_type" value="{{ d['invoice_type'] }}">
               <input type="hidden" name="currency" value="{{ d['currency'] }}">
+              <input type="hidden" name="suggested_invoice_no" value="{{ suggested_invoice_no }}">
+              <input type="hidden" id="invoice_no_manual" name="invoice_no_manual" value="{{ '1' if manual_invoice_no else '0' }}">
               <div><label class="muted small">Rozliczenie</label><div class="hint"><b>{{ 'WDT 0%' if d['invoice_type']=='wdt' else ('Eksport 0%' if d['invoice_type']=='export' else 'Krajowa 23%') }}</b> · {{ d['currency'] }} — ustawione automatycznie z zamówienia</div></div>
               {% if d['invoice_type'] == 'wdt' %}
                 <div class="hint" style="grid-column:1/-1;">
@@ -450,7 +471,7 @@ def register_routes(context):
                   Stawkę 0% stosuj tylko dla dostawy do innego kraju UE i zachowaj dokumenty potwierdzające wywóz oraz dostarczenie towaru.
                 </div>
               {% endif %}
-              <div><label class="muted small">Numer faktury</label><input name="invoice_no" value="{{ d['invoice_no'] }}" required></div>
+              <div><label class="muted small">Numer faktury</label><input id="invoice_no" name="invoice_no" value="{{ d['invoice_no'] }}" oninput="document.getElementById('invoice_no_manual').value='1'" required></div>
               <div><label class="muted small">Miejsce</label><input name="place" value="{{ d['place'] }}"></div>
               <div><label class="muted small">Data wystawienia</label><input id="invoice_issue_date" name="issue_date" type="date" value="{{ d['issue_date'] }}"></div>
               <div><label class="muted small">Data sprzedaĹĽy</label><input name="sell_date" type="date" value="{{ d['sell_date'] }}"></div>
@@ -592,7 +613,7 @@ def register_routes(context):
           </div>
         {% endblock %}
         """
-        return render_template_string(tpl, title="Faktura", base_url=BASE_URL, db_path=DB_PATH, o=o, d=data, company=company, items=items, invoice_rows=invoice_rows, msg=msg, canonical_order_no=canonical_order_no, invoice_from_packing=invoice_from_packing)
+        return render_template_string(tpl, title="Faktura", base_url=BASE_URL, db_path=DB_PATH, o=o, d=data, company=company, items=items, invoice_rows=invoice_rows, msg=msg, canonical_order_no=canonical_order_no, invoice_from_packing=invoice_from_packing, suggested_invoice_no=suggested_invoice_no, manual_invoice_no=manual_invoice_no)
 
 
     @app.route("/orders/<int:order_id>/invoice", methods=["GET", "POST"])
@@ -1660,30 +1681,39 @@ def register_routes(context):
             elif not invoice_items:
                 msg = "Faktura musi zawierać co najmniej jedną pozycję."
             else:
-                old_order_ids = sorted({int(x.get("source_order_id") or x.get("order_id") or 0) for x in edit_items if int(x.get("current_invoice_qty") or 0) > 0})
-                st, pc, city = split_address(data.get("buyer_address", ""))
-                c = conn()
-                cur = c.cursor()
-                cur.execute("""
-                  UPDATE invoices
-                  SET invoice_no=?, issue_date=?, sell_date=?, payment_type=?, payment_to=?,
-                      buyer_name=?, buyer_tax_no=?, buyer_street=?, buyer_post_code=?, buyer_city=?,
-                      buyer_country=?, buyer_email=?, buyer_phone=?, invoice_type=?, currency=?
-                  WHERE id=?
-                """, (
-                    data["invoice_no"], data["issue_date"], data["sell_date"], data["payment_type"], data["payment_to"],
-                    data["buyer_name"], data["buyer_tax_no"], st, pc, city,
-                    data["buyer_country"], data["buyer_email"], data["buyer_phone"], data["invoice_type"], data["currency"], invoice_id
-                ))
-                import invoice_jobs
-                invoice_jobs.stage(cur,invoice_id,invoice_items,now_iso())
-                c.commit()
-                c.close()
+                import invoice_numbering, sys
+                try:
+                    data["invoice_no"] = invoice_numbering.reserve_manual_change(
+                        sys.modules.get('app') or sys.modules['__main__'],
+                        inv.get("invoice_no"), data["invoice_no"], data["issue_date"],
+                    )
+                except ValueError as exc:
+                    msg = str(exc)
+                if not msg:
+                    old_order_ids = sorted({int(x.get("source_order_id") or x.get("order_id") or 0) for x in edit_items if int(x.get("current_invoice_qty") or 0) > 0})
+                    st, pc, city = split_address(data.get("buyer_address", ""))
+                    c = conn()
+                    cur = c.cursor()
+                    cur.execute("""
+                      UPDATE invoices
+                      SET invoice_no=?, issue_date=?, sell_date=?, payment_type=?, payment_to=?,
+                          buyer_name=?, buyer_tax_no=?, buyer_street=?, buyer_post_code=?, buyer_city=?,
+                          buyer_country=?, buyer_email=?, buyer_phone=?, invoice_type=?, currency=?
+                      WHERE id=?
+                    """, (
+                        data["invoice_no"], data["issue_date"], data["sell_date"], data["payment_type"], data["payment_to"],
+                        data["buyer_name"], data["buyer_tax_no"], st, pc, city,
+                        data["buyer_country"], data["buyer_email"], data["buyer_phone"], data["invoice_type"], data["currency"], invoice_id
+                    ))
+                    import invoice_jobs
+                    invoice_jobs.stage(cur,invoice_id,invoice_items,now_iso())
+                    c.commit()
+                    c.close()
 
-                resume_invoice_job(invoice_id)
-                touched = old_order_ids + [int(x.get("source_order_id") or x.get("order_id") or 0) for x in invoice_items]
-                reconcile_orders_after_invoice_change(touched)
-                return redirect(url_for("invoices", edited="1", invoice_id=invoice_id))
+                    resume_invoice_job(invoice_id)
+                    touched = old_order_ids + [int(x.get("source_order_id") or x.get("order_id") or 0) for x in invoice_items]
+                    reconcile_orders_after_invoice_change(touched)
+                    return redirect(url_for("invoices", edited="1", invoice_id=invoice_id))
 
         buyer_address = "\n".join([x for x in [
             inv.get("buyer_street") or "",
