@@ -2,7 +2,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import contextmanager
+from contextvars import ContextVar
 import os
+import re
+import time
 from typing import Protocol
 
 import requests
@@ -20,6 +24,105 @@ STT_CONTEXT_PROMPT = (
 ALLOWED_AUDIO_TYPES = frozenset({
     'audio/webm', 'audio/ogg', 'audio/mp4', 'audio/mpeg', 'audio/wav', 'audio/x-wav',
 })
+
+_SPOKEN_DETAIL_REQUESTS = (
+    'przeczytaj mi wszystkie', 'przeczytaj wszystko', 'podaj wszystkie numery',
+)
+_SPOKEN_URL = re.compile(r'https?://\S+', re.IGNORECASE)
+_SPOKEN_TECHNICAL = re.compile(
+    r'(?i)\b(?:approval_id|operation_id|execution_id|correlation_id|pending_approval|json)\b')
+_SPOKEN_CODE = re.compile(
+    r'\b(?:ZAM[-\s]?\d{5,}|[A-Z]{2,}[A-Z0-9]*-\w{2,}(?:-\w+)+|KSeF[-:\w]+)\b', re.IGNORECASE)
+_SPOKEN_INVOICE = re.compile(r'\b(?:FV(?:AT)?|faktura)\s*[A-Z0-9][A-Z0-9/.-]{4,}\b', re.IGNORECASE)
+_SPOKEN_HEADING = re.compile(r'^\s*(?:#{1,6}\s*)?(?:\d+[.)]\s*)?([^|]+?)\s*$')
+_SPOKEN_BULLET = re.compile(r'^\s*[-*•]\s+(.+?)\s*$')
+
+
+def compact_speech_text(final_text, *, existing_speech_text='', user_message=''):
+    """Create a short, generic spoken rendering without interpreting business state."""
+    request = str(user_message)
+    full_detail = any(phrase in request.casefold() for phrase in _SPOKEN_DETAIL_REQUESTS)
+    keep_requested_code = bool(_SPOKEN_CODE.search(request) or _SPOKEN_INVOICE.search(request))
+    raw = str(final_text or '').strip()
+    if not raw:
+        return str(existing_speech_text or '').strip()[:MAX_SPEECH_TEXT]
+
+    def clean(value, *, keep_codes=False):
+        value = _SPOKEN_URL.sub('', str(value))
+        value = value.replace('**', '').replace('__', '').replace('`', '').replace('|', ' ')
+        if not keep_codes:
+            value = _SPOKEN_CODE.sub('', value)
+            value = _SPOKEN_INVOICE.sub('', value)
+        value = re.sub(r'\s+', ' ', value).strip(' -–—,;:')
+        return value
+
+    if full_detail:
+        safe_lines = [line for line in raw.splitlines()
+                      if line.strip() and '|' not in line
+                      and not line.lstrip().startswith(('{', '['))
+                      and not _SPOKEN_TECHNICAL.search(line)]
+        return clean(' '.join(safe_lines), keep_codes=True)[:MAX_SPEECH_TEXT].strip()
+
+    prose = []
+    sections = []
+    current_heading = ''
+    for source_line in raw.splitlines():
+        line = source_line.strip()
+        if (not line or '|' in line or _SPOKEN_TECHNICAL.search(line)
+                or line.startswith(('{', '['))):
+            continue
+        bullet = _SPOKEN_BULLET.match(line)
+        if bullet:
+            item = clean(bullet.group(1), keep_codes=keep_requested_code)
+            if item and current_heading:
+                if not any(heading == current_heading for heading, _ in sections):
+                    sections.append((current_heading, item))
+            elif item:
+                prose.append(item)
+            continue
+        heading = _SPOKEN_HEADING.match(line)
+        numbered = bool(re.match(r'^\s*(?:#{1,6}\s*|\d+[.)]\s*)', line))
+        if numbered and heading:
+            current_heading = clean(heading.group(1), keep_codes=keep_requested_code)
+            continue
+        prose.extend(clean(part, keep_codes=keep_requested_code)
+                     for part in re.split(r'(?<=[.!?])\s+', line)
+                     if clean(part, keep_codes=keep_requested_code))
+
+    chosen = [item for item in prose if len(item) >= 8][:2]
+    if not chosen:
+        chosen = [f'{heading}: {item}' for heading, item in sections[:3]]
+    elif len(chosen) < 2 and sections:
+        chosen.append(f'{sections[0][0]}: {sections[0][1]}')
+    if not chosen:
+        fallback = clean(existing_speech_text, keep_codes=keep_requested_code)
+        chosen = [fallback] if fallback else ['Szczegóły są widoczne na ekranie.']
+
+    spoken = ' '.join(part.rstrip(' .') + '.' for part in chosen)
+    if len(spoken) > 320:
+        spoken = spoken[:320].rsplit(' ', 1)[0].rstrip(' ,;:') + '.'
+    return spoken.strip()
+
+
+@dataclass
+class TranscriptionDiagnostics:
+    configured_stt_model: str = DEFAULT_STT_MODEL
+    language: str = STT_LANGUAGE
+    provider_http_status: int | None = None
+    provider_latency_ms: float | None = None
+
+
+_stt_diagnostics = ContextVar('stt_diagnostics', default=None)
+
+
+@contextmanager
+def observe_transcription(diagnostics):
+    """Request-local metadata; no audio, transcript or provider contract changes."""
+    token = _stt_diagnostics.set(diagnostics)
+    try:
+        yield diagnostics
+    finally:
+        _stt_diagnostics.reset(token)
 
 
 class VoiceIOError(RuntimeError):
@@ -63,6 +166,11 @@ class OpenAIVoiceIOProvider:
                                stage='provider_response', http_status=status) from exc
 
     def transcribe(self, audio: bytes, *, filename: str, content_type: str) -> str:
+        diagnostics = _stt_diagnostics.get()
+        if diagnostics is not None:
+            diagnostics.configured_stt_model = self.stt_model
+            diagnostics.language = STT_LANGUAGE
+        started = time.perf_counter()
         try:
             response = requests.post(
                 'https://api.openai.com/v1/audio/transcriptions',
@@ -75,12 +183,17 @@ class OpenAIVoiceIOProvider:
                 },
                 timeout=60,
             )
+            if diagnostics is not None:
+                diagnostics.provider_http_status = response.status_code
         except requests.Timeout as exc:
             raise VoiceIOError('STT provider timed out', error_code='STT_TIMEOUT',
                                stage='provider_request') from exc
         except requests.RequestException as exc:
             raise VoiceIOError('STT provider unavailable', error_code='STT_NETWORK_ERROR',
                                stage='provider_request') from exc
+        finally:
+            if diagnostics is not None:
+                diagnostics.provider_latency_ms = round((time.perf_counter() - started) * 1000, 2)
         self._raise_for_status(response, 'STT')
         try:
             data = response.json()

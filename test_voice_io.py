@@ -1,7 +1,9 @@
 import io
 import json
 import logging
+import os
 from html.parser import HTMLParser
+from dataclasses import replace
 
 import pytest
 
@@ -9,8 +11,17 @@ import agent_runtime as runtime
 import app as backend
 import business_operations as operations
 import voice_io
+import voice_debug
 from test_agent_runtime import isolated, owner, respond, tool
 from voice_io import SynthesizedAudio, VoiceIOError
+
+
+@pytest.fixture(autouse=True)
+def isolated_voice_debug(tmp_path, monkeypatch):
+    monkeypatch.setattr(voice_debug, 'DEBUG_AUDIO_DIR', tmp_path / 'private-voice-debug')
+    monkeypatch.setattr(voice_debug, '_start_janitor', lambda: None)
+    monkeypatch.delenv('VOICE_DEBUG_SAVE_AUDIO', raising=False)
+    monkeypatch.delenv('AI_STT_MODEL', raising=False)
 
 
 class FakeVoiceProvider:
@@ -30,7 +41,7 @@ class FakeVoiceProvider:
     def synthesize(self, text):
         self.speeches.append(text)
         if self.tts_error:
-            raise VoiceIOError('tts failed')
+            raise VoiceIOError('tts failed', error_code='TTS_FAILED', stage='provider')
         return SynthesizedAudio(b'fake-mp3', 'audio/mpeg')
 
 
@@ -106,6 +117,59 @@ def test_ptt_stt_existing_conversation_chat_speech_text_and_tts(isolated, monkey
     assert voice.speeches == [answer['speech_text']]
 
 
+def test_voice_speech_text_keeps_ui_detail_but_compacts_spoken_result(isolated):
+    backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([respond(
+        'Masz 7 aktywnych zamówień. Najnowsze ZAM-2609141 wymaga uzupełnienia. '
+        'Pozostałe zamówienia i szczegółowe pozycje są widoczne na ekranie.'
+    )])
+    response = client().post('/api/internal/ai/chat', json={'message': 'Mam jakieś nowe zamówienia?'})
+    payload = response.get_json()
+    assert response.status_code == 200
+    assert 'ZAM-2609141' in payload['message']
+    assert 'ZAM-2609141' not in payload['speech_text']
+    assert len(payload['speech_text']) < len(payload['message'])
+    assert payload['speech_text'].count('.') <= 2
+
+
+def test_daily_summary_speech_uses_short_section_highlights(isolated):
+    full = (
+        '1. Pilne wysyłki\n- MAGMAR — 13 szt., kompletne.\n'
+        '2. Płatności po terminie\n- Brak.\n'
+        '3. Braki wymagające działania\n- Winsor — 13 szt.\n- Aosta — 2 szt.\n'
+        '4. Pozostałe ważne rzeczy\n- Szczegóły na ekranie.'
+    )
+    backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([respond(full)])
+    response = client().post('/api/internal/ai/chat', json={'message': 'Co mam dziś do zrobienia?'})
+    payload = response.get_json()
+    assert response.status_code == 200 and payload['message'] == full
+    assert payload['speech_text'] == (
+        'Pilne wysyłki: MAGMAR — 13 szt., kompletne. '
+        'Płatności po terminie: Brak. Braki wymagające działania: Winsor — 13 szt.'
+    )
+    assert 'Aosta' not in payload['speech_text']
+
+
+def test_explicit_request_allows_fuller_spoken_numbers(isolated):
+    full = 'Zamówienia: ZAM-2609141. ZAM-2609142. ZAM-2609143.'
+    backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([respond(full)])
+    payload = client().post('/api/internal/ai/chat', json={
+        'message': 'Podaj wszystkie numery zamówień.'
+    }).get_json()
+    assert payload['speech_text'] == full
+
+
+def test_spoken_summary_omits_tables_urls_json_and_internal_identifiers():
+    spoken = voice_io.compact_speech_text(
+        'Podsumowanie jest gotowe.\n'
+        '| SKU | Ilość |\n|---|---|\n| CH010-BB-128168 | 7 |\n'
+        '{"operation_id":"private-value"}\n'
+        'Szczegóły: https://example.invalid/private',
+        user_message='Podsumuj wynik.',
+    )
+    assert spoken == 'Podsumowanie jest gotowe. Szczegóły.'
+    assert all(value not in spoken for value in ('CH010', 'operation_id', 'http', '{', '|'))
+
+
 def test_voice_approval_uses_existing_approval_decide(isolated, monkeypatch):
     voice = FakeVoiceProvider('zatwierdzam')
     monkeypatch.setattr(backend, 'VOICE_IO_PROVIDER', voice)
@@ -160,6 +224,24 @@ def test_tts_failure_keeps_text_response_available(isolated, monkeypatch):
     tts = test_client.post('/api/internal/ai/voice/synthesize', json={'speech_text': chat['speech_text']})
     assert chat['message'] == 'Pełna odpowiedź pozostaje na ekranie.'
     assert tts.status_code == 503 and tts.get_json()['error_code'] == 'TTS_FAILED'
+
+
+def test_tts_success_and_failure_logs_are_timed_without_speech_content(isolated, monkeypatch, caplog):
+    phrase = 'Poufna odpowiedź głosowa nie może trafić do logu.'
+    voice = FakeVoiceProvider()
+    monkeypatch.setattr(backend, 'VOICE_IO_PROVIDER', voice)
+    caplog.set_level(logging.INFO)
+    success = client().post('/api/internal/ai/voice/synthesize', json={'speech_text': phrase})
+    assert success.status_code == 200
+    success_log = next(record.message for record in caplog.records if 'VOICE_TTS_RESPONSE' in record.message)
+    assert phrase not in success_log and '"latency_ms":' in success_log
+
+    caplog.clear()
+    monkeypatch.setattr(backend, 'VOICE_IO_PROVIDER', FakeVoiceProvider(tts_error=True))
+    failed = client().post('/api/internal/ai/voice/synthesize', json={'speech_text': phrase})
+    assert failed.status_code == 503
+    error_log = next(record.message for record in caplog.records if 'VOICE_TTS_ERROR' in record.message)
+    assert phrase not in error_log and '"error_code": "TTS_FAILED"' in error_log
 
 
 def test_voice_and_text_have_identical_permission_deny(isolated, monkeypatch):
@@ -337,7 +419,8 @@ def test_stt_provider_failures_have_safe_diagnostics(isolated, monkeypatch, capl
     if failure == 'http':
         assert failures[0]['provider_http_status'] == 429
     allowed = {'stage', 'mime_type', 'blob_size', 'duration_ms', 'http_status', 'latency_ms',
-               'error_code', 'provider_http_status', 'language', 'stt_model'}
+               'error_code', 'provider_http_status', 'language', 'stt_model', 'request_id',
+               'capture_duration_ms', 'file_extension', 'configured_stt_model', 'provider_latency_ms'}
     for event in events:
         payload = json.loads(event.split(' ', 1)[1])
         assert set(payload) <= allowed
@@ -349,7 +432,9 @@ def test_stt_provider_failures_have_safe_diagnostics(isolated, monkeypatch, capl
 
 def test_successful_stt_diagnostics_exclude_transcript_and_audio(isolated, monkeypatch, caplog):
     transcript = 'Poufna treść transkrypcji klienta.'
-    monkeypatch.setattr(backend, 'VOICE_IO_PROVIDER', FakeVoiceProvider(transcript))
+    monkeypatch.setattr(backend, 'VOICE_IO_PROVIDER', voice_io.OpenAIVoiceIOProvider(api_key='test-secret'))
+    monkeypatch.setattr(voice_io.requests, 'post',
+                        lambda *a, **k: StubTranscriptionResponse({'text': transcript}))
     with caplog.at_level(logging.INFO):
         response = transcribe(client())
     assert response.get_json()['text'] == transcript
@@ -365,6 +450,242 @@ def test_successful_stt_diagnostics_exclude_transcript_and_audio(isolated, monke
     assert completed[0]['mime_type'] == 'audio/webm'
     assert transcript not in '\n'.join(events)
     assert 'webm-audio' not in '\n'.join(events)
+
+
+@pytest.mark.parametrize('flag', [None, '0', 'true', 'unexpected'])
+def test_debug_audio_disabled_creates_no_files(isolated, monkeypatch, flag):
+    if flag is not None:
+        monkeypatch.setenv('VOICE_DEBUG_SAVE_AUDIO', flag)
+    monkeypatch.setattr(backend, 'VOICE_IO_PROVIDER', FakeVoiceProvider())
+    assert transcribe(client()).status_code == 200
+    assert not voice_debug.DEBUG_AUDIO_DIR.exists()
+
+
+@pytest.mark.parametrize('mime,extension', [('audio/webm;codecs=opus', '.webm'), ('audio/mp4', '.mp4')])
+def test_debug_audio_admin_saves_exact_blob_and_logs_id(isolated, monkeypatch, caplog, mime, extension):
+    monkeypatch.setenv('VOICE_DEBUG_SAVE_AUDIO', '1')
+    transcript = 'Poufna transkrypcja'
+    voice = FakeVoiceProvider(transcript)
+    monkeypatch.setattr(backend, 'VOICE_IO_PROVIDER', voice)
+    payload = b'private audio bytes\x00\xff\r\n'
+    with caplog.at_level(logging.INFO):
+        response = client().post('/api/internal/ai/voice/transcribe', data={
+            'audio': (io.BytesIO(payload), 'customer-secret.wrong', mime),
+            'capture_duration_ms': '2300'}, headers={'X-CSRF-Token': 'voice-csrf'})
+    assert response.status_code == 200
+    assert response.get_json() == {'ok': True, 'text': transcript}
+    files = [p for p in voice_debug.DEBUG_AUDIO_DIR.iterdir() if p.name != '.lock']
+    assert len(files) == 1
+    saved = files[0]
+    assert voice_debug._AUDIO_NAME.fullmatch(saved.name)
+    assert saved.suffix == extension
+    assert saved.read_bytes() == payload
+    assert voice.transcriptions == [(payload, 'customer-secret.wrong', mime.split(';')[0])]
+    events = [r.getMessage() for r in caplog.records if r.getMessage().startswith('VOICE_STT_')]
+    final = json.loads(next(e.split(' ', 1)[1] for e in events if e.startswith('VOICE_STT_RESPONSE ')))
+    assert final['debug_audio_id'] == saved.name
+    assert final['request_id'] == response.headers['X-Voice-Request-Id']
+    assert len(final['request_id']) == 32
+    assert final['capture_duration_ms'] == 2300
+    assert final['blob_size'] == len(payload)
+    assert final['file_extension'] == extension
+    # A fake adapter has no HTTP response: never invent a provider status.
+    assert final['provider_http_status'] is None
+    assert final['provider_latency_ms'] is None
+    for secret in (transcript, 'customer-secret', 'voice-csrf', 'private audio bytes', voice_io.STT_CONTEXT_PROMPT):
+        assert secret not in '\n'.join(events)
+        assert secret not in saved.name
+    assert client().get('/static/' + saved.name).status_code == 404
+
+
+def test_debug_audio_rotation_age_and_disable_cleanup(isolated, monkeypatch):
+    monkeypatch.setenv('VOICE_DEBUG_SAVE_AUDIO', '1')
+    ids = [voice_debug.save_debug_audio(bytes([i]), 'audio/webm', is_admin=True) for i in range(5)]
+    files = sorted(p.name for p in voice_debug.DEBUG_AUDIO_DIR.iterdir() if p.name != '.lock')
+    assert files == sorted(ids[-3:])
+    old = voice_debug.DEBUG_AUDIO_DIR / ids[-3]
+    os.utime(old, (0, 0))
+    assert voice_debug.cleanup_debug_audio() == 2
+    assert not old.exists()
+    monkeypatch.setenv('VOICE_DEBUG_SAVE_AUDIO', '0')
+    assert voice_debug.save_debug_audio(b'not stored', 'audio/webm', is_admin=True) is None
+    assert list(voice_debug.DEBUG_AUDIO_DIR.iterdir()) == [voice_debug.DEBUG_AUDIO_DIR / '.lock']
+
+
+def test_debug_audio_expiry_runs_without_another_stt_request(isolated, monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setenv('VOICE_DEBUG_SAVE_AUDIO', '1')
+    saved = voice_debug.save_debug_audio(b'expiring', 'audio/webm', is_admin=True)
+    path = voice_debug.DEBUG_AUDIO_DIR / saved
+    expires = path.stat().st_mtime + voice_debug.DEBUG_AUDIO_TTL_SECONDS + 60
+    monkeypatch.setattr(voice_debug, 'time', SimpleNamespace(time=lambda: expires))
+    # Advance the background cleaner's wait without waiting an hour in the test.
+    monkeypatch.setattr(voice_debug, 'threading', SimpleNamespace(
+        Event=lambda: SimpleNamespace(wait=lambda seconds: False)))
+    voice_debug._expire_audio()
+    assert not path.exists()
+
+
+def test_debug_audio_is_kept_when_provider_fails(isolated, monkeypatch, caplog):
+    monkeypatch.setenv('VOICE_DEBUG_SAVE_AUDIO', '1')
+    monkeypatch.setattr(backend, 'VOICE_IO_PROVIDER', FakeVoiceProvider(stt_error=True))
+    with caplog.at_level(logging.INFO):
+        response = transcribe(client())
+    assert response.status_code == 503
+    event = next(r.getMessage() for r in caplog.records if r.getMessage().startswith('VOICE_STT_ERROR '))
+    metadata = json.loads(event.split(' ', 1)[1])
+    assert (voice_debug.DEBUG_AUDIO_DIR / metadata['debug_audio_id']).read_bytes() == b'webm-audio'
+
+
+def test_debug_audio_not_saved_for_non_admin_or_unauthenticated(isolated, monkeypatch):
+    monkeypatch.setenv('VOICE_DEBUG_SAVE_AUDIO', '1')
+    monkeypatch.setattr(backend, 'VOICE_IO_PROVIDER', FakeVoiceProvider())
+    assert transcribe(backend.app.test_client()).status_code == 401
+    assert not voice_debug.DEBUG_AUDIO_DIR.exists()
+    limited_actor = replace(owner(), roles=('WAREHOUSE',))
+    monkeypatch.setattr(backend, 'current_actor_context', lambda: limited_actor)
+    assert transcribe(client()).status_code == 200
+    assert not voice_debug.DEBUG_AUDIO_DIR.exists()
+
+
+def test_debug_audio_storage_failure_does_not_change_stt(isolated, monkeypatch, caplog):
+    monkeypatch.setenv('VOICE_DEBUG_SAVE_AUDIO', '1')
+    monkeypatch.setattr(backend, 'VOICE_IO_PROVIDER', FakeVoiceProvider())
+    def fail(*args, **kwargs):
+        raise OSError('private disk path')
+    monkeypatch.setattr(backend, 'save_debug_audio', fail)
+    with caplog.at_level(logging.INFO):
+        response = transcribe(client())
+    assert response.status_code == 200
+    assert 'DEBUG_AUDIO_STORAGE_ERROR' in caplog.text
+    assert 'private disk path' not in caplog.text
+
+
+@pytest.mark.parametrize('case,status', [('unauthenticated', 401), ('csrf', 403)])
+def test_rejected_stt_attempt_has_safe_diagnostic_without_audio(isolated, monkeypatch, caplog, case, status):
+    monkeypatch.setenv('VOICE_DEBUG_SAVE_AUDIO', '1')
+    test_client = backend.app.test_client() if case == 'unauthenticated' else client()
+    with caplog.at_level(logging.INFO):
+        response = test_client.post('/api/internal/ai/voice/transcribe', data={
+            'audio': (io.BytesIO(b'secret-rejected-audio'), 'private-client.webm', 'audio/webm')})
+    assert response.status_code == status
+    events = [r.getMessage() for r in caplog.records if r.getMessage().startswith('VOICE_STT_')]
+    assert len(events) == 1
+    metadata = json.loads(events[0].split(' ', 1)[1])
+    assert metadata['request_id'] == response.headers['X-Voice-Request-Id']
+    assert metadata['provider_http_status'] is None
+    assert metadata['capture_duration_ms'] is None
+    assert 'debug_audio_id' not in metadata
+    assert not voice_debug.DEBUG_AUDIO_DIR.exists()
+    assert 'secret-rejected-audio' not in events[0]
+    assert 'private-client' not in events[0]
+
+
+@pytest.mark.parametrize('outcome,status', [('ok', 201), ('http_error', 429), ('invalid_json', 200), ('timeout', None)])
+def test_stt_logs_actual_provider_status_latency_and_duration(isolated, monkeypatch, caplog, outcome, status):
+    monkeypatch.setattr(backend, 'VOICE_IO_PROVIDER', voice_io.OpenAIVoiceIOProvider(
+        api_key='secret-provider-key', stt_model='gpt-4o-mini-transcribe'))
+    ticks = iter([10.0, 10.125])
+    from types import SimpleNamespace
+    monkeypatch.setattr(voice_io, 'time', SimpleNamespace(perf_counter=lambda: next(ticks)))
+    def post(*args, **kwargs):
+        if outcome == 'timeout':
+            raise voice_io.requests.Timeout('private timeout message')
+        return StubTranscriptionResponse({'text': 'private transcript'}, status=status,
+                                         json_error=(outcome == 'invalid_json'))
+    monkeypatch.setattr(voice_io.requests, 'post', post)
+    with caplog.at_level(logging.INFO):
+        response = client().post('/api/internal/ai/voice/transcribe', data={
+            'audio': (io.BytesIO(b'audio'), 'recording.webm', 'audio/webm'),
+            'capture_duration_ms': 'not-a-number-secret'}, headers={'X-CSRF-Token': 'voice-csrf'})
+    assert response.status_code == (200 if outcome == 'ok' else 503)
+    final = json.loads([r.getMessage().split(' ', 1)[1] for r in caplog.records
+                        if r.getMessage().startswith(('VOICE_STT_RESPONSE ', 'VOICE_STT_ERROR '))][-1])
+    assert final['provider_http_status'] == status
+    assert final['provider_latency_ms'] == 125.0
+    assert final['configured_stt_model'] == 'gpt-4o-mini-transcribe'
+    assert final['capture_duration_ms'] is None
+    assert 'debug_audio_id' not in final
+    assert voice_io._stt_diagnostics.get() is None
+    for secret in ('private transcript', 'not-a-number-secret', 'secret-provider-key'):
+        assert secret not in caplog.text
+
+
+def test_debug_flag_does_not_change_upstream_request(isolated, monkeypatch):
+    requests = []
+    monkeypatch.setattr(backend, 'VOICE_IO_PROVIDER', voice_io.OpenAIVoiceIOProvider(api_key='test-secret'))
+    def post(url, **kwargs):
+        requests.append((url, kwargs))
+        return StubTranscriptionResponse({'text': 'co mogę zrobić dzisiaj?'})
+    monkeypatch.setattr(voice_io.requests, 'post', post)
+    for flag in ('0', '1'):
+        monkeypatch.setenv('VOICE_DEBUG_SAVE_AUDIO', flag)
+        assert transcribe(client()).status_code == 200
+    assert len(requests) == 2
+    assert requests[0] == requests[1]
+
+
+def test_provider_diagnostics_are_isolated_between_parallel_requests(isolated, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    barrier = threading.Barrier(2)
+    provider = voice_io.OpenAIVoiceIOProvider(api_key='test-secret')
+    def post(*args, **kwargs):
+        status = int(kwargs['files']['file'][1])
+        barrier.wait(timeout=5)
+        return StubTranscriptionResponse({'text': 'test'}, status=status)
+    monkeypatch.setattr(voice_io.requests, 'post', post)
+    def run(status):
+        metrics = voice_io.TranscriptionDiagnostics()
+        with voice_io.observe_transcription(metrics):
+            provider.transcribe(str(status).encode(), filename='recording.webm', content_type='audio/webm')
+        assert voice_io._stt_diagnostics.get() is None
+        return metrics.provider_http_status
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(run, [201, 202])) == [201, 202]
+
+
+def test_debug_audio_rotation_lock_is_shared_between_processes(isolated, monkeypatch):
+    import subprocess
+    import sys
+    monkeypatch.setenv('VOICE_DEBUG_SAVE_AUDIO', '1')
+    with voice_debug._storage_lock():
+        script = '''
+import sys
+from pathlib import Path
+import voice_debug
+voice_debug.DEBUG_AUDIO_DIR = Path(sys.argv[1])
+try:
+    with voice_debug._storage_lock():
+        raise AssertionError('Another process must not enter the storage lock')
+except OSError:
+    pass
+'''
+        result = subprocess.run([sys.executable, '-B', '-c', script, str(voice_debug.DEBUG_AUDIO_DIR)],
+                                capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0, result.stderr
+    assert voice_debug.save_debug_audio(b'after-release', 'audio/webm', is_admin=True)
+
+
+def test_local_stt_comparator_uses_same_audio_language_and_context(isolated, monkeypatch, tmp_path, capsys):
+    import compare_voice_stt
+    audio = tmp_path / 'recording.webm'
+    audio.write_bytes(b'the same input')
+    monkeypatch.setenv('OPENAI_API_KEY', 'test-secret')
+    calls = []
+    def post(url, **kwargs):
+        calls.append(kwargs)
+        return StubTranscriptionResponse({'text': 'porównanie'})
+    monkeypatch.setattr(voice_io.requests, 'post', post)
+    assert compare_voice_stt.main([str(audio)]) == 0
+    assert [c['data']['model'] for c in calls] == ['gpt-4o-mini-transcribe', 'gpt-transcribe']
+    assert calls[0]['files'] == calls[1]['files']
+    for call in calls:
+        assert call['data']['language'] == 'pl'
+        assert call['data']['prompt'] == voice_io.STT_CONTEXT_PROMPT
+    results = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert len(results) == 2 and all(r['transcript'] == 'porównanie' for r in results)
+    assert not voice_debug.DEBUG_AUDIO_DIR.exists()
 
 
 def test_voice_cerne_count_keeps_stock_until_existing_human_approval(isolated, monkeypatch):

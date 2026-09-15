@@ -30,10 +30,12 @@ class Element {
 const flush = async () => { for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve)); };
 
 function browser({types = ['audio/webm;codecs=opus'], captureError, chunks = ['recording'], sttResponse,
+                  sttText = 'jakie mam zaległe faktury?',
+                  chatResponse, ttsResponse, audioPlayError = false,
                   noTracks = false, mediaRecorder = true, getStream} = {}) {
   const elements = Object.fromEntries(['aiForm','aiInput','aiSend','aiMessages','aiEmpty',
     'aiNewConversation','aiVoice','aiVoiceStatus'].map(id => [id, new Element()]));
-  const calls = [], logs = [], recorders = [];
+  const calls = [], logs = [], recorders = [], audios = [];
   const track = {readyState:'live', stopped:false, stop() { this.stopped = true; }};
   const stream = {getAudioTracks:() => noTracks ? [] : [track], getTracks:() => [track]};
   class Recorder extends Element {
@@ -50,26 +52,38 @@ function browser({types = ['audio/webm;codecs=opus'], captureError, chunks = ['r
       });
     }
   }
+  class Playback extends Element {
+    constructor(url) { super(); this.url = url; this.paused = false; this.currentTime = 0; audios.push(this); }
+    async play() { if (audioPlayError) throw new Error('playback'); }
+    pause() { this.paused = true; }
+  }
   const context = {
     document:{getElementById:id => elements[id], querySelectorAll:() => [], createElement:() => new Element()},
     window:{setTimeout, clearTimeout}, navigator:{mediaDevices:{getUserMedia:async () => {
       if (captureError) throw captureError;
       return getStream ? getStream(stream) : stream;
     }}}, MediaRecorder:mediaRecorder ? Recorder : undefined,
-    Blob, FormData, AbortController, performance, URL, console:{info:(event, details) => logs.push({event, ...details})},
+    Blob, FormData, AbortController, performance, Audio:Playback,
+    URL:{createObjectURL:() => 'blob:voice-test', revokeObjectURL() {}},
+    console:{info:(event, details) => logs.push({event, ...details})},
     fetch:async (url, options) => {
       calls.push({url, options});
       if (url.endsWith('/transcribe')) {
         if (sttResponse) return sttResponse();
-        return {ok:true, status:200, json:async () => ({ok:true, text:'jakie mam zaległe faktury?'})};
+        return {ok:true, status:200, json:async () => ({ok:true, text:sttText})};
+      }
+      if (url.endsWith('/synthesize')) {
+        if (ttsResponse) return ttsResponse();
+        return {ok:true, status:200, blob:async () => new Blob(['mp3'], {type:'audio/mpeg'})};
       }
       assert.equal(url, '/api/internal/ai/chat');
+      if (chatResponse) return chatResponse();
       return {ok:true, status:200, json:async () => ({status:'SUCCESS', conversation_id:'existing-conversation',
         message:'Odpowiedź z istniejącego chatu.', artifacts:[]})};
     },
   };
   vm.runInNewContext(script, context);
-  return {elements, calls, logs, recorders, track, click:() => elements.aiVoice.dispatch('click'),
+  return {elements, calls, logs, recorders, audios, track, click:() => elements.aiVoice.dispatch('click'),
     type:message => { elements.aiInput.value = message; elements.aiForm.dispatch('submit'); }};
 }
 
@@ -84,6 +98,7 @@ test('click start/stop -> STT -> same chat and conversation, transcript visible'
   assert.deepEqual(b.calls.map(call => call.url), ['/api/internal/ai/chat',
     '/api/internal/ai/voice/transcribe', '/api/internal/ai/chat']);
   assert.equal(b.calls[1].options.headers['X-CSRF-Token'], 'rendered-csrf');
+  assert.match(b.calls[1].options.body.get('capture_duration_ms'), /^\d+$/);
   assert.deepEqual(JSON.parse(b.calls[2].options.body), {message:'jakie mam zaległe faktury?',
     conversation_id:'existing-conversation'});
   const bubbles = b.elements.aiMessages.children.flatMap(row => row.children).map(child => child.textContent);
@@ -156,4 +171,78 @@ test('new conversation cancels pending microphone permission without recording o
   allow(); await flush();
   assert.equal(b.recorders.length, 0); assert.equal(b.calls.length, 0);
   assert.equal(b.track.stopped, true);
+});
+
+test('voice keeps full UI answer and automatically speaks only speech_text', async () => {
+  const full = 'Masz 7 aktywnych zamówień. Najnowsze zamówienie wymaga uzupełnienia. Dalsza lista pozostaje na ekranie.';
+  const speech = 'Masz jedno nowe zamówienie. Wymaga uzupełnienia.';
+  const b = browser({sttText:'Mam jakieś nowe zamówienia?',
+    chatResponse:async () => ({ok:true, status:200, json:async () => ({
+    status:'SUCCESS', conversation_id:'voice-conversation', message:full, speech_text:speech, artifacts:[],
+  })})});
+  b.click(); await flush(); b.click(); await flush();
+  assert.deepEqual(b.calls.map(call => call.url), ['/api/internal/ai/voice/transcribe',
+    '/api/internal/ai/chat', '/api/internal/ai/voice/synthesize']);
+  assert.equal(JSON.parse(b.calls[1].options.body).message, 'Mam jakieś nowe zamówienia?');
+  assert.equal(JSON.parse(b.calls[2].options.body).speech_text, speech);
+  const bubbles = b.elements.aiMessages.children.flatMap(row => row.children).map(child => child.textContent);
+  assert.ok(bubbles.includes(full));
+  assert.ok(speech.length < full.length);
+  for (const event of ['VOICE_AGENT_RESPONSE','VOICE_TTS_REQUEST_START','VOICE_TTS_RESPONSE',
+    'VOICE_ROUNDTRIP_COMPLETE']) assert.ok(b.logs.some(entry => entry.event === event));
+});
+
+test('voice daily briefing displays full sections and speaks the compact summary', async () => {
+  const full = '1. Pilne wysyłki\n- Jedna wysyłka.\n2. Płatności\n- Brak.\n3. Braki\n- 13 sztuk.';
+  const speech = 'Na dziś masz jedną pilną wysyłkę i 13 sztuk braków. Płatności po terminie brak.';
+  const b = browser({sttText:'Co mam dziś do zrobienia?',
+    chatResponse:async () => ({ok:true, status:200, json:async () => ({
+      status:'SUCCESS', conversation_id:'daily-conversation', message:full, speech_text:speech, artifacts:[],
+    })})});
+  b.click(); await flush(); b.click(); await flush();
+  assert.equal(JSON.parse(b.calls[1].options.body).message, 'Co mam dziś do zrobienia?');
+  assert.equal(JSON.parse(b.calls[2].options.body).speech_text, speech);
+  const bubbles = b.elements.aiMessages.children.flatMap(row => row.children).map(child => child.textContent);
+  assert.ok(bubbles.includes(full));
+  assert.notEqual(speech, full);
+  assert.ok(!speech.includes('\n-'));
+});
+
+test('typed message never starts automatic TTS', async () => {
+  const b = browser({chatResponse:async () => ({ok:true, status:200, json:async () => ({
+    status:'SUCCESS', conversation_id:'text-conversation', message:'Pełna odpowiedź.',
+    speech_text:'Krótka odpowiedź.', artifacts:[],
+  })})});
+  b.type('Wiadomość z klawiatury'); await flush();
+  assert.deepEqual(b.calls.map(call => call.url), ['/api/internal/ai/chat']);
+  assert.equal(b.audios.length, 0);
+});
+
+test('TTS error leaves the successful chat answer visible', async () => {
+  const answer = 'Pełna odpowiedź nadal jest dostępna.';
+  const b = browser({chatResponse:async () => ({ok:true, status:200, json:async () => ({
+    status:'SUCCESS', conversation_id:'voice-conversation', message:answer,
+    speech_text:'Krótka odpowiedź.', artifacts:[],
+  })}), ttsResponse:async () => ({ok:false, status:503, blob:async () => new Blob()})});
+  b.click(); await flush(); b.click(); await flush();
+  const bubbles = b.elements.aiMessages.children.flatMap(row => row.children).map(child => child.textContent);
+  assert.ok(bubbles.includes(answer));
+  assert.equal(b.elements.aiVoiceStatus.textContent, 'Voice: błąd');
+  assert.ok(b.logs.some(entry => entry.event === 'VOICE_TTS_ERROR' && entry.error_code === 'HTTP_503'));
+});
+
+test('voice button stops playback without changing chat history', async () => {
+  const answer = 'Odpowiedź została wykonana i pozostaje w historii.';
+  const b = browser({chatResponse:async () => ({ok:true, status:200, json:async () => ({
+    status:'SUCCESS', conversation_id:'voice-conversation', message:answer,
+    speech_text:'Odpowiedź została wykonana.', artifacts:[],
+  })})});
+  b.click(); await flush(); b.click(); await flush();
+  const before = b.elements.aiMessages.children.length;
+  assert.equal(b.elements.aiVoiceStatus.textContent, 'Voice: odtwarzanie…');
+  b.click(); await flush();
+  assert.equal(b.audios[0].paused, true);
+  assert.equal(b.elements.aiVoiceStatus.textContent, 'Voice: gotowy');
+  assert.equal(b.elements.aiMessages.children.length, before);
+  assert.ok(b.logs.some(entry => entry.event === 'VOICE_TTS_STOP' && entry.stage === 'stopped'));
 });

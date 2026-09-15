@@ -64,10 +64,13 @@ from voice_io import (
     DEFAULT_STT_MODEL,
     MAX_AUDIO_BYTES,
     MAX_SPEECH_TEXT,
-    STT_LANGUAGE,
+    TranscriptionDiagnostics,
     VoiceIOError,
+    compact_speech_text,
+    observe_transcription,
     provider_from_env as voice_provider_from_env,
 )
+from voice_debug import audio_extension, save_debug_audio
 from agent_artifacts import build_artifacts
 from agent_conversation import (
     configure as configure_agent_conversation,
@@ -1326,6 +1329,11 @@ def api_internal_ai_chat():
                        message="Model asystenta nie jest jeszcze skonfigurowany."), 503
     result = run_agent_turn(current_actor_context(), payload.get("message", ""), provider,
                             conversation_id=str(payload.get("conversation_id") or ""))
+    if result.get('status') == 'SUCCESS':
+        result['speech_text'] = compact_speech_text(
+            result.get('message', ''), existing_speech_text=result.get('speech_text', ''),
+            user_message=payload.get('message', ''),
+        )
     status_code = 200 if result["status"] == "SUCCESS" else 403 if result["status"] == "DENIED" else 503
     diagnostics = result.pop('_chat_503_diagnostics', {})
     if status_code == 503:
@@ -1344,6 +1352,27 @@ def api_internal_ai_chat():
     return jsonify(result), status_code
 
 
+@app.after_request
+def voice_stt_rejected_request_diagnostic(response):
+    # Observe rejections before the endpoint (auth/CSRF/HTTP parsing), without reading audio.
+    if (request.path != '/api/internal/ai/voice/transcribe' or request.method != 'POST'
+            or 'X-Voice-Request-Id' in response.headers):
+        return response
+    request_id = uuid.uuid4().hex
+    response.headers['X-Voice-Request-Id'] = request_id
+    model = (getattr(VOICE_IO_PROVIDER, 'stt_model', '')
+             or os.environ.get('AI_STT_MODEL', DEFAULT_STT_MODEL))
+    app.logger.warning('VOICE_STT_ERROR %s', json.dumps({
+        'request_id': request_id, 'stage': 'before_transcription',
+        'error_code': f'HTTP_{response.status_code}', 'http_status': response.status_code,
+        'capture_duration_ms': None, 'blob_size': None, 'mime_type': None,
+        'file_extension': None, 'configured_stt_model': model, 'stt_model': model,
+        'language': TranscriptionDiagnostics().language,
+        'provider_http_status': None, 'provider_latency_ms': None, 'latency_ms': None,
+    }, sort_keys=True))
+    return response
+
+
 @app.post('/api/internal/ai/voice/transcribe')
 @require_permission('inventory.read')
 def api_internal_ai_voice_transcribe():
@@ -1352,27 +1381,42 @@ def api_internal_ai_voice_transcribe():
     audio_size = 0
     stt_model = (getattr(VOICE_IO_PROVIDER, 'stt_model', '')
                  or os.environ.get('AI_STT_MODEL', DEFAULT_STT_MODEL))
+    metrics = TranscriptionDiagnostics(configured_stt_model=stt_model)
+    request_id = uuid.uuid4().hex
+    capture_duration_ms = None
+    debug_audio_id = None
 
-    def diagnostic(event, stage, *, status=None, error_code='', provider_status=None):
+    def diagnostic(event, stage, *, status=None, error_code=''):
         payload = {
+            'request_id': request_id, 'capture_duration_ms': capture_duration_ms,
             'stage': stage, 'mime_type': content_type if content_type in ALLOWED_AUDIO_TYPES else '',
+            'file_extension': audio_extension(content_type),
             'blob_size': audio_size, 'http_status': status,
             'latency_ms': round((time.perf_counter() - started) * 1000, 2),
-            'error_code': error_code, 'language': STT_LANGUAGE, 'stt_model': stt_model,
-            'provider_http_status': provider_status,
+            'error_code': error_code, 'language': metrics.language,
+            'stt_model': metrics.configured_stt_model,
+            'configured_stt_model': metrics.configured_stt_model,
+            'provider_http_status': metrics.provider_http_status,
+            'provider_latency_ms': metrics.provider_latency_ms,
         }
+        if debug_audio_id is not None:
+            payload['debug_audio_id'] = debug_audio_id
         app.logger.log(logging.WARNING if error_code else logging.INFO,
                        '%s %s', event, json.dumps(payload, sort_keys=True))
 
-    def failure(code, status, stage='upload_validation', provider_status=None):
-        diagnostic('VOICE_STT_ERROR', stage, status=status, error_code=code,
-                   provider_status=provider_status)
-        return jsonify(ok=False, error_code=code), status
+    def failure(code, status, stage='upload_validation'):
+        diagnostic('VOICE_STT_ERROR', stage, status=status, error_code=code)
+        return jsonify(ok=False, error_code=code), status, {'X-Voice-Request-Id': request_id}
 
     diagnostic('VOICE_STT_REQUEST_START', 'upload')
     if not _rate_limit('internal_ai_voice_stt', 20, 60):
         return failure('RATE_LIMITED', 429)
     upload = request.files.get('audio')
+    raw_duration = request.form.get('capture_duration_ms', '')
+    if len(raw_duration) <= 9 and raw_duration.isascii() and raw_duration.isdigit():
+        duration = int(raw_duration)
+        if 0 <= duration <= 86400000:
+            capture_duration_ms = duration
     content_type = (upload.content_type or '').split(';', 1)[0].strip().lower() if upload else ''
     if upload is None:
         return failure('MISSING_AUDIO', 400)
@@ -1384,26 +1428,36 @@ def api_internal_ai_voice_transcribe():
         return failure('EMPTY_AUDIO', 400)
     if audio_size > MAX_AUDIO_BYTES:
         return failure('AUDIO_TOO_LARGE', 400)
+    actor = current_actor_context()
     try:
-        text = (VOICE_IO_PROVIDER or voice_provider_from_env()).transcribe(
-            audio, filename=upload.filename or 'recording.webm', content_type=content_type,
-        )
+        debug_audio_id = save_debug_audio(audio, content_type, is_admin=bool(
+            actor and actor.actor_type == 'HUMAN' and 'OWNER' in actor.roles))
+    except OSError:
+        diagnostic('VOICE_STT_DEBUG_ERROR', 'debug_audio', error_code='DEBUG_AUDIO_STORAGE_ERROR')
+    try:
+        with observe_transcription(metrics):
+            text = (VOICE_IO_PROVIDER or voice_provider_from_env()).transcribe(
+                audio, filename=upload.filename or 'recording.webm', content_type=content_type,
+            )
         if not isinstance(text, str):
             return failure('STT_INVALID_RESPONSE', 503, 'provider_response')
         text = text.strip()
         if not text:
             return failure('STT_EMPTY_TRANSCRIPT', 503, 'provider_response')
     except VoiceIOError as exc:
-        return failure(exc.error_code, 503, exc.stage, exc.http_status)
+        if metrics.provider_http_status is None:
+            metrics.provider_http_status = exc.http_status
+        return failure(exc.error_code, 503, exc.stage)
     except Exception:
         return failure('STT_BACKEND_ERROR', 503, 'provider')
-    diagnostic('VOICE_STT_RESPONSE', 'complete', status=200, provider_status=200)
-    return jsonify(ok=True, text=text)
+    diagnostic('VOICE_STT_RESPONSE', 'complete', status=200)
+    return jsonify(ok=True, text=text), 200, {'X-Voice-Request-Id': request_id}
 
 
 @app.post('/api/internal/ai/voice/synthesize')
 @require_permission('inventory.read')
 def api_internal_ai_voice_synthesize():
+    started = time.perf_counter()
     if not _rate_limit('internal_ai_voice_tts', 30, 60):
         return jsonify(ok=False, error_code='RATE_LIMITED'), 429
     payload = request.get_json(silent=True) or {}
@@ -1411,9 +1465,29 @@ def api_internal_ai_voice_synthesize():
     if not text or len(text) > MAX_SPEECH_TEXT:
         return jsonify(ok=False, error_code='INVALID_SPEECH_TEXT'), 400
     try:
-        audio = (VOICE_IO_PROVIDER or voice_provider_from_env()).synthesize(text)
-    except VoiceIOError:
+        provider = VOICE_IO_PROVIDER or voice_provider_from_env()
+        audio = provider.synthesize(text)
+    except VoiceIOError as exc:
+        app.logger.warning('VOICE_TTS_ERROR %s', json.dumps({
+            'stage': exc.stage, 'error_code': exc.error_code,
+            'exception_type': type(exc).__name__, 'provider_http_status': exc.http_status,
+            'latency_ms': round((time.perf_counter() - started) * 1000, 2),
+        }, sort_keys=True))
         return jsonify(ok=False, error_code='TTS_FAILED'), 503
+    except Exception as exc:
+        app.logger.warning('VOICE_TTS_ERROR %s', json.dumps({
+            'stage': 'provider', 'error_code': 'TTS_BACKEND_ERROR',
+            'exception_type': type(exc).__name__, 'provider_http_status': None,
+            'latency_ms': round((time.perf_counter() - started) * 1000, 2),
+        }, sort_keys=True))
+        return jsonify(ok=False, error_code='TTS_FAILED'), 503
+    app.logger.info('VOICE_TTS_RESPONSE %s', json.dumps({
+        'stage': 'complete', 'http_status': 200,
+        'tts_model': getattr(provider, 'tts_model', None),
+        'voice': getattr(provider, 'voice', None),
+        'audio_type': audio.content_type,
+        'latency_ms': round((time.perf_counter() - started) * 1000, 2),
+    }, sort_keys=True))
     return send_file(io.BytesIO(audio.content), mimetype=audio.content_type, download_name='speech.mp3')
 
 
