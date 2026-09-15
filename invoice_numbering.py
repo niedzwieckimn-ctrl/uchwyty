@@ -1,135 +1,116 @@
-"""Invoice numbering with an explicit, user-controlled cursor per period."""
+"""Shared invoice numbering for the UI and fulfillment business operation."""
 import re
 import urllib.error
 from datetime import datetime
 
 
 _STANDARD_NUMBER = r"FVAT (\d+)/{}"
+_CLAIM_TTL_MINUTES = 10
 
 
 def initialize(c):
+    """Keep only short-lived race claims; issued invoices are the sequence truth."""
+    # The counter table remains for backwards-compatible database startup, but
+    # numbering no longer reads or writes it.
     c.execute('CREATE TABLE IF NOT EXISTS invoice_number_counters(period TEXT PRIMARY KEY, last_number INTEGER NOT NULL)')
     c.execute('CREATE TABLE IF NOT EXISTS invoice_number_claims(invoice_no TEXT PRIMARY KEY, created_at TEXT NOT NULL)')
 
-    # Convert the former permanent-history model once. Its claims included every
-    # deleted draft and its counters could only grow.
-    legacy = c.execute(
+    legacy_permanent_claims = c.execute(
         "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name IN "
-        "('retain_invoice_number','retain_updated_invoice_number') LIMIT 1"
-    ).fetchone()
-    c.execute('DROP TRIGGER IF EXISTS retain_invoice_number')
-    c.execute('DROP TRIGGER IF EXISTS retain_updated_invoice_number')
-    if legacy:
-        c.execute('DELETE FROM invoice_number_claims')
-        c.execute('DELETE FROM invoice_number_counters')
-        invoices = c.execute("SELECT invoice_no FROM invoices WHERE invoice_no IS NOT NULL").fetchall()
-        for row in invoices:
-            match = re.fullmatch(r'FVAT (\d+)/((?:0[1-9]|1[0-2])/[0-9]{4})', str(row[0]).strip(), re.I)
-            if match:
-                c.execute(
-                    'INSERT INTO invoice_number_counters VALUES(?,?) '
-                    'ON CONFLICT(period) DO UPDATE SET last_number=MAX(last_number,excluded.last_number)',
-                    (match[2], int(match[1])),
-                )
+        "('retain_invoice_number','retain_updated_invoice_number',"
+        "'retain_final_invoice_number_insert','retain_final_invoice_number_update') LIMIT 1"
+    ).fetchone() is not None
 
-    # Claims protect only reserve -> insert/update. Direct inserts from bootstrap
-    # advance the cursor; reserved manual numbers have already set it exactly.
-    c.execute('DROP TRIGGER IF EXISTS consume_reserved_invoice_number')
+    for trigger in (
+        'retain_invoice_number', 'retain_updated_invoice_number',
+        'consume_reserved_invoice_number', 'consume_changed_invoice_number',
+        'maintain_changed_invoice_number', 'release_deleted_draft_number',
+        'retain_final_invoice_number_insert', 'retain_final_invoice_number_update',
+    ):
+        c.execute(f'DROP TRIGGER IF EXISTS {trigger}')
+
+    # A successful insert/update consumes its transient reservation. The real
+    # invoice row then protects the number through invoices.invoice_no UNIQUE.
     c.execute('''CREATE TRIGGER consume_reserved_invoice_number AFTER INSERT ON invoices BEGIN
-        INSERT INTO invoice_number_counters(period,last_number)
-        SELECT substr(NEW.invoice_no,instr(NEW.invoice_no,'/')+1),
-               CAST(substr(NEW.invoice_no,6,instr(substr(NEW.invoice_no,6),'/')-1) AS INTEGER)
-        WHERE NEW.invoice_no GLOB 'FVAT [0-9]*/[0-1][0-9]/[0-9][0-9][0-9][0-9]'
-          AND NOT EXISTS(SELECT 1 FROM invoice_number_claims WHERE lower(trim(invoice_no))=lower(trim(NEW.invoice_no)))
-        ON CONFLICT(period) DO UPDATE SET last_number=MAX(last_number,excluded.last_number);
         DELETE FROM invoice_number_claims
-         WHERE lower(trim(invoice_no))=lower(trim(NEW.invoice_no))
-           AND NOT EXISTS(SELECT 1 FROM ksef_documents k WHERE k.invoice_id=NEW.id
-             AND (COALESCE(k.ksef_number,'')<>'' OR COALESCE(k.sent_at,'')<>''
-               OR lower(COALESCE(k.status,'')) IN ('sending','processing','unknown','sent','accepted')));
+         WHERE lower(trim(invoice_no))=lower(trim(NEW.invoice_no));
     END''')
-    c.execute('DROP TRIGGER IF EXISTS maintain_changed_invoice_number')
-    c.execute('''CREATE TRIGGER maintain_changed_invoice_number AFTER UPDATE OF invoice_no ON invoices
+    c.execute('''CREATE TRIGGER consume_changed_invoice_number AFTER UPDATE OF invoice_no ON invoices
     WHEN lower(trim(OLD.invoice_no))<>lower(trim(NEW.invoice_no)) BEGIN
-        UPDATE invoice_number_counters
-           SET last_number=CAST(substr(OLD.invoice_no,6,instr(substr(OLD.invoice_no,6),'/')-1) AS INTEGER)-1
-         WHERE OLD.invoice_no GLOB 'FVAT [0-9]*/[0-1][0-9]/[0-9][0-9][0-9][0-9]'
-           AND period=substr(OLD.invoice_no,instr(OLD.invoice_no,'/')+1)
-           AND last_number=CAST(substr(OLD.invoice_no,6,instr(substr(OLD.invoice_no,6),'/')-1) AS INTEGER);
-        INSERT INTO invoice_number_counters(period,last_number)
-        SELECT substr(NEW.invoice_no,instr(NEW.invoice_no,'/')+1),
-               CAST(substr(NEW.invoice_no,6,instr(substr(NEW.invoice_no,6),'/')-1) AS INTEGER)
-        WHERE NEW.invoice_no GLOB 'FVAT [0-9]*/[0-1][0-9]/[0-9][0-9][0-9][0-9]'
-          AND NOT EXISTS(SELECT 1 FROM invoice_number_claims WHERE lower(trim(invoice_no))=lower(trim(NEW.invoice_no)))
-        ON CONFLICT(period) DO UPDATE SET last_number=MAX(last_number,excluded.last_number);
         DELETE FROM invoice_number_claims
-         WHERE lower(trim(invoice_no))=lower(trim(NEW.invoice_no))
-           AND NOT EXISTS(SELECT 1 FROM ksef_documents k WHERE k.invoice_id=NEW.id
-             AND (COALESCE(k.ksef_number,'')<>'' OR COALESCE(k.sent_at,'')<>''
-               OR lower(COALESCE(k.status,'')) IN ('sending','processing','unknown','sent','accepted')));
-    END''')
-    c.execute('DROP TRIGGER IF EXISTS release_deleted_draft_number')
-    c.execute('''CREATE TRIGGER release_deleted_draft_number AFTER DELETE ON invoices BEGIN
-        UPDATE invoice_number_counters
-           SET last_number=CAST(substr(OLD.invoice_no,6,instr(substr(OLD.invoice_no,6),'/')-1) AS INTEGER)-1
-         WHERE OLD.invoice_no GLOB 'FVAT [0-9]*/[0-1][0-9]/[0-9][0-9][0-9][0-9]'
-           AND period=substr(OLD.invoice_no,instr(OLD.invoice_no,'/')+1)
-           AND last_number=CAST(substr(OLD.invoice_no,6,instr(substr(OLD.invoice_no,6),'/')-1) AS INTEGER);
+         WHERE lower(trim(invoice_no))=lower(trim(NEW.invoice_no));
     END''')
 
-    # A finalized KSeF document keeps a permanent claim even if its invoice row
-    # is later removed outside the protected application flow.
-    c.execute('DROP TRIGGER IF EXISTS retain_final_invoice_number_insert')
-    c.execute('''CREATE TRIGGER retain_final_invoice_number_insert AFTER INSERT ON ksef_documents
-    WHEN COALESCE(NEW.ksef_number,'')<>'' OR COALESCE(NEW.sent_at,'')<>''
-      OR lower(COALESCE(NEW.status,'')) IN ('sending','processing','unknown','sent','accepted') BEGIN
-        INSERT OR IGNORE INTO invoice_number_claims(invoice_no,created_at)
-        SELECT invoice_no,COALESCE(NEW.updated_at,'') FROM invoices WHERE id=NEW.invoice_id;
-    END''')
-    c.execute('DROP TRIGGER IF EXISTS retain_final_invoice_number_update')
-    c.execute('''CREATE TRIGGER retain_final_invoice_number_update AFTER UPDATE ON ksef_documents
-    WHEN COALESCE(NEW.ksef_number,'')<>'' OR COALESCE(NEW.sent_at,'')<>''
-      OR lower(COALESCE(NEW.status,'')) IN ('sending','processing','unknown','sent','accepted') BEGIN
-        INSERT OR IGNORE INTO invoice_number_claims(invoice_no,created_at)
-        SELECT invoice_no,COALESCE(NEW.updated_at,'') FROM invoices WHERE id=NEW.invoice_id;
-    END''')
-    c.execute('''INSERT OR IGNORE INTO invoice_number_claims(invoice_no,created_at)
-        SELECT i.invoice_no,COALESCE(k.updated_at,i.created_at,'')
-          FROM invoices i JOIN ksef_documents k ON k.invoice_id=i.id
-         WHERE COALESCE(k.ksef_number,'')<>'' OR COALESCE(k.sent_at,'')<>''
-            OR lower(COALESCE(k.status,'')) IN ('sending','processing','unknown','sent','accepted')''')
+    # Remove records that cannot be active reservations. Fresh orphan claims are
+    # retained briefly because another worker may be between reserve and insert.
+    c.execute('DELETE FROM invoice_number_counters')
+    if legacy_permanent_claims:
+        c.execute('DELETE FROM invoice_number_claims')
+    c.execute('''DELETE FROM invoice_number_claims
+                  WHERE EXISTS(SELECT 1 FROM invoices
+                                WHERE lower(trim(invoices.invoice_no))=lower(trim(invoice_number_claims.invoice_no)))
+                     OR datetime(created_at) IS NULL
+                     OR datetime(created_at) < datetime('now','localtime',?)''',
+              (f'-{_CLAIM_TTL_MINUTES} minutes',))
 
 
 def _period(issue_date):
     return datetime.strptime(issue_date, '%Y-%m-%d').strftime('%m/%Y')
 
 
-def _cursor(c, period):
-    row = c.execute('SELECT last_number FROM invoice_number_counters WHERE period=?', (period,)).fetchone()
-    return max(0, int(row[0])) if row else 0
-
-
-def _is_used(c, number):
+def _real_invoice_exists(c, number):
     return c.execute(
-        '''SELECT 1 FROM invoices WHERE lower(trim(invoice_no))=lower(trim(?))
-           UNION ALL
-           SELECT 1 FROM invoice_number_claims WHERE lower(trim(invoice_no))=lower(trim(?)) LIMIT 1''',
-        (number, number),
+        'SELECT 1 FROM invoices WHERE lower(trim(invoice_no))=lower(trim(?)) LIMIT 1',
+        (number,),
     ).fetchone() is not None
 
 
-def _next_available(c, period, start=0):
-    candidate = max(_cursor(c, period) + 1, int(start or 0), 1)
-    while _is_used(c, f'FVAT {candidate}/{period}'):
+def _last_real_sequence(c, period):
+    highest = 0
+    rows = c.execute(
+        "SELECT invoice_no FROM invoices WHERE lower(trim(invoice_no)) LIKE lower(?)",
+        (f'FVAT %/{period}',),
+    ).fetchall()
+    pattern = re.compile(_STANDARD_NUMBER.format(re.escape(period)), re.I)
+    for row in rows:
+        match = pattern.fullmatch(str(row[0] or '').strip())
+        if match:
+            highest = max(highest, int(match[1]))
+    return highest
+
+
+def _next_real_number(c, period, start=0):
+    candidate = max(_last_real_sequence(c, period) + 1, int(start or 0), 1)
+    while _real_invoice_exists(c, f'FVAT {candidate}/{period}'):
         candidate += 1
     return candidate
 
 
+def _claim_is_live(c, number):
+    return c.execute(
+        '''SELECT 1 FROM invoice_number_claims
+            WHERE lower(trim(invoice_no))=lower(trim(?))
+              AND datetime(created_at) >= datetime('now','localtime',?) LIMIT 1''',
+        (number, f'-{_CLAIM_TTL_MINUTES} minutes'),
+    ).fetchone() is not None
+
+
+def _drop_stale_claim(c, number):
+    c.execute(
+        '''DELETE FROM invoice_number_claims
+            WHERE lower(trim(invoice_no))=lower(trim(?))
+              AND (datetime(created_at) IS NULL
+                   OR datetime(created_at) < datetime('now','localtime',?))''',
+        (number, f'-{_CLAIM_TTL_MINUTES} minutes'),
+    )
+
+
 def preview(b, issue_date):
+    """Return max(real issued invoice in the period) + 1, ignoring claims."""
     period = _period(issue_date)
     c = b.conn()
     try:
-        return f'FVAT {_next_available(c, period)}/{period}'
+        return f'FVAT {_next_real_number(c, period)}/{period}'
     finally:
         c.close()
 
@@ -139,8 +120,30 @@ def _remote_collision(exc):
         return False
     body = exc.read().decode('utf-8', errors='replace').lower()
     return any(marker in body for marker in (
-        'invoice number was already used', 'invoice_number_claims_pkey', 'duplicate key value',
+        'invoice number was already used', 'invoice number is currently reserved',
+        'invoice_number_claims_pkey', 'duplicate key value',
     ))
+
+
+def _reserve_local(c, b, period, custom):
+    if custom:
+        number = custom
+        if _real_invoice_exists(c, number):
+            raise ValueError('Numer faktury został już wykorzystany.')
+        _drop_stale_claim(c, number)
+        if _claim_is_live(c, number):
+            raise ValueError('Numer faktury jest obecnie rezerwowany. Spróbuj ponownie.')
+    else:
+        candidate = _next_real_number(c, period)
+        number = f'FVAT {candidate}/{period}'
+        _drop_stale_claim(c, number)
+        if _claim_is_live(c, number):
+            # Do not skip to a higher number: if the competing request fails,
+            # that would turn its technical claim into a permanent sequence gap.
+            raise ValueError('Numer faktury jest obecnie rezerwowany. Spróbuj ponownie.')
+    c.execute('INSERT INTO invoice_number_claims(invoice_no,created_at) VALUES(?,?)',
+              (number, b.now_iso()))
+    return number
 
 
 def reserve(b, issue_date, requested='', *, manual=False):
@@ -149,36 +152,36 @@ def reserve(b, issue_date, requested='', *, manual=False):
     if manual and not requested:
         raise ValueError('Numer faktury jest wymagany.')
     custom = requested if manual else ''
-    selected = re.fullmatch(_STANDARD_NUMBER.format(re.escape(period)), requested, re.I) if requested and not manual else None
-    requested_min = int(selected[1]) if selected else 0
+
     if b.supabase_enabled():
         try:
-            result = b.supabase_request('/rest/v1/rpc/reserve_invoice_number', method='POST',
-                                        payload={'p_period': period, 'p_custom': custom, 'p_requested_min': requested_min})
+            number = b.supabase_request(
+                '/rest/v1/rpc/reserve_invoice_number', method='POST',
+                # Keep the deployed RPC signature compatible. Automatic
+                # numbering deliberately ignores a stale form suggestion.
+                payload={'p_period': period, 'p_custom': custom, 'p_requested_min': 0},
+            )
         except urllib.error.HTTPError as exc:
             if _remote_collision(exc):
-                raise ValueError('Numer faktury został już wykorzystany.') from None
+                raise ValueError('Numer faktury został już wykorzystany lub jest właśnie rezerwowany.') from None
             raise
-        if not isinstance(result, str) or not result:
+        if not isinstance(number, str) or not number:
             raise ValueError('Nie potwierdzono rezerwacji numeru faktury. Sprawdź migrację numeracji.')
-        number = result
     else:
         number = None
+
     c = b.conn()
     try:
         c.execute('BEGIN IMMEDIATE')
         if number is None:
-            number = custom or f'FVAT {_next_available(c, period, requested_min)}/{period}'
-        if _is_used(c, number):
-            raise ValueError('Numer faktury został już wykorzystany.')
-        c.execute('INSERT INTO invoice_number_claims VALUES(?,?)', (number, b.now_iso()))
-        match = re.fullmatch(_STANDARD_NUMBER.format(re.escape(period)), number, re.I)
-        if match:
-            c.execute(
-                'INSERT INTO invoice_number_counters VALUES(?,?) '
-                'ON CONFLICT(period) DO UPDATE SET last_number=excluded.last_number',
-                (period, int(match[1])),
-            )
+            number = _reserve_local(c, b, period, custom)
+        else:
+            # Supabase serialized the global reservation. Mirror it locally so
+            # the insert trigger can consume it; local history cannot override it.
+            if _real_invoice_exists(c, number):
+                raise ValueError('Numer faktury został już wykorzystany.')
+            c.execute('INSERT OR REPLACE INTO invoice_number_claims(invoice_no,created_at) VALUES(?,?)',
+                      (number, b.now_iso()))
         c.commit()
         return number
     except Exception:

@@ -633,6 +633,16 @@ def perform(name, data, actor):
                 reconciliation_store.publish(b, oid)
             plan = _check_response(b.order_invoice_service(oid, request=request_view('GET'), session={}, structured=True))
             form = dict(plan['defaults'])
+            manual_invoice_no = str(data.get('invoice_no') or '').strip()
+            if manual_invoice_no:
+                form['invoice_no'] = manual_invoice_no
+                form['invoice_no_manual'] = '1'
+            else:
+                # The BO uses the same auto suggestion and dirty-marker contract
+                # as the browser form. It does not reinterpret that suggestion as
+                # an agent-supplied manual number.
+                form['suggested_invoice_no'] = form.get('invoice_no', '')
+                form['invoice_no_manual'] = '0'
             form.update({f'invoice_qty_{iid}': qty for iid, qty in plan['packing_qty'].items()})
             result = _check_response(b.order_invoice_service(oid, request=request_view(form=form), session={}, structured=True))
         inv = b.load_invoice_with_meta(result['invoice_id'])
@@ -841,6 +851,11 @@ def install(ops):
             if name.endswith('.add'): props['product_id'] = {'type': 'integer', 'minimum': 1}; required += ['product_id']
             else: props['item_id'] = {'type': 'integer', 'minimum': 1}; required += ['item_id']
             if not name.endswith('.remove'): props['quantity'] = {'type': 'integer', 'minimum': 1}; required += ['quantity']
+        if name == 'orders.invoice.create':
+            props['invoice_no'] = {
+                'type': 'string', 'minLength': 1, 'maxLength': 100,
+                'description': 'Opcjonalny ręczny numer faktury. Bez niego wspólny backend nada numer automatycznie.',
+            }
         if name == 'shipping.requirements.update':
             props.update({k: {'type': 'number'} for k in ('length', 'width', 'height', 'weight')})
             props.update({k: {'type': 'string'} for k in ('carrier', 'dimension_unit', 'weight_unit', 'weight_source')})
