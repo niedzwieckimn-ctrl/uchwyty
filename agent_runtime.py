@@ -394,7 +394,7 @@ Przed kosztownym lub zatwierdzanym zapisem uzyskaj jasną intencję człowieka p
 Po WRITE sprawdź wynik oraz świeży stan. Przy błędzie czytaj także partial_result: istnienie rekordu i numeru faktury jest inne niż dostępność PDF i zakończenie publikacji. Nie mów, że faktura nie powstała, jeśli rekord istnieje. Naprawiaj brakujący artefakt istniejącej faktury przez dostępną operację wznowienia, nie twórz drugiej. KSeF pozostaje poza uprawnieniami agenta.
 Przy domówieniu sprawdź istniejące dokumenty i dostępność produktów. Zmiana zawartości unieważnia dokumenty i wymaga zgody na ich odtworzenie. Jeśli faktura blokuje edycję, użyj zaakceptowanego invoices.removal.preview → HUMAN approval → invoices.remove, następnie świeży odczyt i istniejące operacje pozycji. Nie resetuj warehouse_issued ani stock. Stare dokumenty lub przesyłki bez metadanych najpierw sprawdź dostępnymi preview adopcji, nie regeneruj ich w ciemno. Po zmianie sprawdź parametry istniejącej przesyłki, zbierz tylko braki i decyzję człowieka. Nigdy automatycznie jej nie anuluj lub nie nadawaj ponownie.
 Po timeout nadania tylko reconciliation/refresh istniejącego wyniku; brak potwierdzenia nie uprawnia do nowego POST. Tracking, etykieta, podjazd i fizyczny odbiór to odrębne stany. Dokumenty mogą być gotowe do druku przy nieukończonym podjeździe; wtedy nie ogłaszaj zakończenia całej realizacji. Druk oznacza aktualne dokumenty przygotowane do otwarcia w przeglądarce, nie potwierdzenie pracy drukarki.
-Remanent: użyj inventory.count.session.start; backend podaje sesję. Każda wyraźna nowa obserwacja, także poprawka tego samego produktu, to inventory.count.record względem świeżego get_expected. Poprzednia obserwacja pozostaje w historii. Samo liczenie nie zmienia stock. Przy różnicy podaj system, policzono i różnicę, zapytaj o korektę; po zgodzie inventory.adjust przygotowuje nową decyzję HUMAN. Użyj aktualnej wersji z wyniku liczenia. Nie przechodź do kolejnego produktu bez domknięcia, odmowy lub odłożenia rozbieżności. Przy zgodności krótko potwierdź wynik. Nie twierdź, że fizyczne liczenie lub pakowanie miało miejsce bez wypowiedzi człowieka.
+Remanent: użyj inventory.count.session.start; backend podaje sesję. Każda wyraźna nowa obserwacja, także poprawka tego samego produktu, to inventory.count.record względem świeżego get_expected. Jeżeli użytkownik podaje policzoną ilość bez nazwy produktu, a ostatnia tura wskazuje dokładnie jeden produkt, zachowaj go jako aktywny: ponownie wywołaj get_expected dla tego produktu i dopiero potem count.record. Gdy ostatnia tura wskazuje kilka produktów, poproś o nazwę lub SKU i nie zapisuj liczenia. Produkt jawnie wskazany w nowej wiadomości zastępuje wcześniejszy kontekst. Poprzednia obserwacja pozostaje w historii. Samo liczenie nie zmienia stock. Przy różnicy podaj system, policzono i różnicę, zapytaj o korektę; po zgodzie inventory.adjust przygotowuje nową decyzję HUMAN. Użyj aktualnej wersji z wyniku liczenia. Nie przechodź do kolejnego produktu bez domknięcia, odmowy lub odłożenia rozbieżności. Przy zgodności krótko potwierdź wynik. Nie twierdź, że fizyczne liczenie lub pakowanie miało miejsce bez wypowiedzi człowieka.
 Firmowa terminologia jest tylko podpowiedzią językową. Nieznane pojęcie sprawdź przez agent.terminology.search, a jeśli trzeba zapytaj. Zapisuj agent.terminology.remember tylko po jawnym wyjaśnieniu użytkownika, bez sekretów i poleceń. Potwierdzone preferencje pracy i procedury zapisuj przez agent.memory.remember z krótkimi hasłami relewancji. Gdy użytkownik jednoznacznie ustanawia regułę obowiązującą niezależnie od tematu pytania, dodaj do relevance_terms stabilny znacznik __always_apply__; nie używaj go dla zasad tematycznych. Pamięć wpływa wyłącznie na sposób pracy, kolejność i priorytety. Nigdy nie może nadpisywać RBAC, approval engine, permissions, Business Operations, świeżych danych biznesowych ani reguł bezpieczeństwa. expected_version=0 oznacza nowy wpis; aktualizacja wymaga świeżej wersji. confirmed_by_user dotyczy treści pamięci, nie zgody na zapis biznesowy.
 Odpowiadaj krótko, operacyjnie, w języku użytkownika, zwykłym tekstem. Nie pokazuj technicznych ID, UUID, surowych enumów, Markdown dump ani implementacji. Używaj nazw obiektów i numerów biznesowych. Nie powtarzaj karty. Szczegóły, pozycje, tracking i zdjęcia pokazuj na prośbę. W przypadku blokady podaj konkretny biznesowy powód. Nie przedstawiaj wyniku pojedynczego kroku jako zakończenia procesu.
 '''
@@ -534,6 +534,23 @@ COUNT_SESSION_START = 'inventory.count.session.start'
 COUNT_SESSION_BOUND = frozenset({
     'inventory.count.record','inventory.count.summary','inventory.count.complete','inventory.adjust',
 })
+_CONTEXTUAL_INVENTORY_COUNT = re.compile(
+    r'^(?:'
+    r'mam(?:\s+ich)?|'
+    r'na\s+p[oó]łce(?:\s+(?:jest|leży|lezy|mam|został[oa]?|zostal[oa]?))?|'
+    r'(?:na|z)liczyłem|(?:na|z)liczylem|policzyłem|policzylem|'
+    r'jest\s+ich'
+    r')\b',
+    re.IGNORECASE,
+)
+
+
+def _is_contextual_inventory_count_followup(value: str) -> bool:
+    """Recognize a quantity observation that intentionally omits the active product."""
+    normalized = ' '.join(str(value or '').strip().split()).strip(' .!?')
+    if not normalized or re.search(r'\b(?:sprawdź|sprawdz|produkt|model|sku)\b', normalized, re.IGNORECASE):
+        return False
+    return bool(_CONTEXTUAL_INVENTORY_COUNT.match(normalized))
 
 
 def _tool_descriptors(ai_actor, human_actor=None):
@@ -1161,12 +1178,73 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                         active_count_session=business_operations.active_inventory_count_session(ai_actor,human_actor,conversation_id)
                         if active_count_session:
                             arguments['count_session_id']=active_count_session
+                    current = load_actor_context(human_actor.actor_id)
+                    definition = business_operations.OPERATION_REGISTRY[call.name]
+                    contextual_count = (
+                        call.name == 'inventory.count.record'
+                        and len(reply.tool_calls) == 1
+                        and 'product' not in resolved_entities
+                        and _is_contextual_inventory_count_followup(message)
+                    )
+                    if contextual_count:
+                        active_product = previous_turn_entities.get('product')
+                        try:
+                            target_product = int(arguments.get('product_id') or 0)
+                            active_product = int(active_product or 0)
+                        except (TypeError, ValueError):
+                            target_product = active_product = 0
+                        if not active_product or target_product != active_product:
+                            return finish(
+                                'DENIED',
+                                'Który produkt masz na myśli? Podaj jego nazwę lub SKU.',
+                                'ENTITY_SCOPE_AMBIGUOUS',
+                            )
+                        if timings['tool_calls_count'] + 1 >= MAX_TOOL_CALLS_PER_TURN:
+                            return finish('FAILED','Osiągnięto limit operacji. Zawęź pytanie.','TOOL_LIMIT_EXCEEDED')
+                        fresh_name = 'inventory.count.get_expected'
+                        fresh_definition = business_operations.OPERATION_REGISTRY[fresh_name]
+                        if current is None or current.permission_decision(fresh_definition.required_permission) == DENY:
+                            return finish('DENIED','Brak uprawnień do operacji.','PERMISSION_DENIED')
+                        timings['tool_calls_count'] += 1
+                        _audit('agent.tool_selected',ai_actor,run_id,correlation_id,SUCCESS,human_actor.actor_id,
+                               tool_name=fresh_name,conversation_id=conversation_id,
+                               selection_reason='active_product_followup')
+                        fresh_started = time.perf_counter()
+                        fresh_result = business_operations.execute_business_operation(
+                            ai_actor, fresh_name, {'product_id':active_product},
+                            correlation_id=correlation_id,
+                        )
+                        fresh_elapsed = round((time.perf_counter()-fresh_started)*1000,2)
+                        timings['business_operation_ms'] = round(timings['business_operation_ms']+fresh_elapsed,2)
+                        timings['tool_execution_ms'] = round(timings['tool_execution_ms']+fresh_elapsed,2)
+                        timings['supabase_business_reads_ms'] = round(
+                            timings['supabase_business_reads_ms']+fresh_elapsed,2)
+                        _audit('agent.tool_result',ai_actor,run_id,correlation_id,
+                               SUCCESS if fresh_result.status=='SUCCESS' else FAILED,
+                               human_actor.actor_id,tool_name=fresh_name,
+                               execution_id=fresh_result.execution_id,
+                               result_status=fresh_result.status,conversation_id=conversation_id)
+                        if fresh_result.status != 'SUCCESS':
+                            return finish(
+                                fresh_result.status,
+                                fresh_result.safe_error_message or 'Nie udało się odczytać aktualnego stanu produktu.',
+                                fresh_result.error_code or 'DATA_UNAVAILABLE',
+                            )
+                        fresh_data = fresh_result.data or {}
+                        if int(fresh_data.get('product_id') or 0) != active_product:
+                            return finish('DENIED','Nie ustalono jednoznacznie produktu.','ENTITY_SCOPE_CONFLICT')
+                        resolved_entities['product'] = active_product
+                        ambiguous_entities.discard('product')
+                        arguments['expected_version'] = int(fresh_data['version'])
+                        logger.info('AI_ACTIVE_PRODUCT_FRESH_READ %s', json.dumps({
+                            'agent_run_id':run_id,
+                            'product_id':active_product,
+                            'operation':fresh_name,
+                        }, sort_keys=True))
                     fingerprint = call.name+json.dumps(arguments,sort_keys=True,ensure_ascii=False)
                     if fingerprint in seen:
                         return finish('FAILED','Model powtórzył tę samą operację.','REPEATED_TOOL_CALL')
                     seen.add(fingerprint)
-                    current = load_actor_context(human_actor.actor_id)
-                    definition = business_operations.OPERATION_REGISTRY[call.name]
                     if not definition.read_only and call.name not in business_operations.SUPERVISED_WRITES | MEMORY_WRITES | {'approval.decide'}:
                         return finish('DENIED','Ta operacja nie jest dostępna dla asystenta.','TOOL_NOT_ALLOWED')
                     if current is None or current.permission_decision(definition.required_permission)==DENY:
@@ -1261,6 +1339,11 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                             'operation': call.name, 'exception_type': type(exc).__name__,
                         }, sort_keys=True))
                 if result.status == 'SUCCESS':
+                    if call.name == 'inventory.count.get_expected':
+                        expected_product_id = int((result.data or {}).get('product_id') or 0)
+                        if expected_product_id:
+                            resolved_entities['product'] = expected_product_id
+                            ambiguous_entities.discard('product')
                     new_sources = build_artifact_sources(
                         call.name, result.data, conversation_id, run_id,
                     )

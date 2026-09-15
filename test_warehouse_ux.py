@@ -165,6 +165,221 @@ def _prepare_adjustment(owner, conversation_id, product_id, expected_version=0):
     ],conversation_id)
 
 
+def _read_active_product(owner, conversation_id, product_id, display_name):
+    return run(owner, f'Sprawdź {display_name}', [
+        runtime.ProviderResponse(tool_calls=(runtime.ToolCall(
+            'product', 'inventory.product.get', json.dumps({'product_id':product_id})),), model='fake'),
+        runtime.ProviderResponse(text=f'{display_name}. Stan magazynowy: odczytany.', model='fake'),
+    ], conversation_id)
+
+
+def _contextual_count(owner, conversation_id, product_id, counted, message, display_name):
+    return run(owner, message, [
+        runtime.ProviderResponse(tool_calls=(runtime.ToolCall(
+            'count', 'inventory.count.record', json.dumps({
+                'product_id':product_id,
+                'counted_quantity':counted,
+                # The runtime must replace this stale model value with the fresh READ version.
+                'expected_version':999,
+                'idempotency_key':f'context-count-{product_id}-{counted}',
+            })),), model='fake'),
+        runtime.ProviderResponse(text=(
+            f'{display_name} — zapisano liczenie:\n'
+            f'stan systemowy odczytany ponownie\npoliczono {counted}\n'
+            f'Czy przygotować korektę stanu do {counted} szt.?'
+        ), model='fake'),
+    ], conversation_id)
+
+
+@pytest.mark.parametrize('message', [
+    'mam 100',
+    'na półce jest 100',
+    'na półce leży mi tylko sto',
+    'naliczyłem 100',
+    'jest ich tylko 100',
+])
+def test_contextual_count_language_keeps_active_product(message):
+    assert runtime._is_contextual_inventory_count_followup(message) is True
+
+
+def test_explicit_product_language_does_not_reuse_active_product():
+    assert runtime._is_contextual_inventory_count_followup(
+        'Sprawdź Winsor 128 BB, mam 10') is False
+
+
+@pytest.mark.parametrize(('display_name','stock','message','counted'), [
+    ('Tom 128 BB', 108, 'Na półce jest 100', 100),
+    ('Cerne 128 BB', 7, 'Mam trzy', 3),
+])
+def test_active_product_count_followup_performs_fresh_read_before_write(
+        isolated, display_name, stock, message, counted):
+    product_id = _add_counted_product(
+        product_id=920 + counted, model=display_name, quantity=stock)
+    owner = _owner()
+    opened = start(owner)
+    _read_active_product(owner, opened['conversation_id'], product_id, display_name)
+
+    result = _contextual_count(
+        owner, opened['conversation_id'], product_id, counted, message, display_name)
+
+    assert result['status'] == 'SUCCESS'
+    assert result['error_code'] == ''
+    card = next(item for item in result['artifacts'] if item['type'] == 'inventory_count_card')
+    assert card['display_name'] == display_name
+    assert (card['expected_quantity'], card['counted_quantity'], card['difference']) == (
+        stock, counted, counted-stock)
+    assert f'policzono {counted}' in result['message']
+    assert f'korektę stanu do {counted}' in result['message']
+    # One automatic get_expected READ and one count.record WRITE were executed.
+    assert result['tool_calls'] == 2
+    db = backend.conn()
+    try:
+        records = db.execute(
+            "SELECT COUNT(*) FROM internal_inventory_count_items WHERE product_id=?",
+            (product_id,),
+        ).fetchone()[0]
+    finally:
+        db.close()
+    assert records == 1
+
+
+def test_model_planned_get_expected_satisfies_same_turn_write_guard(isolated):
+    product_id = _add_counted_product(product_id=930, model='Tom 128 BB', quantity=108)
+    owner = _owner()
+    opened = start(owner)
+    _read_active_product(owner, opened['conversation_id'], product_id, 'Tom 128 BB')
+
+    result = run(owner, 'Na półce leży mi tylko sto', [
+        runtime.ProviderResponse(tool_calls=(runtime.ToolCall(
+            'expected', 'inventory.count.get_expected', json.dumps({'product_id':product_id})),),
+            model='fake'),
+        runtime.ProviderResponse(tool_calls=(runtime.ToolCall(
+            'count', 'inventory.count.record', json.dumps({
+                'product_id':product_id, 'counted_quantity':100, 'expected_version':0,
+                'idempotency_key':'planned-fresh-read-count',
+            })),), model='fake'),
+        runtime.ProviderResponse(
+            text='Tom 128 BB. System: 108. Policzono: 100. Różnica: -8. Skorygować stan do 100?',
+            model='fake'),
+    ], opened['conversation_id'])
+
+    assert result['status'] == 'SUCCESS'
+    assert result['tool_calls'] == 2
+    card = next(item for item in result['artifacts'] if item['type'] == 'inventory_count_card')
+    assert (card['expected_quantity'], card['counted_quantity'], card['difference']) == (108, 100, -8)
+
+
+def test_explicit_new_product_replaces_active_product_for_count(isolated):
+    old_product = _add_counted_product(product_id=931, model='Tom 128 BB', quantity=108)
+    new_product = _add_counted_product(product_id=932, model='Winsor 128 BB', quantity=12)
+    owner = _owner()
+    opened = start(owner)
+    _read_active_product(owner, opened['conversation_id'], old_product, 'Tom 128 BB')
+    count_args = {'product_id':new_product, 'counted_quantity':10, 'expected_version':0,
+                  'idempotency_key':'explicit-winsor-count'}
+
+    result = run(owner, 'Sprawdź Winsor 128 BB, mam 10', [
+        runtime.ProviderResponse(tool_calls=(
+            runtime.ToolCall('product', 'inventory.product.get', json.dumps({'product_id':new_product})),
+            runtime.ToolCall('expected', 'inventory.count.get_expected', json.dumps({'product_id':new_product})),
+            runtime.ToolCall('count', 'inventory.count.record', json.dumps(count_args)),
+        ), model='fake'),
+        runtime.ProviderResponse(
+            text='Winsor 128 BB. System: 12. Policzono: 10. Różnica: -2. Skorygować stan do 10?',
+            model='fake'),
+    ], opened['conversation_id'])
+
+    assert result['status'] == 'SUCCESS'
+    card = next(item for item in result['artifacts'] if item['type'] == 'inventory_count_card')
+    assert card['display_name'] == 'Winsor 128 BB'
+    assert (card['expected_quantity'], card['counted_quantity'], card['difference']) == (12, 10, -2)
+    db = backend.conn()
+    try:
+        assert db.execute(
+            'SELECT COUNT(*) FROM internal_inventory_count_items WHERE product_id=?',
+            (old_product,),
+        ).fetchone()[0] == 0
+    finally:
+        db.close()
+
+
+def test_ambiguous_active_products_require_product_name_without_write(isolated):
+    first = _add_counted_product(product_id=941, model='Tom 128 BB', quantity=8)
+    _add_counted_product(product_id=942, model='Tom 160 BB', quantity=9)
+    owner = _owner()
+    opened = start(owner)
+    searched = run(owner, 'Sprawdź produkty Tom', [
+        runtime.ProviderResponse(tool_calls=(runtime.ToolCall(
+            'search', 'inventory.product.search', json.dumps({'query':'Tom'})),), model='fake'),
+        runtime.ProviderResponse(text='Znalazłem Tom 128 BB i Tom 160 BB.', model='fake'),
+    ], opened['conversation_id'])
+    assert searched['status'] == 'SUCCESS'
+
+    result = run(owner, 'Mam 10', [
+        runtime.ProviderResponse(tool_calls=(runtime.ToolCall(
+            'count', 'inventory.count.record', json.dumps({
+                'product_id':first, 'counted_quantity':10, 'expected_version':0,
+                'idempotency_key':'ambiguous-product-count',
+            })),), model='fake'),
+    ], opened['conversation_id'])
+
+    assert result['status'] == 'DENIED'
+    assert result['error_code'] == 'ENTITY_SCOPE_AMBIGUOUS'
+    assert result['message'] == 'Który produkt masz na myśli? Podaj jego nazwę lub SKU.'
+    db = backend.conn()
+    try:
+        assert db.execute('SELECT COUNT(*) FROM internal_inventory_count_items').fetchone()[0] == 0
+    finally:
+        db.close()
+
+
+def test_read_before_write_guard_still_blocks_non_contextual_product_write(isolated):
+    product_id = _add_counted_product(product_id=951, model='Tom 128 BB', quantity=108)
+    owner = _owner()
+    opened = start(owner)
+    _read_active_product(owner, opened['conversation_id'], product_id, 'Tom 128 BB')
+
+    result = run(owner, 'Zapisz 100 dla produktu 951', [
+        runtime.ProviderResponse(tool_calls=(runtime.ToolCall(
+            'count', 'inventory.count.record', json.dumps({
+                'product_id':product_id, 'counted_quantity':100, 'expected_version':0,
+                'idempotency_key':'guard-remains-active',
+            })),), model='fake'),
+    ], opened['conversation_id'])
+
+    assert result['status'] == 'DENIED'
+    assert result['error_code'] == 'ENTITY_SCOPE_REQUIRED'
+    db = backend.conn()
+    try:
+        assert db.execute('SELECT COUNT(*) FROM internal_inventory_count_items').fetchone()[0] == 0
+    finally:
+        db.close()
+
+
+def test_count_correction_refusal_does_not_execute_inventory_adjust(isolated):
+    product_id = _add_counted_product(product_id=961, model='Tom 128 BB', quantity=108)
+    owner = _owner()
+    opened = start(owner)
+    _read_active_product(owner, opened['conversation_id'], product_id, 'Tom 128 BB')
+    _contextual_count(owner, opened['conversation_id'], product_id, 100,
+                      'Jest ich tylko 100', 'Tom 128 BB')
+
+    refused = run(owner, 'Nie', [
+        runtime.ProviderResponse(text='Dobrze, nie przygotowuję korekty.', model='fake'),
+    ], opened['conversation_id'])
+
+    assert refused['status'] == 'SUCCESS'
+    assert refused['approvals'] == []
+    db = backend.conn()
+    try:
+        assert db.execute(
+            "SELECT COUNT(*) FROM internal_audit_log WHERE operation='inventory.adjust'"
+        ).fetchone()[0] == 0
+        assert db.execute('SELECT qty FROM stock WHERE product_id=?', (product_id,)).fetchone()[0] == 108
+    finally:
+        db.close()
+
+
 def _approval_client(isolated):
     with isolated.session_transaction() as session:
         session['admin_authenticated']=True
