@@ -343,7 +343,7 @@ class StubTranscriptionResponse:
         return self.payload
 
 
-def test_tts_adapter_calls_openai_speech_with_configured_model_voice_and_mp3(isolated, monkeypatch):
+def test_tts_adapter_uses_polish_instructions_and_normalizes_only_provider_input(isolated, monkeypatch):
     calls = []
     response = StubTranscriptionResponse(status=200)
     response.content = b'provider-mp3'
@@ -353,17 +353,32 @@ def test_tts_adapter_calls_openai_speech_with_configured_model_voice_and_mp3(iso
         return response
 
     monkeypatch.setattr(voice_io.requests, 'post', post)
-    provider = voice_io.OpenAIVoiceIOProvider(
-        api_key='test-secret', tts_model='gpt-4o-mini-tts', voice='alloy',
-    )
-    audio = provider.synthesize('Tekst do odtworzenia.')
+    provider = voice_io.OpenAIVoiceIOProvider(api_key='test-secret')
+    visible_speech_text = 'Masz BB, BN, MB i BLK. Kod SKU-128 pozostaje techniczny.'
+    audio = provider.synthesize(visible_speech_text)
 
     assert calls[0][0] == 'https://api.openai.com/v1/audio/speech'
     assert calls[0][1]['json'] == {
-        'model': 'gpt-4o-mini-tts', 'voice': 'alloy',
-        'input': 'Tekst do odtworzenia.', 'response_format': 'mp3',
+        'model': 'gpt-4o-mini-tts', 'voice': 'marin',
+        'input': 'Masz be be, be en, em be i be el ka. Kod SKU-128 pozostaje techniczny.',
+        'response_format': 'mp3', 'instructions': voice_io.TTS_INSTRUCTIONS,
     }
+    assert visible_speech_text == 'Masz BB, BN, MB i BLK. Kod SKU-128 pozostaje techniczny.'
     assert audio.content == b'provider-mp3' and audio.content_type == 'audio/mpeg'
+
+
+def test_tts_legacy_models_do_not_receive_unsupported_instructions(isolated, monkeypatch):
+    calls = []
+    response = StubTranscriptionResponse(status=200)
+    response.content = b'provider-mp3'
+    monkeypatch.setattr(voice_io.requests, 'post', lambda url, **kwargs: calls.append((url, kwargs)) or response)
+    provider = voice_io.OpenAIVoiceIOProvider(
+        api_key='test-secret', tts_model='tts-1', voice='alloy',
+    )
+    provider.synthesize('BB')
+    assert calls[0][1]['json'] == {
+        'model': 'tts-1', 'voice': 'alloy', 'input': 'be be', 'response_format': 'mp3',
+    }
 
 
 def test_stt_adapter_sends_multipart_and_returns_only_transcript(isolated, monkeypatch):

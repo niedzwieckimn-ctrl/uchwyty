@@ -1484,7 +1484,7 @@ def api_internal_ai_voice_synthesize():
     try:
         provider = VOICE_IO_PROVIDER or voice_provider_from_env()
         model = getattr(provider, 'tts_model', None) or os.environ.get('AI_TTS_MODEL', 'gpt-4o-mini-tts')
-        voice = getattr(provider, 'voice', None) or os.environ.get('AI_TTS_VOICE', 'alloy')
+        voice = getattr(provider, 'voice', None) or os.environ.get('AI_TTS_VOICE', 'marin')
         app.logger.info('VOICE_TTS_REQUEST_START %s', json.dumps({
             'model': model, 'voice': voice, 'chars': len(text),
         }, sort_keys=True))

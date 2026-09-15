@@ -15,11 +15,17 @@ import requests
 MAX_AUDIO_BYTES = 10 * 1024 * 1024
 MAX_SPEECH_TEXT = 700
 DEFAULT_STT_MODEL = 'gpt-4o-mini-transcribe'
+DEFAULT_TTS_MODEL = 'gpt-4o-mini-tts'
+DEFAULT_TTS_VOICE = 'marin'
 STT_LANGUAGE = 'pl'
 STT_CONTEXT_PROMPT = (
     'Dokładnie transkrybuj mowę po polsku w aplikacji biznesowej. '
     'Zachowaj nazwy produktów i firm, numery zamówień oraz kody SKU, '
     'w tym litery, cyfry i łączniki, dokładnie tak, jak zostały wypowiedziane.'
+)
+TTS_INSTRUCTIONS = (
+    "Mów naturalnym, neutralnym językiem polskim. Wymawiaj polskie głoski i litery po polsku. "
+    "Skróty typu BB czytaj jako 'be be', BN jako 'be en'. Nie używaj angielskiej intonacji."
 )
 ALLOWED_AUDIO_TYPES = frozenset({
     'audio/webm', 'audio/ogg', 'audio/mp4', 'audio/mpeg', 'audio/wav', 'audio/x-wav',
@@ -36,6 +42,18 @@ _SPOKEN_CODE = re.compile(
 _SPOKEN_INVOICE = re.compile(r'\b(?:FV(?:AT)?|faktura)\s*[A-Z0-9][A-Z0-9/.-]{4,}\b', re.IGNORECASE)
 _SPOKEN_HEADING = re.compile(r'^\s*(?:#{1,6}\s*)?(?:\d+[.)]\s*)?([^|]+?)\s*$')
 _SPOKEN_BULLET = re.compile(r'^\s*[-*•]\s+(.+?)\s*$')
+_TTS_ABBREVIATION = re.compile(r'(?<![A-Z0-9])(BB|BN|MB|BLK)(?![A-Z0-9])')
+_TTS_ABBREVIATIONS = {
+    'BB': 'be be',
+    'BN': 'be en',
+    'MB': 'em be',
+    'BLK': 'be el ka',
+}
+
+
+def normalize_tts_text(text: str) -> str:
+    """Expand selected Polish business abbreviations only in the provider input."""
+    return _TTS_ABBREVIATION.sub(lambda match: _TTS_ABBREVIATIONS[match.group(1)], str(text))
 
 
 def compact_speech_text(final_text, *, existing_speech_text='', user_message=''):
@@ -146,11 +164,14 @@ class VoiceIOProvider(Protocol):
 
 
 class OpenAIVoiceIOProvider:
-    def __init__(self, *, api_key: str = '', stt_model: str = '', tts_model: str = '', voice: str = ''):
+    def __init__(self, *, api_key: str = '', stt_model: str = '', tts_model: str = '',
+                 voice: str = '', tts_instructions: str = ''):
         self.api_key = api_key or os.environ.get('OPENAI_API_KEY', '')
         self.stt_model = stt_model or os.environ.get('AI_STT_MODEL', DEFAULT_STT_MODEL)
-        self.tts_model = tts_model or os.environ.get('AI_TTS_MODEL', 'gpt-4o-mini-tts')
-        self.voice = voice or os.environ.get('AI_TTS_VOICE', 'alloy')
+        self.tts_model = tts_model or os.environ.get('AI_TTS_MODEL', DEFAULT_TTS_MODEL)
+        self.voice = voice or os.environ.get('AI_TTS_VOICE', DEFAULT_TTS_VOICE)
+        self.tts_instructions = (tts_instructions or os.environ.get('AI_TTS_INSTRUCTIONS', '')
+                                 or TTS_INSTRUCTIONS)
         if not self.api_key:
             raise VoiceIOError('Voice provider is not configured',
                                error_code='VOICE_NOT_CONFIGURED', stage='configuration')
@@ -210,11 +231,19 @@ class OpenAIVoiceIOProvider:
         return text
 
     def synthesize(self, text: str) -> SynthesizedAudio:
+        payload = {
+            'model': self.tts_model,
+            'voice': self.voice,
+            'input': normalize_tts_text(text),
+            'response_format': 'mp3',
+        }
+        if self.tts_model.startswith('gpt-4o-mini-tts'):
+            payload['instructions'] = self.tts_instructions
         try:
             response = requests.post(
                 'https://api.openai.com/v1/audio/speech',
                 headers={'Authorization': f'Bearer {self.api_key}', 'Content-Type': 'application/json'},
-                json={'model': self.tts_model, 'voice': self.voice, 'input': text, 'response_format': 'mp3'},
+                json=payload,
                 timeout=60,
             )
         except requests.Timeout as exc:
