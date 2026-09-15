@@ -63,6 +63,8 @@ from agent_runtime import configure_artifact_builder, provider_from_env, reset_a
 from voice_io import (
     ALLOWED_AUDIO_TYPES,
     DEFAULT_STT_MODEL,
+    DEFAULT_TTS_MODEL,
+    DEFAULT_TTS_VOICE,
     MAX_AUDIO_BYTES,
     TranscriptionDiagnostics,
     VoiceIOError,
@@ -1526,8 +1528,8 @@ def api_internal_ai_voice_synthesize():
         return jsonify(ok=False, error_code='INVALID_SPEECH_TEXT'), 400
     try:
         provider = VOICE_IO_PROVIDER or voice_provider_from_env()
-        model = getattr(provider, 'tts_model', None) or os.environ.get('AI_TTS_MODEL', 'gpt-4o-mini-tts')
-        voice = getattr(provider, 'voice', None) or os.environ.get('AI_TTS_VOICE', 'marin')
+        model = getattr(provider, 'tts_model', None) or os.environ.get('AI_TTS_MODEL', DEFAULT_TTS_MODEL)
+        voice = getattr(provider, 'voice', None) or os.environ.get('AI_TTS_VOICE', DEFAULT_TTS_VOICE)
         app.logger.info('VOICE_TTS_REQUEST_START %s', json.dumps({
             'model': model, 'voice': voice, 'chars': len(text),
         }, sort_keys=True))

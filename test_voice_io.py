@@ -518,6 +518,8 @@ class StubTranscriptionResponse:
 
 
 def test_tts_adapter_uses_polish_instructions_and_normalizes_only_provider_input(isolated, monkeypatch):
+    for name in ('AI_TTS_MODEL', 'AI_TTS_VOICE', 'AI_TTS_INSTRUCTIONS'):
+        monkeypatch.delenv(name, raising=False)
     calls = []
     response = StubTranscriptionResponse(status=200)
     response.content = b'provider-mp3'
@@ -533,12 +535,72 @@ def test_tts_adapter_uses_polish_instructions_and_normalizes_only_provider_input
 
     assert calls[0][0] == 'https://api.openai.com/v1/audio/speech'
     assert calls[0][1]['json'] == {
-        'model': 'gpt-4o-mini-tts', 'voice': 'marin',
+        'model': 'gpt-4o-mini-tts', 'voice': 'cedar',
         'input': 'Masz be be, be en, em be i be el ka. Kod SKU-128 pozostaje techniczny.',
         'response_format': 'mp3', 'instructions': voice_io.TTS_INSTRUCTIONS,
     }
     assert visible_speech_text == 'Masz BB, BN, MB i BLK. Kod SKU-128 pozostaje techniczny.'
     assert audio.content == b'provider-mp3' and audio.content_type == 'audio/mpeg'
+    assert len(calls) == 1
+    assert 'speed' not in calls[0][1]['json']
+
+
+@pytest.mark.parametrize('overrides,expected_model,expected_voice,expected_instructions', [
+    ({}, 'gpt-4o-mini-tts-2025-12-15', 'onyx', 'Mów po polsku, szybko.'),
+    ({'tts_model': 'gpt-4o-mini-tts', 'voice': 'cedar', 'tts_instructions': 'Mów wyraźnie.'},
+     'gpt-4o-mini-tts', 'cedar', 'Mów wyraźnie.'),
+])
+def test_tts_request_preserves_explicit_then_env_configuration(
+        monkeypatch, overrides, expected_model, expected_voice, expected_instructions):
+    monkeypatch.setenv('OPENAI_API_KEY', 'test-secret')
+    monkeypatch.setenv('AI_TTS_MODEL', 'gpt-4o-mini-tts-2025-12-15')
+    monkeypatch.setenv('AI_TTS_VOICE', 'onyx')
+    monkeypatch.setenv('AI_TTS_INSTRUCTIONS', 'Mów po polsku, szybko.')
+    calls = []
+    response = StubTranscriptionResponse(status=200)
+    response.content = b'provider-mp3'
+    monkeypatch.setattr(voice_io.requests, 'post', lambda url, **kwargs: calls.append(kwargs) or response)
+    provider = (voice_io.OpenAIVoiceIOProvider(**overrides) if overrides
+                else voice_io.provider_from_env())
+    provider.synthesize('Masz 1 sztukę produktu Cerne 128 BB. Na półce jest 11 sztuk.')
+    assert len(calls) == 1
+    assert calls[0]['json'] == {
+        'model': expected_model, 'voice': expected_voice,
+        'instructions': expected_instructions, 'response_format': 'mp3',
+        'input': 'Masz 1 sztukę produktu Cerne 128 be be. Na półce jest 11 sztuk.',
+    }
+
+
+def test_tts_default_style_requests_male_polish_conversation_pacing(monkeypatch):
+    for name in ('AI_TTS_MODEL', 'AI_TTS_VOICE', 'AI_TTS_INSTRUCTIONS'):
+        monkeypatch.delenv(name, raising=False)
+    provider = voice_io.OpenAIVoiceIOProvider(api_key='test-secret')
+    assert provider.tts_model == 'gpt-4o-mini-tts'
+    assert provider.voice == 'cedar'
+    for style in ('męskim głosem', 'językiem polskim', 'tempie zwykłej rozmowy biznesowej',
+                  'bez przeciągania słów', 'energicznie', 'bez angielskiego akcentu'):
+        assert style in provider.tts_instructions
+
+
+def test_tts_endpoint_logs_and_uses_actual_provider_voice_before_env(isolated, monkeypatch, caplog):
+    monkeypatch.setenv('AI_TTS_VOICE', 'marin')
+    provider = voice_io.OpenAIVoiceIOProvider(
+        api_key='test-secret', tts_model='gpt-4o-mini-tts', voice='cedar')
+    monkeypatch.setattr(backend, 'VOICE_IO_PROVIDER', provider)
+    calls = []
+    response = StubTranscriptionResponse(status=200)
+    response.content = b'unchanged-mp3-bytes'
+    monkeypatch.setattr(voice_io.requests, 'post', lambda url, **kwargs: calls.append(kwargs) or response)
+    with caplog.at_level(logging.INFO):
+        result = client().post('/api/internal/ai/voice/synthesize', json={'speech_text': 'Masz 11 sztuk BB.'})
+    assert result.status_code == 200 and result.mimetype == 'audio/mpeg'
+    assert result.data == response.content
+    assert len(calls) == 1 and calls[0]['json']['voice'] == 'cedar'
+    logged = [json.loads(record.message.split(' ', 1)[1]) for record in caplog.records
+              if record.message.startswith('VOICE_TTS_REQUEST_START ')]
+    assert len(logged) == 1
+    assert logged[0]['voice'] == 'cedar' and logged[0]['model'] == provider.tts_model
+    assert 'Masz 11' not in caplog.text
 
 
 def test_tts_legacy_models_do_not_receive_unsupported_instructions(isolated, monkeypatch):

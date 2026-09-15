@@ -15,7 +15,7 @@ import requests
 MAX_AUDIO_BYTES = 10 * 1024 * 1024
 DEFAULT_STT_MODEL = 'gpt-4o-mini-transcribe'
 DEFAULT_TTS_MODEL = 'gpt-4o-mini-tts'
-DEFAULT_TTS_VOICE = 'marin'
+DEFAULT_TTS_VOICE = 'cedar'
 STT_LANGUAGE = 'pl'
 STT_CONTEXT_PROMPT = (
     'Dokładnie transkrybuj mowę po polsku w aplikacji biznesowej. '
@@ -23,8 +23,11 @@ STT_CONTEXT_PROMPT = (
     'w tym litery, cyfry i łączniki, dokładnie tak, jak zostały wypowiedziane.'
 )
 TTS_INSTRUCTIONS = (
-    "Mów naturalnym, neutralnym językiem polskim. Wymawiaj polskie głoski i litery po polsku. "
-    "Skróty typu BB czytaj jako 'be be', BN jako 'be en'. Nie używaj angielskiej intonacji."
+    "Mów naturalnym językiem polskim, męskim głosem o naturalnej, niższej barwie, "
+    "w sprawnym tempie zwykłej rozmowy biznesowej. Mów konkretnie, bez przeciągania słów "
+    "i długich pauz. Krótkie odpowiedzi wypowiadaj energicznie. "
+    "Stosuj polską wymowę i intonację, bez angielskiego akcentu. "
+    "Wymawiaj BB jako 'be be', BN jako 'be en', MB jako 'em be', BLK jako 'be el ka'."
 )
 ALLOWED_AUDIO_TYPES = frozenset({
     'audio/webm', 'audio/ogg', 'audio/mp4', 'audio/mpeg', 'audio/wav', 'audio/x-wav',
