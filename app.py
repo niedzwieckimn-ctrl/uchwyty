@@ -63,7 +63,6 @@ from voice_io import (
     ALLOWED_AUDIO_TYPES,
     DEFAULT_STT_MODEL,
     MAX_AUDIO_BYTES,
-    MAX_SPEECH_TEXT,
     TranscriptionDiagnostics,
     VoiceIOError,
     compact_speech_text,
@@ -1308,6 +1307,7 @@ def api_ai_approval_decide(approval_id, decision):
                 response['model_status'] = model_result['status']
                 response['message'] = model_result['message']
                 response['speech_text'] = model_result.get('speech_text', '')
+                response['voice_response_mode'] = model_result.get('voice_response_mode', 'adaptive')
                 response['conversation_id'] = model_result['conversation_id']
             except Exception:
                 response['model_status'] = 'FAILED'
@@ -1346,10 +1346,12 @@ def api_internal_ai_chat():
         result['speech_text'] = compact_speech_text(
             result.get('message', ''), existing_speech_text=result.get('speech_text', ''),
             user_message=payload.get('message', ''),
+            voice_response_mode=result.get('voice_response_mode', 'adaptive'),
         )
         app.logger.info('VOICE_SPEECH_TEXT_READY %s', json.dumps({
             'chars': len(result['speech_text']),
             'present': bool(result['speech_text']),
+            'mode': result.get('voice_response_mode', 'adaptive'),
         }, sort_keys=True))
     status_code = 200 if result["status"] == "SUCCESS" else 403 if result["status"] == "DENIED" else 503
     diagnostics = result.pop('_chat_503_diagnostics', {})
@@ -1479,7 +1481,7 @@ def api_internal_ai_voice_synthesize():
         return jsonify(ok=False, error_code='RATE_LIMITED'), 429
     payload = request.get_json(silent=True) or {}
     text = str(payload.get('speech_text') or '').strip() if isinstance(payload, dict) else ''
-    if not text or len(text) > MAX_SPEECH_TEXT:
+    if not text:
         return jsonify(ok=False, error_code='INVALID_SPEECH_TEXT'), 400
     try:
         provider = VOICE_IO_PROVIDER or voice_provider_from_env()

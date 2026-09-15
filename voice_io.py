@@ -13,7 +13,6 @@ import requests
 
 
 MAX_AUDIO_BYTES = 10 * 1024 * 1024
-MAX_SPEECH_TEXT = 700
 DEFAULT_STT_MODEL = 'gpt-4o-mini-transcribe'
 DEFAULT_TTS_MODEL = 'gpt-4o-mini-tts'
 DEFAULT_TTS_VOICE = 'marin'
@@ -31,21 +30,9 @@ ALLOWED_AUDIO_TYPES = frozenset({
     'audio/webm', 'audio/ogg', 'audio/mp4', 'audio/mpeg', 'audio/wav', 'audio/x-wav',
 })
 
-_SPOKEN_DETAIL_REQUESTS = (
-    'przeczytaj mi wszystkie', 'przeczytaj wszystko', 'podaj wszystkie numery',
-)
 _SPOKEN_URL = re.compile(r'https?://\S+', re.IGNORECASE)
 _SPOKEN_TECHNICAL = re.compile(
     r'(?i)\b(?:approval_id|operation_id|execution_id|correlation_id|pending_approval|json)\b')
-_SPOKEN_CODE = re.compile(
-    r'\b(?:ZAM[-\s]?\d{5,}|[A-Z]{2,}[A-Z0-9]*-\w{2,}(?:-\w+)+|KSeF[-:\w]+)\b', re.IGNORECASE)
-_SPOKEN_INVOICE = re.compile(r'\b(?:FV(?:AT)?|faktura)\s*[A-Z0-9][A-Z0-9/.-]{4,}\b', re.IGNORECASE)
-_SPOKEN_HEADING = re.compile(r'^\s*(?:#{1,6}\s*)?(?:\d+[.)]\s*)?([^|]+?)\s*$')
-_SPOKEN_BULLET = re.compile(r'^\s*[-*•]\s+(.+?)\s*$')
-_SPOKEN_STOPWORDS = frozenset({
-    'jakie', 'jaki', 'jaka', 'jest', 'mam', 'mamy', 'masz', 'moje', 'moja', 'tego',
-    'teraz', 'dzisiaj', 'dzis', 'oraz', 'które', 'ktore', 'proszę', 'prosze',
-})
 _TTS_ABBREVIATION = re.compile(r'(?<![A-Z0-9])(BB|BN|MB|BLK)(?![A-Z0-9])')
 _TTS_ABBREVIATIONS = {
     'BB': 'be be',
@@ -60,112 +47,30 @@ def normalize_tts_text(text: str) -> str:
     return _TTS_ABBREVIATION.sub(lambda match: _TTS_ABBREVIATIONS[match.group(1)], str(text))
 
 
-def compact_speech_text(final_text, *, existing_speech_text='', user_message=''):
-    """Prefer the model's intent-aware spoken answer; build a conservative fallback only."""
-    request = str(user_message)
-    full_detail = any(phrase in request.casefold() for phrase in _SPOKEN_DETAIL_REQUESTS)
-    keep_requested_code = bool(_SPOKEN_CODE.search(request) or _SPOKEN_INVOICE.search(request))
-    raw = str(final_text or '').strip()
+def compact_speech_text(final_text, *, existing_speech_text='', user_message='',
+                        voice_response_mode='adaptive'):
+    """Sanitize semantic speech from the final model turn without reshaping its length."""
+    del user_message, voice_response_mode
 
-    def clean(value, *, keep_codes=False):
-        value = _SPOKEN_URL.sub('', str(value))
-        value = value.replace('**', '').replace('__', '').replace('`', '').replace('|', ' ')
-        if not keep_codes:
-            value = _SPOKEN_CODE.sub('', value)
-            value = _SPOKEN_INVOICE.sub('', value)
-        value = re.sub(r'\s+', ' ', value).strip(' -–—,;:')
-        return value
+    def clean(value):
+        safe_lines = []
+        for source_line in str(value or '').splitlines():
+            line = source_line.strip()
+            if (not line or '|' in line or _SPOKEN_URL.search(line)
+                    or _SPOKEN_TECHNICAL.search(line)
+                    or line.startswith(('{', '['))):
+                continue
+            line = re.sub(r'^\s*(?:#{1,6}\s*|[-*•]\s+)', '', line)
+            line = line.replace('**', '').replace('__', '').replace('`', '')
+            line = re.sub(r'\s+', ' ', line).strip(' -–—,;:')
+            if line:
+                safe_lines.append(line)
+        return ' '.join(safe_lines).strip()
 
-    def bounded(value):
-        value = clean(value, keep_codes=True)
-        sentences = [part.strip() for part in re.split(r'(?<=[.!?])\s+', value) if part.strip()]
-        value = ' '.join(sentences[:3])
-        if len(value) > 420:
-            value = value[:420].rsplit(' ', 1)[0].rstrip(' ,;:') + '.'
-        return value[:MAX_SPEECH_TEXT].strip()
-
-    provided = bounded(existing_speech_text)
+    provided = clean(existing_speech_text)
     if provided:
         return provided
-    if not raw:
-        return ''
-
-    if full_detail:
-        safe_lines = [line for line in raw.splitlines()
-                      if line.strip() and '|' not in line
-                      and not line.lstrip().startswith(('{', '['))
-                      and not _SPOKEN_TECHNICAL.search(line)]
-        return clean(' '.join(safe_lines), keep_codes=True)[:MAX_SPEECH_TEXT].strip()
-
-    candidates = []
-    current_heading = ''
-    position = 0
-    for source_line in raw.splitlines():
-        line = source_line.strip()
-        if (not line or '|' in line or _SPOKEN_TECHNICAL.search(line)
-                or line.startswith(('{', '['))):
-            continue
-        bullet = _SPOKEN_BULLET.match(line)
-        if bullet:
-            item = clean(bullet.group(1), keep_codes=keep_requested_code)
-            if item:
-                candidates.append((position, current_heading, item))
-                position += 1
-            continue
-        heading = _SPOKEN_HEADING.match(line)
-        numbered = bool(re.match(r'^\s*(?:#{1,6}\s*|\d+[.)]\s*)', line))
-        if numbered and heading:
-            current_heading = clean(heading.group(1), keep_codes=keep_requested_code)
-            continue
-        for part in re.split(r'(?<=[.!?])\s+', line):
-            item = clean(part, keep_codes=keep_requested_code)
-            if item:
-                candidates.append((position, '', item))
-                position += 1
-
-    request_folded = request.casefold()
-    request_terms = {
-        term for term in re.findall(r'[\wąćęłńóśźż]{3,}', request_folded)
-        if term not in _SPOKEN_STOPWORDS
-    }
-    wants_number = bool(re.search(r'(?i)\b(?:ile|liczb|stan|sztuk)\b', request))
-    wants_overdue = bool(re.search(r'(?i)\b(?:zaleg|po terminie|płatno)\w*', request))
-    wants_shortage = bool(re.search(r'(?i)\bbrak\w*', request))
-    wants_daily = bool(re.search(r'(?i)\b(?:dzisiaj|dziś|dzis|do zrobienia)\b', request))
-
-    ranked = []
-    for position, heading, item in candidates:
-        folded = f'{heading} {item}'.casefold()
-        score = sum(3 for term in request_terms if term in folded)
-        if wants_number and re.search(r'\d', item):
-            score += 7
-        if wants_overdue and re.search(r'(?i)zaleg|po terminie|płatno|faktur', folded):
-            score += 9
-        if wants_shortage and re.search(r'(?i)brak|niepokryt|uzupeł', folded):
-            score += 9
-        if wants_daily:
-            if re.search(r'(?i)wysył|wyślij|piln', folded):
-                score += 9
-            elif re.search(r'(?i)płatno|po terminie', folded):
-                score += 7
-            elif re.search(r'(?i)brak|uzupeł', folded):
-                score += 6
-        if re.search(r'(?i)szczegół|widoczn|na ekranie|mogę', item):
-            score -= 8
-        ranked.append((score, -position, item))
-
-    ranked.sort(reverse=True)
-    chosen = []
-    for score, _position, item in ranked:
-        if len(item) >= 8 and item not in chosen and (score > 0 or not chosen):
-            chosen.append(item)
-        if len(chosen) >= (3 if wants_daily else 2):
-            break
-    if not chosen:
-        chosen = ['Szczegóły są widoczne na ekranie.']
-
-    spoken = ' '.join(part.rstrip(' .') + '.' for part in chosen)
-    return bounded(spoken)
+    return clean(final_text)
 
 
 @dataclass

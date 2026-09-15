@@ -134,10 +134,9 @@ def test_voice_speech_text_keeps_ui_detail_but_compacts_spoken_result(isolated):
     assert 'ZAM-2609141' not in payload['speech_text']
     assert payload['speech_text'] == 'Masz 7 aktywnych zamówień. Jedno z nich wymaga uzupełnienia.'
     assert len(payload['speech_text']) < len(payload['message'])
-    assert payload['speech_text'].count('.') <= 2
     assert len(provider.calls) == 1
-    assert '<speech_text>' in provider.calls[0]['instructions']
-    assert 'Nie przepisuj pierwszych zdań odpowiedzi ekranowej' in provider.calls[0]['instructions']
+    assert '<speech_text mode=' in provider.calls[0]['instructions']
+    assert 'Nie stosuj limitu zdań, sekund ani znaków' in provider.calls[0]['instructions']
     db = backend.conn()
     stored_answer = db.execute(
         'SELECT assistant_text FROM internal_agent_turns WHERE conversation_id=?',
@@ -207,6 +206,132 @@ def test_same_final_model_turn_supplies_intent_aware_speech_text(isolated, quest
     assert payload['speech_text'] == spoken
     assert len(provider.calls) == 1
     assert all(label not in payload['speech_text'] for label in ('SKU:', 'MAGAZYN:', 'ZAMÓWIONE:', 'DOSTĘPNE:'))
+
+
+@pytest.mark.parametrize(('question', 'mode', 'full', 'spoken'), [
+    (
+        'Ile mam Cerne 128 BB?',
+        'direct',
+        'Cerne 128 BB\nSKU: CERNE-128-BB\nMAGAZYN: 1\nDOSTĘPNE: 1',
+        'Masz jedną sztukę.',
+    ),
+    (
+        'Ile mam Tom 128 BB?',
+        'direct',
+        'Tom 128 BB\nSKU: TOM-128-BB\nMAGAZYN: 108\nDOSTĘPNE: 108',
+        'Masz sto osiem sztuk.',
+    ),
+    (
+        'Jakie mam ostatnie zamówienie od MAGMAR?',
+        'detail_offer',
+        'MAGMAR — zamówienie ZAM-2609151, złożone 15.09.2026.\nPozycje: 8.',
+        'Ostatnie zamówienie od MAGMAR zostało złożone dzisiaj. Mam przeczytać zawartość?',
+    ),
+    (
+        'Co mam zrobić dzisiaj?',
+        'summary',
+        'Pełny briefing z kartami wysyłek, płatności, braków i dostaw.',
+        'Najpierw wyślij MAGMAR. Nie masz zaległych płatności. Do uzupełnienia zostało trzynaście uchwytów.',
+    ),
+    (
+        'Podaj wszystkie braki',
+        'full_detail',
+        'Winsor: 1. Sam: 5. Hugo: 7. Razem: 13.',
+        'Brakuje: Winsor, jedna sztuka; Sam, pięć sztuk; Hugo, siedem sztuk. Razem trzynaście sztuk.',
+    ),
+    (
+        'Nie czytaj szczegółów, tylko podaj sumę',
+        'direct',
+        'Winsor: 1. Sam: 5. Hugo: 7. Razem: 13.',
+        'Łącznie brakuje trzynastu sztuk.',
+    ),
+])
+def test_adaptive_voice_modes_follow_user_intent(isolated, question, mode, full, spoken):
+    provider = runtime.FakeModelProvider([respond(
+        f'{full}\n<speech_text mode="{mode}">{spoken}</speech_text>'
+    )])
+    backend.AGENT_MODEL_PROVIDER = provider
+
+    payload = client().post('/api/internal/ai/chat', json={'message':question}).get_json()
+
+    assert payload['message'] == full
+    assert payload['speech_text'] == spoken
+    assert payload['voice_response_mode'] == mode
+    assert len(provider.calls) == 1
+
+
+def test_business_summary_is_not_cut_by_sentence_count(isolated):
+    spoken = (
+        'We wrześniu zarobiłeś sto dwadzieścia tysięcy złotych. '
+        'Faktury kosztowe wyniosły czterdzieści tysięcy złotych. '
+        'Sprowadziłeś dwa tysiące uchwytów. Sprzedałeś tysiąc osiemset sztuk. '
+        'Magazyn zwiększył się o dwieście sztuk. '
+        'Sprzedaż była wyższa niż w sierpniu, przy zachowaniu dodatniego wyniku.'
+    )
+    assert spoken.count('.') > 3
+    provider = runtime.FakeModelProvider([respond(
+        'Pełny raport wrześniowy pozostaje na ekranie.\n'
+        f'<speech_text mode="business_summary">{spoken}</speech_text>'
+    )])
+    backend.AGENT_MODEL_PROVIDER = provider
+
+    payload = client().post('/api/internal/ai/chat', json={
+        'message':'Jakie mam wyniki firmy za wrzesień?',
+    }).get_json()
+
+    assert payload['voice_response_mode'] == 'business_summary'
+    assert payload['speech_text'] == spoken
+
+
+def test_tts_transport_accepts_adaptive_summary_longer_than_old_formatter_limit(isolated, monkeypatch):
+    voice = FakeVoiceProvider()
+    monkeypatch.setattr(backend, 'VOICE_IO_PROVIDER', voice)
+    spoken = ' '.join(['Istotna informacja biznesowa.'] * 30)
+    assert len(spoken) > 700
+
+    response = client().post('/api/internal/ai/voice/synthesize', json={'speech_text':spoken})
+
+    assert response.status_code == 200
+    assert voice.speeches == [spoken]
+
+
+def test_detail_offer_context_makes_yes_followup_full_detail(isolated):
+    provider = runtime.FakeModelProvider([
+        respond(
+            'MAGMAR — zamówienie ZAM-2609151 ma osiem pozycji.\n'
+            '<speech_text mode="detail_offer">Ostatnie zamówienie od MAGMAR zostało złożone dzisiaj. '
+            'Mam przeczytać zawartość?</speech_text>'
+        ),
+        respond(
+            'Pełna zawartość zamówienia jest widoczna na ekranie.\n'
+            '<speech_text mode="full_detail">Winsor, dwie sztuki. Sam, trzy sztuki. '
+            'Hugo, jedna sztuka.</speech_text>'
+        ),
+    ])
+    backend.AGENT_MODEL_PROVIDER = provider
+    test_client = client()
+    first = test_client.post('/api/internal/ai/chat', json={
+        'message':'Jakie mam ostatnie zamówienie od MAGMAR?',
+    }).get_json()
+
+    second = test_client.post('/api/internal/ai/chat', json={
+        'message':'Tak', 'conversation_id':first['conversation_id'],
+    }).get_json()
+
+    assert first['voice_response_mode'] == 'detail_offer'
+    assert second['voice_response_mode'] == 'full_detail'
+    assert second['speech_text'] == 'Winsor, dwie sztuki. Sam, trzy sztuki. Hugo, jedna sztuka.'
+    voice_context = [
+        item for item in provider.calls[1]['input_items']
+        if item.get('type') == 'function_call_output'
+        and str(item.get('call_id') or '').startswith('trusted-voice-')
+    ]
+    assert len(voice_context) == 1
+    stored = json.loads(voice_context[0]['output'])
+    assert stored == {
+        'mode':'detail_offer',
+        'speech_text':'Ostatnie zamówienie od MAGMAR zostało złożone dzisiaj. Mam przeczytać zawartość?',
+    }
 
 
 def test_spoken_summary_omits_tables_urls_json_and_internal_identifiers():

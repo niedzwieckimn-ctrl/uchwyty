@@ -400,21 +400,39 @@ Odpowiadaj krótko, operacyjnie, w języku użytkownika, zwykłym tekstem. Nie p
 '''
 SPEECH_TEXT_INSTRUCTIONS = '''
 Każdą finalną odpowiedź tekstową zakończ osobną linią dokładnie w formacie:
-<speech_text>krótkie podsumowanie do wypowiedzenia</speech_text>
+<speech_text mode="direct|detail_offer|summary|business_summary|full_detail">naturalna odpowiedź do wypowiedzenia</speech_text>
+Wybierz dokładnie jeden voice_response_mode zgodnie z intencją użytkownika, nie według długości odpowiedzi ekranowej:
+- direct: jedna konkretna wartość albo krótki status. Odpowiedz bezpośrednio i nie powtarzaj nazwy obiektu już podanej w pytaniu.
+- detail_offer: obiekt ma wiele szczegółów, ale użytkownik nie prosi o pełne odczytanie. Podaj najważniejszy status i naturalnie zaproponuj odczytanie pozycji lub szczegółów.
+- summary: użytkownik chce kilka najważniejszych działań lub faktów. Wybierz priorytety, nie odtwarzaj wszystkich kart.
+- business_summary: użytkownik pyta o wyniki firmy, okres, sprzedaż, koszty albo zmianę magazynu. Zacznij od głównego wyniku, podaj najważniejsze liczby i zakończ jednym wnioskiem tylko wtedy, gdy dane go wspierają.
+- full_detail: wyłącznie gdy użytkownik wyraźnie prosi o całość albo potwierdza wcześniejszą ofertę odczytania szczegółów.
 Treść przed znacznikiem jest pełną odpowiedzią widoczną na ekranie. Treść znacznika nie jest pokazywana.
 Speech text utwórz w tym samym turnie, bez dodatkowego odczytu i bez dodatkowego wywołania modelu.
 
-Speech text ma bezpośrednio odpowiadać na intencję użytkownika, zwykle w 1–3 krótkich zdaniach i najwyżej
-około 15–25 sekundach mowy. Najpierw podaj odpowiedź, potem najwyżej 1–2 najważniejsze szczegóły. Zachowaj
-istotne liczby i nazwy biznesowe. Nie przepisuj pierwszych zdań odpowiedzi ekranowej, nie streszczaj każdego
-punktu, nie czytaj kart, nagłówków, Markdowna, nazw pól, SKU, ID ani numerów zamówień, chyba że użytkownik
-pyta właśnie o kod lub numer. Przy liście podaj sumę i tylko najważniejsze pozycje.
+Nie stosuj limitu zdań, sekund ani znaków, nie wybieraj pierwszych zdań i nie używaj mechanicznego skracania.
+Długość ma wynikać z wybranego trybu i zakresu pytania. Zachowaj istotne liczby biznesowe. Nie czytaj kart,
+nagłówków, Markdowna, nazw pól, SKU, ID ani numerów zamówień, chyba że użytkownik pyta właśnie o kod lub numer.
+Nie powtarzaj informacji zawartej już w pytaniu, jeśli nie jest potrzebna do zrozumienia odpowiedzi. Pytanie o
+pojedynczą liczbę otrzymuje tę liczbę od razu. Duży obiekt otrzymuje najważniejszy status i ofertę szczegółów.
+Podsumowanie wybiera priorytety. Analiza biznesowa może być dłuższa, ale nie może czytać tabeli po kolei.
+Prośba „tylko suma” ma zawierać wyłącznie sumę, nawet gdy ekran pokazuje szczegóły.
+
+W speech_text odmieniaj liczby i jednostki naturalnie po polsku, na przykład: jedna sztuka, dwie sztuki,
+pięć sztuk, dwadzieścia jeden sztuk, dwadzieścia dwie sztuki. Daty mów naturalnie: dziś, wczoraj,
+przedwczoraj, a dla starszych zdarzeń podaj konkretną datę. Skróty BB, BN, MB i BLK umieszczaj tylko wtedy,
+gdy naprawdę trzeba je przeczytać; warstwa TTS wymówi je po polsku.
+
+Jeżeli poprzedni trusted_voice_response_context ma mode=detail_offer i użytkownik odpowiada „tak”, potraktuj
+to jako prośbę o zaoferowane szczegóły oraz wybierz full_detail. Nie proponuj szczegółów po każdej odpowiedzi.
 
 Przykłady:
-- „Ile mam Winsor 128 BB?” → „Masz 47 sztuk Winsor 128 BB na magazynie.”
-- „Co mam zrobić dzisiaj?” → „Na dziś najważniejsze: wyślij MAGMAR. Nie masz zaległych płatności. Do uzupełnienia zostało 13 uchwytów.”
-- „Czy ktoś zalega z płatnością?” → „Nie, obecnie nie masz faktur po terminie.”
-- „Jakie mam braki?” → „Masz 13 sztuk niepokrytych braków: Winsor 1, Sam 5 i Hugo 7.”
+- „Ile mam Cerne 128 BB?” → mode=direct: „Masz jedną sztukę.”
+- „Ile mam Tom 128 BB?” → mode=direct: „Masz sto osiem sztuk.”
+- „Jakie mam ostatnie zamówienie od MAGMAR?” → mode=detail_offer: „Ostatnie zamówienie od MAGMAR zostało złożone dzisiaj. Mam przeczytać zawartość?”
+- „Co mam zrobić dzisiaj?” → mode=summary: „Najpierw wyślij MAGMAR. Nie masz zaległych płatności. Do uzupełnienia zostało trzynaście uchwytów.”
+- „Jakie mam wyniki firmy za wrzesień?” → mode=business_summary: podaj wynik, koszty, import, sprzedaż, zmianę magazynu i uzasadniony wniosek.
+- „Podaj wszystkie braki” → mode=full_detail: przeczytaj całą merytoryczną listę.
 '''
 FINAL_GREEN_SYNTHESIS_INSTRUCTIONS = '''
 To jest finalna synteza zakończonego batcha GREEN READ. Użyj wyłącznie wyników narzędzi już dostarczonych w input.
@@ -490,8 +508,14 @@ _URL_RULE = re.compile(r'https?://\S+',re.IGNORECASE)
 _UUID_RULE = re.compile(r'\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b',re.IGNORECASE)
 _TECHNICAL_LINE_RULE = re.compile(r'(?im)^.*\b(?:approval_id|execution_id|correlation_id|product_id|count_session_id|expected_version)\b.*$')
 _EXECUTION_TOKEN_RULE = re.compile(r'\b(?:SUCCESS|CONSUMED|PENDING_APPROVAL)\b')
+VOICE_RESPONSE_MODES = frozenset({
+    'direct', 'detail_offer', 'summary', 'business_summary', 'full_detail',
+})
 _SPEECH_TEXT_BLOCK = re.compile(
-    r'\n?\s*<speech_text>\s*(.*?)\s*</speech_text>\s*$', re.IGNORECASE | re.DOTALL)
+    r'\n?\s*<speech_text(?:\s+mode=["\']([^"\']+)["\'])?>'
+    r'\s*(.*?)\s*</speech_text>\s*$',
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def _split_final_response(value):
@@ -499,10 +523,12 @@ def _split_final_response(value):
     text = str(value or '').strip()
     match = _SPEECH_TEXT_BLOCK.search(text)
     if not match:
-        return text, ''
+        return text, '', 'adaptive'
     screen_text = text[:match.start()].rstrip()
-    speech_text = match.group(1).strip()
-    return screen_text or speech_text, speech_text
+    candidate_mode = (match.group(1) or 'adaptive').casefold()
+    mode = candidate_mode if candidate_mode in VOICE_RESPONSE_MODES else 'adaptive'
+    speech_text = match.group(2).strip()
+    return screen_text or speech_text, speech_text, mode
 
 def _plain_response_text(value, *, speech=False):
     text=_conversation_text(value)
@@ -700,22 +726,49 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         'exception_type':None,
     }
 
-    def _finish(status, answer, code='', speech_text=''):
+    def _finish(status, answer, code='', speech_text='', voice_response_mode='adaptive'):
         nonlocal active, current_stage
         if any(item.get('type') == 'inventory_count_card' for item in artifacts):
             artifacts[:] = [item for item in artifacts if item.get('type') != 'product_card']
         # Security redaction only: never parse business claims or language.
         answer = _plain_response_text(answer)
+        if status == 'SUCCESS':
+            from voice_io import compact_speech_text
+            voice_response_mode = (
+                voice_response_mode if voice_response_mode in VOICE_RESPONSE_MODES else 'adaptive')
+            speech_text = compact_speech_text(
+                answer,
+                existing_speech_text=speech_text,
+                user_message=turn_message,
+                voice_response_mode=voice_response_mode,
+            )
+        else:
+            voice_response_mode = 'direct'
+            speech_text = _plain_response_text(answer, speech=True)
         if active:
             try:
+                context_evidence = []
                 if artifact_sources:
                     source_call_id = 'trusted-artifacts-' + run_id
-                    evidence[0:0] = [
+                    context_evidence.extend([
                         {'type':'function_call','call_id':source_call_id,
                          'name':'trusted_artifact_evidence','arguments':'{}'},
                         {'type':'function_call_output','call_id':source_call_id,
                          'output':json.dumps(artifact_sources,ensure_ascii=False,separators=(',',':'))},
-                    ]
+                    ])
+                if speech_text and voice_response_mode == 'detail_offer':
+                    voice_call_id = 'trusted-voice-' + run_id
+                    context_evidence.extend([
+                        {'type':'function_call','call_id':voice_call_id,
+                         'name':'trusted_voice_response_context','arguments':'{}'},
+                        {'type':'function_call_output','call_id':voice_call_id,
+                         'output':json.dumps({
+                             'mode':voice_response_mode,
+                             'speech_text':speech_text,
+                         },ensure_ascii=False,separators=(',',':'))},
+                    ])
+                if context_evidence:
+                    evidence[0:0] = context_evidence
                 agent_conversation.finish_turn(human_actor,ai_actor,conversation_id,run_id,answer,evidence)
             except Exception as exc:
                 current_stage = 'history_save'
@@ -726,6 +779,8 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                     logger.exception('AI_TURN_RELEASE_FAILED %s', run_id)
                 status, code = 'FAILED', 'HISTORY_SAVE_FAILED'
                 answer = 'Nie udało się zapisać odpowiedzi w historii rozmowy.'
+                voice_response_mode = 'direct'
+                speech_text = _plain_response_text(answer, speech=True)
                 logger.error('AI_HISTORY_SAVE_FAILED %s',run_id)
             finally:
                 active = False
@@ -740,6 +795,8 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 chat_503_diagnostics['exception_type'] = type(exc).__name__
                 status, code = 'FAILED', 'AUDIT_FAILED'
                 answer = 'Nie udało się zapisać audytu odpowiedzi.'
+                voice_response_mode = 'direct'
+                speech_text = _plain_response_text(answer, speech=True)
                 logger.error('AI_AUDIT_FAILED %s',run_id)
         timings['total_ms'] = round((time.perf_counter()-started)*1000,2)
         logger.info('AI_TURN_TIMING %s',json.dumps({'agent_run_id':run_id,**timings}))
@@ -771,13 +828,8 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 'input_tokens': usage['input_tokens'] if usage_available else None,
                 'output_tokens': usage['output_tokens'] if usage_available else None,
             }, sort_keys=True))
-        if status == 'SUCCESS':
-            from voice_io import compact_speech_text
-            speech_text = compact_speech_text(
-                answer, existing_speech_text=speech_text, user_message=turn_message)
-        else:
-            speech_text = _plain_response_text(answer, speech=True)
-        result = {'ok':status=='SUCCESS','status':status,'message':answer,'speech_text':speech_text,'agent_run_id':run_id,
+        result = {'ok':status=='SUCCESS','status':status,'message':answer,'speech_text':speech_text,
+                'voice_response_mode':voice_response_mode,'agent_run_id':run_id,
                 'correlation_id':correlation_id,'conversation_id':conversation_id,'tool_calls':timings['tool_calls_count'],
                 'model':model_name,'usage':usage,'error_code':code,'timings':dict(timings),
                 'artifacts':artifacts, 'approvals':pending_approvals,
@@ -786,16 +838,17 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
             result['_chat_503_diagnostics'] = {'stage':current_stage, **chat_503_diagnostics}
         return result
 
-    def finish(status, answer, code='', speech_text=''):
+    def finish(status, answer, code='', speech_text='', voice_response_mode='adaptive'):
         nonlocal active
         try:
-            return _finish(status, answer, code, speech_text)
+            return _finish(status, answer, code, speech_text, voice_response_mode)
         except Exception as exc:
             chat_503_diagnostics['exception_type'] = type(exc).__name__
             logger.exception('AI_TURN_FINALIZATION_FAILED %s', run_id)
             timings['total_ms'] = round((time.perf_counter()-started)*1000,2)
             return {'ok': False, 'status': 'FAILED', 'message': 'Nie udało się teraz pobrać odpowiedzi.',
-                    'speech_text': 'Nie udało się teraz pobrać odpowiedzi.', 'agent_run_id': run_id,
+                    'speech_text': 'Nie udało się teraz pobrać odpowiedzi.',
+                    'voice_response_mode':'direct', 'agent_run_id': run_id,
                     'correlation_id': correlation_id, 'conversation_id': conversation_id,
                     'tool_calls': timings['tool_calls_count'], 'model': model_name, 'usage': usage,
                     'error_code': 'TURN_FINALIZATION_FAILED', 'timings': dict(timings),
@@ -1008,13 +1061,14 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                 if model_calls > 1:
                     chat_503_diagnostics['final_model_call_succeeded'] = True
                 timings['final_model_call_ms'] = elapsed if model_calls>1 else 0.0
-                screen_answer, speech_answer = _split_final_response(reply.text)
+                screen_answer, speech_answer, voice_response_mode = _split_final_response(reply.text)
                 if len(screen_answer)>8000:
                     return finish('FAILED','Odpowiedź przekroczyła limit długości.','RESPONSE_TOO_LARGE')
                 if not screen_answer.strip():
                     return finish('FAILED','Model nie zwrócił odpowiedzi.','PROVIDER_CONTRACT_VIOLATION')
                 logger.info('AI_FINAL_RESPONSE %s',json.dumps({'agent_run_id':run_id,'model':model_name}))
-                return finish('SUCCESS',screen_answer,speech_text=speech_answer)
+                return finish('SUCCESS',screen_answer,speech_text=speech_answer,
+                              voice_response_mode=voice_response_mode)
             current_stage = 'tool_call_validation'
             if green_batch_synthesis_only:
                 return finish('FAILED','Model nie zwrócił finalnej odpowiedzi tekstowej.','PROVIDER_CONTRACT_VIOLATION')
