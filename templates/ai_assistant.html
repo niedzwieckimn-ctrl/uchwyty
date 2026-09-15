@@ -7,7 +7,7 @@
   .ai-empty{margin:auto;max-width:720px;text-align:center;padding:28px}.ai-empty-icon{width:62px;height:62px;margin:0 auto 16px;border-radius:20px;display:grid;place-items:center;background:#eef3ff;color:var(--blue);font-size:28px}.ai-empty h2{font-size:22px;margin-bottom:7px}.ai-examples{display:flex;justify-content:center;flex-wrap:wrap;gap:9px;margin-top:22px}.ai-example{border:1px solid #dfe5f2;background:#fafbff;color:#40506d;border-radius:999px;padding:9px 14px;font:inherit;font-size:13px;cursor:pointer}.ai-example:hover{border-color:#aebdec;background:#f3f6ff}
   .ai-message{display:flex;gap:10px;max-width:min(780px,88%)}.ai-message.user{align-self:flex-end;flex-direction:row-reverse}.ai-avatar{width:34px;height:34px;flex:0 0 34px;border-radius:12px;display:grid;place-items:center;background:#edf2ff;color:var(--blue);font-weight:800;font-size:12px}.ai-message.user .ai-avatar{background:var(--navy);color:#fff}.ai-bubble{padding:12px 15px;border-radius:17px 17px 17px 5px;background:#f2f5fb;border:1px solid #e6eaf2;white-space:pre-wrap;overflow-wrap:anywhere}.ai-message.user .ai-bubble{border:0;border-radius:17px 17px 5px 17px;background:linear-gradient(135deg,var(--blue),var(--blue2));color:#fff}.ai-message.error .ai-bubble{background:#fff3f4;border-color:#ffd9de;color:#a92d41}.ai-loading .ai-bubble{color:var(--muted)}
   .ai-artifacts{display:grid;gap:10px;margin-top:12px;white-space:normal}.ai-artifact{padding:13px;border:1px solid #dce3f0;border-radius:14px;background:#fff;color:var(--ink)}.ai-artifact h3{font-size:15px;margin:0 0 10px}.ai-artifact-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px 14px;font-size:12px}.ai-artifact-grid span{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.04em}.ai-artifact-items{margin-top:10px;display:grid;gap:5px}.ai-artifact-item{display:flex;justify-content:space-between;gap:12px;padding-top:5px;border-top:1px solid #edf0f5;font-size:12px}.ai-artifact-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:11px}.ai-product-image{display:block;max-width:100%;max-height:260px;margin:auto;border-radius:11px;object-fit:contain}.ai-document{display:flex;align-items:center;justify-content:space-between;gap:12px}.ai-document h3{margin:0}
-  .ai-compose{padding:17px 20px;border-top:1px solid var(--line);background:#fff}.ai-form{display:grid;grid-template-columns:1fr auto auto;gap:10px;align-items:end}.ai-input{min-height:48px;max-height:150px;resize:none}.ai-send{height:48px;min-width:112px}.ai-send:disabled,.ai-example:disabled{opacity:.55;cursor:not-allowed;transform:none}.ai-voice{height:48px;min-width:54px;font-size:20px}.ai-voice.recording{background:#b4233c;color:#fff}.ai-voice.playing{background:var(--navy);color:#fff}.ai-voice-status{display:inline-block;min-width:90px;margin-left:8px}.ai-note{margin:8px 3px 0;color:var(--muted);font-size:11px}
+  .ai-compose{padding:17px 20px;border-top:1px solid var(--line);background:#fff}.ai-form{display:grid;grid-template-columns:1fr auto auto;gap:10px;align-items:end}.ai-input{min-height:48px;max-height:150px;resize:none}.ai-send{height:48px;min-width:112px}.ai-send:disabled,.ai-example:disabled{opacity:.55;cursor:not-allowed;transform:none}.ai-voice{height:48px;min-width:54px;font-size:20px}.ai-voice.recording{background:#b4233c;color:#fff}.ai-voice.playing{background:var(--navy);color:#fff}.ai-voice-status{display:inline-block;min-width:90px;margin-left:8px}.ai-replay-voice{margin-left:8px;padding:4px 9px;font-size:11px}.ai-note{margin:8px 3px 0;color:var(--muted);font-size:11px}
   @media(max-width:680px){.ai-card{height:calc(100vh - 125px);min-height:460px}.ai-messages{padding:18px 14px}.ai-message{max-width:95%}.ai-compose{padding:13px}.ai-form{grid-template-columns:1fr auto}.ai-input{grid-column:1/-1}.ai-send{width:100%}.ai-empty{padding:15px}.ai-artifact-grid{grid-template-columns:1fr}}
 </style>
 
@@ -36,7 +36,7 @@
       <button id="aiVoice" class="btn ai-voice" type="button" aria-label="Rozpocznij nagrywanie" aria-pressed="false">🎙</button>
       <button id="aiSend" class="btn primary ai-send" type="submit">Wyślij</button>
     </form>
-    <p class="ai-note">Asystent może dodawać notatki wewnętrzne. Zmiana statusu wymaga zatwierdzenia.<span id="aiVoiceStatus" class="ai-voice-status" role="status">Voice: gotowy</span></p>
+    <p class="ai-note">Asystent może dodawać notatki wewnętrzne. Zmiana statusu wymaga zatwierdzenia.<span id="aiVoiceStatus" class="ai-voice-status" role="status">Voice: gotowy</span><button id="aiReplayVoice" class="btn ai-replay-voice" type="button" hidden disabled>Odtwórz odpowiedź</button></p>
   </div>
 </section>
 
@@ -51,6 +51,7 @@
   const newConversation = document.getElementById('aiNewConversation');
   const voiceButton = document.getElementById('aiVoice');
   const voiceStatus = document.getElementById('aiVoiceStatus');
+  const replayVoiceButton = document.getElementById('aiReplayVoice');
   let busy = false;
   let conversationId = '';
   let voiceState = 'ready';
@@ -63,12 +64,17 @@
   let audioChunks = [];
   let playingAudio = null;
   let playingUrl = '';
+  let playingBlobSize = 0;
+  let playingBlobType = '';
   let ttsController = null;
 
   const voiceLabels = {
     ready:'Voice: gotowy', recording:'Voice: słucham...', requesting:'Voice: przetwarzam...',
     transcribing:'Voice: przetwarzam...', agent:'Voice: przetwarzam...',
-    playing:'Voice: odtwarzanie…', error:'Voice: błąd'
+    tts:'Voice: przygotowuję odpowiedź…', playing:'Voice: odtwarzanie…',
+    stt_error:'Voice: błąd STT', agent_error:'Voice: błąd agenta',
+    tts_error:'Voice: tekst OK, błąd TTS',
+    playback_error:'Voice: tekst OK, odtwarzanie zablokowane'
   };
 
   function setVoiceState(state) {
@@ -83,10 +89,10 @@
   }
 
   function voiceDiagnostic(event, details) {
-    // Only technical metadata: never log audio, transcripts, headers or exception messages.
+    // Only technical metadata: never log audio, transcripts or headers.
     const entry = {};
-    for (const key of ['request_id','stage','mime_type','blob_size','duration_ms','http_status',
-      'latency_ms','error_code','provider_http_status','stt_ms','agent_ms','tts_ms']) {
+    for (const key of ['stage','mime_type','blob_size','blob_type','duration_ms','http_status',
+      'latency_ms','error_code','error_name','error_message']) {
       if (details[key] !== undefined) entry[key] = details[key];
     }
     console.info(event, entry);
@@ -96,21 +102,14 @@
     return Object.assign(new Error(), {voiceCode:code});
   }
 
-  function ioHeaders(requestId, json = true) {
-    const headers = {'X-Request-ID':requestId,
-      'X-CSRF-Token':form.querySelector('input[name="csrf_token"]')?.value || ''};
-    if (json) headers['Content-Type'] = 'application/json';
-    return headers;
-  }
-
-  function ioRequestId() {
-    return typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID()
-      : 'io-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
-  }
-
   function releaseRecordingStream() {
     if (recordingStream) recordingStream.getTracks().forEach(track => track.stop());
     recordingStream = null;
+  }
+
+  function setReplayAvailable(available) {
+    replayVoiceButton.hidden = !available;
+    replayVoiceButton.disabled = !available;
   }
 
   function stopSpeech(reason = 'stopped') {
@@ -124,55 +123,80 @@
     }
     if (playingUrl) URL.revokeObjectURL(playingUrl);
     playingUrl = '';
+    playingBlobSize = 0;
+    playingBlobType = '';
+    setReplayAvailable(false);
     setVoiceState('ready');
     if (hadPlayback) voiceDiagnostic(reason === 'ended' ? 'VOICE_TTS_ENDED' : 'VOICE_TTS_STOP',
       {stage:reason});
   }
 
-  async function playSpeech(speechText, trace) {
+  async function startPlayback() {
+    if (!playingAudio || !playingBlobSize) return false;
+    voiceDiagnostic('VOICE_PLAYBACK_START', {stage:'playback', blob_size:playingBlobSize,
+      blob_type:playingBlobType});
+    try {
+      await playingAudio.play();
+      setReplayAvailable(false);
+      setVoiceState('playing');
+      voiceDiagnostic('VOICE_PLAYBACK_SUCCESS', {stage:'playback'});
+      return true;
+    } catch (error) {
+      const errorName = typeof error?.name === 'string' && error.name ? error.name : 'Error';
+      const errorMessage = typeof error?.message === 'string' ? error.message : '';
+      voiceDiagnostic('VOICE_PLAYBACK_ERROR', {stage:'playback', error_name:errorName,
+        error_message:errorMessage});
+      setVoiceState('playback_error');
+      setReplayAvailable(true);
+      return false;
+    }
+  }
+
+  async function playSpeech(speechText, voiceRoundtripStarted = 0) {
     if (!speechText) return;
     stopSpeech('replaced');
-    setVoiceState('playing');
+    setVoiceState('tts');
     const controller = new AbortController();
     ttsController = controller;
     const started = performance.now();
-    let stage = 'tts_request';
     let httpStatus;
-    voiceDiagnostic('VOICE_TTS_REQUEST_START', {request_id:trace.request_id, stage});
+    voiceDiagnostic('VOICE_TTS_REQUEST_START', {stage:'tts_request'});
     try {
       const response = await fetch('/api/internal/ai/voice/synthesize', {
-        method:'POST', credentials:'same-origin', headers:ioHeaders(trace.request_id),
+        method:'POST', credentials:'same-origin', headers:{'Content-Type':'application/json'},
         body:JSON.stringify({speech_text:speechText}), signal:controller.signal
       });
       httpStatus = response.status;
       if (!response.ok) throw voiceError(`HTTP_${httpStatus}`);
       const blob = await response.blob();
-      trace.tts_ms = Math.round(performance.now() - started);
-      voiceDiagnostic('VOICE_TTS_RESPONSE', {request_id:trace.request_id, stage:'tts_response',
-        http_status:httpStatus, mime_type:blob.type, blob_size:blob.size, latency_ms:trace.tts_ms});
+      voiceDiagnostic('VOICE_TTS_RESPONSE', {stage:'tts_response', http_status:httpStatus,
+        blob_size:blob.size, blob_type:blob.type,
+        latency_ms:Math.round(performance.now() - started)});
+      if (!blob.size) throw voiceError('TTS_EMPTY_AUDIO');
+      if (blob.type !== 'audio/mpeg') throw voiceError('TTS_UNSUPPORTED_AUDIO');
       if (controller.signal.aborted || ttsController !== controller) return;
+      ttsController = null;
       playingUrl = URL.createObjectURL(blob);
+      playingBlobSize = blob.size;
+      playingBlobType = blob.type;
       playingAudio = new Audio(playingUrl);
       playingAudio.addEventListener('ended', () => stopSpeech('ended'), {once:true});
       playingAudio.addEventListener('error', () => {
-        voiceDiagnostic('VOICE_TTS_ERROR', {request_id:trace.request_id,
-          stage:'playback', error_code:'TTS_PLAYBACK_FAILED'});
-        stopSpeech('error'); setVoiceState('error');
+        if (voiceState === 'playback_error') return;
+        voiceDiagnostic('VOICE_PLAYBACK_ERROR', {stage:'playback', error_name:'MediaError',
+          error_message:'Audio element reported an unsupported or unreadable source.'});
+        setVoiceState('playback_error');
+        setReplayAvailable(true);
       }, {once:true});
-      stage = 'playback';
-      await playingAudio.play();
-      if (controller.signal.aborted || ttsController !== controller) return;
-      voiceDiagnostic('VOICE_ROUNDTRIP_COMPLETE', {request_id:trace.request_id, stage:'playback_started',
-        http_status:httpStatus, stt_ms:trace.stt_ms, agent_ms:trace.agent_ms, tts_ms:trace.tts_ms,
-        latency_ms:Math.round(performance.now() - trace.started)});
+      const played = await startPlayback();
+      if (played && voiceRoundtripStarted) voiceDiagnostic('VOICE_ROUNDTRIP_COMPLETE', {stage:'playback_started',
+        latency_ms:Math.round(performance.now() - voiceRoundtripStarted)});
     } catch (error) {
       if (controller.signal.aborted) return;
-      voiceDiagnostic('VOICE_TTS_ERROR', {request_id:trace.request_id, stage, http_status:httpStatus,
-        latency_ms:Math.round(performance.now() - started), error_code:stage === 'playback'
-          ? (error.name === 'NotAllowedError' ? 'AUTOPLAY_BLOCKED' : 'TTS_PLAYBACK_FAILED')
-          : error.voiceCode || 'TTS_FAILED'});
+      voiceDiagnostic('VOICE_TTS_ERROR', {stage:'tts_request', http_status:httpStatus,
+        latency_ms:Math.round(performance.now() - started), error_code:error.voiceCode || 'TTS_FAILED'});
       stopSpeech('error');
-      setVoiceState('error');
+      setVoiceState('tts_error');
     }
   }
 
@@ -282,7 +306,7 @@
     return 'Nie udało się teraz pobrać odpowiedzi. Spróbuj ponownie.';
   }
 
-  async function submitMessage(text, fromVoice = false, trace = null) {
+  async function submitMessage(text, fromVoice = false, voiceRoundtripStarted = 0) {
     const message = text.trim();
     if (!message || busy) return;
     busy = true;
@@ -296,22 +320,17 @@
     const controller = new AbortController();
     const timer = window.setTimeout(() => controller.abort(), 120000);
     const agentStarted = performance.now();
-    const requestId = trace?.request_id || ioRequestId();
     try {
       const response = await fetch('/api/internal/ai/chat', {
         method: 'POST',
         credentials: 'same-origin',
-        headers: ioHeaders(requestId),
+        headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({message: message, conversation_id: conversationId}),
         signal: controller.signal
       });
       const data = await response.json().catch(() => ({}));
-      if (fromVoice) {
-        trace.agent_ms = Math.round(performance.now() - agentStarted);
-        voiceDiagnostic('VOICE_AGENT_RESPONSE', {request_id:requestId, stage:'agent_response',
-          http_status:response.status, latency_ms:trace.agent_ms,
-          error_code:/^[A-Z0-9_]{1,64}$/.test(data?.error_code || '') ? data.error_code : undefined});
-      }
+      if (fromVoice) voiceDiagnostic('VOICE_AGENT_RESPONSE', {stage:'agent_response',
+        http_status:response.status, latency_ms:Math.round(performance.now() - agentStarted)});
       if (typeof data.conversation_id === 'string') conversationId = data.conversation_id;
       loading.remove();
       for (const decision of data.decisions || []) {
@@ -373,31 +392,18 @@
       }
       if (!response.ok || data.status !== 'SUCCESS') {
         addMessage('assistant', friendlyError(response, data), 'error');
-        if (fromVoice) {
-          setVoiceState('error');
-          voiceDiagnostic('VOICE_TTS_SKIPPED', {request_id:requestId, stage:'agent_response',
-            http_status:response.status, error_code:'CHAT_REJECTED'});
-        }
+        if (fromVoice) setVoiceState('agent_error');
       } else {
         const answer = addMessage('assistant', typeof data.message === 'string' ? data.message : 'Nie udało się odczytać odpowiedzi. Spróbuj ponownie.', '');
         renderArtifacts(answer, data.artifacts);
         if (fromVoice && typeof data.speech_text === 'string' && data.speech_text.trim()) {
-          playSpeech(data.speech_text, trace);
-        } else if (fromVoice) {
-          setVoiceState('error');
-          voiceDiagnostic('VOICE_TTS_SKIPPED', {request_id:requestId, stage:'agent_response',
-            http_status:response.status, error_code:'SPEECH_TEXT_MISSING'});
+          playSpeech(data.speech_text, voiceRoundtripStarted);
         }
       }
     } catch (_error) {
       loading.remove();
       addMessage('assistant', 'Nie udało się teraz pobrać odpowiedzi. Spróbuj ponownie.', 'error');
-      if (fromVoice) {
-        setVoiceState('error');
-        voiceDiagnostic('VOICE_AGENT_ERROR', {request_id:requestId, stage:'agent_request',
-          latency_ms:Math.round(performance.now() - agentStarted),
-          error_code:controller.signal.aborted ? 'CHAT_ABORTED' : 'CHAT_NETWORK_ERROR'});
-      }
+      if (fromVoice) setVoiceState('agent_error');
     } finally {
       window.clearTimeout(timer);
       busy = false;
@@ -415,8 +421,7 @@
     const generation = captureGeneration;
     const mimeType = recorder.mimeType;
     const audio = new Blob(audioChunks, {type:mimeType});
-    const trace = {request_id:ioRequestId(), started:recordingStarted};
-    const details = {request_id:trace.request_id, mime_type:mimeType, blob_size:audio.size,
+    const details = {mime_type:mimeType, blob_size:audio.size,
       duration_ms:Math.round(performance.now() - recordingStarted)};
     audioChunks = [];
     releaseRecordingStream();
@@ -440,13 +445,12 @@
       started = performance.now();
       voiceDiagnostic('VOICE_STT_REQUEST_START', {stage, ...details});
       const response = await fetch('/api/internal/ai/voice/transcribe', {
-        method:'POST', credentials:'same-origin', headers:ioHeaders(trace.request_id, false), body, signal:controller.signal
+        method:'POST', credentials:'same-origin', headers:{'X-CSRF-Token':csrf}, body, signal:controller.signal
       });
       httpStatus = response.status;
-      trace.stt_ms = Math.round(performance.now() - started);
       stage = 'stt_response';
       voiceDiagnostic('VOICE_STT_RESPONSE', {stage, ...details, http_status:httpStatus,
-        latency_ms:trace.stt_ms});
+        latency_ms:Math.round(performance.now() - started)});
       let data;
       try { data = await response.json(); }
       catch (_) { throw voiceError(response.ok ? 'STT_INVALID_RESPONSE' : `HTTP_${httpStatus}`); }
@@ -457,12 +461,12 @@
       if (!data.text.trim()) throw voiceError('STT_EMPTY_TRANSCRIPT');
       if (generation !== captureGeneration) return;
       input.value = data.text.trim();
-      await submitMessage(input.value, true, trace);
+      await submitMessage(input.value, true, recordingStarted);
     } catch (error) {
       if (controller.signal.aborted || generation !== captureGeneration) return;
       voiceDiagnostic('VOICE_STT_ERROR', {stage, ...details, http_status:httpStatus,
         latency_ms:Math.round(performance.now() - started), error_code:error.voiceCode || 'STT_NETWORK_ERROR'});
-      setVoiceState('error');
+      setVoiceState('stt_error');
       input.disabled = false;
       input.focus();
     } finally {
@@ -471,7 +475,8 @@
   }
 
   async function startRecording() {
-    if (busy || !['ready','error'].includes(voiceState)) return;
+    if (busy || !['ready','stt_error','agent_error','tts_error','playback_error'].includes(voiceState)) return;
+    if (playingAudio || playingUrl) stopSpeech('replaced');
     const generation = ++captureGeneration;
     const started = performance.now();
     let stage = 'capture_support';
@@ -506,7 +511,7 @@
         recordingCancelled = true;
         releaseRecordingStream();
         voiceDiagnostic('VOICE_STT_ERROR', {stage:'recording', error_code:'MEDIA_RECORDER_ERROR'});
-        setVoiceState('error');
+        setVoiceState('stt_error');
       }, {once:true});
       recorder.start();
       recordingStarted = performance.now();
@@ -520,7 +525,7 @@
         NotFoundError:'MICROPHONE_NOT_FOUND', NotReadableError:'MICROPHONE_UNREADABLE', AbortError:'MICROPHONE_ABORTED'};
       voiceDiagnostic('VOICE_STT_ERROR', {stage, latency_ms:Math.round(performance.now() - started),
         error_code:error.voiceCode || captureErrors[error.name] || 'VOICE_CAPTURE_FAILED'});
-      setVoiceState('error');
+      setVoiceState('stt_error');
     }
   }
 
@@ -555,6 +560,7 @@
     else if (voiceState === 'recording') stopRecording();
     else startRecording();
   });
+  replayVoiceButton.addEventListener('click', () => startPlayback());
   newConversation.addEventListener('click', async () => {
     if (busy) return;
     if (conversationId) {
