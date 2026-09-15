@@ -1347,6 +1347,10 @@ def api_internal_ai_chat():
             result.get('message', ''), existing_speech_text=result.get('speech_text', ''),
             user_message=payload.get('message', ''),
         )
+        app.logger.info('VOICE_SPEECH_TEXT_READY %s', json.dumps({
+            'chars': len(result['speech_text']),
+            'present': bool(result['speech_text']),
+        }, sort_keys=True))
     status_code = 200 if result["status"] == "SUCCESS" else 403 if result["status"] == "DENIED" else 503
     diagnostics = result.pop('_chat_503_diagnostics', {})
     if status_code == 503:
@@ -1479,27 +1483,35 @@ def api_internal_ai_voice_synthesize():
         return jsonify(ok=False, error_code='INVALID_SPEECH_TEXT'), 400
     try:
         provider = VOICE_IO_PROVIDER or voice_provider_from_env()
+        model = getattr(provider, 'tts_model', None) or os.environ.get('AI_TTS_MODEL', 'gpt-4o-mini-tts')
+        voice = getattr(provider, 'voice', None) or os.environ.get('AI_TTS_VOICE', 'alloy')
+        app.logger.info('VOICE_TTS_REQUEST_START %s', json.dumps({
+            'model': model, 'voice': voice, 'chars': len(text),
+        }, sort_keys=True))
         audio = provider.synthesize(text)
+        if not audio.content or audio.content_type != 'audio/mpeg':
+            raise VoiceIOError('Invalid TTS audio response', error_code='TTS_INVALID_RESPONSE',
+                               stage='provider_response')
     except VoiceIOError as exc:
         app.logger.warning('VOICE_TTS_ERROR %s', json.dumps({
             'stage': exc.stage, 'error_code': exc.error_code,
             'exception_type': type(exc).__name__, 'provider_http_status': exc.http_status,
-            'latency_ms': round((time.perf_counter() - started) * 1000, 2),
+            'message': str(exc)[:300],
+            'duration_ms': round((time.perf_counter() - started) * 1000, 2),
         }, sort_keys=True))
         return jsonify(ok=False, error_code='TTS_FAILED'), 503
     except Exception as exc:
         app.logger.warning('VOICE_TTS_ERROR %s', json.dumps({
             'stage': 'provider', 'error_code': 'TTS_BACKEND_ERROR',
             'exception_type': type(exc).__name__, 'provider_http_status': None,
-            'latency_ms': round((time.perf_counter() - started) * 1000, 2),
+            'message': str(exc)[:300],
+            'duration_ms': round((time.perf_counter() - started) * 1000, 2),
         }, sort_keys=True))
         return jsonify(ok=False, error_code='TTS_FAILED'), 503
     app.logger.info('VOICE_TTS_RESPONSE %s', json.dumps({
-        'stage': 'complete', 'http_status': 200,
-        'tts_model': getattr(provider, 'tts_model', None),
-        'voice': getattr(provider, 'voice', None),
-        'audio_type': audio.content_type,
-        'latency_ms': round((time.perf_counter() - started) * 1000, 2),
+        'status': 200, 'content_type': audio.content_type,
+        'bytes': len(audio.content),
+        'duration_ms': round((time.perf_counter() - started) * 1000, 2),
     }, sort_keys=True))
     return send_file(io.BytesIO(audio.content), mimetype=audio.content_type, download_name='speech.mp3')
 
