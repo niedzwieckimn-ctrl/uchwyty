@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import vm from 'node:vm';
 import test from 'node:test';
+import {webcrypto} from 'node:crypto';
 
 const template = readFileSync(new URL('./templates/ai_assistant.html', import.meta.url), 'utf8');
 const script = template.match(/<script>([\s\S]*?)<\/script>/)[1];
@@ -54,7 +55,10 @@ function browser({types = ['audio/webm;codecs=opus'], captureError, chunks = ['r
   }
   class Playback extends Element {
     constructor(url) { super(); this.url = url; this.paused = false; this.currentTime = 0; audios.push(this); }
-    async play() { if (audioPlayError) throw new Error('playback'); }
+    async play() {
+      if (audioPlayError) throw Object.assign(new Error('playback'),
+        {name:audioPlayError === true ? 'Error' : audioPlayError});
+    }
     pause() { this.paused = true; }
   }
   const context = {
@@ -63,7 +67,7 @@ function browser({types = ['audio/webm;codecs=opus'], captureError, chunks = ['r
       if (captureError) throw captureError;
       return getStream ? getStream(stream) : stream;
     }}}, MediaRecorder:mediaRecorder ? Recorder : undefined,
-    Blob, FormData, AbortController, performance, Audio:Playback,
+    Blob, FormData, AbortController, performance, Audio:Playback, crypto:webcrypto,
     URL:{createObjectURL:() => 'blob:voice-test', revokeObjectURL() {}},
     console:{info:(event, details) => logs.push({event, ...details})},
     fetch:async (url, options) => {
@@ -103,7 +107,8 @@ test('click start/stop -> STT -> same chat and conversation, transcript visible'
     conversation_id:'existing-conversation'});
   const bubbles = b.elements.aiMessages.children.flatMap(row => row.children).map(child => child.textContent);
   assert.ok(bubbles.includes('jakie mam zaległe faktury?'));
-  assert.equal(b.elements.aiVoiceStatus.textContent, 'Voice: gotowy');
+  assert.equal(b.elements.aiVoiceStatus.textContent, 'Voice: błąd');
+  assert.ok(b.logs.some(entry => entry.error_code === 'SPEECH_TEXT_MISSING'));
   assert.equal(b.track.stopped, true);
   for (const event of ['VOICE_CAPTURE_START','VOICE_CAPTURE_READY','VOICE_CAPTURE_STOP',
     'VOICE_BLOB_READY','VOICE_STT_REQUEST_START','VOICE_STT_RESPONSE']) {
@@ -245,4 +250,73 @@ test('voice button stops playback without changing chat history', async () => {
   assert.equal(b.elements.aiVoiceStatus.textContent, 'Voice: gotowy');
   assert.equal(b.elements.aiMessages.children.length, before);
   assert.ok(b.logs.some(entry => entry.event === 'VOICE_TTS_STOP' && entry.stage === 'stopped'));
+});
+
+test('chat 403 stops the voice flow and keeps the error visible without calling TTS', async () => {
+  const b = browser({chatResponse:async () => ({ok:false, status:403, json:async () => ({
+    status:'DENIED', error_code:'TOOL_NOT_ALLOWED', message:'Ta operacja nie jest dostępna.',
+    speech_text:'Odmowa.', conversation_id:'existing-conversation',
+  })})});
+  b.click(); await flush(); b.click(); await flush();
+  assert.deepEqual(b.calls.map(call => call.url), ['/api/internal/ai/voice/transcribe', '/api/internal/ai/chat']);
+  assert.equal(b.elements.aiVoiceStatus.textContent, 'Voice: błąd');
+  assert.ok(b.logs.some(entry => entry.event === 'VOICE_AGENT_RESPONSE'
+    && entry.http_status === 403 && entry.error_code === 'TOOL_NOT_ALLOWED'));
+  assert.ok(b.logs.some(entry => entry.event === 'VOICE_TTS_SKIPPED' && entry.error_code === 'CHAT_REJECTED'));
+  assert.ok(!b.logs.some(entry => entry.event === 'VOICE_ROUNDTRIP_COMPLETE'));
+});
+
+for (const [audioPlayError, expectedCode] of [[true, 'TTS_PLAYBACK_FAILED'], ['NotAllowedError', 'AUTOPLAY_BLOCKED']]) {
+test(`audio.play rejection ${expectedCode} is diagnosed as playback`, async () => {
+  const b = browser({audioPlayError, chatResponse:async () => ({
+    ok:true, status:200, json:async () => ({
+      status:'SUCCESS', conversation_id:'existing-conversation', message:'Odpowiedź.',
+      speech_text:'Odpowiedź.',
+    }),
+  })});
+  b.click(); await flush(); b.click(); await flush();
+  assert.ok(b.logs.some(entry => entry.event === 'VOICE_TTS_RESPONSE' && entry.http_status === 200));
+  assert.ok(b.logs.some(entry => entry.event === 'VOICE_TTS_ERROR'
+    && entry.stage === 'playback' && entry.error_code === expectedCode));
+  assert.equal(b.elements.aiVoiceStatus.textContent, 'Voice: błąd');
+  assert.ok(!b.logs.some(entry => entry.event === 'VOICE_ROUNDTRIP_COMPLETE'));
+});
+}
+
+test('identical typed and voice messages share URL, JSON, credentials, CSRF and conversation', async () => {
+  const message = 'Co mam dziś do zrobienia?';
+  const b = browser({sttText:message});
+  b.type('Cześć'); await flush();
+  b.type(message); await flush();
+  b.click(); await flush(); b.click(); await flush();
+  const chats = b.calls.filter(call => call.url === '/api/internal/ai/chat');
+  const typed = chats[1], voice = chats[2];
+  assert.equal(typed.url, voice.url);
+  for (const key of ['method','credentials','body']) assert.equal(typed.options[key], voice.options[key]);
+  for (const key of ['Content-Type','X-CSRF-Token']) assert.equal(typed.options.headers[key], voice.options.headers[key]);
+  assert.equal(voice.options.headers['X-CSRF-Token'], 'rendered-csrf');
+  assert.deepEqual(JSON.parse(voice.options.body), {message, conversation_id:'existing-conversation'});
+  assert.ok(voice.options.headers['X-Request-ID']);
+});
+
+test('one request id and timing breakdown connect the entire voice roundtrip', async () => {
+  const b = browser({chatResponse:async () => ({ok:true, status:200, json:async () => ({
+    status:'SUCCESS', message:'Wynik pozostaje na ekranie.', speech_text:'Wynik jest gotowy.',
+  })})});
+  b.click(); await flush(); b.click(); await flush();
+  const requestId = b.calls[0].options.headers['X-Request-ID'];
+  for (const call of b.calls) assert.equal(call.options.headers['X-Request-ID'], requestId);
+  const events = b.logs.filter(entry => ['VOICE_STT_RESPONSE','VOICE_AGENT_RESPONSE',
+    'VOICE_TTS_RESPONSE','VOICE_ROUNDTRIP_COMPLETE'].includes(entry.event));
+  assert.deepEqual(events.map(entry => entry.event), ['VOICE_STT_RESPONSE','VOICE_AGENT_RESPONSE',
+    'VOICE_TTS_RESPONSE','VOICE_ROUNDTRIP_COMPLETE']);
+  for (const entry of events) {
+    assert.equal(entry.request_id, requestId);
+    assert.equal(entry.http_status, 200);
+    assert.ok(entry.latency_ms >= 0);
+  }
+  const total = events.at(-1);
+  for (const key of ['stt_ms','agent_ms','tts_ms']) assert.ok(total[key] >= 0);
+  assert.ok(b.logs.some(entry => entry.event === 'VOICE_TTS_RESPONSE'
+    && entry.mime_type === 'audio/mpeg' && entry.blob_size > 0));
 });

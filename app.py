@@ -1304,6 +1304,55 @@ def api_ai_approval_decide(approval_id, decision):
 
 
 
+@app.before_request
+def _start_ai_io_diagnostic():
+    if request.method == 'POST' and request.path in {
+        '/api/internal/ai/chat', '/api/internal/ai/voice/transcribe',
+        '/api/internal/ai/voice/synthesize',
+    }:
+        supplied_id = request.headers.get('X-Request-ID', '')
+        g.ai_io = {
+            'request_id': supplied_id if re.fullmatch(r'[A-Za-z0-9._:-]{1,128}', supplied_id) else uuid.uuid4().hex,
+            'started': time.perf_counter(), 'stage': 'before_endpoint',
+            'runtime_started': False, 'provider_http_status': None,
+            'first_model_call_succeeded': False,
+        }
+
+
+def _ai_io_rejected(stage, reason):
+    if hasattr(g, 'ai_io'):
+        g.ai_io.update(stage=stage, reason=reason)
+
+
+@app.after_request
+def _log_ai_io_response(response):
+    context = getattr(g, 'ai_io', None)
+    if context is None:
+        return response
+    response.headers['X-Request-ID'] = context['request_id']
+    if request.path.endswith('/transcribe'):
+        return response  # STT already emits its provider diagnostics.
+    data = response.get_json(silent=True) if response.is_json else {}
+    data = data if isinstance(data, dict) else {}
+    details = {key: value for key, value in context.items() if key != 'started'}
+    details.update(http_status=response.status_code,
+                   latency_ms=round((time.perf_counter() - context['started']) * 1000, 2))
+    if context['stage'] == 'before_endpoint' and response.status_code == 403 and 'permission' in data:
+        details.update(stage='require_permission', reason='PERMISSION_DENIED')
+    elif context['stage'] == 'before_endpoint' and response.status_code == 401:
+        details.update(stage='authentication', reason='IDENTITY_REQUIRED')
+    details.setdefault('reason', 'SUCCESS' if response.status_code == 200 else f'HTTP_{response.status_code}')
+    level = logging.INFO if response.status_code == 200 else logging.WARNING
+    if request.path == '/api/internal/ai/chat':
+        app.logger.log(level, 'VOICE_AGENT_RESPONSE %s', json.dumps(details, sort_keys=True))
+        if response.status_code == 403:
+            app.logger.warning('AI_CHAT_403 %s', json.dumps(details, sort_keys=True))
+    else:
+        event = 'VOICE_TTS_RESPONSE' if response.status_code == 200 else 'VOICE_TTS_ERROR'
+        app.logger.log(level, '%s %s', event, json.dumps(details, sort_keys=True))
+    return response
+
+
 @app.post("/api/internal/ai/chat")
 @require_permission("inventory.read")
 def api_internal_ai_chat():
@@ -1327,6 +1376,7 @@ def api_internal_ai_chat():
         }, sort_keys=True))
         return jsonify(ok=False, status="FAILED", error_code="MODEL_NOT_CONFIGURED",
                        message="Model asystenta nie jest jeszcze skonfigurowany."), 503
+    g.ai_io.update(stage='agent_runtime', runtime_started=True)
     result = run_agent_turn(current_actor_context(), payload.get("message", ""), provider,
                             conversation_id=str(payload.get("conversation_id") or ""))
     if result.get('status') == 'SUCCESS':
@@ -1336,6 +1386,18 @@ def api_internal_ai_chat():
         )
     status_code = 200 if result["status"] == "SUCCESS" else 403 if result["status"] == "DENIED" else 503
     diagnostics = result.pop('_chat_503_diagnostics', {})
+    g.ai_io.update(
+        stage=diagnostics.get('stage') or 'agent_response',
+        reason=result.get('error_code') or result['status'],
+        agent_run_id=result.get('agent_run_id') or '',
+        conversation_id=result.get('conversation_id') or '',
+        speech_text_present=bool(result.get('speech_text')),
+        first_model_call_succeeded=bool(diagnostics.get('first_model_call_succeeded')
+                                        or result['status'] == 'SUCCESS'),
+        tool_calls=result.get('tool_calls', 0),
+        tool_calls_ok=diagnostics.get('tool_calls_ok'),
+        tool_calls_data_unavailable=diagnostics.get('tool_calls_data_unavailable'),
+    )
     if status_code == 503:
         _ai_chat_logger.error("AI_CHAT_503 %s", json.dumps({
             "stage":diagnostics.get("stage") or "agent_runtime",
@@ -1358,7 +1420,7 @@ def voice_stt_rejected_request_diagnostic(response):
     if (request.path != '/api/internal/ai/voice/transcribe' or request.method != 'POST'
             or 'X-Voice-Request-Id' in response.headers):
         return response
-    request_id = uuid.uuid4().hex
+    request_id = g.ai_io['request_id']
     response.headers['X-Voice-Request-Id'] = request_id
     model = (getattr(VOICE_IO_PROVIDER, 'stt_model', '')
              or os.environ.get('AI_STT_MODEL', DEFAULT_STT_MODEL))
@@ -1382,7 +1444,7 @@ def api_internal_ai_voice_transcribe():
     stt_model = (getattr(VOICE_IO_PROVIDER, 'stt_model', '')
                  or os.environ.get('AI_STT_MODEL', DEFAULT_STT_MODEL))
     metrics = TranscriptionDiagnostics(configured_stt_model=stt_model)
-    request_id = uuid.uuid4().hex
+    request_id = g.ai_io['request_id']
     capture_duration_ms = None
     debug_audio_id = None
 
@@ -1457,37 +1519,40 @@ def api_internal_ai_voice_transcribe():
 @app.post('/api/internal/ai/voice/synthesize')
 @require_permission('inventory.read')
 def api_internal_ai_voice_synthesize():
-    started = time.perf_counter()
+    g.ai_io.update(stage='tts_validation')
     if not _rate_limit('internal_ai_voice_tts', 30, 60):
+        _ai_io_rejected('tts_validation', 'RATE_LIMITED')
         return jsonify(ok=False, error_code='RATE_LIMITED'), 429
     payload = request.get_json(silent=True) or {}
     text = str(payload.get('speech_text') or '').strip() if isinstance(payload, dict) else ''
     if not text or len(text) > MAX_SPEECH_TEXT:
+        _ai_io_rejected('tts_validation', 'INVALID_SPEECH_TEXT')
         return jsonify(ok=False, error_code='INVALID_SPEECH_TEXT'), 400
     try:
         provider = VOICE_IO_PROVIDER or voice_provider_from_env()
+        g.ai_io.update(stage='tts_provider', tts_model=getattr(provider, 'tts_model', None),
+                       voice=getattr(provider, 'voice', None))
         audio = provider.synthesize(text)
     except VoiceIOError as exc:
-        app.logger.warning('VOICE_TTS_ERROR %s', json.dumps({
+        g.ai_io.update({
             'stage': exc.stage, 'error_code': exc.error_code,
+            'reason': exc.error_code,
             'exception_type': type(exc).__name__, 'provider_http_status': exc.http_status,
-            'latency_ms': round((time.perf_counter() - started) * 1000, 2),
-        }, sort_keys=True))
+        })
         return jsonify(ok=False, error_code='TTS_FAILED'), 503
     except Exception as exc:
-        app.logger.warning('VOICE_TTS_ERROR %s', json.dumps({
+        g.ai_io.update({
             'stage': 'provider', 'error_code': 'TTS_BACKEND_ERROR',
+            'reason': 'TTS_BACKEND_ERROR',
             'exception_type': type(exc).__name__, 'provider_http_status': None,
-            'latency_ms': round((time.perf_counter() - started) * 1000, 2),
-        }, sort_keys=True))
+        })
         return jsonify(ok=False, error_code='TTS_FAILED'), 503
-    app.logger.info('VOICE_TTS_RESPONSE %s', json.dumps({
-        'stage': 'complete', 'http_status': 200,
-        'tts_model': getattr(provider, 'tts_model', None),
-        'voice': getattr(provider, 'voice', None),
+    g.ai_io.update({
+        'stage': 'complete',
         'audio_type': audio.content_type,
-        'latency_ms': round((time.perf_counter() - started) * 1000, 2),
-    }, sort_keys=True))
+        'provider_http_status': audio.provider_http_status,
+        'provider_latency_ms': audio.provider_latency_ms,
+    })
     return send_file(io.BytesIO(audio.content), mimetype=audio.content_type, download_name='speech.mp3')
 
 
@@ -5175,6 +5240,7 @@ def security_gate():
     if path == "/logout":
         return None
     if not session.get("admin_authenticated"):
+        _ai_io_rejected('authentication', 'ADMIN_SESSION_REQUIRED')
         if path.startswith("/api/"):
             return jsonify(ok=False, error="Brak autoryzacji administratora"), 401
         return redirect(url_for("login", next=request.full_path if request.query_string else path))
@@ -5184,10 +5250,12 @@ def security_gate():
             origin = norm(request.headers.get("Origin")).rstrip("/")
             expected = request.host_url.rstrip("/")
             if origin and origin != expected:
+                _ai_io_rejected('security_gate.origin', 'ORIGIN_MISMATCH')
                 return jsonify(ok=False, error="Nieprawidłowe źródło żądania"), 403
         else:
             supplied = norm(request.form.get("csrf_token") or request.headers.get("X-CSRF-Token"))
             if not supplied or not hmac.compare_digest(supplied, session.get("csrf_token", "")):
+                _ai_io_rejected('security_gate.csrf', 'CSRF_TOKEN_INVALID' if supplied else 'CSRF_TOKEN_MISSING')
                 return "Nieprawidłowy token bezpieczeństwa formularza. Odśwież stronę.", 403
 
 @app.after_request

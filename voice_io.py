@@ -138,6 +138,8 @@ class VoiceIOError(RuntimeError):
 class SynthesizedAudio:
     content: bytes
     content_type: str
+    provider_http_status: int | None = None
+    provider_latency_ms: float | None = None
 
 
 class VoiceIOProvider(Protocol):
@@ -210,6 +212,7 @@ class OpenAIVoiceIOProvider:
         return text
 
     def synthesize(self, text: str) -> SynthesizedAudio:
+        started = time.perf_counter()
         try:
             response = requests.post(
                 'https://api.openai.com/v1/audio/speech',
@@ -218,11 +221,14 @@ class OpenAIVoiceIOProvider:
                 timeout=60,
             )
         except requests.RequestException as exc:
-            raise VoiceIOError('TTS provider unavailable') from exc
+            raise VoiceIOError('TTS provider unavailable', error_code='TTS_NETWORK_ERROR',
+                               stage='provider_request') from exc
         self._raise_for_status(response, 'TTS')
         if not response.content:
-            raise VoiceIOError('Empty speech audio')
-        return SynthesizedAudio(response.content, 'audio/mpeg')
+            raise VoiceIOError('Empty speech audio', error_code='TTS_EMPTY_AUDIO',
+                               stage='provider_response', http_status=response.status_code)
+        return SynthesizedAudio(response.content, 'audio/mpeg', response.status_code,
+                                round((time.perf_counter() - started) * 1000, 2))
 
 
 def provider_from_env() -> VoiceIOProvider:

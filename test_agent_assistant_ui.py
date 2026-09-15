@@ -106,5 +106,5 @@ def test_assistant_ui_has_supervised_approval_and_push_to_talk(client):
     assert "new MediaRecorder" in html
     assert "/api/internal/ai/voice/transcribe" in html
     assert "/api/internal/ai/voice/synthesize" in html
-    assert "playSpeech(data.speech_text, voiceRoundtripStarted)" in html
+    assert "playSpeech(data.speech_text, trace)" in html
     assert client.get('/ai-assistant').headers['Permissions-Policy'] == 'camera=(self), microphone=(self), geolocation=()'
