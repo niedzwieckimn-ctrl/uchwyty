@@ -95,7 +95,11 @@ def multi_order_flow(tmp_path, monkeypatch):
     monkeypatch.setattr(backend, "generate_invoice_packing_list_pdf", fake_packing_pdf)
     with backend.app.test_request_context():
         backend._refresh_domain_route_context()
-    return {"tmp_path": tmp_path, "pdf_calls": pdf_calls}
+    return {
+        "tmp_path": tmp_path,
+        "pdf_calls": pdf_calls,
+        "fake_packing_pdf": fake_packing_pdf,
+    }
 
 
 def _actor():
@@ -123,6 +127,38 @@ def _generate_args(preview):
         "packing_items": preview["preview"]["approval_items"],
         "total_quantity": preview["preview"]["total_quantity"],
     }
+
+
+def _approve_and_execute(args):
+    with backend.app.test_request_context():
+        pending = operations.execute_business_operation(
+            _actor(), "orders.packing_list.generate", args
+        )
+        assert pending.status == "PENDING_APPROVAL", pending
+        approvals.approve_request(
+            pending.approval_id,
+            rbac.load_actor_context(rbac.BOOTSTRAP_OWNER_ACTOR_ID),
+        )
+        result = operations.execute_business_operation(
+            _actor(),
+            "orders.packing_list.generate",
+            args,
+            approval_id=pending.approval_id,
+        )
+    return pending, result
+
+
+def _selected_order_statuses():
+    db = backend.conn()
+    try:
+        return {
+            row["id"]: (row["status"], row["packed_at"])
+            for row in db.execute(
+                "SELECT id,status,packed_at FROM orders WHERE id IN (101,103)"
+            ).fetchall()
+        }
+    finally:
+        db.close()
 
 
 def test_preview_reuses_ui_multi_order_selection_and_excludes_unavailable_or_other_customer(multi_order_flow):
@@ -244,6 +280,12 @@ def test_approved_generate_creates_one_batch_and_document_for_all_selected_order
            WHERE operation='orders.packing_list.generate' AND result='SUCCESS' AND approval_id=?""",
         (pending.approval_id,),
     ).fetchone()[0]
+    committed_audit_count = db.execute(
+        """SELECT COUNT(*) FROM internal_audit_log
+           WHERE operation='orders.packing_list.generate'
+             AND approval_id=? AND after_state LIKE '%domain_committed%'""",
+        (pending.approval_id,),
+    ).fetchone()[0]
     db.close()
 
     assert len(batches) == 1
@@ -255,6 +297,7 @@ def test_approved_generate_creates_one_batch_and_document_for_all_selected_order
     assert {row["document_id"] for row in documents} == {batches[0]["id"]}
     assert len({row["path"] for row in documents}) == 1
     assert audit_count >= 1
+    assert committed_audit_count == 1
     assert approvals.get_request_snapshot(pending.approval_id)["status"] == "CONSUMED"
 
 
@@ -300,3 +343,151 @@ def test_tool_descriptions_route_one_package_intent_to_preview_then_existing_gen
     assert "nie twórz shipment.merge" in generate_definition.description
     assert "packing_scope_fingerprint" in generate_definition.input_schema["properties"]
     assert "packing_items" in generate_definition.input_schema["properties"]
+
+
+def test_pdf_failure_leaves_no_batch_status_or_document_and_fresh_retry_is_safe(
+    multi_order_flow, monkeypatch
+):
+    original_statuses = _selected_order_statuses()
+
+    def fail_pdf(*args, **kwargs):
+        raise RuntimeError("forced PDF failure")
+
+    monkeypatch.setattr(backend, "generate_invoice_packing_list_pdf", fail_pdf)
+    with backend.app.test_request_context():
+        backend._refresh_domain_route_context()
+    failed_args = _generate_args(_preview())
+    _, failed = _approve_and_execute(failed_args)
+
+    assert failed.status == "FAILED"
+    assert "forced PDF failure" in failed.safe_error_message
+    db = backend.conn()
+    assert db.execute("SELECT COUNT(*) FROM packing_batches").fetchone()[0] == 0
+    assert db.execute("SELECT COUNT(*) FROM packing_allocations").fetchone()[0] == 0
+    assert db.execute("SELECT COUNT(*) FROM fulfillment_documents").fetchone()[0] == 0
+    assert db.execute(
+        """SELECT COUNT(*) FROM internal_audit_log
+           WHERE operation='orders.packing_list.generate'
+             AND after_state LIKE '%domain_committed%'"""
+    ).fetchone()[0] == 0
+    db.close()
+    assert _selected_order_statuses() == original_statuses
+
+    monkeypatch.setattr(
+        backend, "generate_invoice_packing_list_pdf", multi_order_flow["fake_packing_pdf"]
+    )
+    with backend.app.test_request_context():
+        backend._refresh_domain_route_context()
+    retry_args = _generate_args(_preview())
+    _, retried = _approve_and_execute(retry_args)
+
+    assert retried.status == "SUCCESS", retried
+    db = backend.conn()
+    assert db.execute("SELECT COUNT(*) FROM packing_batches").fetchone()[0] == 1
+    assert db.execute("SELECT COUNT(*) FROM packing_allocations").fetchone()[0] == 2
+    assert db.execute(
+        "SELECT COUNT(*) FROM fulfillment_documents WHERE kind='packing_list'"
+    ).fetchone()[0] == 2
+    db.close()
+
+
+def test_document_write_failure_rolls_back_batch_allocations_and_statuses(
+    multi_order_flow
+):
+    original_statuses = _selected_order_statuses()
+    db = backend.conn()
+    db.execute(
+        """CREATE TRIGGER fail_second_packing_document
+           BEFORE INSERT ON fulfillment_documents
+           WHEN NEW.kind='packing_list' AND NEW.order_id=103
+           BEGIN
+             SELECT RAISE(ABORT, 'forced document persistence failure');
+           END"""
+    )
+    db.commit()
+    db.close()
+
+    _, result = _approve_and_execute(_generate_args(_preview()))
+
+    assert result.status == "FAILED"
+    assert "forced document persistence failure" in result.safe_error_message
+    db = backend.conn()
+    assert db.execute("SELECT COUNT(*) FROM packing_batches").fetchone()[0] == 0
+    assert db.execute("SELECT COUNT(*) FROM packing_allocations").fetchone()[0] == 0
+    assert db.execute("SELECT COUNT(*) FROM fulfillment_documents").fetchone()[0] == 0
+    assert db.execute(
+        """SELECT COUNT(*) FROM internal_audit_log
+           WHERE operation='orders.packing_list.generate'
+             AND after_state LIKE '%domain_committed%'"""
+    ).fetchone()[0] == 0
+    db.close()
+    assert _selected_order_statuses() == original_statuses
+
+
+def test_retry_repairs_matching_legacy_partial_batch_without_duplicate(
+    multi_order_flow
+):
+    legacy_items = [
+        {"source_order_id": 101, "order_item_id": 1001, "qty": 3},
+        {"source_order_id": 103, "order_item_id": 1003, "qty": 2},
+    ]
+    legacy_batch_id = backend.save_packing_selection(ROOT_ORDER_ID, legacy_items)
+    db = backend.conn()
+    packed_at = backend.now_iso()
+    db.execute(
+        "UPDATE orders SET status='packed_partial',packed_at=? WHERE id IN (101,103)",
+        (packed_at,),
+    )
+    db.commit()
+    db.close()
+
+    _, result = _approve_and_execute(_generate_args(_preview()))
+
+    assert result.status == "SUCCESS", result
+    db = backend.conn()
+    batches = [row[0] for row in db.execute("SELECT id FROM packing_batches ORDER BY id")]
+    document_ids = {
+        row[0]
+        for row in db.execute(
+            "SELECT document_id FROM fulfillment_documents WHERE kind='packing_list'"
+        )
+    }
+    allocation_count = db.execute(
+        "SELECT COUNT(*) FROM packing_allocations WHERE batch_id=?", (legacy_batch_id,)
+    ).fetchone()[0]
+    db.close()
+    assert batches == [legacy_batch_id]
+    assert document_ids == {legacy_batch_id}
+    assert allocation_count == 2
+
+
+def test_retry_with_mismatched_legacy_batch_stops_without_duplicate(
+    multi_order_flow
+):
+    legacy_batch_id = backend.save_packing_selection(
+        ROOT_ORDER_ID,
+        [{"source_order_id": 101, "order_item_id": 1001, "qty": 1}],
+    )
+    db = backend.conn()
+    packed_at = backend.now_iso()
+    db.execute(
+        "UPDATE orders SET status='packed_partial',packed_at=? WHERE id IN (101,103)",
+        (packed_at,),
+    )
+    db.commit()
+    db.close()
+
+    _, result = _approve_and_execute(_generate_args(_preview()))
+
+    assert result.status == "FAILED"
+    assert "niejednoznaczny lub niezgodny otwarty batch pakowania" in result.safe_error_message
+    db = backend.conn()
+    assert [row[0] for row in db.execute("SELECT id FROM packing_batches")] == [legacy_batch_id]
+    assert [
+        tuple(row)
+        for row in db.execute(
+            "SELECT order_id,order_item_id,qty FROM packing_allocations ORDER BY id"
+        )
+    ] == [(101, 1001, 1)]
+    assert db.execute("SELECT COUNT(*) FROM fulfillment_documents").fetchone()[0] == 0
+    db.close()

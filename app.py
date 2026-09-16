@@ -4780,8 +4780,20 @@ def order_fully_invoiced(cur, order_id: int) -> bool:
     return all(int(row["qty"] or 0) > 0 and int(done.get(int(row["id"]), 0)) >= int(row["qty"] or 0) for row in rows)
 
 
-def save_packing_selection(root_order_id: int, packing_items: list[dict]) -> int:
-    """Persist one packing choice until it is consumed by an invoice."""
+def save_packing_selection(
+    root_order_id: int,
+    packing_items: list[dict],
+    *,
+    connection=None,
+    reuse_matching: bool = False,
+    reject_mismatched_open: bool = False,
+) -> int:
+    """Persist one packing choice until it is consumed by an invoice.
+
+    A caller that supplies ``connection`` owns the transaction.  This lets the
+    fulfillment operation commit the batch, its allocations, order statuses
+    and document records as one unit.
+    """
     rows = []
     for item in packing_items or []:
         order_id = to_int(item.get("source_order_id") or item.get("order_id"), 0)
@@ -4791,21 +4803,62 @@ def save_packing_selection(root_order_id: int, packing_items: list[dict]) -> int
             rows.append((order_id, item_id, qty))
     if not rows:
         return 0
-    c = conn()
-    cur = c.cursor()
-    cur.execute(
-        "INSERT INTO packing_batches(root_order_id, invoice_id, created_at) VALUES(?,NULL,?)",
-        (int(root_order_id), now_iso()),
-    )
-    batch_id = int(cur.lastrowid)
-    cur.executemany(
-        """INSERT INTO packing_allocations(batch_id, order_id, order_item_id, qty, created_at)
-           VALUES(?,?,?,?,?)""",
-        [(batch_id, order_id, item_id, qty, now_iso()) for order_id, item_id, qty in rows],
-    )
-    c.commit()
-    c.close()
-    return batch_id
+    owned = connection is None
+    c = connection or conn()
+    try:
+        cur = c.cursor()
+        if reuse_matching:
+            expected = sorted(rows)
+            cur.execute(
+                """SELECT id FROM packing_batches
+                   WHERE root_order_id=? AND invoice_id IS NULL
+                   ORDER BY id DESC""",
+                (int(root_order_id),),
+            )
+            open_batches = cur.fetchall()
+            matching_batch_ids = []
+            for batch in open_batches:
+                candidate_id = int(batch["id"])
+                actual = sorted(
+                    (int(row["order_id"]), int(row["order_item_id"]), int(row["qty"]))
+                    for row in cur.execute(
+                        """SELECT order_id,order_item_id,qty FROM packing_allocations
+                           WHERE batch_id=?""",
+                        (candidate_id,),
+                    ).fetchall()
+                )
+                if actual == expected:
+                    matching_batch_ids.append(candidate_id)
+            if reject_mismatched_open and (
+                len(open_batches) > 1 or (open_batches and not matching_batch_ids)
+            ):
+                raise ValueError(
+                    "Istnieje niejednoznaczny lub niezgodny otwarty batch pakowania. "
+                    "Wymagana jest kontrola stanu przed ponowieniem."
+                )
+            if matching_batch_ids:
+                return matching_batch_ids[0]
+        cur.execute(
+            "INSERT INTO packing_batches(root_order_id, invoice_id, created_at) VALUES(?,NULL,?)",
+            (int(root_order_id), now_iso()),
+        )
+        batch_id = int(cur.lastrowid)
+        created_at = now_iso()
+        cur.executemany(
+            """INSERT INTO packing_allocations(batch_id, order_id, order_item_id, qty, created_at)
+               VALUES(?,?,?,?,?)""",
+            [(batch_id, order_id, item_id, qty, created_at) for order_id, item_id, qty in rows],
+        )
+        if owned:
+            c.commit()
+        return batch_id
+    except Exception:
+        if owned:
+            c.rollback()
+        raise
+    finally:
+        if owned:
+            c.close()
 
 
 def load_open_packing_selection(root_order_id: int) -> dict:
@@ -6490,7 +6543,7 @@ def _record_email_event(event_key, event_type, ref_id, recipient, result):
         c.close()
 
 
-def _partial_packing_order_ids(order_ids, packing_items) -> set[int]:
+def _partial_packing_order_ids(order_ids, packing_items, connection=None) -> set[int]:
     """Return orders whose current packing list does not cover every ordered item."""
     clean_ids = sorted({to_int(value, 0) for value in (order_ids or []) if to_int(value, 0) > 0})
     if not clean_ids or not packing_items:
@@ -6501,7 +6554,8 @@ def _partial_packing_order_ids(order_ids, packing_items) -> set[int]:
         if item_id <= 0:
             continue
         selected_by_item[item_id] = selected_by_item.get(item_id, 0) + max(0, to_int(item.get("qty"), 0))
-    c = conn()
+    owned = connection is None
+    c = connection or conn()
     try:
         placeholders = ",".join(["?"] * len(clean_ids))
         cur = c.cursor()
@@ -6511,7 +6565,8 @@ def _partial_packing_order_ids(order_ids, packing_items) -> set[int]:
         )
         rows = [dict(row) for row in cur.fetchall()]
     finally:
-        c.close()
+        if owned:
+            c.close()
     rows_by_order = {}
     for row in rows:
         rows_by_order.setdefault(to_int(row.get("order_id"), 0), []).append(row)
@@ -6526,41 +6581,46 @@ def _partial_packing_order_ids(order_ids, packing_items) -> set[int]:
     return partial_ids
 
 
-def mark_orders_packed(order_ids, packing_path: str = "", packing_items=None) -> list[int]:
-    """Mark selected orders as being packed without issuing stock again."""
+def mark_orders_packed_transaction(connection, order_ids, packing_items=None) -> dict:
+    """Write packing statuses using the caller's transaction, without side effects."""
     clean_ids = sorted({to_int(value, 0) for value in (order_ids or []) if to_int(value, 0) > 0})
     if not clean_ids:
-        return []
-    partial_ids = _partial_packing_order_ids(clean_ids, packing_items)
-    c = conn()
-    try:
-        placeholders = ",".join(["?"] * len(clean_ids))
-        cur = c.cursor()
+        return {"changed_ids": [], "newly_packed_ids": []}
+    partial_ids = _partial_packing_order_ids(clean_ids, packing_items, connection=connection)
+    placeholders = ",".join(["?"] * len(clean_ids))
+    cur = connection.cursor()
+    cur.execute(
+        f"SELECT id, LOWER(COALESCE(status,'')) AS status FROM orders WHERE id IN ({placeholders})",
+        tuple(clean_ids),
+    )
+    already_packed_ids = {
+        int(row["id"]) for row in cur.fetchall()
+        if norm(row["status"]).lower() in {"packed", "packed_partial"}
+    }
+    packed_at = now_iso()
+    for packed_order_id in clean_ids:
+        next_status = "packed_partial" if packed_order_id in partial_ids else "packed"
         cur.execute(
-            f"SELECT id, LOWER(COALESCE(status,'')) AS status FROM orders WHERE id IN ({placeholders})",
-            tuple(clean_ids),
+            """UPDATE orders SET status=?, packed_at=?
+               WHERE id=? AND LOWER(COALESCE(status,''))
+               NOT IN ('issued','completed','cancelled','shipped')""",
+            (next_status, packed_at, packed_order_id),
         )
-        already_packed_ids = {
-            int(row["id"]) for row in cur.fetchall()
-            if norm(row["status"]).lower() in {"packed", "packed_partial"}
-        }
-        packed_at = now_iso()
-        for packed_order_id in clean_ids:
-            next_status = "packed_partial" if packed_order_id in partial_ids else "packed"
-            cur.execute(
-                """UPDATE orders SET status=?, packed_at=?
-                   WHERE id=? AND LOWER(COALESCE(status,''))
-                   NOT IN ('issued','completed','cancelled','shipped')""",
-                (next_status, packed_at, packed_order_id),
-            )
-        c.commit()
-        cur.execute(
-            f"SELECT id FROM orders WHERE id IN ({placeholders}) AND status IN ('packed','packed_partial')",
-            tuple(clean_ids),
-        )
-        changed_ids = [int(row["id"]) for row in cur.fetchall()]
-    finally:
-        c.close()
+    cur.execute(
+        f"SELECT id FROM orders WHERE id IN ({placeholders}) AND status IN ('packed','packed_partial')",
+        tuple(clean_ids),
+    )
+    changed_ids = [int(row["id"]) for row in cur.fetchall()]
+    return {
+        "changed_ids": changed_ids,
+        "newly_packed_ids": [order_id for order_id in changed_ids if order_id not in already_packed_ids],
+    }
+
+
+def complete_orders_packed_side_effects(packing_result, packing_path: str = "") -> list[int]:
+    """Run retry-safe sync and notifications only after the DB transaction commits."""
+    changed_ids = list((packing_result or {}).get("changed_ids") or [])
+    newly_packed_ids = set((packing_result or {}).get("newly_packed_ids") or [])
     if changed_ids and supabase_enabled():
         try:
             sync_local_rows_to_supabase("orders", "id", changed_ids)
@@ -6577,7 +6637,7 @@ def mark_orders_packed(order_ids, packing_path: str = "", packing_items=None) ->
             c.close()
         pending_orders = [
             order for order in packed_orders
-            if to_int(order.get("id"), 0) not in already_packed_ids
+            if to_int(order.get("id"), 0) in newly_packed_ids
             if not _email_event_already_ok(f"order_packed:{to_int(order.get('id'), 0)}")
         ]
         orders_by_recipient = {}
@@ -6608,6 +6668,21 @@ def mark_orders_packed(order_ids, packing_path: str = "", packing_items=None) ->
                     norm(result.get("error")) or "nieznany blad",
                 )
     return changed_ids
+
+
+def mark_orders_packed(order_ids, packing_path: str = "", packing_items=None) -> list[int]:
+    """Mark selected orders as packed and issue retry-safe post-commit side effects."""
+    c = conn()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        packing_result = mark_orders_packed_transaction(c, order_ids, packing_items)
+        c.commit()
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
+    return complete_orders_packed_side_effects(packing_result, packing_path)
 
 
 def _send_orders_packed_email(orders: list[dict], packing_path: str = "") -> dict:

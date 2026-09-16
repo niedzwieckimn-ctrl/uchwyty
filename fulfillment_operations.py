@@ -179,6 +179,11 @@ def capabilities(data, actor=None, correlation_id='', transaction_connection=Non
 
 def _order_closed_for_operation(name, order):
     status = str(order.get('status') or '').lower()
+    # A failed legacy packing attempt can leave a partially shipped order as
+    # packed_partial without its document.  Packing-list generation is the
+    # recovery operation for that exact state.
+    if name == 'orders.packing_list.generate' and status == 'packed_partial':
+        return False
     if order.get('shipped_at') and status != 'partially_shipped':
         return True
     closed = {'shipped', 'completed', 'cancelled', 'issued', 'in_delivery'}
@@ -191,10 +196,45 @@ def _has_open_current_packing(snapshot_data, current):
     if not current['packing_list']['current']:
         return False
     document_id = current['packing_list'].get('document_id')
-    return any(
+    open_batch = any(
         int(batch.get('id') or 0) == int(document_id or 0) and not batch.get('invoice_id')
         for batch in snapshot_data['batches']
     )
+    if not open_batch:
+        return False
+    db = b.conn()
+    try:
+        member_ids = sorted({
+            int(row['order_id'])
+            for row in db.execute(
+                'SELECT order_id FROM packing_allocations WHERE batch_id=?',
+                (int(document_id),),
+            ).fetchall()
+        })
+        if not member_ids:
+            return False
+        placeholders = ','.join('?' for _ in member_ids)
+        records = {
+            int(row['order_id']): dict(row)
+            for row in db.execute(
+                f'''SELECT * FROM fulfillment_documents
+                    WHERE kind='packing_list' AND document_id=?
+                      AND order_id IN ({placeholders})''',
+                (int(document_id), *member_ids),
+            ).fetchall()
+        }
+    finally:
+        db.close()
+    if set(records) != set(member_ids):
+        return False
+    for member in member_ids:
+        record = records[member]
+        actual_hash = _document_file_hash(record.get('path'))
+        if not actual_hash or actual_hash != record.get('file_hash'):
+            return False
+        if record.get('content_hash') != snapshot(member, include_package=False)['content_hash']:
+            return False
+    return True
 
 
 def _packing_scope_matches(data, proposal):
@@ -500,19 +540,103 @@ def _check_response(result):
     return result
 
 
-def save_document(oid, kind, document_id, path):
-    s = snapshot(oid)
+def save_document(oid, kind, document_id, path, *, connection=None, content_hash=None, file_hash=None):
+    owned = connection is None
+    c = connection or b.conn()
+    try:
+        if content_hash is None:
+            content_hash = snapshot(oid, c, include_package=False)['content_hash']
+        file_hash = file_hash or _document_file_hash(path)
+        if not file_hash:
+            raise error('DOCUMENT_FILE_UNAVAILABLE', 'Nie można odczytać zapisanego dokumentu.')
+        c.execute('INSERT OR REPLACE INTO fulfillment_documents VALUES(?,?,?,?,?,?,?)',
+                  (oid, kind, document_id, content_hash, str(path), b.now_iso(),
+                   file_hash))
+        if owned:
+            c.commit()
+    except Exception:
+        if owned:
+            c.rollback()
+        raise
+    finally:
+        if owned:
+            c.close()
+
+
+def finalize_packing_list(
+    root_order_id,
+    prepared,
+    *,
+    actor=None,
+    correlation_id='',
+    approval_id='',
+    before_state=None,
+):
+    """Atomically publish one prepared packing list to every selected order."""
+    from internal_audit import record_audit_event
+
+    path = prepared['path']
+    items = prepared['items']
+    order_ids = sorted({int(value) for value in prepared['order_ids']})
     file_hash = _document_file_hash(path)
     if not file_hash:
-        raise error('DOCUMENT_FILE_UNAVAILABLE', 'Nie można odczytać zapisanego dokumentu.')
-    c = b.conn()
+        raise error('DOCUMENT_FILE_UNAVAILABLE', 'Nie można odczytać wygenerowanej listy pakowej.')
+
+    db = b.conn()
     try:
-        c.execute('INSERT OR REPLACE INTO fulfillment_documents VALUES(?,?,?,?,?,?,?)',
-                  (oid, kind, document_id, s['content_hash'], str(path), b.now_iso(),
-                   file_hash))
-        c.commit()
+        db.execute('BEGIN IMMEDIATE')
+        content_hashes = {
+            member: snapshot(member, db, include_package=False)['content_hash']
+            for member in order_ids
+        }
+        batch_id = b.save_packing_selection(
+            root_order_id,
+            items,
+            connection=db,
+            reuse_matching=True,
+            reject_mismatched_open=True,
+        )
+        if not batch_id:
+            raise error('PACKING_SELECTION_EMPTY', 'Lista pakowa nie zawiera pozycji.')
+        packing_result = b.mark_orders_packed_transaction(db, order_ids, packing_items=items)
+        for member in order_ids:
+            save_document(
+                member,
+                'packing_list',
+                batch_id,
+                path,
+                connection=db,
+                content_hash=content_hashes[member],
+                file_hash=file_hash,
+            )
+        record_audit_event(
+            'orders.packing_list.generate',
+            result='SUCCESS',
+            actor_context=actor,
+            entity_type='order',
+            entity_id=str(root_order_id),
+            correlation_id=correlation_id,
+            approval_id=approval_id,
+            before_state=before_state,
+            after_state={
+                'phase': 'domain_committed',
+                'batch_id': batch_id,
+                'order_ids': order_ids,
+                'path': str(path),
+            },
+            transaction_connection=db,
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     finally:
-        c.close()
+        db.close()
+
+    # Remote sync and e-mail are retry-safe and run only after the complete
+    # local state exists.  Their helpers contain their own failure handling.
+    b.complete_orders_packed_side_effects(packing_result, packing_path=path)
+    return batch_id
 
 
 def safe_create_shipment(oid, recipient, parcel, reference, service, options):
@@ -631,7 +755,7 @@ def parameters_match(booked, fields):
     return all(key not in fields or fields[key] == (key in options) for key in ('sms', 'email'))
 
 
-def perform(name, data, actor):
+def perform(name, data, actor, *, correlation_id='', approval_id='', before_state=None):
     oid = data['order_id']
     s = snapshot(oid)
     current = state({'order_id': oid})['state']
@@ -674,9 +798,21 @@ def perform(name, data, actor):
             'carrier': 'pending',
             **{f"pack_qty_{item['order_item_id']}": item['pack_qty'] for item in proposal['items']},
         }
-        result = _check_response(b.order_packing_list_download_admin_service(oid, request=request_view(form=form), session={}, structured=True))
-        for member in result['order_ids']:
-            save_document(member, 'packing_list', result['batch_id'], result['path'])
+        prepared = _check_response(b.order_packing_list_download_admin_service(
+            oid,
+            request=request_view(form=form),
+            session={},
+            structured=True,
+            defer_persistence=True,
+        ))
+        prepared['batch_id'] = finalize_packing_list(
+            oid,
+            prepared,
+            actor=actor,
+            correlation_id=correlation_id,
+            approval_id=approval_id,
+            before_state=before_state,
+        )
     elif name == 'orders.invoice.create':
         if current['invoice']['current']:
             return state(data)
@@ -884,7 +1020,14 @@ def execute(execution_id, definition, actor, data, approval_id, entity_type, ent
             entity_type='order', entity_id=str(oid), correlation_id=correlation_id, approval_id=approval_id,
             before_state=before, after_state={'phase': 'started'}, transaction_connection=db)
         db.commit(); db.close(); db = None; locked = True
-        output = ops.validate_output(definition, perform(definition.operation_name, data, actor))
+        output = ops.validate_output(definition, perform(
+            definition.operation_name,
+            data,
+            actor,
+            correlation_id=correlation_id,
+            approval_id=approval_id,
+            before_state=before,
+        ))
         import reconciliation_store
         if definition.operation_name != 'orders.fulfillment.reconcile':
             for member in snapshot(oid)['package_ids']:
