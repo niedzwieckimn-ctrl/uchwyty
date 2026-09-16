@@ -26,6 +26,7 @@ from pathlib import Path
 import order_write
 import invoice_amendment
 import fulfillment_operations
+import packing_history
 import agent_conversation
 import business_query
 import business_read_models
@@ -57,7 +58,7 @@ MAX_BUSINESS_SEARCH_RESULTS = 50
 IDEMPOTENT_REPLAY_WAIT_SECONDS = 5.0
 GENERIC_READ_OPERATIONS = frozenset({"business.describe_schema", "business.query"})
 HIGH_LEVEL_READ_OPERATIONS = business_read_models.READ_OPERATIONS
-DIRECT_READ_RESULT_OPERATIONS = GENERIC_READ_OPERATIONS | HIGH_LEVEL_READ_OPERATIONS
+DIRECT_READ_RESULT_OPERATIONS = GENERIC_READ_OPERATIONS | HIGH_LEVEL_READ_OPERATIONS | {packing_history.OPERATION}
 WARSAW_TZ = ZoneInfo("Europe/Warsaw")
 logger = logging.getLogger(__name__)
 
@@ -372,6 +373,38 @@ FULFILLMENT_READINESS_OUTPUT = {
     "properties": {"ok": {"type": "boolean"}, "results": {"type": "array", "maxItems": MAX_BUSINESS_SEARCH_RESULTS},
                    "count": {"type": "integer"}, "ready_count": {"type": "integer"}, "truncated": {"type": "boolean"}},
 }
+PACKING_HISTORY_INPUT = {
+    "type": "object", "additionalProperties": False, "properties": {
+        "batch_id": {"type": "integer", "minimum": 1, "maximum": 9_223_372_036_854_775_807},
+        "order_id": {"type": "integer", "minimum": 1, "maximum": 9_223_372_036_854_775_807},
+        "customer_id": {"type": "integer", "minimum": 1, "maximum": 9_223_372_036_854_775_807},
+        "customer": {"type": "string", "minLength": 1, "maxLength": 160},
+        "latest": {"type": "boolean"},
+    },
+}
+_PACKING_HISTORY_ALLOCATION = {
+    "type": "object", "additionalProperties": False,
+    "required": ["order_item_id", "order_id", "order_number", "sku", "model_name", "note", "packed_qty"],
+    "properties": {
+        "order_item_id": {"type": "integer"}, "order_id": {"type": "integer"},
+        "order_number": {"type": "string"}, "sku": {"type": "string"},
+        "model_name": {"type": "string"}, "note": {"type": "string"},
+        "packed_qty": {"type": "integer"},
+    },
+}
+PACKING_HISTORY_OUTPUT = {
+    "type": "object", "additionalProperties": False,
+    "required": ["ok", "batch_id", "created_at", "order_ids", "allocations",
+                 "total_lines", "total_qty", "document_id", "document_path"],
+    "properties": {
+        "ok": {"type": "boolean"}, "batch_id": {"type": "integer"},
+        "created_at": {"type": "string"},
+        "order_ids": {"type": "array", "maxItems": 500, "items": {"type": "integer"}},
+        "allocations": {"type": "array", "maxItems": 500, "items": _PACKING_HISTORY_ALLOCATION},
+        "total_lines": {"type": "integer"}, "total_qty": {"type": "integer"},
+        "document_id": {"type": "integer"}, "document_path": {"type": "string"},
+    },
+}
 CHINA_SEARCH_INPUT = {
     "type": "object", "additionalProperties": False,
     "properties": {
@@ -595,6 +628,12 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
         "Deterministically checks whether order items can be fully fulfilled from currently available inventory and reports shortages.",
         "orders.read_full", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
         FULFILLMENT_READINESS_INPUT, FULFILLMENT_READINESS_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
+    ),
+    packing_history.OPERATION: BusinessOperationDefinition(
+        packing_history.OPERATION, 1,
+        "Odczytuje dokładną historyczną listę pakową po batch_id, order_id, customer_id, dokładnej nazwie/e-mailu klienta albo latest=true. Zwraca wyłącznie zapisane packing allocations i treść utrwalonego PDF. Nie używa bieżących order_items, stanów, dostępności ani sum zamówień. Jeśli dokumentu nie można odczytać, operacja odmawia rekonstrukcji.",
+        "packing.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
+        PACKING_HISTORY_INPUT, PACKING_HISTORY_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
     "invoices.search": BusinessOperationDefinition(
         "invoices.search", 1, "Wyszukuje faktury, opcjonalnie dla customer_id; payment_status=unpaid oznacza nieopłacone, a zaległe obsługuje invoices.overdue.",
@@ -906,10 +945,22 @@ def validate_output(definition: BusinessOperationDefinition, supplied: Any) -> d
                 raise ControlledOperationError("INVALID_HANDLER_OUTPUT", f"Handler zwrócił za dużo elementów pola {name}")
             item_schema = schema["properties"][name].get("items", {})
             for item in value:
-                if not isinstance(item, Mapping):
-                    raise ControlledOperationError("INVALID_HANDLER_OUTPUT", f"Handler zwrócił zły element pola {name}")
-                if item_schema.get("properties") and (set(item_schema.get("required", ())) - set(item) or set(item) - set(item_schema["properties"])):
-                    raise ControlledOperationError("INVALID_HANDLER_OUTPUT", f"Handler zwrócił nieprawidłowe pola {name}")
+                if item_schema.get("properties"):
+                    if not isinstance(item, Mapping):
+                        raise ControlledOperationError("INVALID_HANDLER_OUTPUT", f"Handler zwrócił zły element pola {name}")
+                    if set(item_schema.get("required", ())) - set(item) or set(item) - set(item_schema["properties"]):
+                        raise ControlledOperationError("INVALID_HANDLER_OUTPUT", f"Handler zwrócił nieprawidłowe pola {name}")
+                elif item_schema.get("type"):
+                    item_actual = (
+                        "null" if item is None else "boolean" if isinstance(item, bool)
+                        else "integer" if isinstance(item, int) else "number" if isinstance(item, float)
+                        else "string" if isinstance(item, str) else "array" if isinstance(item, list)
+                        else "object" if isinstance(item, Mapping) else "other"
+                    )
+                    item_expected = item_schema["type"]
+                    item_allowed = set(item_expected if isinstance(item_expected, list) else [item_expected])
+                    if item_actual not in item_allowed:
+                        raise ControlledOperationError("INVALID_HANDLER_OUTPUT", f"Handler zwrócił zły element pola {name}")
     return dict(supplied)
 
 
@@ -939,6 +990,10 @@ def _entity(definition: BusinessOperationDefinition, data: Mapping[str, Any]) ->
         return "finance_operational_state", str(data.get("period") or "this_month"), None
     if definition.operation_name == "business.deliveries.state":
         return "deliveries_operational_state", "active", None
+    if definition.operation_name == packing_history.OPERATION:
+        selector = (data.get("batch_id") or data.get("order_id") or data.get("customer_id")
+                    or data.get("customer") or "latest")
+        return "packing_history", str(selector), None
     if definition.operation_name == 'approval.decide':
         return 'approval', data['approval_id'], None
     if definition.operation_name == 'shipping.capabilities':
@@ -1797,6 +1852,13 @@ def _china_orders_summary(data, actor, correlation_id, transaction_connection=No
         if transaction_connection is None: db.close()
 
 
+def _packing_history_read(data):
+    try:
+        return packing_history.read(data, connection_factory=_factory())
+    except packing_history.PackingHistoryError as exc:
+        raise ControlledOperationError(exc.code, exc.safe_message) from exc
+
+
 def _customers_get(data, actor, correlation_id, transaction_connection=None):
     db = transaction_connection or _factory()()
     try:
@@ -2343,6 +2405,8 @@ _HANDLERS: dict[str, Callable[[Mapping[str, Any], ActorContext, str, sqlite3.Con
     "orders.get": _orders_get,
     "orders.summary": _orders_summary,
     "orders.fulfillment.readiness": _orders_fulfillment_readiness,
+    packing_history.OPERATION: lambda data, actor, correlation_id, transaction_connection=None:
+        _packing_history_read(data),
     "orders.packing.check": _orders_packing_check,
     "orders.packing.shortage.report": _packing_shortage_report,
     "orders.packing.confirm": _packing_confirm,
