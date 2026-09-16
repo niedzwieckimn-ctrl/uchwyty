@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from werkzeug.datastructures import MultiDict
 from werkzeug.exceptions import HTTPException, Conflict
 
-READS = {'orders.fulfillment.state', 'shipping.requirements.get', 'orders.documents.print_ready', 'shipping.capabilities'}
+READS = {'orders.fulfillment.state', 'orders.packing_list.preview', 'shipping.requirements.get', 'orders.documents.print_ready', 'shipping.capabilities'}
 READS |= {'orders.documents.adoption.preview', 'shipping.shipment.adoption.preview'}
 WRITES = {'orders.packing_list.generate', 'orders.invoice.create', 'orders.items.add',
           'orders.items.update', 'orders.items.remove', 'shipping.requirements.update',
@@ -22,7 +22,8 @@ PERMISSIONS = {
     'orders.documents.adoption.preview': 'invoices.read', 'orders.documents.adopt': 'invoices.publish',
     'shipping.shipment.adoption.preview': 'shipping.read', 'shipping.shipment.adopt': 'shipping.prepare',
     'shipping.capabilities': 'shipping.read',
-    'orders.fulfillment.state': 'orders.read_full', 'shipping.requirements.get': 'shipping.read',
+    'orders.fulfillment.state': 'orders.read_full', 'orders.packing_list.preview': 'packing.read',
+    'shipping.requirements.get': 'shipping.read',
     'orders.documents.print_ready': 'orders.read_full',
     'orders.packing_list.generate': 'packing.prepare', 'orders.invoice.create': 'invoices.publish',
     'orders.items.add': 'orders.update', 'orders.items.update': 'orders.update', 'orders.items.remove': 'orders.update',
@@ -107,7 +108,9 @@ def snapshot(oid, db=None, include_package=True):
         metas = [dict(r) for i in invoices for r in db.execute('SELECT * FROM invoice_meta WHERE invoice_id=?', (i['id'],))]
         requirements = db.execute('SELECT payload FROM order_shipping_requirements WHERE order_id=?', (oid,)).fetchone()
         docs = _rows(db, 'SELECT * FROM fulfillment_documents WHERE order_id=? ORDER BY kind', (oid,))
-        batches = _rows(db, 'SELECT * FROM packing_batches WHERE root_order_id=? ORDER BY id', (oid,))
+        batches = _rows(db, '''SELECT DISTINCT pb.* FROM packing_batches pb
+            LEFT JOIN packing_allocations pa ON pa.batch_id=pb.id
+            WHERE pb.root_order_id=? OR pa.order_id=? ORDER BY pb.id''', (oid, oid))
         attempts = _rows(db, '''SELECT a.* FROM fulfillment_shipping_attempts a
             WHERE a.order_id=? OR a.order_id IN (SELECT attempt_order_id FROM fulfillment_shipping_members WHERE order_id=?)''', (oid, oid))
         intents = _rows(db, 'SELECT * FROM fulfillment_document_intents WHERE order_id=? ORDER BY kind', (oid,))
@@ -174,12 +177,40 @@ def capabilities(data, actor=None, correlation_id='', transaction_connection=Non
         'missing_configuration': cfg.get('missing') or []}]}
 
 
+def _order_closed_for_operation(name, order):
+    status = str(order.get('status') or '').lower()
+    if order.get('shipped_at') and status != 'partially_shipped':
+        return True
+    closed = {'shipped', 'completed', 'cancelled', 'issued', 'in_delivery'}
+    if status in closed:
+        return True
+    return status == 'partially_shipped' and name != 'orders.packing_list.generate'
+
+
+def _has_open_current_packing(snapshot_data, current):
+    if not current['packing_list']['current']:
+        return False
+    document_id = current['packing_list'].get('document_id')
+    return any(
+        int(batch.get('id') or 0) == int(document_id or 0) and not batch.get('invoice_id')
+        for batch in snapshot_data['batches']
+    )
+
+
+def _packing_scope_matches(data, proposal):
+    return (
+        data.get('packing_scope_fingerprint') == proposal['fingerprint']
+        and data.get('packing_items') == proposal['approval_items']
+        and data.get('total_quantity') == proposal['total_quantity']
+    )
+
+
 def preflight(name, data, actor=None):
     s = snapshot(data['order_id'])
     if version(s) != data['expected_version']:
         raise error('ENTITY_VERSION_CONFLICT', 'Zamówienie zmieniło się. Odczytaj aktualny stan.', 'CONFLICT')
     o = s['order']
-    if name not in {'shipping.shipment.refresh', 'shipping.pickup.request', 'orders.fulfillment.reconcile'} and (o.get('shipped_at') or o['status'] in {'shipped', 'partially_shipped', 'completed', 'cancelled', 'issued', 'in_delivery'}):
+    if name not in {'shipping.shipment.refresh', 'shipping.pickup.request', 'orders.fulfillment.reconcile'} and _order_closed_for_operation(name, o):
         raise error('ORDER_CLOSED', 'Zamówienie zostało wysłane lub zamknięte.', 'DENIED')
     current = state({'order_id': o['id']})['state']
     if name == 'shipping.shipment.create' and len(s['package_ids']) > 1 and data.get('package_fingerprint') != _hash(s):
@@ -211,11 +242,21 @@ def preflight(name, data, actor=None):
         proof = fulfillment_adoption.document_proof(__import__(__name__), o['id']) if name == 'orders.documents.adopt' else fulfillment_adoption.shipment_proof(__import__(__name__), o['id'])
         if proof.get('status') != 'SAFE' or proof.get('fingerprint') != data['preview_fingerprint']:
             raise error('ADOPTION_CONFLICT', 'Adopcja wymaga zgodnego, kompletnego podglądu.', 'CONFLICT')
-    if name == 'orders.packing_list.generate' and not current['packing_list']['current']:
-        if s['invoices']:
-            raise error('EXISTING_INVOICE', 'Najpierw sprawdź istniejącą fakturę.')
-        if not current['readiness']['complete']:
-            raise error('ORDER_NOT_READY', 'Brakuje produktów do kompletnej realizacji.')
+    if name == 'orders.packing_list.generate' and not _has_open_current_packing(s, current):
+        proposal = packing_list_preview(o['id'])
+        scope_supplied = any(
+            key in data for key in ('packing_scope_fingerprint', 'packing_items', 'total_quantity')
+        )
+        if len(proposal['candidate_order_ids']) > 1 and not _packing_scope_matches(data, proposal):
+            raise error(
+                'PACKING_SCOPE_CONFLICT',
+                'Odczytaj orders.packing_list.preview i zatwierdź aktualny zakres wspólnej listy pakowej.',
+                'CONFLICT',
+            )
+        if scope_supplied and not _packing_scope_matches(data, proposal):
+            raise error('PACKING_SCOPE_CONFLICT', 'Zakres listy pakowej zmienił się. Odczytaj aktualną propozycję.', 'CONFLICT')
+        if not proposal['items']:
+            raise error('NOTHING_AVAILABLE_TO_PACK', 'Brak pozycji dostępnych obecnie do wspólnego pakowania.')
     if name == 'orders.invoice.create' and not current['invoice']['current']:
         if s['invoices']:
             matching_intent = any(i['kind'] == 'invoice' and i['content_hash'] == s['content_hash'] for i in s['intents'])
@@ -413,6 +454,42 @@ def request_view(method='POST', form=None, args=None):
     return SimpleNamespace(method=method, form=MultiDict(form or {}), args=MultiDict(args or {}))
 
 
+def packing_list_preview(oid):
+    proposal = _check_response(b.order_packing_list_download_admin_service(
+        oid,
+        request=request_view(method='GET'),
+        session={},
+        structured=True,
+    ))
+    fingerprint_payload = {
+        'root_order_id': proposal['root_order_id'],
+        'customer': proposal['customer'],
+        'candidate_order_ids': proposal['candidate_order_ids'],
+        'order_ids': proposal['order_ids'],
+        'items': proposal['items'],
+    }
+    approval_items = [
+        {
+            'order_id': item['order_id'],
+            'order_number': item['order_number'],
+            'order_item_id': item['order_item_id'],
+            'sku': item['sku'],
+            'quantity': item['pack_qty'],
+        }
+        for item in proposal['items']
+    ]
+    return {
+        **proposal,
+        'approval_items': approval_items,
+        'fingerprint': _hash(fingerprint_payload),
+    }
+
+
+def packing_list_preview_operation(data, actor=None, correlation_id='', transaction_connection=None):
+    current = state({'order_id': data['order_id']})
+    return {**current, 'preview': packing_list_preview(data['order_id'])}
+
+
 def _check_response(result):
     if isinstance(result, tuple):
         raise error('BUSINESS_RULE_BLOCKED', str(result[0]))
@@ -585,15 +662,21 @@ def perform(name, data, actor):
         args = (oid,) if name.endswith('.add') else (oid, data['item_id'])
         _check_response(method(*args, request=request_view(form={'product_id': data.get('product_id'), 'qty': data.get('quantity')}), structured=True))
     elif name == 'orders.packing_list.generate':
-        if current['packing_list']['current']:
+        if _has_open_current_packing(s, current):
             return state(data)
-        if s['invoices']:
-            raise error('EXISTING_INVOICE', 'Najpierw sprawdź istniejącą fakturę. Nie przebudowuję jej listy pakowej w ciemno.')
-        if not current['readiness']['complete']:
-            raise error('ORDER_NOT_READY', 'Brakuje produktów do kompletnej realizacji.')
-        form = {'carrier': 'pending', **{f"pack_qty_{i['id']}": i['qty'] for i in s['items']}}
+        proposal = packing_list_preview(oid)
+        scope_supplied = any(
+            key in data for key in ('packing_scope_fingerprint', 'packing_items', 'total_quantity')
+        )
+        if scope_supplied and not _packing_scope_matches(data, proposal):
+            raise error('PACKING_SCOPE_CONFLICT', 'Zakres listy pakowej zmienił się. Odczytaj aktualną propozycję.', 'CONFLICT')
+        form = {
+            'carrier': 'pending',
+            **{f"pack_qty_{item['order_item_id']}": item['pack_qty'] for item in proposal['items']},
+        }
         result = _check_response(b.order_packing_list_download_admin_service(oid, request=request_view(form=form), session={}, structured=True))
-        save_document(oid, 'packing_list', result['batch_id'], result['path'])
+        for member in result['order_ids']:
+            save_document(member, 'packing_list', result['batch_id'], result['path'])
     elif name == 'orders.invoice.create':
         if current['invoice']['current']:
             return state(data)
@@ -776,7 +859,10 @@ def execute(execution_id, definition, actor, data, approval_id, entity_type, ent
         from contextlib import ExitStack
         lease = ExitStack()
         try:
-            for member in snapshot(oid)['package_ids']:
+            lease_members = set(snapshot(oid)['package_ids'])
+            if definition.operation_name == 'orders.packing_list.generate':
+                lease_members.update(packing_list_preview(oid)['order_ids'])
+            for member in sorted(lease_members):
                 lease.enter_context(order_lease(member, execution_id))
         except Exception:
             lease.close()
@@ -784,7 +870,7 @@ def execute(execution_id, definition, actor, data, approval_id, entity_type, ent
         locked = True
         preflight(definition.operation_name, data, actor)
         before = snapshot(oid)
-        if definition.operation_name not in {'shipping.shipment.refresh', 'shipping.pickup.request', 'orders.fulfillment.reconcile'} and (before['order'].get('shipped_at') or before['order']['status'] in {'shipped', 'partially_shipped', 'completed', 'cancelled', 'issued', 'in_delivery'}):
+        if definition.operation_name not in {'shipping.shipment.refresh', 'shipping.pickup.request', 'orders.fulfillment.reconcile'} and _order_closed_for_operation(definition.operation_name, before['order']):
             raise error('ORDER_CLOSED', 'Zamówienie zostało wysłane lub zamknięte.', 'DENIED')
         db = b.conn(); db.execute('BEGIN IMMEDIATE')
         now_version = version(snapshot(oid, db))
@@ -856,6 +942,30 @@ def install(ops):
                 'type': 'string', 'minLength': 1, 'maxLength': 100,
                 'description': 'Opcjonalny ręczny numer faktury. Bez niego wspólny backend nada numer automatycznie.',
             }
+        if name == 'orders.packing_list.generate':
+            props['packing_scope_fingerprint'] = {
+                'type': 'string', 'minLength': 64, 'maxLength': 64,
+                'description': 'Fingerprint z orders.packing_list.preview. Wymagany, gdy propozycja obejmuje wiele zamówień klienta.',
+            }
+            props['packing_items'] = {
+                'type': 'array', 'maxItems': 200,
+                'description': 'Skopiuj approval_items z orders.packing_list.preview, aby approval pokazywał zamówienia, SKU i ilości.',
+                'items': {
+                    'type': 'object', 'additionalProperties': False,
+                    'required': ['order_id', 'order_number', 'order_item_id', 'sku', 'quantity'],
+                    'properties': {
+                        'order_id': {'type': 'integer', 'minimum': 1},
+                        'order_number': {'type': 'string'},
+                        'order_item_id': {'type': 'integer', 'minimum': 1},
+                        'sku': {'type': 'string'},
+                        'quantity': {'type': 'integer', 'minimum': 1},
+                    },
+                },
+            }
+            props['total_quantity'] = {
+                'type': 'integer', 'minimum': 1,
+                'description': 'Łączna ilość sztuk z orders.packing_list.preview.',
+            }
         if name == 'shipping.requirements.update':
             props.update({k: {'type': 'number'} for k in ('length', 'width', 'height', 'weight')})
             props.update({k: {'type': 'string'} for k in ('carrier', 'dimension_unit', 'weight_unit', 'weight_source')})
@@ -871,13 +981,18 @@ def install(ops):
             props['preview_fingerprint'] = {'type': 'string', 'minLength': 64, 'maxLength': 64}
             required += ['preview_fingerprint']
         risk = 'GREEN' if read or name in GREEN else 'YELLOW'
+        description = 'Realizuje jeden krok istniejącego fulfillment. Najpierw orders.fulfillment.state; użyj zwróconej expected_version. Po WRITE odczytaj state z wyniku i kontynuuj next_step. Nie odtwarzaj poprawnych dokumentów. Pytaj tylko o requirements.missing_fields. Nie anuluj przesyłki. shipping.shipment.refresh odzyskuje wynik timeoutu bez ponownego POST. Druk oznacza przygotowanie PDF, nie fizyczny wydruk.'
+        if name == 'orders.packing_list.preview':
+            description = 'Pokazuje tę samą propozycję co UI Wybierz zawartość paczki: wszystkie kwalifikujące się zamówienia tego klienta, dostępne pozycje, ilości i łączną liczbę sztuk. Użyj przy intencji jednej paczki lub jednej listy pakowej dla wielu zamówień; po wyszukaniu klienta podaj dowolny jego kwalifikujący się order_id jako root. Po pokazaniu propozycji przekaż fingerprint i approval_items do orders.packing_list.generate.'
+        elif name == 'orders.packing_list.generate':
+            description = 'Tworzy jedną wspólną listę pakową przez ten sam service co UI. Przy intencji spakowania wszystkich dostępnych zamówień klienta najpierw wywołaj orders.packing_list.preview, pokaż order IDs, SKU, ilości i sumę, a następnie przekaż fingerprint, approval_items jako packing_items oraz total_quantity. Operacja sama uruchamia wymagany HUMAN approval; nie twórz shipment.merge.'
         ops.OPERATION_REGISTRY[name] = ops.BusinessOperationDefinition(name, 1,
-            'Realizuje jeden krok istniejącego fulfillment. Najpierw orders.fulfillment.state; użyj zwróconej expected_version. Po WRITE odczytaj state z wyniku i kontynuuj next_step. Nie odtwarzaj poprawnych dokumentów. Pytaj tylko o requirements.missing_fields. Nie anuluj przesyłki. shipping.shipment.refresh odzyskuje wynik timeoutu bez ponownego POST. Druk oznacza przygotowanie PDF, nie fizyczny wydruk.',
+            description,
             PERMISSIONS[name], risk, 'NONE' if risk == 'GREEN' else 'REQUIRED', frozenset({'HUMAN', 'AI_AGENT'}),
             {'type': 'object', 'additionalProperties': False, 'required': required, 'properties': props},
             {'type': 'object', 'required': ['ok', 'state'], 'properties': output},
             ops.IDEMPOTENCY_NONE if read else ops.IDEMPOTENCY_REQUIRED, 'READ_STANDARD' if read else 'WRITE', read)
-        ops._HANDLERS[name] = capabilities if name == 'shipping.capabilities' else print_ready if name == 'orders.documents.print_ready' else state
+        ops._HANDLERS[name] = capabilities if name == 'shipping.capabilities' else print_ready if name == 'orders.documents.print_ready' else packing_list_preview_operation if name == 'orders.packing_list.preview' else state
         if name.endswith('.adoption.preview'):
             import fulfillment_adoption
             ops._HANDLERS[name] = lambda data, actor, correlation_id='', transaction_connection=None, operation=name: fulfillment_adoption.preview(__import__(__name__), operation, data)

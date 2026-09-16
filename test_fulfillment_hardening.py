@@ -197,6 +197,13 @@ def prepare_combined():
             b._refresh_domain_route_context()
             s = f.state({'order_id': 802})['state']
             payload = {'order_id': 802, 'expected_version': s['expected_version'], 'idempotency_key': str(uuid.uuid4())}
+            if name == 'orders.packing_list.generate':
+                preview = f.packing_list_preview(802)
+                payload.update(
+                    packing_scope_fingerprint=preview['fingerprint'],
+                    packing_items=preview['approval_items'],
+                    total_quantity=preview['total_quantity'],
+                )
             result = ops.execute_business_operation(actor(), name, payload)
             assert result.status == 'PENDING_APPROVAL', result
             approvals.approve_request(result.approval_id, human())

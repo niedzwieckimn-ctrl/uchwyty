@@ -67,16 +67,17 @@ def test_qty_seven_stock_six_reports_shortage(order_99):
     assert "Z magazynu" not in page
 
 
-def test_stock_refresh_changes_status_and_preflight_uses_current_stock(order_99):
+def test_stock_refresh_changes_status_and_packing_uses_current_available_quantity(order_99):
     snapshot = fulfillment_operations.snapshot(99)
     payload = {
         "order_id": 99,
         "expected_version": fulfillment_operations.version(snapshot),
     }
     _set_stock(6)
-    with pytest.raises(Exception) as blocked:
-        fulfillment_operations.preflight("orders.packing_list.generate", payload)
-    assert getattr(blocked.value, "error_code", "") == "ORDER_NOT_READY"
+    current = fulfillment_operations.preflight("orders.packing_list.generate", payload)
+    proposal = fulfillment_operations.packing_list_preview(99)
+    assert current["readiness"]["complete"] is False
+    assert proposal["total_quantity"] == 6
     assert "Brak towaru" in _order_page(order_99)
 
     _set_stock(8)
@@ -84,6 +85,7 @@ def test_stock_refresh_changes_status_and_preflight_uses_current_stock(order_99)
         "orders.packing_list.generate", payload
     )
     assert current["readiness"]["complete"] is True
+    assert fulfillment_operations.packing_list_preview(99)["total_quantity"] == 7
     page = _order_page(order_99)
     assert "Z magazynu" in page
     assert "Brak towaru" not in page
