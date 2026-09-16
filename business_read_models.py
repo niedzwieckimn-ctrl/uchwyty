@@ -46,11 +46,21 @@ FINANCE_STATE_INPUT = {
 }
 STATE_OUTPUT = {
     "type": "object",
-    "required": ["ok", "read_model", "as_of", "complete", "truncated", "sections"],
+    "required": ["ok", "read_model", "as_of", "complete", "truncated", "scope", "sections"],
     "properties": {
         "ok": {"type": "boolean"}, "read_model": {"type": "string"},
         "as_of": {"type": "string"}, "complete": {"type": "boolean"},
-        "truncated": {"type": "boolean"}, "sections": {"type": "object"},
+        "truncated": {"type": "boolean"},
+        "scope": {
+            "type": "object", "additionalProperties": False,
+            "required": ["kind", "entity_existence_authoritative", "empty_means"],
+            "properties": {
+                "kind": {"type": "string", "enum": ["operational_view"]},
+                "entity_existence_authoritative": {"type": "boolean"},
+                "empty_means": {"type": "string"},
+            },
+        },
+        "sections": {"type": "object"},
     },
 }
 
@@ -116,7 +126,13 @@ def _bounded(sections: dict, limit: int) -> tuple[dict, bool]:
 def _response(read_model: str, sections: dict, now: datetime, limit: int) -> dict:
     sections, truncated = _bounded(sections, limit)
     return {"ok": True, "read_model": read_model, "as_of": now.isoformat(),
-            "complete": not truncated, "truncated": truncated, "sections": sections}
+            "complete": not truncated, "truncated": truncated,
+            "scope": {
+                "kind": "operational_view",
+                "entity_existence_authoritative": False,
+                "empty_means": "no_matching_rows_in_this_operational_view",
+            },
+            "sections": sections}
 
 
 def orders_state(data, actor, correlation_id="", transaction_connection=None,

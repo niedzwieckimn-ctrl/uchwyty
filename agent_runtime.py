@@ -387,15 +387,75 @@ def _prefer_generic_tool_catalog(tools):
 
 
 _V1_REPLACED_BROAD_READS = frozenset({
-    'business.describe_schema', 'orders.summary', 'orders.fulfillment.readiness',
-    'inventory.summary', 'inventory.replenishment.ranking', 'invoices.overdue',
-    'china.orders.summary', 'business.sales.summary',
+    # Schema-first planning is unnecessary because every registered tool already
+    # has a bounded input/output contract.  Keep the established specialist
+    # READs visible: a state view is intentionally not a complete entity store.
+    'business.describe_schema',
 })
 
 
 def _v1_high_level_tool_catalog(tools):
-    """Hide broad legacy READ choices while retaining exact lookup and WRITE support."""
+    """Keep specialist and exact READs beside scoped operational state views."""
     return [item for item in tools if item['name'] not in _V1_REPLACED_BROAD_READS]
+
+
+def _read_question_domains(value: str) -> frozenset[str]:
+    normalized = ' '.join(str(value or '').casefold().split())
+    domains = set()
+    patterns = {
+        'product': r'\b(?:produkt\w*|sku|ean|model\w*|uchwyt\w*|towar\w*)\b',
+        'customer': r'\b(?:klient\w*|kontrahent\w*|firma\w*|kto)\b',
+        'orders': r'\b(?:zam[oó]wieni\w*|kupił\w*|kupil\w*|kupował\w*|kupowal\w*|sprzedał\w*|sprzedal\w*)\b',
+        'inventory': r'\b(?:magazyn\w*|zapas\w*|stan\w*|dostępn\w*|dostepn\w*)\b',
+        'finance': r'\b(?:faktur\w*|płatno\w*|platno\w*|należno\w*|nalezno\w*|sprzedaż\w*|sprzedaz\w*|obr[oó]t\w*)\b',
+        'deliveries': r'\b(?:dostaw\w*|p/o|purchase order|chin\w*)\b',
+    }
+    for domain, pattern in patterns.items():
+        if re.search(pattern, normalized):
+            domains.add(domain)
+    return frozenset(domains)
+
+
+def _read_planning_mode(value: str, intent: str = '') -> str:
+    """Classify READ planning without treating a regex intent as the whole plan."""
+    normalized = ' '.join(str(value or '').casefold().split()).strip(' ?!.')
+    intent = intent or _detect_read_intent(normalized)
+    if intent == 'packing_history':
+        return 'authoritative_history'
+    investigative = bool(re.search(
+        r'\b(?:kto\s+(?:ostatnio\s+)?(?:kupił|kupil|kupował|kupowal)|'
+        r'ile\s+.+\s+(?:kupił|kupil|kupowała|kupowala|zamówił|zamowil)|'
+        r'klient\w*\s*,?\s+kt[oó]r\w*|przez\s+ostatni\w*|histori\w*\s+zakup\w*)\b',
+        normalized,
+    ))
+    if investigative:
+        return 'investigative_lookup'
+    operational = (
+        _is_daily_work_briefing(normalized)
+        or bool(re.search(
+            r'\b(?:zablokowan\w*|niepokryt\w*|do\s+zrobienia|trzeba\s+dom[oó]wić|'
+            r'blokuj\w*|brak\w*\s+towar\w*|'
+            r'wymaga\w*\s+uwagi|gotow\w*\s+do\s+wysył|zam[oó]wieni\w*.*gotow\w*|'
+            r'aktywn\w*\s+zam[oó]wieni|'
+            r'zam[oó]wieni\w*\s+mają\s+komplet|dzisiejsz\w*)\b',
+            normalized,
+        ))
+    )
+    if operational:
+        return 'operational_snapshot'
+    return 'standard_read'
+
+
+def _investigative_read_tool_catalog(tools):
+    """Expose only bounded GREEN READs while an investigative question is open."""
+    result = []
+    for item in tools:
+        if item['name'] in _V1_REPLACED_BROAD_READS:
+            continue
+        definition = business_operations.OPERATION_REGISTRY.get(item['name'])
+        if definition and definition.read_only and definition.risk_level == 'GREEN':
+            result.append(item)
+    return result
 
 
 def _packing_history_tool_catalog(tools):
@@ -580,7 +640,7 @@ zbędnych relacji. Wywołaj go tylko dla konkretnej luki widocznej w wyniku. Nie
 narzędzia ani więcej niż jednego follow-up query. Gdy danych nie ma, nazwij brak i zakończ zamiast szukać dalej.
 '''
 HIGH_LEVEL_READ_MODEL_INSTRUCTIONS = '''
-Dla szerokiego pytania operacyjnego wybierz na podstawie bieżącej wiadomości i całej historii dokładnie jeden,
+Dla szerokiego pytania operacyjnego wybierz na podstawie bieżącej wiadomości i historii dokładnie jeden,
 a tylko dla pytania łączącego dwa obszary maksymalnie dwa gotowe modele READ:
 - business.orders.state: aktywne zamówienia, kompletność, blokery i braki zamówień,
 - business.inventory.state: pokrycie popytu, niskie stany i priorytety uzupełnienia,
@@ -588,9 +648,24 @@ a tylko dla pytania łączącego dwa obszary maksymalnie dwa gotowe modele READ:
 - business.deliveries.state: aktywne P/O z Chin, ich pozycje, etapy i problemy,
 - business.daily.state: wyłącznie konkretne działania wymagane dzisiaj.
 Nie ograniczaj nowego pytania do zakresu poprzedniej odpowiedzi, jeśli użytkownik rozszerza, koryguje lub zmienia
-obszar. Dla konkretnego obiektu możesz użyć dokładnego search/get. business.query zostaw dla ad-hoc analytics,
-agregacji i lookupów niepokrytych gotowym stanem. Nie używaj schema-first, nie uruchamiaj łańcucha fallbacków i nie
-odtwarzaj readiness ani coverage z surowych danych. Gdy gotowy stan nie zawiera danych, zakończ krótką informacją.
+obszar. Gotowy business.*.state jest ograniczonym widokiem operacyjnym, a nie pełnym katalogiem encji. Pusta sekcja
+oznacza brak wpisu w tym widoku i jego zakresie; nie dowodzi, że produkt, klient, zamówienie albo zdarzenie nie istnieje
+w systemie. Pole complete mówi wyłącznie, czy wynik tego widoku został obcięty. Dla konkretnego obiektu użyj dokładnego
+search/get. business.query stosuj do kontrolowanych agregacji i lookupów niepokrytych gotowym stanem. Nie używaj
+schema-first i nie odtwarzaj readiness ani coverage z surowych danych.
+'''
+INVESTIGATIVE_READ_INSTRUCTIONS = '''
+To jest pytanie dochodzeniowe po danych. Rozbij je na wszystkie fakty wymagane do odpowiedzi i pilnuj źródła dla
+każdego z nich. Możesz wykonać kolejne, zależne GREEN READ-y: najpierw search ustalający encję, potem get lub wąskie
+business.query. Nie przedstawiaj częściowego wyniku jako pełnej odpowiedzi. Brak encji w business.*.state nie jest
+dowodem jej braku w systemie. Nie wykonuj WRITE, nie rozszerzaj zakresu poza pytanie i nie powtarzaj tego samego READ.
+Jeśli wynik search jest niejednoznaczny, zakończ prośbą o doprecyzowanie zamiast wybierać rekord samodzielnie.
+'''
+READ_EVIDENCE_CHECK_INSTRUCTIONS = '''
+Masz już wynik co najmniej jednego GREEN READ. Sprawdź, czy istnieje zaufany wynik dla każdej części pytania
+użytkownika. Jeśli tak, odpowiedz teraz. Jeśli brakuje konkretnego faktu, wykonaj tylko najmniejszy kolejny GREEN READ,
+który go dostarczy. Sukces techniczny narzędzia nie oznacza jeszcze kompletnej odpowiedzi. Pusta sekcja widoku
+operacyjnego nie potwierdza braku encji w pełnym systemie. Nie powtarzaj wcześniejszych argumentów i nie wykonuj WRITE.
 '''
 PACKING_HISTORY_READ_INSTRUCTIONS = '''
 To pytanie dotyczy historycznej, już utworzonej listy pakowej lub paczki. Użyj wyłącznie
@@ -947,12 +1022,17 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
     memory_write_receipts = []
     current_stage = 'runtime_initialization'
     detected_intent = _detect_read_intent(message)
+    read_planning_mode = _read_planning_mode(message, detected_intent)
+    read_question_domains = sorted(_read_question_domains(message))
     packing_history_read = detected_intent == 'packing_history'
     model_calls = 0
     generic_analytical_read = False
     ambiguous_business_read = False
     high_level_read_enabled = False
-    high_level_read_diagnostics = {'selected_read_models': [], 'result_bytes': 0}
+    high_level_read_diagnostics = {
+        'selected_read_models': [], 'result_bytes': 0,
+        'planning_mode': read_planning_mode, 'read_rounds': 0,
+    }
     generic_read_diagnostics = {
         'schema_discovery_used':False,
         'computed_fields_selected':[],
@@ -1052,6 +1132,8 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         logger.info('AI_READ_INTENT_DIAGNOSTIC %s', json.dumps({
             'agent_run_id':run_id,
             'detected_intent':detected_intent,
+            'read_planning_mode':read_planning_mode,
+            'read_question_domains':read_question_domains,
             'model_call_count':model_calls,
             'tool_call_count':timings['tool_calls_count'],
             'main_query_fields':generic_read_diagnostics['main_query_fields'],
@@ -1070,6 +1152,8 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
             logger.info('AI_HIGH_LEVEL_READ_STRATEGY %s', json.dumps({
                 'agent_run_id': run_id,
                 'selected_read_models': high_level_read_diagnostics['selected_read_models'],
+                'planning_mode': high_level_read_diagnostics['planning_mode'],
+                'read_rounds': high_level_read_diagnostics['read_rounds'],
                 'model_call_count': model_calls,
                 'tool_call_count': timings['tool_calls_count'],
                 'result_bytes': high_level_read_diagnostics['result_bytes'],
@@ -1244,6 +1328,12 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         if packing_history_read:
             tools = _packing_history_tool_catalog(tools)
             high_level_read_enabled = False
+        elif read_planning_mode == 'investigative_lookup':
+            tools = _investigative_read_tool_catalog(tools)
+            high_level_read_enabled = (
+                high_level_read_enabled
+                and any(item['name'] in business_read_models.READ_OPERATIONS for item in tools)
+            )
         elif not high_level_read_enabled:
             generic_analytical_read = (
                 _prefers_generic_business_read(turn_message, detected_intent)
@@ -1303,6 +1393,12 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         seen = set()
         generic_tools_used = set()
         green_batch_synthesis_only = False
+        read_planning_rounds = 0
+        max_read_planning_rounds = (
+            3 if read_planning_mode == 'investigative_lookup'
+            else 1 if read_planning_mode == 'operational_snapshot'
+            else 2
+        )
         only_green_reads_so_far = True
         packing_history_result = None
         packing_history_error = ''
@@ -1378,8 +1474,13 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
             remaining_tool_budget = MAX_TOOL_CALLS_PER_TURN - timings['tool_calls_count']
             exhausted_green_synthesis = (
                 model_calls > 0 and remaining_tool_budget <= 0 and only_green_reads_so_far)
+            read_planning_exhausted = (
+                (high_level_read_enabled or read_planning_mode == 'investigative_lookup')
+                and read_planning_rounds >= max_read_planning_rounds
+            )
             synthesis_only = (
                 green_batch_synthesis_only or exhausted_green_synthesis
+                or read_planning_exhausted
                 or generic_analytical_read and generic_read_diagnostics['query_count'] >= 2
                 or generic_analytical_read and detected_intent in {'sales_analytics', 'overdue_payments'}
                     and bool(generic_tools_used)
@@ -1400,6 +1501,10 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
 '''
             elif china_shortage_coverage_question:
                 model_instructions += CHINA_SHORTAGE_COVERAGE_INSTRUCTIONS
+            if read_planning_mode == 'investigative_lookup':
+                model_instructions += INVESTIGATIVE_READ_INSTRUCTIONS
+            if read_planning_rounds and not synthesis_only:
+                model_instructions += READ_EVIDENCE_CHECK_INSTRUCTIONS
             if model_calls == 0:
                 model_instructions += FIRST_PASS_PLANNING_INSTRUCTIONS.format(
                     tool_limit=MAX_TOOL_CALLS_PER_TURN)
@@ -1561,6 +1666,10 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                         and call.name not in high_level_read_diagnostics['selected_read_models']):
                     high_level_read_diagnostics['selected_read_models'].append(call.name)
             only_green_reads_so_far = only_green_reads_so_far and all(
+                business_operations.OPERATION_REGISTRY[call.name].read_only
+                and business_operations.OPERATION_REGISTRY[call.name].risk_level == 'GREEN'
+                for call in reply.tool_calls)
+            green_read_round = bool(reply.tool_calls) and all(
                 business_operations.OPERATION_REGISTRY[call.name].read_only
                 and business_operations.OPERATION_REGISTRY[call.name].risk_level == 'GREEN'
                 for call in reply.tool_calls)
@@ -1877,6 +1986,9 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                 turn_outputs.append({'type':'function_call_output','call_id':call.call_id,'output':encoded})
             input_items.extend(outputs+turn_outputs)
             evidence.extend(outputs+turn_outputs)
+            if green_read_round:
+                read_planning_rounds += 1
+                high_level_read_diagnostics['read_rounds'] = read_planning_rounds
             if packing_history_read:
                 if packing_history_result is not None:
                     return finish(
@@ -1890,8 +2002,8 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                        'nie będę rekonstruować jej z bieżących zamówień.',
                     voice_response_mode='direct',
                 )
-            if (parallel_read_batch
-                    or v1_read_batch
+            if ((read_planning_mode != 'investigative_lookup'
+                    and (parallel_read_batch or v1_read_batch))
                     or generic_analytical_read and generic_read_diagnostics['query_count'] >= 2
                     or generic_analytical_read and detected_intent in {'sales_analytics', 'overdue_payments'}
                         and bool(generic_tools_used)
