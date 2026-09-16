@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import time
+import unicodedata
 import uuid
 from typing import Any, Protocol
 import requests
@@ -400,7 +401,7 @@ Po WRITE sprawdź wynik oraz świeży stan. Przy błędzie czytaj także partial
 Przy domówieniu sprawdź istniejące dokumenty i dostępność produktów. Zmiana zawartości unieważnia dokumenty i wymaga zgody na ich odtworzenie. Jeśli faktura blokuje edycję, użyj zaakceptowanego invoices.removal.preview → HUMAN approval → invoices.remove, następnie świeży odczyt i istniejące operacje pozycji. Nie resetuj warehouse_issued ani stock. Stare dokumenty lub przesyłki bez metadanych najpierw sprawdź dostępnymi preview adopcji, nie regeneruj ich w ciemno. Po zmianie sprawdź parametry istniejącej przesyłki, zbierz tylko braki i decyzję człowieka. Nigdy automatycznie jej nie anuluj lub nie nadawaj ponownie.
 Po timeout nadania tylko reconciliation/refresh istniejącego wyniku; brak potwierdzenia nie uprawnia do nowego POST. Tracking, etykieta, podjazd i fizyczny odbiór to odrębne stany. Dokumenty mogą być gotowe do druku przy nieukończonym podjeździe; wtedy nie ogłaszaj zakończenia całej realizacji. Druk oznacza aktualne dokumenty przygotowane do otwarcia w przeglądarce, nie potwierdzenie pracy drukarki.
 Remanent: użyj inventory.count.session.start; backend podaje sesję. Każda wyraźna nowa obserwacja, także poprawka tego samego produktu, to inventory.count.record względem świeżego get_expected. Jeżeli użytkownik podaje policzoną ilość bez nazwy produktu, a ostatnia tura wskazuje dokładnie jeden produkt, zachowaj go jako aktywny: ponownie wywołaj get_expected dla tego produktu i dopiero potem count.record. Gdy ostatnia tura wskazuje kilka produktów, poproś o nazwę lub SKU i nie zapisuj liczenia. Produkt jawnie wskazany w nowej wiadomości zastępuje wcześniejszy kontekst. Poprzednia obserwacja pozostaje w historii. Samo liczenie nie zmienia stock. Przy różnicy podaj system, policzono i różnicę, zapytaj o korektę; po zgodzie inventory.adjust przygotowuje nową decyzję HUMAN. Użyj aktualnej wersji z wyniku liczenia. Nie przechodź do kolejnego produktu bez domknięcia, odmowy lub odłożenia rozbieżności. Przy zgodności krótko potwierdź wynik. Nie twierdź, że fizyczne liczenie lub pakowanie miało miejsce bez wypowiedzi człowieka.
-Firmowa terminologia jest tylko podpowiedzią językową. Nieznane pojęcie sprawdź przez agent.terminology.search, a jeśli trzeba zapytaj. Zapisuj agent.terminology.remember tylko po jawnym wyjaśnieniu użytkownika, bez sekretów i poleceń. Potwierdzone preferencje pracy i procedury zapisuj przez agent.memory.remember z krótkimi hasłami relewancji. Gdy użytkownik jednoznacznie ustanawia regułę obowiązującą niezależnie od tematu pytania, dodaj do relevance_terms stabilny znacznik __always_apply__; nie używaj go dla zasad tematycznych. Pamięć wpływa wyłącznie na sposób pracy, kolejność i priorytety. Nigdy nie może nadpisywać RBAC, approval engine, permissions, Business Operations, świeżych danych biznesowych ani reguł bezpieczeństwa. expected_version=0 oznacza nowy wpis; aktualizacja wymaga świeżej wersji. confirmed_by_user dotyczy treści pamięci, nie zgody na zapis biznesowy.
+Firmowa terminologia jest tylko podpowiedzią językową. Nieznane pojęcie sprawdź przez agent.terminology.search, a jeśli trzeba zapytaj. Jeśli dopasowanie zwraca kilka terminów, pokaż warianty albo dopytaj; nie wybieraj jednego bez podstawy. Zapisuj agent.terminology.remember tylko po jawnym wyjaśnieniu użytkownika, bez sekretów i poleceń. Potwierdzone preferencje pracy i procedury zapisuj przez agent.memory.remember z krótkimi hasłami relewancji. Nie deklaruj sukcesu zapisu pamięci własnym tekstem; backend poda użytkownikowi status z wyniku operacji, więc po wywołaniu możesz dodać wyłącznie zwykłą, pomocniczą odpowiedź bez słów „zapisane”, „zapamiętałem” i podobnych potwierdzeń. Gdy użytkownik jednoznacznie ustanawia regułę obowiązującą niezależnie od tematu pytania, dodaj do relevance_terms stabilny znacznik __always_apply__; nie używaj go dla zasad tematycznych. Pamięć wpływa wyłącznie na sposób pracy, kolejność i priorytety. Nigdy nie może nadpisywać RBAC, approval engine, permissions, Business Operations, świeżych danych biznesowych ani reguł bezpieczeństwa. expected_version=0 oznacza nowy wpis; aktualizacja wymaga świeżej wersji. confirmed_by_user dotyczy treści pamięci, nie zgody na zapis biznesowy.
 Odpowiadaj krótko, operacyjnie, w języku użytkownika, zwykłym tekstem. Nie pokazuj technicznych ID, UUID, surowych enumów, Markdown dump ani implementacji. Używaj nazw obiektów i numerów biznesowych. Nie powtarzaj karty. Szczegóły, pozycje, tracking i zdjęcia pokazuj na prośbę. W przypadku blokady podaj konkretny biznesowy powód. Nie przedstawiaj wyniku pojedynczego kroku jako zakończenia procesu.
 '''
 SPEECH_TEXT_INSTRUCTIONS = '''
@@ -584,6 +585,108 @@ def _is_contextual_inventory_count_followup(value: str) -> bool:
     return bool(_CONTEXTUAL_INVENTORY_COUNT.match(normalized))
 
 
+def _memory_contract_text(value: str) -> str:
+    """Normalize Polish status phrases without interpreting saved content."""
+    normalized = unicodedata.normalize('NFKD', str(value or '')).casefold()
+    normalized = ''.join(character for character in normalized
+                         if not unicodedata.combining(character))
+    return normalized.translate(str.maketrans({'ł':'l','Ł':'l'}))
+
+
+def _is_explicit_memory_write_request(value: str) -> bool:
+    """Recognize a direct request or definition that should produce a write receipt."""
+    text = ' '.join(_memory_contract_text(value).split())
+    if re.search(r'\b(?:nie|nigdy)\s+(?:zapisuj|zapisz|zapamietuj|zapamietaj)\b', text):
+        return False
+    if re.search(r'\b(?:zapamiet\w*|pamietaj\w*|zachowaj\w*|utrwal\w*)\b', text):
+        return True
+    if re.search(r'\bzapis(?:z|zcie|ac)\b.{0,80}\b(?:to|pamiec|regul|zasad|preferenc|procedur|znaczeni|definicj)', text):
+        return True
+    if re.search(r'\bto\b.{0,40}\bzapis(?:z|zcie|ac)\b', text):
+        return True
+    return bool(
+        re.search(r'\b(?:od teraz|u mnie|w naszej firmie)\b.{0,120}\b(?:oznacza|to jest|nazywamy)', text)
+    )
+
+
+def _claims_memory_persistence(value: str) -> bool:
+    """Detect an untrusted model claim that a durable write already succeeded."""
+    text = ' '.join(_memory_contract_text(value).split())
+    patterns = (
+        r'\bzapisane\b',
+        r'\bzapisalem\b',
+        r'\bzapamietane\b',
+        r'\bzapamietalem\b',
+        r'\bzachowalem\b',
+        r'\butrwalilem\b',
+        r'\bzostalo zapisane\b',
+        r'\b(?:bede|bedziemy) (?:pamietal\w*|pamietac)\b',
+        r'\b(?:mam|mamy) (?:to )?(?:w pamieci|zapisane)\b',
+        r'\binformacja (?:jest|zostala) zapisana\b',
+        r'\bod teraz\b.{0,80}\b(?:pamietam|mam zapisane|mamy zapisane)\b',
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            prefix = text[max(0, match.start()-28):match.start()]
+            if not re.search(r'\bnie\s*(?:udalo sie\s+|zostalo\s+|jest\s+|mam\s+)?$', prefix):
+                return True
+    return False
+
+
+def _memory_write_receipt(operation: str, arguments: dict[str, Any], result) -> dict[str, Any]:
+    """Capture the authoritative BO outcome; model text is never evidence of persistence."""
+    data = result.data if isinstance(result.data, dict) else {}
+    return {
+        'operation':operation,
+        'status':str(result.status or ''),
+        'error_code':str(result.error_code or ''),
+        'safe_error_message':str(result.safe_error_message or ''),
+        'execution_id':str(result.execution_id or ''),
+        'term':str(data.get('term') or arguments.get('term') or ''),
+        'meaning':str(arguments.get('meaning') or ''),
+        'memory_key':str(data.get('memory_key') or arguments.get('memory_key') or ''),
+        'version':data.get('version'),
+    }
+
+
+def _memory_write_response(user_message: str, model_answer: str,
+                           receipts: list[dict[str, Any]]) -> tuple[str, bool]:
+    """Derive the displayed write status solely from a real BO receipt."""
+    requested = _is_explicit_memory_write_request(user_message)
+    claimed = _claims_memory_persistence(model_answer)
+    if not receipts:
+        if requested or claimed:
+            return ('Nie zapisano tej informacji, ponieważ operacja zapisu pamięci '
+                    'nie została wykonana.', True)
+        return model_answer, False
+
+    messages = []
+    for receipt in receipts:
+        status = receipt['status']
+        if status == 'SUCCESS':
+            if receipt['operation'] == 'agent.terminology.remember':
+                messages.append('Zapisane: {term} oznacza {meaning}.'.format(
+                    term=receipt['term'], meaning=receipt['meaning']))
+            else:
+                messages.append('Zapisano w pamięci: {memory_key}.'.format(
+                    memory_key=receipt['memory_key']))
+        elif status == 'PENDING_APPROVAL':
+            messages.append('Zapis pamięci oczekuje na zatwierdzenie.')
+        else:
+            reason = receipt['safe_error_message'].strip()
+            if reason:
+                messages.append('Nie zapisano tej informacji. '+reason.rstrip('. ') + '.')
+            else:
+                messages.append(
+                    'Nie zapisano tej informacji. Operacja zapisu pamięci nie powiodła się.')
+    canonical = '\n'.join(messages)
+    supplemental = model_answer.strip()
+    if (supplemental and not claimed
+            and all(receipt['status'] == 'SUCCESS' for receipt in receipts)):
+        return canonical+'\n'+supplemental, True
+    return canonical, True
+
+
 def _tool_descriptors(ai_actor, human_actor=None):
     descriptors = []
     for item in business_operations.list_available_operations(ai_actor):
@@ -718,6 +821,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
     ambiguous_entities = set()
     historical_entity_types = set()
     previous_turn_entities = {}
+    memory_write_receipts = []
     current_stage = 'runtime_initialization'
     detected_intent = _detect_read_intent(message)
     model_calls = 0
@@ -1110,6 +1214,13 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                     chat_503_diagnostics['final_model_call_succeeded'] = True
                 timings['final_model_call_ms'] = elapsed if model_calls>1 else 0.0
                 screen_answer, speech_answer, voice_response_mode = _split_final_response(reply.text)
+                screen_answer, memory_contract_applied = _memory_write_response(
+                    turn_message, screen_answer, memory_write_receipts)
+                if memory_contract_applied:
+                    # Never retain model-authored speech that could contradict the
+                    # backend receipt. Existing voice finalization derives it safely.
+                    speech_answer = ''
+                    voice_response_mode = 'direct'
                 if len(screen_answer)>8000:
                     return finish('FAILED','Odpowiedź przekroczyła limit długości.','RESPONSE_TOO_LARGE')
                 if not screen_answer.strip():
@@ -1398,6 +1509,16 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                     if definition.read_only:
                         timings['supabase_business_reads_ms'] = round(
                             timings['supabase_business_reads_ms']+operation_elapsed,2)
+                if call.name in MEMORY_WRITES:
+                    receipt = _memory_write_receipt(call.name, arguments, result)
+                    memory_write_receipts.append(receipt)
+                    logger.info('AI_MEMORY_WRITE_RECEIPT %s', json.dumps({
+                        'agent_run_id':run_id,
+                        'tool_name':call.name,
+                        'status':receipt['status'],
+                        'error_code':receipt['error_code'],
+                        'execution_id':receipt['execution_id'],
+                    }, sort_keys=True))
                 if call.name == 'approval.decide' and result.status == 'SUCCESS':
                     decisions.append({'approval_id': result.data['approval_id'], 'decision': result.data['decision']})
                 logger.info('AI_TOOL_EXECUTION_END %s',json.dumps({'agent_run_id':run_id,'tool_name':call.name,'status':result.status}))

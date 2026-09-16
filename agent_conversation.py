@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import logging
 import re
+import unicodedata
 import uuid
 from pathlib import Path
 from internal_audit import SUCCESS, record_audit_event, sanitize_audit_text
@@ -173,6 +174,86 @@ def _tokens(value):
     return {token for token in re.findall(r'(?u)\b[\w-]{3,}\b', str(value).casefold())}
 
 
+_POLISH_INFLECTION_CLASSES = (
+    # Conservative, deterministic noun/adjective classes.  They intentionally
+    # do not provide a generic "strip the ending" fallback.
+    ('ska', ('ska', 'skiej', 'ską', 'skie', 'scy')),
+    ('cka', ('cka', 'ckiej', 'cką', 'ckie', 'ccy')),
+    ('dzka', ('dzka', 'dzkiej', 'dzką', 'dzkie', 'dzcy')),
+    ('nia', ('nia', 'ni', 'nię', 'nią')),
+    ('wa', ('wa', 'wy', 'wę', 'wie', 'wą', 'wach')),
+    ('ra', ('ra', 'ry', 'rę', 'rze', 'rą')),
+    ('ma', ('ma', 'my', 'mę', 'mie', 'mą')),
+    ('na', ('na', 'nej', 'ną', 'ne', 'ni')),
+    ('ka', ('ka', 'ki', 'kę', 'ce', 'ką')),
+    ('ga', ('ga', 'gi', 'gę', 'dze', 'gą')),
+    ('ca', ('ca', 'cy', 'cę', 'cą')),
+    ('ów', ('ów', 'owa', 'owie', 'owem')),
+    ('aw', ('aw', 'awia', 'awiu', 'awiem')),
+    ('dź', ('dź', 'dzi', 'dzią')),
+    ('ń', ('ń', 'nia', 'niu', 'niem')),
+    ('sk', ('sk', 'ska', 'sku', 'skiem')),
+    ('in', ('in', 'ina', 'inie', 'inem')),
+    ('ice', ('ice', 'ic', 'icach', 'icami')),
+)
+
+
+def _terminology_words(value):
+    normalized = unicodedata.normalize('NFKC', str(value or '')).casefold()
+    return re.findall(r'(?u)[\w]+', normalized)
+
+
+def _inflection_identity(word):
+    """Return bounded Polish inflection identities for one word."""
+    identities = set()
+    for class_name, variants in _POLISH_INFLECTION_CLASSES:
+        for variant in variants:
+            if word.endswith(variant) and len(word) - len(variant) >= 3:
+                identities.add((class_name, word[:-len(variant)]))
+    return identities
+
+
+def _terminology_match_rank(term, query):
+    """Match a stored term in text, sharing semantics between prefetch and search."""
+    term_words = _terminology_words(term)
+    query_words = _terminology_words(query)
+    if not term_words or not query_words:
+        return None
+    width = len(term_words)
+    for start in range(len(query_words) - width + 1):
+        candidate = query_words[start:start + width]
+        if candidate == term_words:
+            return 0
+        if all(
+            wanted == actual or bool(_inflection_identity(wanted) & _inflection_identity(actual))
+            for wanted, actual in zip(term_words, candidate)
+        ):
+            return 1
+    # Preserve the documented fragment lookup for a short explicit search,
+    # without interpreting a whole sentence as a fragment.
+    if len(query_words) == 1 and len(query_words[0]) >= 3:
+        needle = query_words[0]
+        if any(needle in word for word in term_words):
+            return 2
+    return None
+
+
+def _matching_terminology(rows, query, limit):
+    ranked = []
+    for row in rows:
+        item = dict(row)
+        rank = _terminology_match_rank(item.get('term'), query)
+        if rank is not None:
+            ranked.append((rank, item))
+    # Stable passes make the result deterministic: rank, newest definition,
+    # then term.  All matching definitions remain candidates; none is silently
+    # selected when more than one term matches.
+    ranked.sort(key=lambda item: str(item[1].get('term') or '').casefold())
+    ranked.sort(key=lambda item: str(item[1].get('updated_at') or ''), reverse=True)
+    ranked.sort(key=lambda item: item[0])
+    return [item for _rank, item in ranked[:limit]], len(ranked)
+
+
 def _memory_write_failure(exc, data):
     status = None
     current = exc
@@ -257,13 +338,23 @@ def _relevant_memory(rows, human, query, limit=8):
 def memory_for_model(human, ai, query=''):
     # The existing installation is single-company, one SQLite database per company.
     with connection() as db:
-        terms = db.execute('SELECT term,meaning,scope,source,version FROM internal_agent_terminology WHERE instr(lower(?),lower(term))>0 ORDER BY updated_at DESC LIMIT ?', (query,MAX_TERMS)).fetchall()
+        term_rows = db.execute(
+            'SELECT term,meaning,scope,source,version,updated_at FROM internal_agent_terminology'
+        ).fetchall()
         style = db.execute('SELECT preferences_json FROM internal_agent_user_style WHERE human_actor_id=?', (human.actor_id,)).fetchone()
+    terms, terminology_matched = _matching_terminology(term_rows, query, MAX_TERMS)
     durable = _relevant_memory(_memory_rows(), human, query)
     result = {'confirmed_terminology': [], 'user_style': json.loads(style[0]) if style else {},
               'relevant_company_memory': []}
     if len(json.dumps(result, ensure_ascii=False).encode()) > 1000:
         result['user_style'] = {}
+    terminology_included = 0
+    for row in terms:
+        candidate = {key: row[key] for key in ('term', 'meaning', 'scope', 'source', 'version')}
+        result['confirmed_terminology'].append(candidate)
+        if len(json.dumps(result,ensure_ascii=False).encode()) > MAX_MEMORY_BYTES:
+            result['confirmed_terminology'].pop(); break
+        terminology_included += 1
     for row in durable:
         result['relevant_company_memory'].append(
             {'memory_key':row['memory_key'],'category':row['category'],'scope':row['scope'],
@@ -271,11 +362,13 @@ def memory_for_model(human, ai, query=''):
         if len(json.dumps(result,ensure_ascii=False).encode()) > MAX_MEMORY_BYTES:
             result['relevant_company_memory'].pop()
             break
-    for row in terms:
-        candidate = dict(row)
-        result['confirmed_terminology'].append(candidate)
-        if len(json.dumps(result,ensure_ascii=False).encode()) > MAX_MEMORY_BYTES:
-            result['confirmed_terminology'].pop(); break
+    logger.info('TERMINOLOGY_RETRIEVAL %s', json.dumps({
+        'matched_count':terminology_matched,
+        'included_count':terminology_included,
+        'dropped_by_limit':max(0, terminology_matched-terminology_included),
+        'ambiguous':terminology_matched > 1,
+        'source':'prefetch',
+    }, sort_keys=True))
     return result
 
 
@@ -425,5 +518,18 @@ def remember_terminology(data, actor, correlation_id, transaction_connection=Non
 
 def search_terminology(data, actor, correlation_id, transaction_connection=None):
     with connection() as db:
-        rows = db.execute("SELECT term,meaning,scope,source,version FROM internal_agent_terminology WHERE instr(lower(term),lower(?))>0 ORDER BY term LIMIT 10", (data['query'],)).fetchall()
-    return {'ok':True,'results':[dict(row) for row in rows]}
+        term_rows = db.execute(
+            'SELECT term,meaning,scope,source,version,updated_at FROM internal_agent_terminology'
+        ).fetchall()
+    rows, matched = _matching_terminology(term_rows, data['query'], 10)
+    logger.info('TERMINOLOGY_RETRIEVAL %s', json.dumps({
+        'matched_count':matched,
+        'included_count':len(rows),
+        'dropped_by_limit':max(0, matched-len(rows)),
+        'ambiguous':matched > 1,
+        'source':'explicit_search',
+    }, sort_keys=True))
+    return {'ok':True,'results':[
+        {key: row[key] for key in ('term', 'meaning', 'scope', 'source', 'version')}
+        for row in rows
+    ]}
