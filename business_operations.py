@@ -377,8 +377,10 @@ PACKING_HISTORY_INPUT = {
     "type": "object", "additionalProperties": False, "properties": {
         "batch_id": {"type": "integer", "minimum": 1, "maximum": 9_223_372_036_854_775_807},
         "order_id": {"type": "integer", "minimum": 1, "maximum": 9_223_372_036_854_775_807},
+        "order_number": {"type": "string", "minLength": 1, "maxLength": 80},
         "customer_id": {"type": "integer", "minimum": 1, "maximum": 9_223_372_036_854_775_807},
         "customer": {"type": "string", "minLength": 1, "maxLength": 160},
+        "today": {"type": "boolean"},
         "latest": {"type": "boolean"},
     },
 }
@@ -639,7 +641,7 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
     ),
     packing_history.OPERATION: BusinessOperationDefinition(
         packing_history.OPERATION, 1,
-        "Odczytuje dokładną historyczną listę pakową po batch_id, order_id, customer_id, dokładnej nazwie/e-mailu klienta albo latest=true. Zwraca wyłącznie zapisane packing allocations i treść utrwalonego PDF. Nie używa bieżących order_items, stanów, dostępności ani sum zamówień. Jeśli dokumentu nie można odczytać, operacja odmawia rekonstrukcji.",
+        "Odczytuje dokładną historyczną listę pakową po batch_id, wewnętrznym order_id, historycznym order_number, customer_id, dokładnej nazwie/e-mailu klienta, today=true albo latest=true. Zwraca wyłącznie zapisane packing allocations i treść utrwalonego PDF. Nie używa bieżących order_items, stanów, dostępności ani sum zamówień. Jeśli dokumentu nie można odczytać, operacja odmawia rekonstrukcji.",
         "packing.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
         PACKING_HISTORY_INPUT, PACKING_HISTORY_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),

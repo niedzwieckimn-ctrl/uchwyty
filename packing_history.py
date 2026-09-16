@@ -8,12 +8,14 @@ Current order items are deliberately never queried here.
 
 from __future__ import annotations
 
+from datetime import datetime
 from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
 import json
 import re
 from typing import Any, Mapping
+from zoneinfo import ZoneInfo
 
 from pypdf import PdfReader
 
@@ -126,11 +128,12 @@ def _document_rows(content: bytes) -> tuple[list[dict[str, Any]], int | None, in
 
 def _selector(data: Mapping[str, Any]) -> tuple[str, Any]:
     supplied = []
-    for key in ("batch_id", "order_id", "customer_id", "customer"):
+    for key in ("batch_id", "order_id", "order_number", "customer_id", "customer"):
         if data.get(key) not in (None, ""):
             supplied.append((key, data[key]))
-    if data.get("latest") is True:
-        supplied.append(("latest", True))
+    for key in ("today", "latest"):
+        if data.get(key) is True:
+            supplied.append((key, True))
     if len(supplied) != 1:
         raise PackingHistoryError(
             "PACKING_HISTORY_SELECTOR_REQUIRED",
@@ -304,6 +307,29 @@ def _select_batch(db, data: Mapping[str, Any]):
                  ORDER BY pb.created_at DESC,pb.id DESC LIMIT 1""",
             (int(value), int(value)),
         ).fetchone(), None
+    if selector == "order_number":
+        requested = _key_text(value)
+        matches = []
+        unverifiable_batches = 0
+        for raw_batch in db.execute(
+                "SELECT * FROM packing_batches ORDER BY created_at DESC,id DESC").fetchall():
+            batch = dict(raw_batch)
+            allocations = _batch_allocations(db, int(batch["id"]))
+            if not allocations:
+                continue
+            try:
+                evidence = _historical_allocation_keys(db, batch, allocations)
+            except PackingHistoryError:
+                unverifiable_batches += 1
+                continue
+            if any(key[0] == requested for _allocation, key in evidence[0]):
+                matches.append((raw_batch, evidence))
+        if matches:
+            return matches[0]
+        if unverifiable_batches:
+            raise _not_verifiable(
+                "Nie można wiarygodnie ustalić historycznego batcha dla tego numeru zamówienia.")
+        return None, None
     if selector in {"customer_id", "customer"}:
         requested = int(value) if selector == "customer_id" else _key_text(value)
         matches = []
@@ -340,6 +366,20 @@ def _select_batch(db, data: Mapping[str, Any]):
             raise _not_verifiable(
                 "Nie można wiarygodnie ustalić historycznego batcha dla tego klienta.")
         return None, None
+    if selector == "today":
+        today = datetime.now(ZoneInfo("Europe/Warsaw")).date().isoformat()
+        rows = db.execute(
+            """SELECT * FROM packing_batches
+                 WHERE substr(created_at,1,10)=?
+                 ORDER BY created_at DESC,id DESC""",
+            (today,),
+        ).fetchall()
+        if len(rows) > 1:
+            raise PackingHistoryError(
+                "PACKING_HISTORY_SCOPE_AMBIGUOUS",
+                "Dziś zapisano więcej niż jedną listę pakową. Wskaż numer zamówienia albo konkretny batch.",
+            )
+        return (rows[0] if rows else None), None
     return (db.execute(
         "SELECT * FROM packing_batches ORDER BY created_at DESC,id DESC LIMIT 1"
     ).fetchone(), None)

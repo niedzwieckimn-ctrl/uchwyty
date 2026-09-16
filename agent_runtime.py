@@ -240,13 +240,56 @@ def _is_packing_history_read(value: str) -> bool:
         return False
     return bool(
         re.search(r'\b(?:odczytaj|pokaż|pokaz|przeczytaj)\b.*\blist[ęa]\s+pakow', normalized)
+        or re.search(r'\b(?:daj|podaj)\b(?:\s+mi)?\s+.*\blist[ęa]\s+pakow', normalized)
         or re.search(r'\bco\s+(?:było|bylo)\s+(?:w\s+paczk|w\s+paczc|na\s+(?:liście|liscie)\s+pakow|spakowan|wysłan|wyslan)', normalized)
         or re.search(r'\b(?:jaka\s+była\s+|jaka\s+byla\s+|pokaż\s+|pokaz\s+)?zawartoś\w*\s+(?:ostatni\w*\s+)?paczk', normalized)
         or re.search(r'\bco\s+(?:zawierał\w*|zawieral\w*|znajdował\w*\s+się|znajdowal\w*\s+sie)\s+(?:(?:w\s+)?paczk|w\s+paczc)', normalized)
         or re.search(r'\bco\s+(?:ostatnio\s+)?(?:spakowałem|spakowalem|spakowaliśmy|spakowalismy|wysłałem|wyslalem|wysłaliśmy|wyslalismy)\b', normalized)
+        or re.search(r'\bjakie\s+zam[oó]wieni\w*\b.*\b(?:wysłałem|wyslalem|wysłaliśmy|wyslalismy|wydałem|wydalem|wydaliśmy|wydalismy)\b', normalized)
         or re.search(r'\bostatni\w*\s+(?:paczk|list\w*\s+pakow)', normalized)
         or re.search(r'\b(?:historyczn\w*|wcześniejsz\w*|wczesniejsz\w*)\s+(?:paczk|list\w*\s+pakow)', normalized)
     )
+
+
+def _packing_history_order_number(value: str) -> str:
+    """Extract a spoken or typed ZAM number without resolving it through current orders."""
+    match = re.search(
+        r'\bzam\s*[-–—]?\s*((?:\d[\s-]*){5,20})\b',
+        str(value or ''), re.IGNORECASE,
+    )
+    if not match:
+        return ''
+    digits = re.sub(r'\D', '', match.group(1))
+    return f'ZAM-{digits}' if 5 <= len(digits) <= 20 else ''
+
+
+def _packing_history_direct_selector(value: str) -> tuple[dict[str, Any] | None, str]:
+    """Return selectors that are explicit enough to avoid a model-chosen wrong ID."""
+    order_number = _packing_history_order_number(value)
+    if order_number:
+        return {'order_number': order_number}, 'explicit_historical_order_number'
+    normalized = ' '.join(str(value or '').casefold().split()).strip(' ?!.')
+    generic_latest = bool(
+        re.fullmatch(
+            r'(?:(?:odczytaj|pokaż|pokaz|przeczytaj|daj|podaj)(?:\s+mi)?\s+)?'
+            r'(?:ostatni\w*|najnowsz\w*)\s+(?:paczk\w*|list\w*\s+pakow\w*)',
+            normalized,
+        )
+        or re.fullmatch(
+            r'co\s+ostatnio\s+(?:spakowałem|spakowalem|spakowaliśmy|spakowalismy|wysłałem|wyslalem|wysłaliśmy|wyslalismy)',
+            normalized,
+        )
+        or re.fullmatch(
+            r'jakie\s+zam[oó]wieni\w*\s+(?:dziś|dzis|dzisiaj)\s+'
+            r'(?:wysłałem|wyslalem|wysłaliśmy|wyslalismy|wydałem|wydalem|wydaliśmy|wydalismy)',
+            normalized,
+        )
+    )
+    today = bool(re.search(r'\b(?:dziś|dzis|dzisiaj)\b', normalized))
+    if generic_latest:
+        return ({'today': True}, 'explicit_today_packing_history') if today else (
+            {'latest': True}, 'explicit_latest_packing_history')
+    return None, ''
 
 
 def _is_packing_history_followup(value: str) -> bool:
@@ -551,8 +594,9 @@ odtwarzaj readiness ani coverage z surowych danych. Gdy gotowy stan nie zawiera 
 '''
 PACKING_HISTORY_READ_INSTRUCTIONS = '''
 To pytanie dotyczy historycznej, już utworzonej listy pakowej lub paczki. Użyj wyłącznie
-orders.packing_history.get. Wskaż dokładnie jeden selektor: batch_id, order_id, customer_id,
-customer albo latest=true. Dla pytania bez wskazanego obiektu użyj latest=true. Nie używaj
+orders.packing_history.get. Wskaż dokładnie jeden selektor: batch_id, wewnętrzny order_id,
+historyczny order_number, customer_id, customer, today=true albo latest=true. Numeru ZAM-... nigdy nie
+przekazuj jako order_id. Dla pytania bez wskazanego obiektu użyj latest=true. Nie używaj
 bieżących zamówień, order_items, dostępności ani statusów do rekonstrukcji zawartości paczki.
 Jeżeli historyczny odczyt nie jest dostępny albo narzędzie zwróci błąd, nie zgaduj zawartości.
 '''
@@ -1172,10 +1216,18 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         })
         packing_history_context_batch_id = previous_turn_entities.get('packing_batch')
         packing_history_document_followup = False
+        packing_history_direct_arguments = None
+        packing_history_selection_reason = ''
         if packing_history_context_batch_id and _is_packing_history_followup(turn_message):
             detected_intent = 'packing_history'
             packing_history_read = True
             packing_history_document_followup = _is_packing_history_document_followup(turn_message)
+            packing_history_direct_arguments = {'batch_id': int(packing_history_context_batch_id)}
+            packing_history_selection_reason = 'trusted_batch_followup'
+        elif packing_history_read:
+            packing_history_direct_arguments, packing_history_selection_reason = (
+                _packing_history_direct_selector(turn_message)
+            )
         import human_approval
         eligible_approvals = human_approval.pending(business_operations, conversation_id, human_actor) if message.strip() and execution_outcome is None else []
         timings['context_history_build_ms'] = round((time.perf_counter()-stage_started)*1000,2)
@@ -1255,17 +1307,18 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         packing_history_result = None
         packing_history_error = ''
         china_shortage_coverage_question = _is_china_shortage_coverage_question(turn_message)
-        if packing_history_read and packing_history_context_batch_id:
+        if packing_history_read and packing_history_direct_arguments:
             definition = business_operations.OPERATION_REGISTRY[PACKING_HISTORY_OPERATION]
             current = load_actor_context(human_actor.actor_id)
             if current is None or current.permission_decision(definition.required_permission) == DENY:
                 return finish('DENIED','Brak uprawnień do operacji.','PERMISSION_DENIED')
-            arguments = {'batch_id': int(packing_history_context_batch_id)}
+            arguments = packing_history_direct_arguments
             call_id = 'packing-history-context-' + run_id
             timings['tool_calls_count'] += 1
             _audit('agent.tool_selected',ai_actor,run_id,correlation_id,SUCCESS,
                    human_actor.actor_id,tool_name=PACKING_HISTORY_OPERATION,
-                   conversation_id=conversation_id,selection_reason='trusted_batch_followup')
+                   conversation_id=conversation_id,
+                   selection_reason=packing_history_selection_reason)
             operation_started = time.perf_counter()
             result = business_operations.execute_business_operation(
                 ai_actor, PACKING_HISTORY_OPERATION, arguments, correlation_id=correlation_id)
