@@ -317,3 +317,96 @@ def test_general_memory_success_uses_receipt_and_keeps_non_status_response():
         'Zapisano w pamięci: kolejność pracy.\n'
         'Mogę też od razu sprawdzić bieżące blokery.'
     )
+
+
+def test_production_alias_is_applied_before_business_read_and_matches_direct_name():
+    db = backend.conn()
+    now = backend.now_iso()
+    db.execute(
+        "INSERT INTO customers(id,name,address,phone,email,nip,language,price_list,created_at) "
+        "VALUES(20,'Artystyczna Manufaktura','Testowa 20','','','', 'pl','pln',?)",
+        (now,),
+    )
+    for sequence in range(1, 10):
+        db.execute(
+            "INSERT INTO orders(id,order_no,customer_id,customer_name,status,created_at,currency,price_list) "
+            "VALUES(?,?,20,'Artystyczna Manufaktura','confirmed',?,'PLN','pln')",
+            (200 + sequence, f'ZAM-ALIAS-{sequence}', now),
+        )
+    db.commit()
+    db.close()
+
+    saved = runtime.run_agent_turn(
+        owner(),
+        'Do Warszawy, czyli do Artystycznej Manufaktury, zapisz to.',
+        runtime.FakeModelProvider([terminology_call(), respond('Zapisane.')]),
+    )
+    assert saved['message'].startswith('Zapisane: Warszawa')
+
+    def run_order_lookup(question, *, expect_alias_context, conversation_id=''):
+        selected_calls = []
+        order_numbers = []
+
+        def select_orders(kwargs):
+            terminology_outputs = [
+                json.loads(item['output'])
+                for item in kwargs['input_items']
+                if item.get('type') == 'function_call_output'
+                and str(item.get('call_id') or '').startswith('confirmed-terminology-')
+            ]
+            if expect_alias_context:
+                assert terminology_outputs == [{
+                    'matched_terms':[{ 
+                        'term':'Warszawa', 'meaning':'Artystyczna Manufaktura',
+                        'scope':'company', 'source':'confirmed_by_user', 'version':1,
+                    }],
+                    'matched_count':1,
+                    'ambiguous':False,
+                    'scope':'interpret_current_user_language_only',
+                    'business_entities_require_read':True,
+                }]
+                assert 'użyj znaczenia aliasu w zapytaniu' in kwargs['instructions']
+                assert 'Nie wykonuj najpierw literalnego wyszukania po aliasie' in kwargs['instructions']
+            else:
+                assert terminology_outputs == []
+            selected_calls.append(('orders.search', {
+                'query':'Artystyczna Manufaktura', 'limit':50,
+            }))
+            return tool(
+                'orders.search', {'query':'Artystyczna Manufaktura', 'limit':50},
+                'orders-search')
+
+        def answer(kwargs):
+            order_result = json.loads(kwargs['input_items'][-1]['output'])
+            order_numbers.extend(item['order_number'] for item in order_result['results'])
+            return respond('Znalazłem dziewięć zamówień.')
+
+        result = runtime.run_agent_turn(
+            owner(), question,
+            runtime.FakeModelProvider([select_orders, answer]),
+            conversation_id=conversation_id,
+        )
+        return result, selected_calls, set(order_numbers)
+
+    alias_result, alias_calls, alias_orders = run_order_lookup(
+        'jakie mam zamówienia do warszawy?',
+        expect_alias_context=True,
+        conversation_id=saved['conversation_id'],
+    )
+    direct_result, direct_calls, direct_orders = run_order_lookup(
+        'jakie mam zamówienia do artystycznej manufaktury?',
+        expect_alias_context=False,
+    )
+
+    assert alias_result['status'] == direct_result['status'] == 'SUCCESS'
+    assert alias_result['tool_calls'] == direct_result['tool_calls'] == 1
+    assert alias_calls == direct_calls == [
+        ('orders.search', {'query':'Artystyczna Manufaktura', 'limit':50}),
+    ]
+    assert all(
+        arguments.get('query', '').casefold() != 'warszawa'
+        for _operation, arguments in alias_calls
+    )
+    assert alias_orders == direct_orders == {
+        f'ZAM-ALIAS-{sequence}' for sequence in range(1, 10)
+    }
