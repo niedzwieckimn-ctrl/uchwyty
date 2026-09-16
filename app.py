@@ -134,6 +134,7 @@ import invoice_foreign
 import ksef_domestic
 import ksef_foreign
 from cash_flow_module import register_cash_flow, cash_flow_overdue_invoices
+import payment_reminders
 from inventory_analytics import ACTIVE_ORDER_STATUSES, build_replenishment_analysis, recommended_replenishments
 from seventeentrack_module import SeventeenTrackClient, enabled as seventeentrack_is_enabled, map_package_status, monotonic_status, parse_tracking_payload, verify_webhook_signature
 from proforma_module import generate_proforma_pdf
@@ -1218,6 +1219,11 @@ def api_internal_ai_packing_history_document(batch_id):
         result = packing_history.read({'batch_id': batch_id}, connection_factory=conn)
     except packing_history.PackingHistoryError as exc:
         return jsonify(status='FAILED', error_code=exc.code, message=exc.safe_message), 404
+    if not result.get('document_available') or not result.get('document_path'):
+        return jsonify(
+            status='FAILED', error_code='PACKING_HISTORY_DOCUMENT_UNAVAILABLE',
+            message='Dane listy są dostępne, ale historyczny PDF nie jest dostępny.',
+        ), 404
     return send_file(
         result['document_path'], mimetype='application/pdf', as_attachment=True,
         download_name=f'packing-list-{batch_id}.pdf', conditional=True,
@@ -4588,7 +4594,15 @@ def upload_invoice_pdfs_to_supabase(invoice_id: int, invoice_no: str, invoice_pd
 
 def generate_invoice_packing_list_pdf(order_row, items, meta, invoice_pdf_path: str = "") -> str:
     customer_dir = invoice_dir_for_customer(meta.get("buyer_name") or (order_row["customer_name"] if order_row and "customer_name" in order_row.keys() else "") or "Klient")
-    fpath = packing_list_pdf_path_for_invoice(invoice_pdf_path or os.path.join(customer_dir, f"{safe_filename(meta['invoice_no'])}.pdf"), meta["invoice_no"])
+    packing_name = str(meta["invoice_no"])
+    raw_document_token = str(meta.get("packing_document_token") or "").strip()
+    document_token = safe_filename(raw_document_token) if raw_document_token else ""
+    if document_token:
+        packing_name = f"{packing_name}_{document_token}"
+    fpath = packing_list_pdf_path_for_invoice(
+        invoice_pdf_path or os.path.join(customer_dir, f"{safe_filename(packing_name)}.pdf"),
+        packing_name,
+    )
     w, h = 210 * mm, 297 * mm
     cpdf = canvas.Canvas(fpath, pagesize=(w, h))
     pdf_font, pdf_font_bold = get_pdf_font_names()
@@ -8448,13 +8462,12 @@ def send_automatic_payment_reminders(reference_time=None) -> dict:
     failed = []
     for invoice_id in invoice_ids:
         try:
-            if not send_payment_reminder:
-                raise RuntimeError("Moduł wysyłki przypomnień nie jest dostępny")
-            invoice_row, pdf_url = _invoice_email_context(invoice_id)
-            result = send_payment_reminder(invoice_row, pdf_url=pdf_url)
+            result = payment_reminders.send(
+                invoice_id, trigger_source="automatic_scheduler",
+                attempt_id=f"automatic:{invoice_id}:{overdue_before_or_on}",
+            )
             if not result.get("ok"):
                 raise RuntimeError(norm(result.get("error")) or "Wysyłka nie powiodła się")
-            _set_invoice_payment_state(invoice_id, reminder=1, paid=None)
             sent_ids.append(invoice_id)
         except Exception as exc:
             failed.append({"invoice_id": invoice_id, "error": str(exc)[:300]})
@@ -8604,6 +8617,7 @@ import sys as _amendment_sys
 invoice_amendment.configure(_amendment_sys.modules[__name__])
 import fulfillment_operations
 fulfillment_operations.configure(_amendment_sys.modules[__name__])
+payment_reminders.configure(_amendment_sys.modules[__name__])
 from business_operations import configure_order_status
 from order_write import transition as local_order_transition
 configure_order_status(lambda db, order_id, status: local_order_transition(

@@ -11,6 +11,8 @@ from inventory_analytics import build_replenishment_analysis, recommended_replen
 # Stały, świadomie uproszczony kurs używany wyłącznie w analizie Cash flow.
 # Nie zmienia kwot ani waluty zapisanych na fakturze.
 EUR_TO_PLN_CASH_FLOW_RATE = 4.30
+CASHFLOW_READ_OPERATION = "cashflow.read"
+_runtime_deps = None
 
 
 def invoice_cash_flow_context(order_currency, invoice_items_json):
@@ -147,7 +149,410 @@ def ensure_cash_flow_tables(conn, now_iso):
     c.close()
 
 
+def load_cash_flow_settings(conn):
+    data = dict(CASH_FLOW_SETTING_KEYS)
+    c = conn()
+    try:
+        for row in c.execute("SELECT key,value FROM cash_flow_settings"):
+            if row["key"] in data:
+                data[row["key"]] = row["value"]
+    finally:
+        c.close()
+    return data
+
+
+def calculate_cash_flow_snapshot(deps, *, current_time=None):
+    """One source of truth for the Cash flow panel and controlled agent READ."""
+    conn = deps["conn"]
+    app_now = deps["app_now"]
+    to_float = deps["to_float"]
+    effective_now = current_time or app_now()
+    today = effective_now.date()
+    settings = load_cash_flow_settings(conn)
+    account_balance = to_float(settings.get("account_balance"), 0)
+    monthly_zus = to_float(settings.get("monthly_zus"), 0)
+    cash_buffer = to_float(settings.get("cash_buffer"), 0)
+    planned_china_budget = to_float(settings.get("planned_china_budget"), 0)
+    growth_percent = to_float(settings.get("growth_percent"), 0)
+    growth_factor = max(0, 1 + (growth_percent / 100.0))
+    reorder_horizon_days = int(to_float(settings.get("reorder_horizon_days"), 60))
+    if reorder_horizon_days not in (45, 60, 90):
+        reorder_horizon_days = 60
+
+    c = conn()
+    cur = c.cursor()
+
+    cur.execute("""
+      SELECT i.*,
+             COALESCE(m.paid,0) AS paid,
+             m.paid_at,
+             COALESCE(m.payment_reminder,0) AS payment_reminder,
+             m.invoice_items_json,
+             COALESCE(o.currency,'PLN') AS order_currency
+      FROM invoices i
+      LEFT JOIN invoice_meta m ON m.invoice_id=i.id
+      LEFT JOIN orders o ON o.id=i.order_id
+      ORDER BY COALESCE(i.payment_to, i.issue_date) ASC, i.id DESC
+    """)
+    invoices_rows = cur.fetchall()
+    overdue_invoice_ids = {
+        int(row["id"])
+        for row in cash_flow_overdue_invoices(c, current_time=app_now())
+    }
+
+    unpaid_total = overdue_total = due_7_total = due_30_total = 0.0
+    month_vat = month_net = month_profit = 0.0
+    last_30_net = last_30_profit = 0.0
+    sold_30_qty = 0
+    overdue_clients_map = {}
+    paid_clients_map = {}
+    inflow_rows = []
+    sources = []
+    sales_chart = recent_months(today, 12)
+    sales_chart_by_month = {row["key"]: row for row in sales_chart}
+
+    for inv in invoices_rows:
+        invoice_items, invoice_currency, cash_flow_rate = invoice_cash_flow_context(
+            inv["order_currency"], inv["invoice_items_json"]
+        )
+        gross_original = to_float(inv["total_gross"], 0)
+        net_original = to_float(inv["total_net"], 0)
+        gross = gross_original * cash_flow_rate
+        net = net_original * cash_flow_rate
+        vat = max(0.0, gross - net)
+        paid = int(inv["paid"] or 0) == 1
+        issue_d = parse_date_safe(inv["issue_date"])
+        due_d = parse_date_safe(inv["payment_to"]) or issue_d or today
+        buyer = inv["buyer_name"] or "-"
+        invoice_no = inv["invoice_no"] or "-"
+        inclusion_rules = ["monthly_sales_by_issue_date"] if issue_d else []
+        if not paid:
+            inclusion_rules.append("unpaid_receivable")
+            if due_d <= today + timedelta(days=7):
+                inclusion_rules.append("due_within_7_days")
+            if due_d <= today + timedelta(days=30):
+                inclusion_rules.append("due_within_30_days")
+            if int(inv["id"]) in overdue_invoice_ids:
+                inclusion_rules.append("overdue_after_due_date_visibility_threshold")
+        sources.append({
+            "source_type": "invoice", "source_id": int(inv["id"]),
+            "document_no": invoice_no,
+            "date": issue_d.isoformat() if issue_d else "",
+            "due_date": due_d.isoformat() if due_d else "",
+            "amount_original": gross_original, "net_original": net_original,
+            "currency": invoice_currency, "conversion_rate": cash_flow_rate,
+            "amount_pln": gross, "net_pln": net,
+            "inclusion_rules": inclusion_rules,
+            "contribution": {
+                "unpaid_total": 0.0 if paid else gross,
+                "overdue_total": gross if not paid and int(inv["id"]) in overdue_invoice_ids else 0.0,
+                "due_7_total": gross if not paid and due_d <= today + timedelta(days=7) else 0.0,
+                "due_30_total": gross if not paid and due_d <= today + timedelta(days=30) else 0.0,
+                "monthly_revenue_net": net if issue_d and issue_d.strftime("%Y-%m") in sales_chart_by_month else 0.0,
+                "month_vat": vat if issue_d and issue_d.year == today.year and issue_d.month == today.month else 0.0,
+                "last_30_net": net if issue_d and issue_d >= today - timedelta(days=30) else 0.0,
+                "last_30_profit_estimate": net * 0.60 if issue_d and issue_d >= today - timedelta(days=30) else 0.0,
+            },
+        })
+
+        if issue_d:
+            chart_row = sales_chart_by_month.get(issue_d.strftime("%Y-%m"))
+            if chart_row is not None:
+                chart_row["invoices"] += 1
+                chart_row["revenue"] += net
+                invoice_units = 0
+                invoice_units = sum(
+                    int(item.get("qty") or item.get("invoice_qty") or item.get("current_invoice_qty") or 0)
+                    for item in invoice_items
+                )
+                if invoice_units <= 0:
+                    cur.execute(
+                        "SELECT COALESCE(SUM(qty),0) AS qty FROM invoice_allocations WHERE invoice_id=?",
+                        (int(inv["id"]),),
+                    )
+                    allocation_row = cur.fetchone()
+                    invoice_units = int(allocation_row["qty"] or 0) if allocation_row else 0
+                chart_row["units"] += invoice_units
+
+        if issue_d and issue_d.year == today.year and issue_d.month == today.month:
+            month_net += net
+            month_vat += vat
+            month_profit += net * 0.60
+
+        if issue_d and issue_d >= today - timedelta(days=30):
+            last_30_net += net
+            last_30_profit += net * 0.60
+            for item in invoice_items:
+                sold_30_qty += int(item.get("qty") or item.get("invoice_qty") or item.get("current_invoice_qty") or 0)
+
+        if paid:
+            paid_d = parse_date_safe(inv["paid_at"]) or issue_d
+            if paid_d and paid_d >= today - timedelta(days=30):
+                rec = paid_clients_map.setdefault(buyer, {"buyer": buyer, "gross": 0.0, "count": 0, "last": ""})
+                rec["gross"] += gross
+                rec["count"] += 1
+                rec["last"] = max(rec["last"], str(paid_d))
+            continue
+
+        unpaid_total += gross
+        if due_d <= today + timedelta(days=7):
+            due_7_total += gross
+        if due_d <= today + timedelta(days=30):
+            due_30_total += gross
+        is_overdue = int(inv["id"]) in overdue_invoice_ids
+        if is_overdue:
+            overdue_total += gross
+            days_late = (today - due_d).days
+            rec = overdue_clients_map.setdefault(buyer, {"buyer": buyer, "gross": 0.0, "count": 0, "days_late": 0})
+            rec["gross"] += gross
+            rec["count"] += 1
+            rec["days_late"] = max(rec["days_late"], days_late)
+
+        inflow_rows.append({
+            "invoice_id": int(inv["id"]),
+            "invoice_no": invoice_no,
+            "buyer": buyer,
+            "due": due_d.isoformat() if due_d else "-",
+            "gross": gross,
+            "gross_original": gross_original,
+            "currency": invoice_currency,
+            "cash_flow_rate": cash_flow_rate,
+            "days": (due_d - today).days if due_d else 0,
+            "overdue": is_overdue,
+            "reminder": int(inv["payment_reminder"] or 0) == 1,
+        })
+
+    # Liczba zamowien oznacza wszystkie zamowienia zapisane w danym
+    # miesiacu wedlug daty zlozenia. Status (takze anulowanie) nie zmienia
+    # historycznego faktu, ze zamowienie zostalo wtedy zlozone.
+    cur.execute("""
+      SELECT substr(trim(o.created_at),1,7) AS month_key,
+             COUNT(DISTINCT o.id) AS orders_count
+      FROM orders o
+      WHERE trim(COALESCE(o.created_at,'')) <> ''
+      GROUP BY substr(trim(o.created_at),1,7)
+    """)
+    for order_month in cur.fetchall():
+        chart_row = sales_chart_by_month.get(order_month["month_key"])
+        if chart_row is not None:
+            chart_row["orders"] = int(order_month["orders_count"] or 0)
+
+    cur.execute("SELECT * FROM cash_flow_expenses ORDER BY expense_date DESC, id DESC")
+    manual_expenses = [dict(row) for row in cur.fetchall()]
+    expense_rows = []
+    for row in manual_expenses:
+        expense_rows.append({**row, "source": "Wydatek ręczny", "can_delete": True})
+        sources.append({
+            "source_type": "manual_expense", "source_id": int(row["id"]),
+            "document_no": str(row.get("document_no") or ""),
+            "date": str(row.get("expense_date") or ""),
+            "amount_original": to_float(row.get("amount"), 0), "currency": "PLN",
+            "conversion_rate": 1.0, "amount_pln": to_float(row.get("amount"), 0),
+            "inclusion_rules": ["monthly_expense_by_expense_date"],
+            "contribution": {"monthly_expense": to_float(row.get("amount"), 0)},
+        })
+        chart_row = sales_chart_by_month.get(str(row["expense_date"])[:7])
+        if chart_row is not None:
+            chart_row["expenses"] += to_float(row["amount"], 0)
+
+    cur.execute("""
+      SELECT id, package_no, cost_amount, cost_document_no, created_at
+      FROM china_packages
+      WHERE COALESCE(cost_amount,0) > 0
+      ORDER BY created_at DESC, id DESC
+    """)
+    for row in cur.fetchall():
+        expense = {
+            "id": int(row["id"]),
+            "expense_date": str(row["created_at"] or "")[:10],
+            "category": "Zakup Chiny P/O",
+            "description": "Koszt paczki " + str(row["package_no"] or ""),
+            "document_no": row["cost_document_no"] or row["package_no"],
+            "amount": to_float(row["cost_amount"], 0),
+            "source": "Chiny P/O",
+            "can_delete": False,
+        }
+        expense_rows.append(expense)
+        sources.append({
+            "source_type": "china_purchase_order_cost", "source_id": int(row["id"]),
+            "document_no": str(expense["document_no"] or ""),
+            "date": expense["expense_date"],
+            "amount_original": expense["amount"], "currency": "PLN",
+            "conversion_rate": 1.0, "amount_pln": expense["amount"],
+            "inclusion_rules": ["monthly_expense_by_package_created_at"],
+            "contribution": {"monthly_expense": expense["amount"]},
+        })
+        chart_row = sales_chart_by_month.get(str(row["created_at"] or "")[:7])
+        if chart_row is not None:
+            chart_row["expenses"] += expense["amount"]
+
+    expense_rows.sort(key=lambda row: (str(row["expense_date"]), int(row["id"])), reverse=True)
+    for chart_row in sales_chart:
+        chart_row["expenses"] += monthly_zus
+        chart_row["revenue"] = round(chart_row["revenue"], 2)
+        chart_row["expenses"] = round(chart_row["expenses"], 2)
+        chart_row["profit"] = round(chart_row["revenue"] - chart_row["expenses"], 2)
+
+    cur.execute("""
+      SELECT COALESCE(SUM(s.qty),0) AS units,
+             COALESCE(SUM(s.qty * COALESCE(pr.net_price,0)),0) AS sale_net,
+             COALESCE(SUM(s.qty * COALESCE(pr.net_price,0) / 2.5),0) AS cost_est
+      FROM stock s
+      LEFT JOIN products p ON p.id=s.product_id
+      LEFT JOIN pricing pr ON lower(pr.model)=lower(COALESCE(p.sku,p.model))
+    """)
+    stock_row = cur.fetchone()
+    stock_units = int(stock_row["units"] or 0)
+    stock_sale_net = to_float(stock_row["sale_net"], 0)
+    stock_cost_est = to_float(stock_row["cost_est"], 0)
+
+    cur.execute("""
+      SELECT COALESCE(SUM(ci.qty),0) AS qty,
+             COALESCE(SUM(ci.qty * COALESCE(pr.net_price,0) / 2.5),0) AS cost_est
+      FROM china_items ci
+      JOIN china_packages cp ON cp.id=ci.package_id
+      LEFT JOIN products p ON p.id=ci.product_id
+      LEFT JOIN pricing pr ON lower(pr.model)=lower(COALESCE(p.sku, ci.sku))
+      WHERE lower(COALESCE(cp.status,'')) IN ('ordered','shipped','problem')
+    """)
+    china_row = cur.fetchone()
+    china_qty = int(china_row["qty"] or 0)
+    china_cost_est = to_float(china_row["cost_est"], 0)
+
+    c.close()
+
+    replenishment_rows = build_replenishment_analysis(
+        conn, today=today, horizon_days=reorder_horizon_days
+    )
+    reorder_rows = recommended_replenishments(replenishment_rows, limit=10)
+
+    avg_daily_gross = (last_30_net * 1.23) / 30.0 if last_30_net else 0.0
+    forecast_7_sales = avg_daily_gross * 7 * growth_factor
+    forecast_30_sales = avg_daily_gross * 30 * growth_factor
+    forecast_7_total = due_7_total + forecast_7_sales
+    forecast_30_total = due_30_total + forecast_30_sales
+    # Realna kwota do wydania na Chiny liczona jest tylko z gotówki na koncie.
+    # Prognozy oraz niezapłacone faktury to informacja pomocnicza, ale nie kasa,
+    # którą można dziś bezpiecznie wydać.
+    real_cash_for_china = account_balance - month_vat - monthly_zus - cash_buffer - planned_china_budget
+    safe_to_spend = max(0.0, real_cash_for_china)
+    cash_shortage = max(0.0, -real_cash_for_china)
+
+    overdue_clients = sorted(overdue_clients_map.values(), key=lambda r: (r["days_late"], r["gross"]), reverse=True)[:10]
+    paid_clients = sorted(paid_clients_map.values(), key=lambda r: r["gross"], reverse=True)[:10]
+    inflow_rows = sorted(inflow_rows, key=lambda r: (r["overdue"], r["due"]), reverse=True)
+    kpis = {
+        "account_balance": account_balance,
+        "unpaid_total": unpaid_total,
+        "overdue_total": overdue_total,
+        "due_7_total": due_7_total,
+        "due_30_total": due_30_total,
+        "month_vat": month_vat,
+        "monthly_zus": monthly_zus,
+        "china_cost_est": china_cost_est,
+        "china_qty": china_qty,
+        "stock_units": stock_units,
+        "stock_sale_net": stock_sale_net,
+        "stock_cost_est": stock_cost_est,
+        "stock_profit_est": stock_sale_net * 0.60,
+        "last_30_net": last_30_net,
+        "last_30_profit": last_30_profit,
+        "sold_30_qty": sold_30_qty,
+        "forecast_7_total": forecast_7_total,
+        "forecast_30_total": forecast_30_total,
+        "forecast_7_sales": forecast_7_sales,
+        "forecast_30_sales": forecast_30_sales,
+        "real_cash_for_china": real_cash_for_china,
+        "safe_to_spend": safe_to_spend,
+        "cash_shortage": cash_shortage,
+    }
+
+    settings_sources = (
+        ("account_balance", account_balance, {"real_cash_for_china": account_balance}),
+        ("monthly_zus", monthly_zus, {"real_cash_for_china": -monthly_zus}),
+        ("cash_buffer", cash_buffer, {"real_cash_for_china": -cash_buffer}),
+        ("planned_china_budget", planned_china_budget,
+         {"real_cash_for_china": -planned_china_budget}),
+        ("growth_percent", growth_percent,
+         {"forecast_7_sales": forecast_7_sales, "forecast_30_sales": forecast_30_sales}),
+        ("reorder_horizon_days", reorder_horizon_days,
+         {"replenishment_horizon_days": reorder_horizon_days}),
+    )
+    for key, value, contribution in settings_sources:
+        sources.append({
+            "source_type": "cashflow_setting",
+            "source_id": key,
+            "document_no": key,
+            "date": today.isoformat(),
+            "amount_original": value,
+            "currency": "PLN" if key not in {"growth_percent", "reorder_horizon_days"} else "",
+            "conversion_rate": 1.0,
+            "amount_pln": value if key not in {"growth_percent", "reorder_horizon_days"} else 0.0,
+            "inclusion_rules": ["cash_flow_setting"],
+            "contribution": contribution,
+        })
+
+    return {
+        "as_of": effective_now.isoformat(),
+        "settings": settings,
+        "kpis": kpis,
+        "inflow_rows": inflow_rows,
+        "overdue_clients": overdue_clients,
+        "paid_clients": paid_clients,
+        "expense_rows": expense_rows,
+        "sales_chart": sales_chart,
+        "reorder_rows": reorder_rows,
+        "reorder_horizon_days": reorder_horizon_days,
+        "sources": sources,
+        "capabilities": {
+            "daily_balance_timeline": False,
+            "daily_balance_explanation": False,
+            "reason": "Panel nie posiada dziennego harmonogramu przyszłego salda.",
+        },
+    }
+
+
+def business_read(data, actor=None, correlation_id='', transaction_connection=None):
+    del actor, correlation_id, transaction_connection
+    if _runtime_deps is None:
+        raise RuntimeError('Źródło Cash flow nie jest skonfigurowane.')
+    _runtime_deps['maybe_pull_shared_from_supabase']()
+    snapshot = calculate_cash_flow_snapshot(_runtime_deps)
+    section = data.get('section') or 'overview'
+    sources = snapshot['sources']
+    if data.get('source_type'):
+        sources = [row for row in sources if row['source_type'] == data['source_type']]
+    if data.get('source_id') not in (None, ''):
+        wanted = str(data['source_id'])
+        sources = [row for row in sources if str(row['source_id']) == wanted]
+    if data.get('date_from'):
+        sources = [row for row in sources if str(row.get('date') or '') >= data['date_from']]
+    if data.get('date_to'):
+        sources = [row for row in sources if str(row.get('date') or '') <= data['date_to']]
+    offset = int(data.get('offset') or 0)
+    limit = int(data.get('limit') or 100)
+    page = sources[offset:offset + limit] if section in {'sources', 'all'} else []
+    return {
+        'ok': True,
+        'read_model': 'cash_flow_panel',
+        'as_of': snapshot['as_of'],
+        'scope': {'kind': 'panel_source_of_truth', 'entity_existence_authoritative': True,
+                  'empty_means': 'no_matching_cash_flow_source_rows'},
+        'complete': section == 'overview' or offset + len(page) >= len(sources),
+        'truncated': section != 'overview' and offset + len(page) < len(sources),
+        'kpis': snapshot['kpis'],
+        'sales_chart': snapshot['sales_chart'],
+        'inflows': snapshot['inflow_rows'] if section in {'inflows', 'all'} else [],
+        'sources': page,
+        'sources_total': len(sources),
+        'next_offset': offset + len(page) if offset + len(page) < len(sources) else None,
+        'capabilities': snapshot['capabilities'],
+    }
+
+
 def register_cash_flow(app, deps):
+    global _runtime_deps
+    _runtime_deps = deps
     conn = deps["conn"]
     now_iso = deps["now_iso"]
     app_now = deps["app_now"]
@@ -239,257 +644,17 @@ def register_cash_flow(app, deps):
             cash_flow_settings_save(request.form)
             return redirect(url_for("cash_flow", saved=1))
 
-        today = app_now().date()
-        settings = cash_flow_settings_load()
-        account_balance = to_float(settings.get("account_balance"), 0)
-        monthly_zus = to_float(settings.get("monthly_zus"), 0)
-        cash_buffer = to_float(settings.get("cash_buffer"), 0)
-        planned_china_budget = to_float(settings.get("planned_china_budget"), 0)
-        growth_percent = to_float(settings.get("growth_percent"), 0)
-        growth_factor = max(0, 1 + (growth_percent / 100.0))
-        reorder_horizon_days = int(to_float(settings.get("reorder_horizon_days"), 60))
-        if reorder_horizon_days not in (45, 60, 90):
-            reorder_horizon_days = 60
-
-        c = conn()
-        cur = c.cursor()
-
-        cur.execute("""
-          SELECT i.*,
-                 COALESCE(m.paid,0) AS paid,
-                 m.paid_at,
-                 COALESCE(m.payment_reminder,0) AS payment_reminder,
-                 m.invoice_items_json,
-                 COALESCE(o.currency,'PLN') AS order_currency
-          FROM invoices i
-          LEFT JOIN invoice_meta m ON m.invoice_id=i.id
-          LEFT JOIN orders o ON o.id=i.order_id
-          ORDER BY COALESCE(i.payment_to, i.issue_date) ASC, i.id DESC
-        """)
-        invoices_rows = cur.fetchall()
-        overdue_invoice_ids = {
-            int(row["id"])
-            for row in cash_flow_overdue_invoices(c, current_time=app_now())
-        }
-
-        unpaid_total = overdue_total = due_7_total = due_30_total = 0.0
-        month_vat = month_net = month_profit = 0.0
-        last_30_net = last_30_profit = 0.0
-        sold_30_qty = 0
-        overdue_clients_map = {}
-        paid_clients_map = {}
-        inflow_rows = []
-        sales_chart = recent_months(today, 12)
-        sales_chart_by_month = {row["key"]: row for row in sales_chart}
-
-        for inv in invoices_rows:
-            invoice_items, invoice_currency, cash_flow_rate = invoice_cash_flow_context(
-                inv["order_currency"], inv["invoice_items_json"]
-            )
-            gross_original = to_float(inv["total_gross"], 0)
-            net_original = to_float(inv["total_net"], 0)
-            gross = gross_original * cash_flow_rate
-            net = net_original * cash_flow_rate
-            vat = max(0.0, gross - net)
-            paid = int(inv["paid"] or 0) == 1
-            issue_d = parse_date_safe(inv["issue_date"])
-            due_d = parse_date_safe(inv["payment_to"]) or issue_d or today
-            buyer = inv["buyer_name"] or "-"
-            invoice_no = inv["invoice_no"] or "-"
-
-            if issue_d:
-                chart_row = sales_chart_by_month.get(issue_d.strftime("%Y-%m"))
-                if chart_row is not None:
-                    chart_row["invoices"] += 1
-                    chart_row["revenue"] += net
-                    invoice_units = 0
-                    invoice_units = sum(
-                        int(item.get("qty") or item.get("invoice_qty") or item.get("current_invoice_qty") or 0)
-                        for item in invoice_items
-                    )
-                    if invoice_units <= 0:
-                        cur.execute(
-                            "SELECT COALESCE(SUM(qty),0) AS qty FROM invoice_allocations WHERE invoice_id=?",
-                            (int(inv["id"]),),
-                        )
-                        allocation_row = cur.fetchone()
-                        invoice_units = int(allocation_row["qty"] or 0) if allocation_row else 0
-                    chart_row["units"] += invoice_units
-
-            if issue_d and issue_d.year == today.year and issue_d.month == today.month:
-                month_net += net
-                month_vat += vat
-                month_profit += net * 0.60
-
-            if issue_d and issue_d >= today - timedelta(days=30):
-                last_30_net += net
-                last_30_profit += net * 0.60
-                for item in invoice_items:
-                    sold_30_qty += int(item.get("qty") or item.get("invoice_qty") or item.get("current_invoice_qty") or 0)
-
-            if paid:
-                paid_d = parse_date_safe(inv["paid_at"]) or issue_d
-                if paid_d and paid_d >= today - timedelta(days=30):
-                    rec = paid_clients_map.setdefault(buyer, {"buyer": buyer, "gross": 0.0, "count": 0, "last": ""})
-                    rec["gross"] += gross
-                    rec["count"] += 1
-                    rec["last"] = max(rec["last"], str(paid_d))
-                continue
-
-            unpaid_total += gross
-            if due_d <= today + timedelta(days=7):
-                due_7_total += gross
-            if due_d <= today + timedelta(days=30):
-                due_30_total += gross
-            is_overdue = int(inv["id"]) in overdue_invoice_ids
-            if is_overdue:
-                overdue_total += gross
-                days_late = (today - due_d).days
-                rec = overdue_clients_map.setdefault(buyer, {"buyer": buyer, "gross": 0.0, "count": 0, "days_late": 0})
-                rec["gross"] += gross
-                rec["count"] += 1
-                rec["days_late"] = max(rec["days_late"], days_late)
-
-            inflow_rows.append({
-                "invoice_no": invoice_no,
-                "buyer": buyer,
-                "due": due_d.isoformat() if due_d else "-",
-                "gross": gross,
-                "gross_original": gross_original,
-                "currency": invoice_currency,
-                "cash_flow_rate": cash_flow_rate,
-                "days": (due_d - today).days if due_d else 0,
-                "overdue": is_overdue,
-                "reminder": int(inv["payment_reminder"] or 0) == 1,
-            })
-
-        # Liczba zamowien oznacza wszystkie zamowienia zapisane w danym
-        # miesiacu wedlug daty zlozenia. Status (takze anulowanie) nie zmienia
-        # historycznego faktu, ze zamowienie zostalo wtedy zlozone.
-        cur.execute("""
-          SELECT substr(trim(o.created_at),1,7) AS month_key,
-                 COUNT(DISTINCT o.id) AS orders_count
-          FROM orders o
-          WHERE trim(COALESCE(o.created_at,'')) <> ''
-          GROUP BY substr(trim(o.created_at),1,7)
-        """)
-        for order_month in cur.fetchall():
-            chart_row = sales_chart_by_month.get(order_month["month_key"])
-            if chart_row is not None:
-                chart_row["orders"] = int(order_month["orders_count"] or 0)
-
-        cur.execute("SELECT * FROM cash_flow_expenses ORDER BY expense_date DESC, id DESC")
-        manual_expenses = [dict(row) for row in cur.fetchall()]
-        expense_rows = []
-        for row in manual_expenses:
-            expense_rows.append({**row, "source": "Wydatek ręczny", "can_delete": True})
-            chart_row = sales_chart_by_month.get(str(row["expense_date"])[:7])
-            if chart_row is not None:
-                chart_row["expenses"] += to_float(row["amount"], 0)
-
-        cur.execute("""
-          SELECT id, package_no, cost_amount, cost_document_no, created_at
-          FROM china_packages
-          WHERE COALESCE(cost_amount,0) > 0
-          ORDER BY created_at DESC, id DESC
-        """)
-        for row in cur.fetchall():
-            expense = {
-                "id": int(row["id"]),
-                "expense_date": str(row["created_at"] or "")[:10],
-                "category": "Zakup Chiny P/O",
-                "description": "Koszt paczki " + str(row["package_no"] or ""),
-                "document_no": row["cost_document_no"] or row["package_no"],
-                "amount": to_float(row["cost_amount"], 0),
-                "source": "Chiny P/O",
-                "can_delete": False,
-            }
-            expense_rows.append(expense)
-            chart_row = sales_chart_by_month.get(str(row["created_at"] or "")[:7])
-            if chart_row is not None:
-                chart_row["expenses"] += expense["amount"]
-
-        expense_rows.sort(key=lambda row: (str(row["expense_date"]), int(row["id"])), reverse=True)
-        for chart_row in sales_chart:
-            chart_row["expenses"] += monthly_zus
-            chart_row["revenue"] = round(chart_row["revenue"], 2)
-            chart_row["expenses"] = round(chart_row["expenses"], 2)
-            chart_row["profit"] = round(chart_row["revenue"] - chart_row["expenses"], 2)
-
-        cur.execute("""
-          SELECT COALESCE(SUM(s.qty),0) AS units,
-                 COALESCE(SUM(s.qty * COALESCE(pr.net_price,0)),0) AS sale_net,
-                 COALESCE(SUM(s.qty * COALESCE(pr.net_price,0) / 2.5),0) AS cost_est
-          FROM stock s
-          LEFT JOIN products p ON p.id=s.product_id
-          LEFT JOIN pricing pr ON lower(pr.model)=lower(COALESCE(p.sku,p.model))
-        """)
-        stock_row = cur.fetchone()
-        stock_units = int(stock_row["units"] or 0)
-        stock_sale_net = to_float(stock_row["sale_net"], 0)
-        stock_cost_est = to_float(stock_row["cost_est"], 0)
-
-        cur.execute("""
-          SELECT COALESCE(SUM(ci.qty),0) AS qty,
-                 COALESCE(SUM(ci.qty * COALESCE(pr.net_price,0) / 2.5),0) AS cost_est
-          FROM china_items ci
-          JOIN china_packages cp ON cp.id=ci.package_id
-          LEFT JOIN products p ON p.id=ci.product_id
-          LEFT JOIN pricing pr ON lower(pr.model)=lower(COALESCE(p.sku, ci.sku))
-          WHERE lower(COALESCE(cp.status,'')) IN ('ordered','shipped','problem')
-        """)
-        china_row = cur.fetchone()
-        china_qty = int(china_row["qty"] or 0)
-        china_cost_est = to_float(china_row["cost_est"], 0)
-
-        c.close()
-
-        replenishment_rows = build_replenishment_analysis(
-            conn, today=today, horizon_days=reorder_horizon_days
-        )
-        reorder_rows = recommended_replenishments(replenishment_rows, limit=10)
-
-        avg_daily_gross = (last_30_net * 1.23) / 30.0 if last_30_net else 0.0
-        forecast_7_sales = avg_daily_gross * 7 * growth_factor
-        forecast_30_sales = avg_daily_gross * 30 * growth_factor
-        forecast_7_total = due_7_total + forecast_7_sales
-        forecast_30_total = due_30_total + forecast_30_sales
-        # Realna kwota do wydania na Chiny liczona jest tylko z gotówki na koncie.
-        # Prognozy oraz niezapłacone faktury to informacja pomocnicza, ale nie kasa,
-        # którą można dziś bezpiecznie wydać.
-        real_cash_for_china = account_balance - month_vat - monthly_zus - cash_buffer - planned_china_budget
-        safe_to_spend = max(0.0, real_cash_for_china)
-        cash_shortage = max(0.0, -real_cash_for_china)
-
-        overdue_clients = sorted(overdue_clients_map.values(), key=lambda r: (r["days_late"], r["gross"]), reverse=True)[:10]
-        paid_clients = sorted(paid_clients_map.values(), key=lambda r: r["gross"], reverse=True)[:10]
-        inflow_rows = sorted(inflow_rows, key=lambda r: (r["overdue"], r["due"]), reverse=True)[:25]
-        kpis = {
-            "account_balance": account_balance,
-            "unpaid_total": unpaid_total,
-            "overdue_total": overdue_total,
-            "due_7_total": due_7_total,
-            "due_30_total": due_30_total,
-            "month_vat": month_vat,
-            "monthly_zus": monthly_zus,
-            "china_cost_est": china_cost_est,
-            "china_qty": china_qty,
-            "stock_units": stock_units,
-            "stock_sale_net": stock_sale_net,
-            "stock_cost_est": stock_cost_est,
-            "stock_profit_est": stock_sale_net * 0.60,
-            "last_30_net": last_30_net,
-            "last_30_profit": last_30_profit,
-            "sold_30_qty": sold_30_qty,
-            "forecast_7_total": forecast_7_total,
-            "forecast_30_total": forecast_30_total,
-            "forecast_7_sales": forecast_7_sales,
-            "forecast_30_sales": forecast_30_sales,
-            "real_cash_for_china": real_cash_for_china,
-            "safe_to_spend": safe_to_spend,
-            "cash_shortage": cash_shortage,
-        }
-
+        snapshot = calculate_cash_flow_snapshot(deps)
+        today = parse_date_safe(snapshot["as_of"]) or app_now().date()
+        settings = snapshot["settings"]
+        kpis = snapshot["kpis"]
+        inflow_rows = snapshot["inflow_rows"][:25]
+        overdue_clients = snapshot["overdue_clients"]
+        paid_clients = snapshot["paid_clients"]
+        expense_rows = snapshot["expense_rows"]
+        sales_chart = snapshot["sales_chart"]
+        reorder_rows = snapshot["reorder_rows"]
+        reorder_horizon_days = snapshot["reorder_horizon_days"]
         tpl = r"""
         {% extends "base.html" %}
         {% block content %}

@@ -27,11 +27,16 @@ import order_write
 import invoice_amendment
 import fulfillment_operations
 import packing_history
+import payment_reminders
+import search_analytics
 import agent_conversation
 import business_query
 import business_read_models
 import internal_approval as approvals
-from cash_flow_module import cash_flow_overdue_invoices
+from cash_flow_module import (
+    CASHFLOW_READ_OPERATION, business_read as cashflow_business_read,
+    cash_flow_overdue_invoices,
+)
 from inventory_analytics import build_replenishment_analysis, recommended_replenishments
 from fulfillment_readiness import calculate_fulfillment_readiness
 from internal_audit import (
@@ -58,7 +63,47 @@ MAX_BUSINESS_SEARCH_RESULTS = 50
 IDEMPOTENT_REPLAY_WAIT_SECONDS = 5.0
 GENERIC_READ_OPERATIONS = frozenset({"business.describe_schema", "business.query"})
 HIGH_LEVEL_READ_OPERATIONS = business_read_models.READ_OPERATIONS
-DIRECT_READ_RESULT_OPERATIONS = GENERIC_READ_OPERATIONS | HIGH_LEVEL_READ_OPERATIONS | {packing_history.OPERATION}
+DIRECT_READ_RESULT_OPERATIONS = GENERIC_READ_OPERATIONS | HIGH_LEVEL_READ_OPERATIONS | {
+    packing_history.OPERATION, payment_reminders.READ,
+    search_analytics.OPERATION,
+    CASHFLOW_READ_OPERATION,
+}
+CAPABILITY_CONTRACTS = {
+    packing_history.OPERATION: {
+        "implemented": True,
+        "authoritative_source": "packing_allocation_snapshot",
+        "empty_or_missing": "PACKING_HISTORY_NOT_FOUND",
+        "incomplete": "SUCCESS_with_complete_false_or_PACKING_HISTORY_INCOMPLETE",
+        "permission_denied": "DENIED_PERMISSION_DENIED",
+        "document_required": False,
+    },
+    payment_reminders.READ: {
+        "implemented": True,
+        "authoritative_source": "payment_reminder_attempts",
+        "empty_or_missing": "SUCCESS_with_empty_attempts_or_INVOICE_NOT_FOUND",
+        "permission_denied": "DENIED_PERMISSION_DENIED",
+    },
+    payment_reminders.WRITE: {
+        "implemented": True,
+        "approval_required": True,
+        "side_effect": "existing_invoice_email_mechanism",
+        "success_state_change": "payment_reminder_flag_after_confirmed_send",
+        "permission_denied": "DENIED_PERMISSION_DENIED",
+    },
+    search_analytics.OPERATION: {
+        "implemented": True,
+        "authoritative_source": "search_analytics_records_shared_projection",
+        "empty_or_missing": "SUCCESS_with_empty_results",
+        "permission_denied": "DENIED_PERMISSION_DENIED",
+    },
+    CASHFLOW_READ_OPERATION: {
+        "implemented": True,
+        "authoritative_source": "cash_flow_panel_calculator",
+        "empty_or_missing": "SUCCESS_with_empty_sources",
+        "permission_denied": "DENIED_PERMISSION_DENIED",
+        "daily_balance_timeline": False,
+    },
+}
 WARSAW_TZ = ZoneInfo("Europe/Warsaw")
 logger = logging.getLogger(__name__)
 
@@ -397,14 +442,21 @@ _PACKING_HISTORY_ALLOCATION = {
 PACKING_HISTORY_OUTPUT = {
     "type": "object", "additionalProperties": False,
     "required": ["ok", "batch_id", "created_at", "order_ids", "allocations",
-                 "total_lines", "total_qty", "document_id", "document_path", "customer"],
+                 "total_lines", "total_qty", "document_id", "document_path",
+                 "document_available", "document_verified", "complete",
+                 "incomplete_fields", "history_source", "customer"],
     "properties": {
         "ok": {"type": "boolean"}, "batch_id": {"type": "integer"},
         "created_at": {"type": "string"},
         "order_ids": {"type": "array", "maxItems": 500, "items": {"type": "integer"}},
         "allocations": {"type": "array", "maxItems": 500, "items": _PACKING_HISTORY_ALLOCATION},
         "total_lines": {"type": "integer"}, "total_qty": {"type": "integer"},
-        "document_id": {"type": "integer"}, "document_path": {"type": "string"},
+        "document_id": {"type": ["integer", "null"]}, "document_path": {"type": "string"},
+        "document_available": {"type": "boolean"},
+        "document_verified": {"type": "boolean"},
+        "complete": {"type": "boolean"},
+        "incomplete_fields": {"type": "array", "items": {"type": "string"}},
+        "history_source": {"type": "string"},
         "customer": {
             "type":"object", "additionalProperties":False,
             "required":["id","name","email"],
@@ -480,7 +532,7 @@ WAREHOUSE_WRITES = frozenset({
     'orders.packing.shortage.report', 'orders.packing.confirm',
 })
 LOCAL_WRITES = ORDER_WRITES | WAREHOUSE_WRITES
-SERVICE_WRITES = invoice_amendment.WRITES | fulfillment_operations.WRITES
+SERVICE_WRITES = invoice_amendment.WRITES | fulfillment_operations.WRITES | payment_reminders.WRITES
 SUPERVISED_WRITES = LOCAL_WRITES | SERVICE_WRITES
 _ORDER_WRITE_INPUT = {
     'type': 'object', 'additionalProperties': False,
@@ -641,7 +693,7 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
     ),
     packing_history.OPERATION: BusinessOperationDefinition(
         packing_history.OPERATION, 1,
-        "Odczytuje dokładną historyczną listę pakową po batch_id, wewnętrznym order_id, historycznym order_number, customer_id, dokładnej nazwie/e-mailu klienta, today=true albo latest=true. Zwraca wyłącznie zapisane packing allocations i treść utrwalonego PDF. Nie używa bieżących order_items, stanów, dostępności ani sum zamówień. Jeśli dokumentu nie można odczytać, operacja odmawia rekonstrukcji.",
+        "Odczytuje dokładną historyczną listę pakową po batch_id, wewnętrznym order_id, historycznym order_number, customer_id, dokładnej nazwie/e-mailu klienta, today=true albo latest=true. Źródłem prawdy jest utrwalony snapshot packing allocations; PDF jest opcjonalnym dokumentem i ma osobne pola dostępności oraz weryfikacji. Nie używa bieżących order_items, stanów, dostępności ani sum zamówień i nie zgaduje brakujących pól.",
         "packing.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
         PACKING_HISTORY_INPUT, PACKING_HISTORY_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
@@ -659,6 +711,75 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
         "invoices.overdue", 1, "Zwraca zaległe faktury po terminie według Cash Flow, opcjonalnie ograniczone przez customer_id.",
         "payments.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
         INVOICE_OVERDUE_INPUT, INVOICE_OVERDUE_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
+    ),
+    payment_reminders.READ: BusinessOperationDefinition(
+        payment_reminders.READ, 1,
+        "Odczytuje faktury i historię prób przypomnień. Wynik rozróżnia brak rekordu, brak prób oraz niepełny limit.",
+        "payments.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
+        {"type":"object","additionalProperties":False,"properties":{
+            "invoice_id":{"type":"integer","minimum":1},
+            "query":{"type":"string","minLength":1,"maxLength":160},
+            "only_overdue":{"type":"boolean"},
+            "limit":{"type":"integer","minimum":1,"maximum":100}}},
+        {"type":"object","required":["ok","scope","complete","truncated","records","count"],
+         "properties":{"ok":{"type":"boolean"},"scope":{"type":"object"},
+                       "complete":{"type":"boolean"},"truncated":{"type":"boolean"},
+                       "records":{"type":"array","maxItems":100},"count":{"type":"integer"}}},
+        IDEMPOTENCY_NONE, "READ_STANDARD", True,
+    ),
+    payment_reminders.WRITE: BusinessOperationDefinition(
+        payment_reminders.WRITE, 1,
+        "Wysyła jedno przypomnienie o płatności przez istniejący mechanizm aplikacji. Wymaga zatwierdzenia i zmienia znacznik dopiero po potwierdzonym sukcesie.",
+        "payments.remind", approvals.YELLOW, "REQUIRED", frozenset({"HUMAN", "AI_AGENT"}),
+        {"type":"object","additionalProperties":False,
+         "required":["invoice_id","idempotency_key"],
+         "properties":{"invoice_id":{"type":"integer","minimum":1},
+                       "idempotency_key":{"type":"string","minLength":1,"maxLength":200}}},
+        {"type":"object","required":["ok","invoice_id","reminder_sent","attempt_id"],
+         "properties":{"ok":{"type":"boolean"},"invoice_id":{"type":"integer"},
+                       "reminder_sent":{"type":"boolean"},"attempt_id":{"type":"string"}}},
+        IDEMPOTENCY_REQUIRED, "WRITE", False,
+    ),
+    search_analytics.OPERATION: BusinessOperationDefinition(
+        search_analytics.OPERATION, 1,
+        "Zwraca tę samą projekcję intencji i agregaty, których używa panel wyszukiwania: modele, braki wyników, jawne wybory SKU i aliasy.",
+        "reports.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
+        {"type":"object","additionalProperties":False,"properties":{
+            "days":{"type":"integer","enum":[7,30,90]},
+            "query":{"type":"string","minLength":1,"maxLength":120},
+            "customer_id":{"type":"string","minLength":1,"maxLength":160},
+            "result":{"type":"string","enum":["all","yes","no"]},
+            "limit":{"type":"integer","minimum":1,"maximum":200}}},
+        {"type":"object","required":["ok","scope","complete","truncated","period","totals","models","missing","intents","aliases"],
+         "properties":{"ok":{"type":"boolean"},"scope":{"type":"object"},
+                       "complete":{"type":"boolean"},"truncated":{"type":"boolean"},
+                       "period":{"type":"object"},"totals":{"type":"object"},
+                       "models":{"type":"array"},"missing":{"type":"array"},
+                       "intents":{"type":"array","maxItems":200},"aliases":{"type":"object"}}},
+        IDEMPOTENCY_NONE, "READ_STANDARD", True,
+    ),
+    CASHFLOW_READ_OPERATION: BusinessOperationDefinition(
+        CASHFLOW_READ_OPERATION, 1,
+        "Zwraca wartości z tego samego kalkulatora co panel Cash flow. section=sources udostępnia stronicowane składniki diagnostyczne; capabilities jawnie opisuje brak dziennej osi przyszłego salda.",
+        "cashflow.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
+        {"type":"object","additionalProperties":False,"properties":{
+            "section":{"type":"string","enum":["overview","inflows","sources","all"]},
+            "source_type":{"type":"string","enum":["invoice","manual_expense","china_purchase_order_cost","cashflow_setting"]},
+            "source_id":{"type":"string","minLength":1,"maxLength":120},
+            "date_from":{"type":"string","format":"date"},
+            "date_to":{"type":"string","format":"date"},
+            "offset":{"type":"integer","minimum":0,"maximum":1000000},
+            "limit":{"type":"integer","minimum":1,"maximum":500}}},
+        {"type":"object","required":["ok","read_model","as_of","scope","complete","truncated","kpis","sales_chart","inflows","sources","sources_total","next_offset","capabilities"],
+         "properties":{"ok":{"type":"boolean"},"read_model":{"type":"string"},
+                       "as_of":{"type":"string"},"scope":{"type":"object"},
+                       "complete":{"type":"boolean"},"truncated":{"type":"boolean"},
+                       "kpis":{"type":"object"},"sales_chart":{"type":"array"},
+                       "inflows":{"type":"array"},"sources":{"type":"array","maxItems":500},
+                       "sources_total":{"type":"integer"},
+                       "next_offset":{"type":["integer","null"]},
+                       "capabilities":{"type":"object"}}},
+        IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
     "customers.search": BusinessOperationDefinition(
         "customers.search", 1, "Wyszukuje firmy i klientów po pełnej lub skróconej nazwie, także bez spacji, oraz po NIP, e-mailu lub telefonie.",
@@ -835,6 +956,8 @@ def _now() -> str:
 def initialize_schema(db: sqlite3.Connection) -> None:
     invoice_amendment.initialize(db)
     fulfillment_operations.initialize(db)
+    payment_reminders.initialize(db)
+    search_analytics.initialize(db)
     db.executescript((Path(__file__).parent / 'migrations' / 'first_supervised_write.sql').read_text(encoding='utf-8'))
     db.executescript((Path(__file__).parent / 'migrations' / 'warehouse_operations.sql').read_text(encoding='utf-8'))
     import inventory_recount
@@ -1004,6 +1127,12 @@ def _entity(definition: BusinessOperationDefinition, data: Mapping[str, Any]) ->
         selector = (data.get("batch_id") or data.get("order_id") or data.get("customer_id")
                     or data.get("customer") or "latest")
         return "packing_history", str(selector), None
+    if definition.operation_name in {payment_reminders.READ, payment_reminders.WRITE}:
+        return "invoice", str(data.get("invoice_id") or data.get("query") or "overdue"), None
+    if definition.operation_name == search_analytics.OPERATION:
+        return "search_analytics", str(data.get("days") or 30), None
+    if definition.operation_name == CASHFLOW_READ_OPERATION:
+        return "cashflow", str(data.get("section") or "overview"), None
     if definition.operation_name == 'approval.decide':
         return 'approval', data['approval_id'], None
     if definition.operation_name == 'shipping.capabilities':
@@ -2417,6 +2546,10 @@ _HANDLERS: dict[str, Callable[[Mapping[str, Any], ActorContext, str, sqlite3.Con
     "orders.fulfillment.readiness": _orders_fulfillment_readiness,
     packing_history.OPERATION: lambda data, actor, correlation_id, transaction_connection=None:
         _packing_history_read(data),
+    payment_reminders.READ: payment_reminders.read,
+    payment_reminders.WRITE: lambda *_args, **_kwargs: None,
+    search_analytics.OPERATION: search_analytics.business_read,
+    CASHFLOW_READ_OPERATION: cashflow_business_read,
     "orders.packing.check": _orders_packing_check,
     "orders.packing.shortage.report": _packing_shortage_report,
     "orders.packing.confirm": _packing_confirm,
@@ -2694,7 +2827,12 @@ def execute_business_operation(
                     current = _wait_for_idempotent_result(execution_id)
                 return _result_from_row(current, status=NOOP if current["status"] == "RUNNING" else None)
             if definition.operation_name in SERVICE_WRITES:
-                executor = fulfillment_operations.execute if definition.operation_name in fulfillment_operations.WRITES else invoice_amendment.execute
+                if definition.operation_name in fulfillment_operations.WRITES:
+                    executor = fulfillment_operations.execute
+                elif definition.operation_name in invoice_amendment.WRITES:
+                    executor = invoice_amendment.execute
+                else:
+                    executor = payment_reminders.execute
                 return executor(execution_id, definition, actor, data, stored_approval,
                     entity_type, entity_id, expected_version, row['correlation_id'])
             if definition.operation_name not in LOCAL_WRITES | {"internal.test.change_setting"}:
@@ -2775,7 +2913,7 @@ def execute_business_operation(
 
 
 def operation_descriptor(definition: BusinessOperationDefinition) -> dict[str, Any]:
-    return {
+    descriptor = {
         "name": definition.operation_name,
         "version": definition.operation_version,
         "description": definition.description,
@@ -2783,6 +2921,10 @@ def operation_descriptor(definition: BusinessOperationDefinition) -> dict[str, A
         "read_only": definition.read_only,
         "idempotency": definition.idempotency_requirement,
     }
+    contract = CAPABILITY_CONTRACTS.get(definition.operation_name)
+    if contract is not None:
+        descriptor["capability_contract"] = dict(contract)
+    return descriptor
 
 
 def list_available_operations(actor_context: ActorContext) -> list[dict[str, Any]]:

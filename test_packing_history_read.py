@@ -507,7 +507,7 @@ def test_current_order_changes_do_not_change_saved_batch_answer(historical_batch
     assert all(row["sku"] != "CURRENT-NOT-HISTORY" for row in after["allocations"])
 
 
-def test_missing_file_hash_fails_closed(historical_batch):
+def test_missing_file_hash_keeps_structural_history_readable(historical_batch):
     db = backend.conn()
     db.execute("UPDATE fulfillment_documents SET file_hash='' WHERE document_id=77")
     db.commit()
@@ -516,16 +516,18 @@ def test_missing_file_hash_fails_closed(historical_batch):
     result = operations.execute_business_operation(
         _ai(), "orders.packing_history.get", {"batch_id": 77}, correlation_id="missing-hash",
     )
-    assert result.status == "FAILED"
-    assert result.error_code == "HISTORY_DOCUMENT_NOT_VERIFIABLE"
-    assert result.data is None
+    assert result.status == "SUCCESS"
+    assert result.data["total_qty"] == 14
+    assert result.data["history_source"] == "allocation_snapshot"
+    assert result.data["document_available"] is False
+    assert result.data["document_verified"] is False
 
 
 @pytest.mark.parametrize(("include_total_lines", "include_total_qty", "correlation_id"), (
     (False, True, "missing-footer-lines"),
     (True, False, "missing-footer-qty"),
 ))
-def test_missing_required_pdf_footer_fails_closed(
+def test_pdf_footer_is_not_required_for_structural_history(
         historical_batch, tmp_path, include_total_lines, include_total_qty, correlation_id):
     rows = [
         {"order_number": "ZAM-2609151", "sku": "CH030-BB-N25", "model": "Tom", "qty": 2},
@@ -545,12 +547,14 @@ def test_missing_required_pdf_footer_fails_closed(
     result = operations.execute_business_operation(
         _ai(), "orders.packing_history.get", {"batch_id": 77}, correlation_id=correlation_id,
     )
-    assert result.status == "FAILED"
-    assert result.error_code == "HISTORY_DOCUMENT_NOT_VERIFIABLE"
-    assert result.data is None
+    assert result.status == "SUCCESS"
+    assert result.data["total_qty"] == 14
+    assert result.data["history_source"] == "allocation_snapshot"
+    assert result.data["document_available"] is True
+    assert result.data["document_verified"] is True
 
 
-def test_wrong_file_hash_fails_closed(historical_batch):
+def test_wrong_file_hash_does_not_block_structural_history(historical_batch):
     db = backend.conn()
     db.execute("UPDATE fulfillment_documents SET file_hash=? WHERE document_id=77", ("0" * 64,))
     db.commit()
@@ -559,12 +563,13 @@ def test_wrong_file_hash_fails_closed(historical_batch):
     result = operations.execute_business_operation(
         _ai(), "orders.packing_history.get", {"batch_id": 77}, correlation_id="wrong-hash",
     )
-    assert result.status == "FAILED"
-    assert result.error_code == "PACKING_HISTORY_DOCUMENT_MISMATCH"
-    assert result.data is None
+    assert result.status == "SUCCESS"
+    assert result.data["total_qty"] == 14
+    assert result.data["document_available"] is False
+    assert result.data["document_verified"] is False
 
 
-def test_pdf_missing_an_allocation_row_fails_closed(historical_batch, tmp_path):
+def test_pdf_contents_do_not_replace_structural_allocations(historical_batch, tmp_path):
     incomplete_rows = [
         {"order_number": "ZAM-2609151", "sku": "CH030-BB-N25", "model": "Tom", "qty": 2},
         {"order_number": "ZAM-2609151", "sku": "CH032-BB-N25", "model": "Leo", "qty": 2},
@@ -577,12 +582,13 @@ def test_pdf_missing_an_allocation_row_fails_closed(historical_batch, tmp_path):
     result = operations.execute_business_operation(
         _ai(), "orders.packing_history.get", {"batch_id": 77}, correlation_id="incomplete-pdf",
     )
-    assert result.status == "FAILED"
-    assert result.error_code == "PACKING_HISTORY_DOCUMENT_MISMATCH"
-    assert result.data is None
+    assert result.status == "SUCCESS"
+    assert result.data["total_lines"] == 5
+    assert result.data["total_qty"] == 14
+    assert result.data["history_source"] == "allocation_snapshot"
 
 
-def test_missing_saved_document_refuses_order_reconstruction(historical_batch):
+def test_missing_saved_document_keeps_structural_history_readable(historical_batch):
     db = backend.conn()
     db.execute("DELETE FROM fulfillment_documents WHERE document_id=77 AND kind='packing_list'")
     db.commit()
@@ -591,10 +597,11 @@ def test_missing_saved_document_refuses_order_reconstruction(historical_batch):
     result = operations.execute_business_operation(
         _ai(), "orders.packing_history.get", {"batch_id": 77}, correlation_id="missing-document",
     )
-    assert result.status == "FAILED"
-    assert result.error_code == "PACKING_HISTORY_DOCUMENT_UNAVAILABLE"
-    assert "nie rekonstruuję" in result.safe_error_message
-    assert result.data is None
+    assert result.status == "SUCCESS"
+    assert result.data["total_qty"] == 14
+    assert result.data["document_id"] is None
+    assert result.data["document_available"] is False
+    assert result.data["history_source"] == "allocation_snapshot"
 
 
 @pytest.mark.parametrize("phrase", (
@@ -649,15 +656,15 @@ def test_agent_routes_only_to_history_and_returns_deterministic_14(historical_ba
     assert [tuple(row) for row in executions] == [("orders.packing_history.get", "SUCCESS")]
 
 
-def test_agent_refuses_model_guess_when_history_tool_is_not_called(historical_batch):
+def test_agent_uses_history_read_instead_of_accepting_model_guess(historical_batch):
     provider = runtime.FakeModelProvider([
         runtime.ProviderResponse(text="Winsor 39, Sam 6, Tom 2, Leo 2. Razem 49 sztuk.", model="fake-model")
     ])
     result = runtime.run_agent_turn(owner(), "Odczytaj ostatnią listę pakową.", provider)
 
     assert result["status"] == "SUCCESS"
-    assert result["tool_calls"] == 0
-    assert "nie będę rekonstruować" in result["message"]
+    assert result["tool_calls"] == 1
+    assert "Razem: 5 pozycji, 14 sztuk." in result["message"]
     assert "49" not in result["message"]
 
 

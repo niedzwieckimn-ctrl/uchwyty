@@ -1,9 +1,10 @@
-"""Read-only access to the immutable contents of a saved packing list.
+"""Read-only access to immutable packing-list data.
 
-Packing allocations are authoritative for line identity and quantity.  Product
-labels and order notes are read from the saved PDF because the legacy
-``packing_allocations`` schema does not snapshot those display fields.
-Current order items are deliberately never queried here.
+The allocation snapshot is authoritative for new lists.  A verified PDF is an
+optional human document, not a prerequisite for the agent read.  Older rows
+without the structural snapshot may still use append-only audit evidence and a
+verified historical PDF.  Current orders and order items are never used to
+reconstruct history.
 """
 
 from __future__ import annotations
@@ -294,6 +295,51 @@ def _batch_allocations(db, batch_id: int) -> list[dict[str, Any]]:
     ).fetchall()]
 
 
+def _document_records(db, batch_id: int) -> list[dict[str, Any]]:
+    """Prefer immutable history; use the old current pointer for legacy DBs."""
+    try:
+        rows = db.execute(
+            """SELECT order_id,document_id,path,file_hash,created_at
+                 FROM fulfillment_document_history
+                WHERE kind='packing_list' AND document_id=?
+                ORDER BY created_at DESC,order_id""",
+            (batch_id,),
+        ).fetchall()
+    except Exception:
+        rows = []
+    if not rows:
+        rows = db.execute(
+            """SELECT order_id,document_id,path,file_hash,created_at
+                 FROM fulfillment_documents
+                WHERE kind='packing_list' AND document_id=?
+                ORDER BY created_at DESC,order_id""",
+            (batch_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _verified_document(records: list[dict[str, Any]], allocation_order_ids: set[int]):
+    if not records:
+        return None, False
+    document_order_ids = {int(row["order_id"]) for row in records}
+    identities = {
+        (int(row["document_id"]), str(row.get("path") or ""), str(row.get("file_hash") or ""))
+        for row in records
+    }
+    if document_order_ids != allocation_order_ids or len(identities) != 1:
+        return None, False
+    document = records[0]
+    path = Path(str(document.get("path") or ""))
+    expected_hash = str(document.get("file_hash") or "").strip()
+    if not expected_hash:
+        return document, False
+    try:
+        content = path.read_bytes()
+    except (OSError, ValueError):
+        return document, False
+    return document, bool(content and sha256(content).hexdigest() == expected_hash)
+
+
 def _select_batch(db, data: Mapping[str, Any]):
     selector, value = _selector(data)
     if selector == "batch_id":
@@ -401,31 +447,55 @@ def read(data: Mapping[str, Any], *, connection_factory) -> dict[str, Any]:
                 "PACKING_HISTORY_ALLOCATIONS_MISSING",
                 "Historyczny batch nie zawiera zapisanych alokacji listy pakowej.",
             )
+        snapshot_evidence = _snapshot_allocation_keys(allocations)
         keyed_allocations, customer = (
             cached_evidence if cached_evidence is not None
             else _historical_allocation_keys(db, batch, allocations)
         )
-        documents = [dict(row) for row in db.execute(
-            """SELECT order_id,document_id,path,file_hash,created_at FROM fulfillment_documents
-                 WHERE kind='packing_list' AND document_id=?
-                 ORDER BY created_at DESC""",
-            (int(batch["id"]),),
-        ).fetchall()]
-        if not documents:
-            raise PackingHistoryError(
-                "PACKING_HISTORY_DOCUMENT_UNAVAILABLE",
-                "Batch istnieje, ale nie ma dostępu do jego zapisanej historycznej listy pakowej; nie rekonstruuję jej z zamówień.",
-            )
         allocation_order_ids = {int(row["order_id"]) for row in allocations}
-        document_order_ids = {int(row["order_id"]) for row in documents}
-        document_identities = {
-            (int(row["document_id"]), str(row.get("path") or ""), str(row.get("file_hash") or ""))
-            for row in documents
-        }
-        if document_order_ids != allocation_order_ids or len(document_identities) != 1:
-            raise _not_verifiable(
-                "Dokument historycznej listy nie jest spójnie przypisany do wszystkich zamówień batcha.")
-        document = documents[0]
+        documents = _document_records(db, int(batch["id"]))
+        document, document_verified = _verified_document(documents, allocation_order_ids)
+
+        if snapshot_evidence is not None:
+            result_allocations = []
+            incomplete_fields = []
+            for allocation, _key in keyed_allocations:
+                result_row = {
+                    "order_item_id": int(allocation["order_item_id"]),
+                    "order_id": int(allocation["order_id"]),
+                    "order_number": " ".join(str(allocation.get("order_number_snapshot") or "").split()),
+                    "sku": " ".join(str(allocation.get("sku_snapshot") or "").split()),
+                    "model_name": " ".join(str(allocation.get("model_name_snapshot") or "").split()),
+                    "note": " ".join(str(allocation.get("note_snapshot") or "").split()),
+                    "packed_qty": int(allocation["qty"]),
+                }
+                if not result_row["model_name"]:
+                    incomplete_fields.append(
+                        f"allocations[{len(result_allocations)}].model_name"
+                    )
+                result_allocations.append(result_row)
+            return {
+                "ok": True,
+                "batch_id": int(batch["id"]),
+                "created_at": str(batch.get("created_at") or ""),
+                "order_ids": sorted(allocation_order_ids),
+                "allocations": result_allocations,
+                "total_lines": len(result_allocations),
+                "total_qty": sum(int(row["qty"] or 0) for row in allocations),
+                "document_id": int(document["document_id"]) if document else None,
+                "document_path": str(document.get("path") or "") if document and document_verified else "",
+                "document_available": bool(document and document_verified),
+                "document_verified": bool(document_verified),
+                "complete": not incomplete_fields,
+                "incomplete_fields": incomplete_fields,
+                "history_source": "allocation_snapshot",
+                "customer": customer,
+            }
+        if not document:
+            raise PackingHistoryError(
+                "PACKING_HISTORY_INCOMPLETE",
+                "Starszy batch nie ma kompletnego snapshotu ani weryfikowalnego dokumentu historycznego.",
+            )
     finally:
         db.close()
 
@@ -503,5 +573,10 @@ def read(data: Mapping[str, Any], *, connection_factory) -> dict[str, Any]:
         "total_qty": allocation_qty,
         "document_id": int(document["document_id"]),
         "document_path": str(document["path"]),
+        "document_available": True,
+        "document_verified": True,
+        "complete": True,
+        "incomplete_fields": [],
+        "history_source": "legacy_verified_document",
         "customer": customer,
     }

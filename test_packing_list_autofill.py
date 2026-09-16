@@ -170,7 +170,10 @@ def test_overallocated_history_never_produces_negative_packable(packing_app):
 
 def test_post_cannot_pack_more_than_remaining(packing_app, tmp_path, monkeypatch):
     _add_shipped_allocation(4)
-    fake_pdf = lambda *a, **k: str(tmp_path / "packing.pdf")
+    def fake_pdf(*_args, **_kwargs):
+        path = tmp_path / "packing.pdf"
+        path.write_bytes(b"%PDF-1.4\npacking")
+        return str(path)
     monkeypatch.setattr(backend, "generate_invoice_packing_list_pdf", fake_pdf)
     monkeypatch.setattr(shipping_routes, "generate_invoice_packing_list_pdf", fake_pdf)
 

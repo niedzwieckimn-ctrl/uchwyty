@@ -49,6 +49,17 @@ def initialize(db):
     CREATE TABLE IF NOT EXISTS fulfillment_documents(order_id INTEGER NOT NULL, kind TEXT NOT NULL,
         document_id INTEGER NOT NULL, content_hash TEXT NOT NULL, path TEXT NOT NULL, created_at TEXT NOT NULL,
         PRIMARY KEY(order_id,kind));
+    CREATE TABLE IF NOT EXISTS fulfillment_document_history(
+        order_id INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        document_id INTEGER NOT NULL,
+        content_hash TEXT NOT NULL,
+        path TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        file_hash TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY(order_id,kind,document_id));
+    CREATE INDEX IF NOT EXISTS idx_fulfillment_document_history_document
+        ON fulfillment_document_history(kind,document_id,order_id);
     CREATE TABLE IF NOT EXISTS fulfillment_locks(order_id INTEGER PRIMARY KEY, token TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS fulfillment_document_intents(order_id INTEGER NOT NULL, kind TEXT NOT NULL,
         content_hash TEXT NOT NULL, PRIMARY KEY(order_id,kind));
@@ -59,6 +70,20 @@ def initialize(db):
     ''')
     if 'file_hash' not in {r[1] for r in db.execute('PRAGMA table_info(fulfillment_documents)')}:
         db.execute("ALTER TABLE fulfillment_documents ADD COLUMN file_hash TEXT NOT NULL DEFAULT ''")
+    db.execute('''INSERT OR IGNORE INTO fulfillment_document_history(
+                    order_id,kind,document_id,content_hash,path,created_at,file_hash)
+                  SELECT order_id,kind,document_id,content_hash,path,created_at,
+                         COALESCE(file_hash,'')
+                    FROM fulfillment_documents
+                   WHERE kind='packing_list' ''')
+    db.executescript('''
+    CREATE TRIGGER IF NOT EXISTS fulfillment_document_history_no_update
+    BEFORE UPDATE ON fulfillment_document_history
+    BEGIN SELECT RAISE(ABORT, 'fulfillment document history is immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS fulfillment_document_history_no_delete
+    BEFORE DELETE ON fulfillment_document_history
+    BEGIN SELECT RAISE(ABORT, 'fulfillment document history is immutable'); END;
+    ''')
 
 
 def error(code, message, status='FAILED'):
@@ -549,11 +574,49 @@ def save_document(oid, kind, document_id, path, *, connection=None, content_hash
         file_hash = file_hash or _document_file_hash(path)
         if not file_hash:
             raise error('DOCUMENT_FILE_UNAVAILABLE', 'Nie można odczytać zapisanego dokumentu.')
-        c.execute('INSERT OR REPLACE INTO fulfillment_documents VALUES(?,?,?,?,?,?,?)',
-                  (oid, kind, document_id, content_hash, str(path), b.now_iso(),
-                   file_hash))
+        created_at = b.now_iso()
+        historical = (int(oid), str(kind), int(document_id), str(content_hash),
+                      str(path), created_at, str(file_hash))
+        persisted = historical
+        if str(kind) == 'packing_list':
+            c.execute('''INSERT OR IGNORE INTO fulfillment_document_history(
+                             order_id,kind,document_id,content_hash,path,created_at,file_hash)
+                         VALUES(?,?,?,?,?,?,?)''', historical)
+            saved = c.execute('''SELECT order_id,kind,document_id,content_hash,path,created_at,file_hash
+                                   FROM fulfillment_document_history
+                                  WHERE order_id=? AND kind=? AND document_id=?''',
+                              (int(oid), str(kind), int(document_id))).fetchone()
+            if saved is None or str(saved['content_hash']) != str(content_hash):
+                raise error(
+                    'HISTORICAL_DOCUMENT_CONFLICT',
+                    'Ta historyczna wersja listy pakowej ma już inną utrwaloną treść.',
+                    status='CONFLICT',
+                )
+            # Repeated execution of the same open batch is idempotent.  Keep
+            # the first immutable document even if a caller rendered a fresh
+            # temporary PDF before recognizing the existing batch.
+            persisted = (
+                int(saved['order_id']), str(saved['kind']), int(saved['document_id']),
+                str(saved['content_hash']), str(saved['path']), str(saved['created_at']),
+                str(saved['file_hash']),
+            )
+        c.execute('''INSERT INTO fulfillment_documents(
+                         order_id,kind,document_id,content_hash,path,created_at,file_hash)
+                     VALUES(?,?,?,?,?,?,?)
+                     ON CONFLICT(order_id,kind) DO UPDATE SET
+                         document_id=excluded.document_id,
+                         content_hash=excluded.content_hash,
+                         path=excluded.path,
+                         created_at=excluded.created_at,
+                         file_hash=excluded.file_hash''', persisted)
         if owned:
             c.commit()
+        return {
+            'order_id': persisted[0], 'kind': persisted[1],
+            'document_id': persisted[2], 'content_hash': persisted[3],
+            'path': persisted[4], 'created_at': persisted[5],
+            'file_hash': persisted[6],
+        }
     except Exception:
         if owned:
             c.rollback()
@@ -578,10 +641,6 @@ def finalize_packing_list(
     path = prepared['path']
     items = prepared['items']
     order_ids = sorted({int(value) for value in prepared['order_ids']})
-    file_hash = _document_file_hash(path)
-    if not file_hash:
-        raise error('DOCUMENT_FILE_UNAVAILABLE', 'Nie można odczytać wygenerowanej listy pakowej.')
-
     db = b.conn()
     try:
         db.execute('BEGIN IMMEDIATE')
@@ -598,6 +657,16 @@ def finalize_packing_list(
         )
         if not batch_id:
             raise error('PACKING_SELECTION_EMPTY', 'Lista pakowa nie zawiera pozycji.')
+        source_path = Path(path)
+        archive_path = source_path.with_name(
+            f'{source_path.stem}_batch_{batch_id}{source_path.suffix}'
+        )
+        if not archive_path.exists():
+            archive_path.write_bytes(source_path.read_bytes())
+        path = str(archive_path)
+        file_hash = _document_file_hash(path)
+        if not file_hash:
+            raise error('DOCUMENT_FILE_UNAVAILABLE', 'Nie można odczytać wygenerowanej listy pakowej.')
         packing_result = b.mark_orders_packed_transaction(db, order_ids, packing_items=items)
         for member in order_ids:
             save_document(

@@ -12,6 +12,26 @@ from zoneinfo import ZoneInfo
 
 WINDOW = 300
 WARSAW = ZoneInfo('Europe/Warsaw')
+OPERATION = 'search.analytics.read'
+_backend = None
+
+
+def configure(backend):
+    global _backend
+    _backend = backend
+
+
+def initialize(db):
+    """Create the local event store eagerly so controlled READs work before UI use."""
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS search_analytics_records(
+               id TEXT PRIMARY KEY,
+               kind TEXT NOT NULL,
+               created_at TEXT NOT NULL,
+               payload TEXT NOT NULL
+           )"""
+    )
+    db.commit()
 
 
 def key(value):
@@ -148,20 +168,145 @@ class Store:
         return [json.loads(r['payload']) if isinstance(r['payload'], str) else r['payload'] for r in raw]
 
 
+def catalog_for(b):
+    store = Store(b)
+    if b.supabase_enabled():
+        products = b.supabase_select_rows(
+            'products', extra_params={'select':'id,sku,model,name', 'archived':'eq.0'})
+    else:
+        c = b.conn()
+        try:
+            products = [dict(r) for r in c.execute(
+                'SELECT id,sku,model,name FROM products WHERE COALESCE(archived,0)=0')]
+        finally:
+            c.close()
+    return Catalog(products, store.rows('rule'))
+
+
+def analytics_snapshot(b, *, days=30, query='', customer='', result='all', now=None):
+    """Shared projection and aggregation used by the panel and agent READ."""
+    now = now or datetime.now(timezone.utc)
+    days = int(days)
+    if days not in {7, 30, 90}:
+        raise ValueError('Nieobsługiwany okres statystyk wyszukiwania.')
+    result = result if result in {'all', 'yes', 'no'} else 'all'
+    start = datetime.combine(
+        now.astimezone(WARSAW).date() - timedelta(days=days - 1),
+        datetime.min.time(), WARSAW)
+    store = Store(b)
+    cat = catalog_for(b)
+    # Full history is required before the date filter so a boundary cannot
+    # split one typing/editing chain into two intents.
+    events = store.rows('event')
+    intents = project(events, now)
+    normalized_query = key(query)
+    filtered = [
+        intent for intent in intents
+        if stamp(intent['started_at']) >= start and not intent['superseded']
+        and (not customer or intent['customer_id'] == customer)
+        and (not normalized_query or normalized_query in key(
+            ' '.join(intent['raw_phrases']) + ' ' + intent['model_name'] + ' ' + intent['customer_name']))
+        and (result == 'all' or result == 'yes' and intent['results_count'] > 0
+             or result == 'no' and intent['no_result'])
+    ]
+    models, clients, missing = {}, {}, {}
+    trend = Counter(stamp(intent['started_at']).astimezone(WARSAW).date()
+                    for intent in filtered)
+    for intent in filtered:
+        client = clients.setdefault(
+            intent['customer_id'], {'name': intent['customer_name'], 'count': 0, 'missing': 0})
+        client['count'] += 1
+        client['missing'] += int(intent['no_result'])
+        if intent['model_id']:
+            model = models.setdefault(intent['model_id'], {
+                'id': intent['model_id'], 'name': intent['model_name'], 'count': 0,
+                'clients': set(), 'last': '', 'phrases': Counter(), 'skus': Counter()})
+            model['count'] += 1
+            model['clients'].add(intent['customer_id'])
+            model['last'] = max(model['last'], intent['last_activity_at'])
+            model['phrases'].update(event['query'] for event in intent['events'])
+            model['skus'].update(
+                event['selected_sku'] for event in intent['events'] if event.get('selected_sku'))
+        if intent['no_result']:
+            phrase = key(intent['query'])
+            rule = cat.rules.get(phrase, {})
+            row = missing.setdefault(phrase, {
+                'phrase': phrase, 'count': 0, 'last': '',
+                'ignored': rule.get('ignored', False),
+                'purchase': rule.get('purchase', False),
+                'assigned': cat.families.get(rule.get('model_id'), '')})
+            row['count'] += 1
+            row['last'] = max(row['last'], intent['last_activity_at'])
+    for client in clients.values():
+        client['percent'] = round(client['missing'] / client['count'] * 100, 1)
+    model_rows = sorted(models.values(), key=lambda model: (-model['count'], model['name']))
+    for row in missing.values():
+        suggestion = get_close_matches(
+            row['phrase'], [key(name) for name in cat.families.values()], n=1, cutoff=.65)
+        row['suggestion'] = next(
+            (name for name in cat.families.values() if suggestion and key(name) == suggestion[0]), '')
+    return {
+        'days': days, 'start': start, 'events': events, 'intents': intents,
+        'filtered': filtered, 'catalog': cat,
+        'clients_all': sorted({(i['customer_id'], i['customer_name']) for i in intents}, key=lambda x:x[1]),
+        'models': model_rows, 'clients': clients,
+        'missing': sorted(missing.values(), key=lambda row: -row['count']),
+        'trend': trend,
+    }
+
+
+def business_read(data, actor=None, correlation_id='', transaction_connection=None):
+    del actor, correlation_id, transaction_connection
+    if _backend is None:
+        raise RuntimeError('Źródło statystyk wyszukiwania nie jest skonfigurowane.')
+    snapshot = analytics_snapshot(
+        _backend, days=int(data.get('days') or 30), query=data.get('query') or '',
+        customer=data.get('customer_id') or '', result=data.get('result') or 'all')
+    limit = int(data.get('limit') or 100)
+    intents = sorted(snapshot['filtered'], key=lambda row: row['last_activity_at'], reverse=True)
+    public_models = [{
+        'model_id': row['id'], 'model_name': row['name'], 'intent_count': row['count'],
+        'customer_count': len(row['clients']), 'last_at': row['last'],
+        'phrases': [{'phrase': phrase, 'count': count}
+                    for phrase, count in row['phrases'].most_common()],
+        'explicit_sku_selections': [{'sku': sku, 'count': count}
+                                    for sku, count in row['skus'].most_common()],
+    } for row in snapshot['models']]
+    public_intents = [{
+        'intent_id': row['id'], 'customer_id': row['customer_id'],
+        'customer_name': row['customer_name'], 'model_id': row['model_id'],
+        'model_name': row['model_name'], 'started_at': row['started_at'],
+        'last_activity_at': row['last_activity_at'], 'phrases': row['raw_phrases'],
+        'results_count': row['results_count'], 'no_result': row['no_result'],
+        'status': row['status'], 'raw_event_count': row['raw_count'],
+        'explicit_sku_selections': [event['selected_sku'] for event in row['events']
+                                    if event.get('selected_sku')],
+    } for row in intents[:limit]]
+    return {
+        'ok': True,
+        'scope': {'kind': 'projected_analytics', 'entity_existence_authoritative': True,
+                  'empty_means': 'no_matching_projected_search_intents'},
+        'complete': len(intents) <= limit, 'truncated': len(intents) > limit,
+        'period': {'days': snapshot['days'], 'date_from': snapshot['start'].date().isoformat(),
+                   'date_to': datetime.now(WARSAW).date().isoformat()},
+        'totals': {'intents': len(snapshot['filtered']),
+                   'active_customers': len(snapshot['clients']),
+                   'no_result_intents': sum(row['no_result'] for row in snapshot['filtered'])},
+        'models': public_models, 'missing': snapshot['missing'],
+        'intents': public_intents,
+        'aliases': {phrase: snapshot['catalog'].families[rule['model_id']]
+                    for phrase, rule in snapshot['catalog'].rules.items()
+                    if rule.get('model_id') in snapshot['catalog'].families},
+    }
+
+
 def register(b):
     from flask import request, jsonify, g, render_template, redirect, url_for, Response
+    configure(b)
     store = Store(b)
 
     def catalog():
-        if b.supabase_enabled():
-            products = b.supabase_select_rows('products', extra_params={'select':'id,sku,model,name', 'archived':'eq.0'})
-        else:
-            c = b.conn()
-            try:
-                products = [dict(r) for r in c.execute('SELECT id,sku,model,name FROM products WHERE COALESCE(archived,0)=0')]
-            finally:
-                c.close()
-        return Catalog(products, store.rows('rule'))
+        return catalog_for(b)
 
     old_log = b.app.view_functions['api_client_search_log']
     old_dashboard = b.app.view_functions['client_searches']
@@ -241,25 +386,27 @@ def register(b):
     def dashboard():
         if request.args.get('legacy') == '1':
             return old_dashboard()
-        now = datetime.now(timezone.utc)
         days = int(request.args.get('days', '30')) if request.args.get('days', '30') in {'7','30','90'} else 30
-        start = datetime.combine(now.astimezone(WARSAW).date() - timedelta(days=days-1), datetime.min.time(), WARSAW)
+        q, customer, result = key(request.args.get('q')), request.args.get('customer',''), request.args.get('result','all')
         error = ''
         try:
-            cat = catalog()
-            # Fetch full new event history before filtering: a boundary must not create an extra intent.
-            events = store.rows('event')
-            intents = project(events, now)
+            projection = analytics_snapshot(
+                b, days=days, query=q, customer=customer, result=result)
         except Exception:
             b.app.logger.exception('Search analytics read failed')
-            cat, events, intents = Catalog([]), [], []
+            empty = Catalog([])
+            start = datetime.combine(
+                datetime.now(WARSAW).date() - timedelta(days=days-1),
+                datetime.min.time(), WARSAW)
+            projection = {
+                'days': days, 'start': start, 'events': [], 'intents': [],
+                'filtered': [], 'catalog': empty, 'clients_all': [], 'models': [],
+                'clients': {}, 'missing': [], 'trend': Counter(),
+            }
             error = 'Nie udało się pobrać statystyk. Sprawdź wdrożenie migracji i połączenie z bazą. Odśwież stronę.'
-        clients_all = sorted({(i['customer_id'], i['customer_name']) for i in intents}, key=lambda x:x[1])
-        q, customer, result = key(request.args.get('q')), request.args.get('customer',''), request.args.get('result','all')
-        filtered = [i for i in intents if stamp(i['started_at']) >= start and not i['superseded']
-                    and (not customer or i['customer_id'] == customer)
-                    and (not q or q in key(' '.join(i['raw_phrases']) + ' ' + i['model_name'] + ' ' + i['customer_name']))
-                    and (result == 'all' or result == 'yes' and i['results_count'] > 0 or result == 'no' and i['no_result'])]
+        start, events = projection['start'], projection['events']
+        filtered, cat = projection['filtered'], projection['catalog']
+        clients_all = projection['clients_all']
         if request.args.get('export') == '1':
             if error:
                 return error, 503
@@ -272,35 +419,13 @@ def register(b):
             for i in filtered:
                 writer.writerow(map(safe, [i['started_at'], i['last_activity_at'], i['customer_name'], i['model_name'], ' | '.join(i['raw_phrases']), i['results_count'], i['status'], i['raw_count']]))
             return Response('\ufeff' + out.getvalue(), mimetype='text/csv', headers={'Content-Disposition':'attachment; filename=wyszukiwania.csv'})
-        models, clients, missing = {}, {}, {}
-        trend = Counter(stamp(i['started_at']).astimezone(WARSAW).date() for i in filtered)
-        for i in filtered:
-            c = clients.setdefault(i['customer_id'], {'name':i['customer_name'], 'count':0, 'missing':0})
-            c['count'] += 1
-            c['missing'] += int(i['no_result'])
-            if i['model_id']:
-                m = models.setdefault(i['model_id'], {'id':i['model_id'], 'name':i['model_name'], 'count':0, 'clients':set(), 'last':'', 'phrases':Counter(), 'skus':Counter()})
-                m['count'] += 1
-                m['clients'].add(i['customer_id'])
-                m['last'] = max(m['last'], i['last_activity_at'])
-                m['phrases'].update(e['query'] for e in i['events'])
-                # SKU drilldown counts explicit selections only, never treats all search matches as clicks.
-                m['skus'].update(e['selected_sku'] for e in i['events'] if e.get('selected_sku'))
-            if i['no_result']:
-                phrase = key(i['query'])
-                r = cat.rules.get(phrase, {})
-                m = missing.setdefault(phrase, {'phrase':phrase, 'count':0, 'last':'', 'ignored':r.get('ignored',False), 'purchase':r.get('purchase',False), 'assigned':cat.families.get(r.get('model_id'),'')})
-                m['count'] += 1
-                m['last'] = max(m['last'], i['last_activity_at'])
-        for c in clients.values():
-            c['percent'] = round(c['missing'] / c['count'] * 100, 1)
+        clients = projection['clients']
         sort = request.args.get('sort','count')
         if sort not in {'count','missing','percent'}:
             sort = 'count'
-        model_rows = sorted(models.values(), key=lambda m:(-m['count'],m['name']))
-        for m in missing.values():
-            suggestion = get_close_matches(m['phrase'], [key(n) for n in cat.families.values()], n=1, cutoff=.65)
-            m['suggestion'] = next((n for n in cat.families.values() if suggestion and key(n) == suggestion[0]), '')
+        model_rows = projection['models']
+        missing_rows = projection['missing']
+        trend = projection['trend']
         bars = [(start.date()+timedelta(days=d), trend[start.date()+timedelta(days=d)]) for d in range(days)]
         pagesize = 10
         try: page = max(1, int(request.args.get('page',1)))
@@ -315,7 +440,7 @@ def register(b):
             days=days, q=request.args.get('q',''), customer=customer, result=result, clients_all=clients_all,
             total=len(filtered), active=len(clients), no_results=sum(i['no_result'] for i in filtered),
             top=model_rows[0] if model_rows else None, models=model_rows, clients=sorted(clients.values(),key=lambda c:-c[sort]),
-            missing=sorted(missing.values(),key=lambda m:-m['count']), families=cat.families, rules=cat.rules,
+            missing=missing_rows, families=cat.families, rules=cat.rules,
             bars=bars, maxbar=max([v for _,v in bars]+[1]), latest=ordered[(page-1)*pagesize:page*pagesize],
             page=page, more=page*pagesize<len(ordered), link=link, error=error, sort=sort,
             raw_latest=sorted([e for e in events if stamp(e['created_at']) >= start
