@@ -1,0 +1,41 @@
+--- a/routes/shipping.py
++++ b/routes/shipping.py
+@@ -551,6 +551,10 @@
+         if not order_items:
+             return "Brak pozycji zamowienia", 400
+ 
++        invoiced_by_item = invoiced_qty_by_order_item_ids(
++            [int(item["id"]) for item in order_items]
++        )
++
+         # Wspólna pula dla product_id zapobiega wybraniu tego samego stanu
+         # kilka razy, gdy produkt występuje w kilku zamówieniach klienta.
+         stock_pool = {}
+@@ -559,9 +563,12 @@
+         for item in order_items:
+             product_id = int(item.get("product_id") or 0)
+             available = stock_pool.setdefault(product_id, max(0, int(item.get("stock_qty") or 0)))
+-            max_pack_qty = min(max(0, int(item.get("qty") or 0)), available)
+-            pack_qty = max_pack_qty if request.method == "GET" else min(
+-                max_pack_qty,
++            ordered_qty = max(0, int(item.get("qty") or 0))
++            already_shipped_qty = max(0, int(invoiced_by_item.get(int(item["id"])) or 0))
++            remaining_to_ship = max(0, ordered_qty - already_shipped_qty)
++            packable_now = min(remaining_to_ship, available)
++            pack_qty = packable_now if request.method == "GET" else min(
++                packable_now,
+                 max(0, to_int(request.form.get(f"pack_qty_{item['id']}"), 0)),
+             )
+             stock_pool[product_id] = available - pack_qty
+@@ -571,7 +578,10 @@
+                 source_order.get("id"), source_order.get("created_at"), source_order.get("order_no")
+             )
+             item["source_order_note"] = norm(source_order.get("note"))
+-            item["max_pack_qty"] = max_pack_qty
++            item["already_shipped_qty"] = already_shipped_qty
++            item["remaining_to_ship"] = remaining_to_ship
++            item["packable_now"] = packable_now
++            item["max_pack_qty"] = packable_now
+             item["selected_pack_qty"] = pack_qty
+             selection_rows.append(item)
+             if pack_qty <= 0:
