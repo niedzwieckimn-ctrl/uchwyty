@@ -1302,13 +1302,13 @@ def register_routes(context):
 
     @app.post("/invoices/<int:invoice_id>/payment-reminder")
     def invoice_payment_reminder_admin(invoice_id):
-        _set_invoice_payment_state(invoice_id, reminder=1, paid=0)
-        try:
-            if send_payment_reminder:
-                invoice_row, pdf_url = _invoice_email_context(invoice_id)
-                send_payment_reminder(invoice_row, pdf_url=pdf_url)
-        except Exception:
-            pass
+        result = payment_reminders.send(invoice_id, trigger_source="manual_ui")
+        if not result.get("ok"):
+            return (
+                "Nie udało się wysłać przypomnienia. Stan faktury nie został zmieniony. "
+                + str(result.get("error") or "Spróbuj ponownie."),
+                502,
+            )
         return _redirect_after_invoice_action()
 
 

@@ -669,6 +669,8 @@ def register_routes(context):
             "buyer_name": norm(order_row["customer_name"]),
             "buyer_email": norm(order_row["customer_email"]),
         }
+        if not defer_persistence:
+            meta["packing_document_token"] = uuid.uuid4().hex
         pack_path = generate_invoice_packing_list_pdf(order_row, items, meta)
         if defer_persistence:
             return {
@@ -696,6 +698,26 @@ def register_routes(context):
                 packed_order_ids,
                 packing_items=items,
             )
+            packing_file_hash = fulfillment_operations._document_file_hash(pack_path)
+            if not packing_file_hash:
+                raise RuntimeError("Nie można odczytać wygenerowanej listy pakowej")
+            persisted_paths = set()
+            for member in packed_order_ids:
+                persisted_document = fulfillment_operations.save_document(
+                    member,
+                    "packing_list",
+                    packing_state["batch_id"],
+                    pack_path,
+                    connection=packing_db,
+                    content_hash=fulfillment_operations.snapshot(
+                        member, packing_db, include_package=False
+                    )["content_hash"],
+                    file_hash=packing_file_hash,
+                )
+                persisted_paths.add(persisted_document["path"])
+            if len(persisted_paths) != 1:
+                raise RuntimeError("Niejednoznaczna historyczna lista pakowa")
+            pack_path = persisted_paths.pop()
             packing_db.commit()
         except Exception:
             packing_db.rollback()
