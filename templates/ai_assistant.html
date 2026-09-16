@@ -483,6 +483,29 @@
     }
   }
 
+  async function recoverApprovedExecution(approvalId) {
+    const deadline = Date.now() + 60000;
+    while (Date.now() < deadline) {
+      try {
+        const query = conversationId ? `?conversation_id=${encodeURIComponent(conversationId)}` : '';
+        const response = await fetch(
+          `/api/internal/ai/approvals/${encodeURIComponent(approvalId)}/outcome${query}`,
+          {method:'GET', credentials:'same-origin', headers:{'Accept':'application/json'}}
+        );
+        const result = await response.json().catch(() => ({}));
+        if (response.ok && result.status === 'SUCCESS'
+            && typeof result.message === 'string' && result.message
+            && result.turn_released !== false) {
+          return result;
+        }
+        const executionStatus = result.execution_outcome?.execution_status;
+        if (['FAILED', 'DENIED', 'CONFLICT'].includes(executionStatus)) return null;
+      } catch (_) {}
+      await new Promise(resolve => window.setTimeout(resolve, 500));
+    }
+    return null;
+  }
+
   function acceptsAgentStream() {
     return typeof ReadableStream !== 'undefined' && typeof TextDecoder !== 'undefined';
   }
@@ -597,14 +620,25 @@
                   'Accept':acceptsAgentStream() ? 'text/event-stream' : 'application/json'},
                 body: JSON.stringify({conversation_id: conversationId}), signal:controller.signal
               });
-              const result = await readAgentResponse(response,
+              let result = await readAgentResponse(response,
                 agentDisplayHandler(answer, controller, generation, started), controller.signal);
               if (!isCurrent()) return;
               if (controller.signal.aborted) throw new Error('AGENT_STREAM_CANCELLED');
+              const storedSuccess = result.execution_outcome?.execution_status === 'SUCCESS'
+                && result.execution_outcome?.result?.status === 'SUCCESS';
+              if (storedSuccess && (result._streamFailed
+                  || (result.model_status && result.model_status !== 'SUCCESS')
+                  || typeof result.message !== 'string')) {
+                const recovered = await recoverApprovedExecution(approval.approval_id);
+                if (recovered) result = recovered;
+              }
               if (typeof result.conversation_id === 'string') conversationId = result.conversation_id;
               answer.classList.toggle('ai-loading', false);
-              const modelFailed = result._streamFailed || (result.model_status && result.model_status !== 'SUCCESS');
-              answer.classList.toggle('error', !response.ok || Boolean(modelFailed));
+              const executionConfirmed = result.execution_outcome?.execution_status === 'SUCCESS'
+                && result.execution_outcome?.result?.status === 'SUCCESS';
+              const modelFailed = !executionConfirmed
+                && (result._streamFailed || (result.model_status && result.model_status !== 'SUCCESS'));
+              answer.classList.toggle('error', !executionConfirmed && (!response.ok || Boolean(modelFailed)));
               answerBubble.textContent = typeof result.message === 'string'
                 ? result.message
                 : modelFailed ? 'Nie udało się odczytać pełnego wyniku. Sprawdź stan operacji przed ponowieniem.'
@@ -613,10 +647,20 @@
               if (!response.ok || result.status === 'NOOP') buttons.forEach(b => b.disabled = false);
             } catch (_) {
               if (!isCurrent()) return;
+              const recovered = action === 'approve'
+                ? await recoverApprovedExecution(approval.approval_id) : null;
+              if (!isCurrent()) return;
               answer.classList.toggle('ai-loading', false);
-              answer.classList.toggle('error', true);
-              answerBubble.textContent = 'Nie udało się odczytać pełnego wyniku. Sprawdź stan operacji przed ponowieniem.';
-              buttons.forEach(b => b.disabled = false);
+              if (recovered) {
+                if (typeof recovered.conversation_id === 'string') conversationId = recovered.conversation_id;
+                answer.classList.toggle('error', false);
+                answerBubble.textContent = recovered.message;
+                renderArtifacts(answer, recovered.artifacts);
+              } else {
+                answer.classList.toggle('error', true);
+                answerBubble.textContent = 'Nie udało się odczytać pełnego wyniku. Sprawdź stan operacji przed ponowieniem.';
+                buttons.forEach(b => b.disabled = false);
+              }
             } finally {
               window.clearTimeout(timer);
               if (isCurrent()) {
