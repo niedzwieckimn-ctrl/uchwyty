@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 import app as b
+import agent_runtime as runtime
 import business_operations as ops
 import fulfillment_operations as f
 import internal_rbac as rbac
@@ -75,6 +76,103 @@ def success(name, **values):
 def docs():
     success('orders.packing_list.generate')
     success('orders.invoice.create')
+
+
+def test_multi_order_success_survives_synthesis_failure_and_transport_recovery(flow, monkeypatch):
+    c = b.conn()
+    c.execute("""INSERT INTO orders(id,order_no,customer_name,customer_email,customer_address,
+                 customer_phone,status,currency,created_at)
+                 VALUES(704,'MAG-704','Magmar','test@example.invalid','Testowa 1, 00-001 Warszawa',
+                 '501502503','confirmed','PLN',?)""", (b.now_iso(),))
+    c.execute("""INSERT INTO order_items(id,order_id,product_id,sku,qty,unit_net_price,currency,created_at)
+                 VALUES(705,704,701,'ANDRE-128-AB',3,10,'PLN',?)""", (b.now_iso(),))
+    c.commit(); c.close()
+    pdf_calls, email_calls = [], []
+    original_pdf = b.generate_invoice_packing_list_pdf
+
+    def counted_pdf(*args, **kwargs):
+        pdf_calls.append(1)
+        return original_pdf(*args, **kwargs)
+
+    def counted_email(orders, **kwargs):
+        email_calls.append(sorted(int(order['id']) for order in orders))
+        return {'ok':True, 'id':'delivered-test'}
+
+    monkeypatch.setattr(b, 'generate_invoice_packing_list_pdf', counted_pdf)
+    monkeypatch.setattr(b, '_send_orders_packed_email', counted_email)
+    b.app.secret_key = 'post-success-packing-test'
+    expected_version = state()['expected_version']
+    preview = f.packing_list_preview(702)
+    payload = {'order_id':702, 'expected_version':expected_version,
+               'idempotency_key':'post-success-multi-order-packing',
+               'packing_scope_fingerprint':preview['fingerprint'],
+               'packing_items':preview['approval_items'],
+               'total_quantity':preview['total_quantity']}
+    with b.app.test_request_context():
+        b._refresh_domain_route_context()
+        pending = ops.execute_business_operation(actor(), 'orders.packing_list.generate', payload)
+    assert pending.status == 'PENDING_APPROVAL', (pending.error_code, pending.safe_error_message)
+
+    human = rbac.load_actor_context(rbac.BOOTSTRAP_OWNER_ACTOR_ID)
+    opened = runtime.run_agent_turn(human, 'Rozpocznij rozmowę.', runtime.FakeModelProvider([
+        runtime.ProviderResponse(text='Jestem gotowy.', model='fake'),
+    ]))
+    cid = opened['conversation_id']
+    b.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([
+        TimeoutError('Injected final synthesis timeout'),
+    ])
+    client = b.app.test_client()
+    with client.session_transaction() as session:
+        session['admin_authenticated'] = True
+        session['csrf_token'] = 'post-success-packing-test'
+        b.bind_bootstrap_owner_session(session)
+    response = client.post(
+        f'/api/internal/ai/approvals/{pending.approval_id}/approve',
+        json={'conversation_id':cid}, headers={'Accept':'text/event-stream'}, buffered=False)
+    from test_agent_streaming import frames
+    try:
+        received = list(frames(response))
+    finally:
+        response.close()
+    final = received[-1][1]
+    assert received[-1][0] == 'done'
+    assert final['status'] == final['model_status'] == 'SUCCESS'
+    assert final['confirmation_source'] == 'stored_execution'
+    assert final['synthesis_status'] == 'FAILED'
+    assert final['message'] == (
+        'Gotowe. Utworzono jedną listę pakową dla 5 sztuk '
+        'z 2 zamówień (2 pozycje) i wysłano ją do klienta.')
+    c = b.conn()
+    assert c.execute('SELECT COUNT(*) FROM packing_batches').fetchone()[0] == 1
+    assert c.execute('SELECT COUNT(*) FROM packing_allocations').fetchone()[0] == 2
+    assert c.execute("SELECT COUNT(*) FROM fulfillment_documents WHERE kind='packing_list'").fetchone()[0] == 2
+    execution = c.execute(
+        'SELECT status,result_summary FROM internal_operation_executions WHERE approval_id=?',
+        (pending.approval_id,),
+    ).fetchone()
+    assert execution['status'] == 'SUCCESS' and json.loads(execution['result_summary'])['ok'] is True
+    assert c.execute('SELECT COUNT(*) FROM internal_agent_turn_leases').fetchone()[0] == 0
+    c.close()
+    assert pdf_calls == [1]
+    assert email_calls == [[702,704]]
+
+    recovered = client.get(
+        f'/api/internal/ai/approvals/{pending.approval_id}/outcome',
+        query_string={'conversation_id':cid})
+    recovered_again = client.get(
+        f'/api/internal/ai/approvals/{pending.approval_id}/outcome',
+        query_string={'conversation_id':cid})
+    assert recovered.status_code == recovered_again.status_code == 200
+    assert recovered.get_json()['message'] == final['message']
+    assert recovered.get_json()['turn_released'] is True
+    assert pdf_calls == [1] and email_calls == [[702,704]]
+
+    followup = runtime.run_agent_turn(human, 'Dziękuję.', runtime.FakeModelProvider([
+        runtime.ProviderResponse(text='Proszę bardzo.', model='fake'),
+    ]), conversation_id=cid)
+    assert followup['status'] == 'SUCCESS'
+    assert followup['error_code'] != 'CONVERSATION_BUSY'
+    b.AGENT_MODEL_PROVIDER = None
 
 
 def remote_invoice_pdf(monkeypatch):

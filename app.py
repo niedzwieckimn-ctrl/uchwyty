@@ -19,7 +19,7 @@ import hmac
 import urllib.parse
 import urllib.request
 import urllib.error
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 
 _STARTUP_STARTED = time.monotonic()
@@ -764,6 +764,28 @@ def init_db():
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_packing_batches_root_open ON packing_batches(root_order_id, invoice_id, id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_packing_allocations_batch ON packing_allocations(batch_id)")
+    packing_allocation_columns = {
+        row[1] for row in cur.execute("PRAGMA table_info(packing_allocations)").fetchall()
+    }
+    for column_name, column_type in (
+        ("order_number_snapshot", "TEXT"),
+        ("sku_snapshot", "TEXT"),
+        ("model_name_snapshot", "TEXT"),
+        ("note_snapshot", "TEXT"),
+        ("customer_id_snapshot", "INTEGER"),
+        ("customer_name_snapshot", "TEXT"),
+        ("customer_email_snapshot", "TEXT"),
+    ):
+        if column_name not in packing_allocation_columns:
+            cur.execute(f"ALTER TABLE packing_allocations ADD COLUMN {column_name} {column_type}")
+    cur.executescript("""
+    CREATE TRIGGER IF NOT EXISTS packing_allocations_no_update
+    BEFORE UPDATE ON packing_allocations
+    BEGIN SELECT RAISE(ABORT, 'packing_allocations are immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS packing_allocations_no_delete
+    BEFORE DELETE ON packing_allocations
+    BEGIN SELECT RAISE(ABORT, 'packing_allocations are immutable'); END;
+    """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_invoices_issue_date ON invoices(issue_date DESC, id DESC)")
 
     cur.execute("""
@@ -1187,6 +1209,21 @@ def api_internal_ai_packing_list(invoice_id):
     )
 
 
+@app.get('/api/internal/ai/documents/packing-history/<int:batch_id>')
+@require_permission('packing.read')
+def api_internal_ai_packing_history_document(batch_id):
+    """Return an already-saved and reverified packing PDF; never generate one."""
+    import packing_history
+    try:
+        result = packing_history.read({'batch_id': batch_id}, connection_factory=conn)
+    except packing_history.PackingHistoryError as exc:
+        return jsonify(status='FAILED', error_code=exc.code, message=exc.safe_message), 404
+    return send_file(
+        result['document_path'], mimetype='application/pdf', as_attachment=True,
+        download_name=f'packing-list-{batch_id}.pdf', conditional=True,
+    )
+
+
 def _json_object(value):
     if not value:
         return None
@@ -1195,6 +1232,104 @@ def _json_object(value):
         return decoded if isinstance(decoded, dict) else None
     except (TypeError, ValueError):
         return None
+
+
+def _stored_execution_confirmation(db, execution) -> dict | None:
+    """Build a deterministic confirmation only from an already stored SUCCESS."""
+    if execution is None or execution['status'] != 'SUCCESS':
+        return None
+    operation = execution['operation']
+    if operation == 'orders.packing_list.generate':
+        try:
+            root_order_id = int(execution['entity_id'])
+        except (TypeError, ValueError):
+            root_order_id = 0
+        document = db.execute(
+            """SELECT document_id FROM fulfillment_documents
+                 WHERE order_id=? AND kind='packing_list'
+                 ORDER BY created_at DESC LIMIT 1""",
+            (root_order_id,),
+        ).fetchone() if root_order_id else None
+        if document:
+            allocation_summary = db.execute(
+                """SELECT COUNT(*) AS item_count,COUNT(DISTINCT order_id) AS order_count,
+                          COALESCE(SUM(qty),0) AS total_quantity
+                     FROM packing_allocations WHERE batch_id=?""",
+                (document['document_id'],),
+            ).fetchone()
+            order_ids = [int(row['order_id']) for row in db.execute(
+                'SELECT DISTINCT order_id FROM packing_allocations WHERE batch_id=? ORDER BY order_id',
+                (document['document_id'],),
+            ).fetchall()]
+            if allocation_summary and int(allocation_summary['order_count'] or 0) > 0:
+                order_count = int(allocation_summary['order_count'])
+                item_count = int(allocation_summary['item_count'] or 0)
+                total_quantity = int(allocation_summary['total_quantity'] or 0)
+                keys = [f'order_packed:{order_id}' for order_id in order_ids]
+                delivered = 0
+                if keys:
+                    placeholders = ','.join('?' for _ in keys)
+                    delivered = int(db.execute(
+                        f'SELECT COUNT(*) FROM email_events WHERE ok=1 AND event_key IN ({placeholders})',
+                        tuple(keys),
+                    ).fetchone()[0])
+                item_label = ('pozycja' if item_count == 1 else 'pozycje'
+                              if item_count % 10 in {2,3,4} and item_count % 100 not in {12,13,14}
+                              else 'pozycji')
+                email_delivered = bool(order_ids and delivered == len(order_ids))
+                message = (f'Gotowe. Utworzono jedną listę pakową dla {total_quantity} sztuk '
+                           f'z {order_count} zamówień ({item_count} {item_label})')
+                message += ' i wysłano ją do klienta.' if email_delivered else '.'
+                return {
+                    'message':message, 'batch_id':int(document['document_id']),
+                    'order_ids':order_ids, 'order_count':order_count,
+                    'item_count':item_count, 'total_quantity':total_quantity,
+                    'email_delivered':email_delivered,
+                }
+        return {'message':'Gotowe. Lista pakowa została utworzona.'}
+    messages = {
+        'orders.status.transition':'Gotowe. Zmiana statusu zamówienia została zapisana.',
+        'inventory.adjust':'Gotowe. Korekta stanu magazynowego została zapisana.',
+        'invoices.remove':'Gotowe. Zatwierdzona zmiana faktury została wykonana.',
+    }
+    return {'message':messages.get(operation, 'Gotowe. Zatwierdzona operacja została wykonana.')}
+
+
+def _apply_stored_success_confirmation(response: dict, outcome: dict,
+                                       synthesis_status='FAILED') -> bool:
+    result = outcome.get('result') if isinstance(outcome, dict) else None
+    confirmation = result.get('confirmation') if isinstance(result, dict) else None
+    if (outcome.get('execution_status') != 'SUCCESS'
+            or not isinstance(result, dict) or result.get('status') != 'SUCCESS'
+            or not isinstance(confirmation, dict) or not confirmation.get('message')):
+        return False
+    message = str(confirmation['message'])
+    response.update(
+        model_status='SUCCESS', synthesis_status=synthesis_status,
+        confirmation_source='stored_execution', message=message,
+        speech_text=message, voice_response_mode='direct',
+    )
+    return True
+
+
+def _conversation_turn_released(conversation_id: str, human) -> bool:
+    if not conversation_id:
+        return True
+    db = conn()
+    try:
+        owned = db.execute(
+            'SELECT 1 FROM internal_agent_conversations WHERE conversation_id=? AND human_actor_id=?',
+            (conversation_id, human.actor_id),
+        ).fetchone()
+        if not owned:
+            return False
+        lease = db.execute(
+            'SELECT expires_at FROM internal_agent_turn_leases WHERE conversation_id=?',
+            (conversation_id,),
+        ).fetchone()
+        return not lease or lease['expires_at'] <= datetime.now(timezone.utc).isoformat()
+    finally:
+        db.close()
 
 
 def _approval_execution_outcome(approval_id: str) -> dict:
@@ -1217,6 +1352,17 @@ def _approval_execution_outcome(approval_id: str) -> dict:
                 (execution['correlation_id'], execution['operation'],
                  execution['entity_type'], execution['entity_id']),
             ).fetchone()
+        try:
+            confirmation = _stored_execution_confirmation(db, execution)
+        except Exception:
+            app.logger.exception('Stored execution confirmation could not read optional details')
+            confirmation = (
+                {'message':'Gotowe. Lista pakowa została utworzona.'}
+                if execution and execution['status'] == 'SUCCESS'
+                and execution['operation'] == 'orders.packing_list.generate'
+                else {'message':'Gotowe. Zatwierdzona operacja została wykonana.'}
+                if execution and execution['status'] == 'SUCCESS' else None
+            )
     finally:
         db.close()
     if approval_row is None or execution is None:
@@ -1245,6 +1391,7 @@ def _approval_execution_outcome(approval_id: str) -> dict:
         'result': {
             'status': logical_result,
             'data': _json_object(execution['result_summary']),
+            'confirmation': confirmation,
         },
         'failure': error if execution_status in {'FAILED', 'DENIED'} else None,
         'conflict': error if execution_status == 'CONFLICT' else None,
@@ -1313,11 +1460,23 @@ def api_ai_approval_decide(approval_id, decision):
                             stream_trace=stream_trace)
 
                     def finalize_followup(model_result):
-                        model_result, http_status = _finalize_ai_chat_result(model_result, '')
+                        try:
+                            model_result, http_status = _finalize_ai_chat_result(model_result, '')
+                        except Exception:
+                            app.logger.exception('Approval follow-up finalization failed after execution')
+                            if _apply_stored_success_confirmation(response, outcome):
+                                return response, 200
+                            raise
                         response.update(model_status=model_result['status'],
                             message=model_result['message'], speech_text=model_result.get('speech_text', ''),
                             voice_response_mode=model_result.get('voice_response_mode', 'adaptive'),
                             conversation_id=model_result['conversation_id'])
+                        for key in ('confirmation_source','synthesis_status','synthesis_error_code'):
+                            if key in model_result:
+                                response[key] = model_result[key]
+                        if model_result['status'] != 'SUCCESS' and _apply_stored_success_confirmation(
+                                response, outcome, model_result['status']):
+                            return response, 200
                         return response, http_status
 
                     return sse_response(run_followup, finalize_followup, trace=trace)
@@ -1330,11 +1489,68 @@ def api_ai_approval_decide(approval_id, decision):
                 response['speech_text'] = model_result.get('speech_text', '')
                 response['voice_response_mode'] = model_result.get('voice_response_mode', 'adaptive')
                 response['conversation_id'] = model_result['conversation_id']
+                for key in ('confirmation_source','synthesis_status','synthesis_error_code'):
+                    if key in model_result:
+                        response[key] = model_result[key]
+                if model_result['status'] != 'SUCCESS':
+                    _apply_stored_success_confirmation(response, outcome, model_result['status'])
             except Exception:
-                response['model_status'] = 'FAILED'
+                app.logger.exception('Approval follow-up failed after execution')
+                if not _apply_stored_success_confirmation(response, outcome):
+                    response['model_status'] = 'FAILED'
+        else:
+            _apply_stored_success_confirmation(response, outcome, 'NOT_REQUESTED')
         return jsonify(response)
     except internal_approval.ApprovalDenied as exc:
         return jsonify(status='DENIED', error_code=exc.code), 409
+
+
+@app.get('/api/internal/ai/approvals/<approval_id>/outcome')
+@require_permission('approvals.decide')
+def api_ai_approval_outcome(approval_id):
+    """Read a stored approval result without executing or retrying it."""
+    import business_operations
+    import internal_approval
+    human = current_actor_context()
+    conversation_id = str(request.args.get('conversation_id') or '')
+    snapshot = internal_approval.get_request_snapshot(approval_id)
+    allowed_approval_operations = {
+        'orders.status.transition','inventory.adjust','orders.packing.confirm','invoices.remove',
+    }
+    from fulfillment_operations import WRITES as _fulfillment_writes
+    allowed_approval_operations |= _fulfillment_writes
+    if (human.actor_type != 'HUMAN' or not snapshot
+            or snapshot['operation'] not in allowed_approval_operations):
+        return jsonify(status='DENIED'), 404
+    db = conn()
+    try:
+        execution = db.execute(
+            'SELECT * FROM internal_operation_executions WHERE approval_id=?', (approval_id,)
+        ).fetchone()
+        binding = db.execute(
+            'SELECT human_id FROM internal_business_write_actors WHERE execution_id=?',
+            (execution['execution_id'],),
+        ).fetchone() if execution else None
+        if not binding and execution and snapshot['operation'] == 'orders.status.transition':
+            binding = db.execute(
+                'SELECT human_id FROM internal_order_write_actors WHERE execution_id=?',
+                (execution['execution_id'],),
+            ).fetchone()
+    finally:
+        db.close()
+    if not execution or not binding or binding['human_id'] != human.actor_id:
+        return jsonify(status='DENIED'), 403
+    permission = business_operations.OPERATION_REGISTRY[snapshot['operation']].required_permission
+    if human.permission_decision(permission) == 'DENY':
+        return jsonify(status='DENIED'), 403
+    outcome = _approval_execution_outcome(approval_id)
+    response = {
+        'status':outcome['result']['status'], 'execution_outcome':outcome,
+        'conversation_id':conversation_id,
+        'turn_released':_conversation_turn_released(conversation_id, human),
+    }
+    _apply_stored_success_confirmation(response, outcome, 'TRANSPORT_RECOVERY')
+    return jsonify(response), 200
 
 
 
@@ -4800,7 +5016,15 @@ def save_packing_selection(
         item_id = to_int(item.get("order_item_id") or item.get("id"), 0)
         qty = max(0, to_int(item.get("qty"), 0))
         if order_id > 0 and item_id > 0 and qty > 0:
-            rows.append((order_id, item_id, qty))
+            rows.append({
+                "order_id": order_id,
+                "order_item_id": item_id,
+                "qty": qty,
+                "order_number": norm(item.get("source_order_no") or item.get("order_number")),
+                "sku": norm(item.get("sku")),
+                "model_name": norm(item.get("model") or item.get("name") or item.get("model_name")),
+                "note": norm(item.get("source_order_note") or item.get("order_note") or item.get("note")),
+            })
     if not rows:
         return 0
     owned = connection is None
@@ -4808,7 +5032,9 @@ def save_packing_selection(
     try:
         cur = c.cursor()
         if reuse_matching:
-            expected = sorted(rows)
+            expected = sorted(
+                (row["order_id"], row["order_item_id"], row["qty"]) for row in rows
+            )
             cur.execute(
                 """SELECT id FROM packing_batches
                    WHERE root_order_id=? AND invoice_id IS NULL
@@ -4844,10 +5070,23 @@ def save_packing_selection(
         )
         batch_id = int(cur.lastrowid)
         created_at = now_iso()
+        root_order = cur.execute(
+            "SELECT customer_id,customer_name,customer_email FROM orders WHERE id=?",
+            (int(root_order_id),),
+        ).fetchone()
+        root_order = dict(root_order) if root_order else {}
         cur.executemany(
-            """INSERT INTO packing_allocations(batch_id, order_id, order_item_id, qty, created_at)
-               VALUES(?,?,?,?,?)""",
-            [(batch_id, order_id, item_id, qty, created_at) for order_id, item_id, qty in rows],
+            """INSERT INTO packing_allocations(
+                   batch_id,order_id,order_item_id,qty,created_at,
+                   order_number_snapshot,sku_snapshot,model_name_snapshot,note_snapshot,
+                   customer_id_snapshot,customer_name_snapshot,customer_email_snapshot
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            [(
+                batch_id, row["order_id"], row["order_item_id"], row["qty"], created_at,
+                row["order_number"], row["sku"], row["model_name"], row["note"],
+                root_order.get("customer_id"), root_order.get("customer_name"),
+                root_order.get("customer_email"),
+            ) for row in rows],
         )
         if owned:
             c.commit()

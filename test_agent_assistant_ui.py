@@ -102,6 +102,9 @@ def test_assistant_ui_has_supervised_approval_and_push_to_talk(client):
     assert "Zmiana wymaga zatwierdzenia" in html
     assert "Zatwierdź" in html and "Odrzuć" in html
     assert "/api/internal/ai/approvals/" in html
+    assert "recoverApprovedExecution" in html
+    assert "/outcome${query}" in html
+    assert "result.turn_released !== false" in html
     assert 'id="aiVoice"' in html
     assert "getUserMedia({audio:true})" in html
     assert "new MediaRecorder" in html

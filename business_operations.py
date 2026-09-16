@@ -395,7 +395,7 @@ _PACKING_HISTORY_ALLOCATION = {
 PACKING_HISTORY_OUTPUT = {
     "type": "object", "additionalProperties": False,
     "required": ["ok", "batch_id", "created_at", "order_ids", "allocations",
-                 "total_lines", "total_qty", "document_id", "document_path"],
+                 "total_lines", "total_qty", "document_id", "document_path", "customer"],
     "properties": {
         "ok": {"type": "boolean"}, "batch_id": {"type": "integer"},
         "created_at": {"type": "string"},
@@ -403,6 +403,14 @@ PACKING_HISTORY_OUTPUT = {
         "allocations": {"type": "array", "maxItems": 500, "items": _PACKING_HISTORY_ALLOCATION},
         "total_lines": {"type": "integer"}, "total_qty": {"type": "integer"},
         "document_id": {"type": "integer"}, "document_path": {"type": "string"},
+        "customer": {
+            "type":"object", "additionalProperties":False,
+            "required":["id","name","email"],
+            "properties": {
+                "id":{"type":["integer","null"]},
+                "name":{"type":"string"}, "email":{"type":"string"},
+            },
+        },
     },
 }
 CHINA_SEARCH_INPUT = {

@@ -571,16 +571,20 @@ def test_approval_final_synthesis_error_preserves_committed_success_without_reex
         received = list(frames(response))
     finally:
         response.close()
-    assert not any(name == 'display_delta' for name, _ in received)
-    assert received[-1][0] == 'error'
+    assert any(name == 'display_delta' for name, _ in received)
+    assert received[-1][0] == 'done'
     final = received[-1][1]
-    assert final['status'] == 'SUCCESS'
-    assert final['model_status'] == 'FAILED'
+    assert final['status'] == final['model_status'] == 'SUCCESS'
+    assert final['confirmation_source'] == 'stored_execution'
+    assert final['synthesis_status'] == 'FAILED'
+    assert final['message'] == 'Gotowe. Zmiana statusu zamówienia została zapisana.'
     assert final['execution_outcome']['execution_status'] == 'SUCCESS'
     assert final['execution_outcome']['approval_status'] == 'CONSUMED'
-    assert not any(name in {'done', 'speech_ready'} for name, _ in received)
     assert_approved_order_committed(approval_id)
-    assert len(read_rows("SELECT 1 FROM internal_audit_log WHERE operation='agent.failed'")) == 1
+    assert not read_rows("SELECT 1 FROM internal_audit_log WHERE operation='agent.failed'")
+    assert len(read_rows("SELECT 1 FROM internal_audit_log WHERE operation='agent.completed'")) == 2
+    history = read_rows('SELECT assistant_text FROM internal_agent_turns WHERE conversation_id=? ORDER BY turn_id DESC', (cid,))
+    assert history[0][0] == final['message']
     assert not read_rows('SELECT 1 FROM internal_agent_turn_leases')
     assert [name for name, _ in provider.calls] == ['complete']
 

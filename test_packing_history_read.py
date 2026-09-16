@@ -1,6 +1,7 @@
 import hashlib
 import json
 from pathlib import Path
+import uuid
 
 import pytest
 from reportlab.pdfgen import canvas
@@ -9,6 +10,8 @@ import app as backend
 import agent_runtime as runtime
 import business_operations as operations
 import internal_rbac as rbac
+import internal_approval
+import internal_audit
 import packing_history
 from test_agent_runtime import isolated, owner, tool
 
@@ -68,7 +71,7 @@ def historical_batch(tmp_path):
         (now,),
     )
     db.execute(
-        "INSERT INTO packing_batches(id,root_order_id,invoice_id,created_at) VALUES(77,151,770,?)",
+        "INSERT INTO packing_batches(id,root_order_id,invoice_id,created_at) VALUES(77,151,NULL,?)",
         (now,),
     )
     historical_items = (
@@ -84,9 +87,12 @@ def historical_batch(tmp_path):
     for allocation_id, (item_id, order_id, order_number, sku, model, qty) in enumerate(
             historical_items, start=1):
         db.execute(
-            "INSERT INTO packing_allocations(id,batch_id,order_id,order_item_id,qty,created_at) "
-            "VALUES(?,77,?,?,?,?)",
-            (allocation_id, order_id, item_id, qty, now),
+            """INSERT INTO packing_allocations(
+                   id,batch_id,order_id,order_item_id,qty,created_at,
+                   order_number_snapshot,sku_snapshot,model_name_snapshot,note_snapshot,
+                   customer_id_snapshot,customer_name_snapshot,customer_email_snapshot
+               ) VALUES(?,77,?,?,?,?,?,?,?,?,20,'Artystyczna Manufaktura','art@example.test')""",
+            (allocation_id, order_id, item_id, qty, now, order_number, sku, model, ""),
         )
         db.execute(
             """INSERT INTO invoice_allocations(
@@ -131,10 +137,10 @@ def historical_batch(tmp_path):
         str(tmp_path / "batch-77.pdf"),
     )
     file_hash = hashlib.sha256(open(pdf_path, "rb").read()).hexdigest()
-    db.execute(
+    db.executemany(
         "INSERT INTO fulfillment_documents(order_id,kind,document_id,content_hash,path,created_at,file_hash) "
-        "VALUES(151,'packing_list',77,'fixture-history',?,?,?)",
-        (pdf_path, now, file_hash),
+        "VALUES(?,'packing_list',77,'fixture-history',?,?,?)",
+        [(order_id, pdf_path, now, file_hash) for order_id, _number in orders],
     )
     db.commit()
     current_total = db.execute(
@@ -173,15 +179,19 @@ def _insert_history_batch(tmp_path, *, batch_id, invoice_id, rows, pdf_rows=None
         (invoice_id, root_order_id, f"FV-HISTORY-{invoice_id}", now),
     )
     db.execute(
-        "INSERT INTO packing_batches(id,root_order_id,invoice_id,created_at) VALUES(?,?,?,?)",
-        (batch_id, root_order_id, invoice_id, now),
+        "INSERT INTO packing_batches(id,root_order_id,invoice_id,created_at) VALUES(?,?,NULL,?)",
+        (batch_id, root_order_id, now),
     )
     invoice_items = []
     for row in rows:
         db.execute(
-            """INSERT INTO packing_allocations(batch_id,order_id,order_item_id,qty,created_at)
-               VALUES(?,?,?,?,?)""",
-            (batch_id, row["order_id"], row["item_id"], row["qty"], now),
+            """INSERT INTO packing_allocations(
+                   batch_id,order_id,order_item_id,qty,created_at,
+                   order_number_snapshot,sku_snapshot,model_name_snapshot,note_snapshot,
+                   customer_id_snapshot,customer_name_snapshot,customer_email_snapshot
+               ) VALUES(?,?,?,?,?,?,?,?,?,20,'Artystyczna Manufaktura','art@example.test')""",
+            (batch_id, row["order_id"], row["item_id"], row["qty"], now,
+             row["order_number"], row["sku"], row["model"], row.get("note", "")),
         )
         db.execute(
             """INSERT INTO invoice_allocations(
@@ -227,11 +237,11 @@ def _insert_history_batch(tmp_path, *, batch_id, invoice_id, rows, pdf_rows=None
         str(tmp_path / f"batch-{batch_id}.pdf"),
     )
     file_hash = hashlib.sha256(Path(pdf_path).read_bytes()).hexdigest()
-    db.execute(
+    db.executemany(
         """INSERT INTO fulfillment_documents(
                order_id,kind,document_id,content_hash,path,created_at,file_hash
            ) VALUES(?,'packing_list',?,'fixture-history',?,?,?)""",
-        (root_order_id, batch_id, pdf_path, now, file_hash),
+        [(order_id, batch_id, pdf_path, now, file_hash) for order_id in seen_orders],
     )
     db.commit()
     db.close()
@@ -389,9 +399,28 @@ def test_same_order_sku_and_qty_without_unique_key_fails_closed(historical_batch
     assert result.data is None
 
 
-def test_batch_without_immutable_invoice_snapshot_fails_closed(historical_batch):
+def test_batch_with_null_invoice_id_uses_immutable_allocation_snapshot(historical_batch):
     db = backend.conn()
     db.execute("UPDATE packing_batches SET invoice_id=NULL WHERE id=77")
+    db.commit()
+    db.close()
+
+    result = operations.execute_business_operation(
+        _ai(), "orders.packing_history.get", {"batch_id": 77}, correlation_id="missing-snapshot",
+    )
+    assert result.status == "SUCCESS"
+    assert result.data["total_lines"] == 5
+    assert result.data["total_qty"] == 14
+
+
+def test_batch_without_snapshot_or_audit_fails_closed(historical_batch):
+    db = backend.conn()
+    db.execute("DROP TRIGGER packing_allocations_no_update")
+    db.execute(
+        """UPDATE packing_allocations SET order_number_snapshot=NULL,sku_snapshot=NULL,
+                  model_name_snapshot=NULL,note_snapshot=NULL,customer_id_snapshot=NULL,
+                  customer_name_snapshot=NULL,customer_email_snapshot=NULL WHERE batch_id=77"""
+    )
     db.commit()
     db.close()
 
@@ -401,6 +430,62 @@ def test_batch_without_immutable_invoice_snapshot_fails_closed(historical_batch)
     assert result.status == "FAILED"
     assert result.error_code == "HISTORY_DOCUMENT_NOT_VERIFIABLE"
     assert result.data is None
+
+
+def test_legacy_null_invoice_batch_uses_append_only_approval_audit(historical_batch):
+    items = [
+        {"order_id":151,"order_number":"ZAM-2609151","order_item_id":1511,"sku":"CH030-BB-N25","quantity":2},
+        {"order_id":151,"order_number":"ZAM-2609151","order_item_id":1512,"sku":"CH032-BB-N25","quantity":2},
+        {"order_id":141,"order_number":"ZAM-2609141","order_item_id":1411,"sku":"CH010-BB-192232","quantity":2},
+        {"order_id":121,"order_number":"ZAM-2609121","order_item_id":1211,"sku":"CH036-BN-192240","quantity":1},
+        {"order_id":8271,"order_number":"ZAM-2608271","order_item_id":82711,"sku":"CH010-AB-320360","quantity":7},
+    ]
+    actor = _ai()
+    correlation_id = "legacy-null-invoice-audit"
+    payload = {"order_id":151,"packing_items":items,"packing_scope_fingerprint":"fixture",
+               "total_quantity":14,"expected_version":1}
+    approval_id = internal_approval.request_approval(
+        actor, "orders.packing_list.generate", payload=payload,
+        entity_type="order", entity_id="151", expected_entity_version=1,
+        correlation_id=correlation_id,
+    )
+    db = backend.conn()
+    db.execute("DROP TRIGGER packing_allocations_no_update")
+    db.execute(
+        """UPDATE packing_allocations SET order_number_snapshot=NULL,sku_snapshot=NULL,
+                  model_name_snapshot=NULL,note_snapshot=NULL,customer_id_snapshot=NULL,
+                  customer_name_snapshot=NULL,customer_email_snapshot=NULL WHERE batch_id=77"""
+    )
+    execution_id = str(uuid.uuid4())
+    now = backend.now_iso()
+    db.execute(
+        """INSERT INTO internal_operation_executions(
+               execution_id,operation,operation_version,actor_id,actor_type,permission,risk_level,
+               approval_id,entity_type,entity_id,idempotency_key,input_fingerprint,status,
+               created_at,started_at,completed_at,request_id,correlation_id,result_summary,updated_at
+           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (execution_id,"orders.packing_list.generate",1,actor.actor_id,actor.actor_type,
+         "packing.prepare","YELLOW",approval_id,"order","151","fixture-idem","fixture-fingerprint",
+         "SUCCESS",now,now,now,actor.request_id,correlation_id,json.dumps({"ok":True}),now),
+    )
+    db.commit()
+    db.close()
+    internal_audit.record_audit_event(
+        "orders.packing_list.generate", result="SUCCESS", actor_context=actor,
+        entity_type="order", entity_id="151", correlation_id=correlation_id,
+        approval_id=approval_id,
+        before_state={"order":{"customer_id":20,"customer_name":"Artystyczna Manufaktura",
+                               "customer_email":"art@example.test"}},
+        after_state={"phase":"domain_committed","batch_id":77,
+                     "order_ids":[121,141,151,8271]},
+    )
+
+    result = operations.execute_business_operation(
+        _ai(), "orders.packing_history.get", {"batch_id":77}, correlation_id="legacy-read")
+    assert result.status == "SUCCESS"
+    assert result.data["total_lines"] == 5
+    assert result.data["total_qty"] == 14
+    assert result.data["customer"]["name"] == "Artystyczna Manufaktura"
 
 
 def test_current_order_changes_do_not_change_saved_batch_answer(historical_batch):
@@ -499,7 +584,7 @@ def test_pdf_missing_an_allocation_row_fails_closed(historical_batch, tmp_path):
 
 def test_missing_saved_document_refuses_order_reconstruction(historical_batch):
     db = backend.conn()
-    db.execute("DELETE FROM fulfillment_documents WHERE order_id=151 AND kind='packing_list'")
+    db.execute("DELETE FROM fulfillment_documents WHERE document_id=77 AND kind='packing_list'")
     db.commit()
     db.close()
 
@@ -574,3 +659,88 @@ def test_agent_refuses_model_guess_when_history_tool_is_not_called(historical_ba
     assert result["tool_calls"] == 0
     assert "nie będę rekonstruować" in result["message"]
     assert "49" not in result["message"]
+
+
+def test_reference_conversation_keeps_alias_batch_and_existing_pdf(historical_batch):
+    remember = runtime.FakeModelProvider([
+        tool("agent.terminology.remember", {
+            "term":"Warszawa", "meaning":"Artystyczna Manufaktura",
+            "confirmed_by_user":True, "expected_version":0,
+        }, call_id="remember-warszawa"),
+        runtime.ProviderResponse(text="Rozumiem.", model="fake-model"),
+    ])
+    turn1 = runtime.run_agent_turn(
+        owner(), "Zapamiętaj, że Artystyczną Manufakturę będę nazywał Warszawą.", remember)
+    assert turn1["status"] == "SUCCESS"
+    assert "Zapisane: Warszawa oznacza Artystyczna Manufaktura." in turn1["message"]
+    conversation_id = turn1["conversation_id"]
+
+    def read_alias(kwargs):
+        evidence = json.dumps(kwargs["input_items"], ensure_ascii=False)
+        assert "confirmed_business_terminology" in evidence
+        assert "Warszawa" in evidence and "Artystyczna Manufaktura" in evidence
+        assert {item["name"] for item in kwargs["tools"]} == {"orders.packing_history.get"}
+        return tool("orders.packing_history.get", {"customer":"Artystyczna Manufaktura"},
+                    call_id="history-warszawa")
+
+    turn2_provider = runtime.FakeModelProvider([read_alias])
+    turn2 = runtime.run_agent_turn(
+        owner(), "Co ostatnio spakowałem do Warszawy?", turn2_provider,
+        conversation_id=conversation_id)
+    assert turn2["status"] == "SUCCESS"
+    assert "Razem: 5 pozycji, 14 sztuk." in turn2["message"]
+    assert "49" not in turn2["message"] and "Razem: 4" not in turn2["message"]
+
+    turn3_provider = runtime.FakeModelProvider([])
+    turn3 = runtime.run_agent_turn(
+        owner(), "Jaka była lista pakowania?", turn3_provider,
+        conversation_id=conversation_id)
+    assert turn3["status"] == "SUCCESS"
+    assert "batch 77" in turn3["message"]
+    assert "Razem: 5 pozycji, 14 sztuk." in turn3["message"]
+    assert not turn3_provider.calls
+
+    turn4_provider = runtime.FakeModelProvider([])
+    turn4 = runtime.run_agent_turn(
+        owner(), "PDF chcę ją.", turn4_provider, conversation_id=conversation_id)
+    assert turn4["status"] == "SUCCESS"
+    assert "istniejący historyczny dokument" in turn4["message"]
+    assert not turn4_provider.calls
+    assert turn4["tool_calls"] == 1
+    assert turn4["artifacts"] == [{
+        "type":"document_link", "document_type":"packing_list",
+        "name":"Historyczna lista pakowa PDF",
+        "url":"/api/internal/ai/documents/packing-history/77",
+        "batch_id":77, "document_id":77,
+    }]
+
+    db = backend.conn()
+    writes = db.execute(
+        """SELECT COUNT(*) FROM internal_operation_executions
+             WHERE operation='orders.packing_list.generate'"""
+    ).fetchone()[0]
+    db.close()
+    assert writes == 0
+
+
+def test_history_pdf_route_returns_existing_verified_file_without_write(
+        historical_batch, monkeypatch):
+    monkeypatch.setattr(
+        backend, "generate_invoice_packing_list_pdf",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("generator must not run")),
+    )
+    client = backend.app.test_client()
+    with client.session_transaction() as session:
+        session["admin_authenticated"] = True
+        session["csrf_token"] = "csrf"
+    response = client.get("/api/internal/ai/documents/packing-history/77")
+    assert response.status_code == 200
+    assert response.mimetype == "application/pdf"
+    assert hashlib.sha256(response.data).hexdigest() == hashlib.sha256(
+        Path(historical_batch["pdf_path"]).read_bytes()).hexdigest()
+    db = backend.conn()
+    assert db.execute(
+        "SELECT COUNT(*) FROM internal_operation_executions WHERE operation='orders.packing_list.generate'"
+    ).fetchone()[0] == 0
+    assert db.execute("SELECT COUNT(*) FROM internal_approval_requests").fetchone()[0] == 0
+    db.close()

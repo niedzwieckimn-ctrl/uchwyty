@@ -54,6 +54,23 @@ def build_artifact_sources(
     """Build bounded evidence that a later model turn may select and re-read."""
     if not isinstance(result, Mapping) or result.get('ok') is not True:
         return []
+    if operation == 'orders.packing_history.get' and result.get('batch_id'):
+        customer = result.get('customer') if isinstance(result.get('customer'), Mapping) else {}
+        return [{
+            'operation': operation,
+            'entity_type': 'packing_batch',
+            'entity_id': int(result['batch_id']),
+            'trusted_result_subset': {
+                'batch_id': int(result['batch_id']),
+                'document_id': result.get('document_id'),
+                'customer': _fields(customer, ('id', 'name', 'email')),
+                'order_ids': list(result.get('order_ids') or [])[:20],
+                'total_lines': result.get('total_lines'),
+                'total_qty': result.get('total_qty'),
+            },
+            'conversation_id': conversation_id,
+            'source_turn_id': source_turn_id,
+        }]
     if isinstance(result.get('state'), Mapping) and result['state'].get('order_id'):
         s = result['state']
         return [{'operation': operation, 'entity_type': 'order', 'entity_id': s['order_id'],
@@ -129,6 +146,16 @@ def build_artifacts(
     """Map only fields already returned by a trusted operation into UI metadata."""
     if not isinstance(result, Mapping) or result.get('ok') is not True:
         return []
+    if operation == 'orders.packing_history.get' and result.get('batch_id') and result.get('document_id'):
+        batch_id = int(result['batch_id'])
+        return [{
+            'type': 'document_link',
+            'document_type': 'packing_list',
+            'name': 'Historyczna lista pakowa PDF',
+            'url': f'/api/internal/ai/documents/packing-history/{batch_id}',
+            'batch_id': batch_id,
+            'document_id': result.get('document_id'),
+        }]
     record = _record(operation, result)
     if record is None:
         return []
