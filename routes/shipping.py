@@ -467,7 +467,9 @@ def register_routes(context):
 
 
 
-    def order_packing_list_download_admin_service(order_id, *, request, session=None, structured=False):
+    def order_packing_list_download_admin_service(
+        order_id, *, request, session=None, structured=False, defer_persistence=False
+    ):
         """Generuje wspolna liste pakowania dla zamowien tego samego klienta."""
         selected_carrier = norm(request.form.get("carrier") or request.args.get("carrier")).lower()
         after_invoice = request.args.get("after_invoice") == "1"
@@ -660,8 +662,6 @@ def register_routes(context):
                 if int(item.get("id") or item.get("order_item_id") or 0) > 0 and int(item.get("qty") or 0) > 0
             ],
         }
-        packing_state["batch_id"] = save_packing_selection(order_id, items)
-        session["latest_packing_selection"] = packing_state
         order_no = canonical_order_no(order_row["id"], order_row["created_at"], order_row["order_no"])
         meta = {
             "invoice_no": order_no,
@@ -670,7 +670,40 @@ def register_routes(context):
             "buyer_email": norm(order_row["customer_email"]),
         }
         pack_path = generate_invoice_packing_list_pdf(order_row, items, meta)
-        mark_orders_packed(packed_order_ids, packing_path=pack_path, packing_items=items)
+        if defer_persistence:
+            return {
+                'ok': True,
+                'path': pack_path,
+                'order_ids': packed_order_ids,
+                'items': items,
+            }
+
+        # PDF is prepared first.  The batch, allocations and statuses then use
+        # one transaction, so a later DB error cannot leave a completed status
+        # without a durable packing selection.
+        packing_db = conn()
+        try:
+            packing_db.execute("BEGIN IMMEDIATE")
+            packing_state["batch_id"] = save_packing_selection(
+                order_id,
+                items,
+                connection=packing_db,
+                reuse_matching=True,
+                reject_mismatched_open=True,
+            )
+            packing_result = mark_orders_packed_transaction(
+                packing_db,
+                packed_order_ids,
+                packing_items=items,
+            )
+            packing_db.commit()
+        except Exception:
+            packing_db.rollback()
+            raise
+        finally:
+            packing_db.close()
+        session["latest_packing_selection"] = packing_state
+        complete_orders_packed_side_effects(packing_result, packing_path=pack_path)
         if structured:
             return {'ok': True, 'path': pack_path, 'batch_id': packing_state['batch_id'], 'order_ids': packed_order_ids}
         filename_suffix = "_zbiorcza" if len(packed_order_ids) > 1 else ""
