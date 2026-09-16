@@ -529,7 +529,7 @@ def register_routes(context):
               FROM orders
               WHERE id<>?
                 AND LOWER(TRIM(COALESCE(customer_email,'')))=?
-                AND LOWER(COALESCE(status,'')) IN ('confirmed','packed','packed_partial')
+                AND LOWER(COALESCE(status,'')) IN ('confirmed','packed','packed_partial','partially_shipped')
               ORDER BY created_at, id
             """, (order_id, recipient))
             candidate_orders.extend(dict(row) for row in cur.fetchall())
@@ -591,6 +591,34 @@ def register_routes(context):
             items.append(packed_item)
 
         if request.method == "GET":
+            if structured:
+                preview_items = [
+                    {
+                        "order_id": int(item["source_order_id"]),
+                        "order_number": item["source_order_no"],
+                        "order_note": item["source_order_note"],
+                        "order_item_id": int(item["id"]),
+                        "product_id": int(item.get("product_id") or 0),
+                        "sku": item.get("sku") or "",
+                        "model": item.get("model") or "",
+                        "name": item.get("name") or "",
+                        "ordered_qty": max(0, int(item.get("qty") or 0)),
+                        "already_shipped_qty": int(item["already_shipped_qty"]),
+                        "available_to_package": int(item["packable_now"]),
+                        "pack_qty": int(item["selected_pack_qty"]),
+                    }
+                    for item in selection_rows
+                    if int(item["packable_now"]) > 0
+                ]
+                return {
+                    "ok": True,
+                    "root_order_id": int(order_id),
+                    "customer": norm(order_row["customer_name"]),
+                    "candidate_order_ids": candidate_ids,
+                    "order_ids": sorted({int(item["order_id"]) for item in preview_items}),
+                    "items": preview_items,
+                    "total_quantity": sum(int(item["pack_qty"]) for item in preview_items),
+                }
             tpl = r"""
             {% extends "base.html" %}{% block content %}
               <div class="card">
