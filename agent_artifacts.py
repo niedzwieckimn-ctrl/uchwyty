@@ -199,7 +199,8 @@ def build_artifacts(
         if packing_url:
             artifacts.append({
                 'type': 'document_link', 'document_type': 'packing_list',
-                'label': 'Lista pakowa', 'url': packing_url,
+                'label': 'Bieżąca lista pakowa faktury', 'url': packing_url,
+                'document_basis': 'existing_invoice_document',
                 'order_id': record.get('id'),
                 'invoice_id': links.get('packing_invoice_id'),
             })

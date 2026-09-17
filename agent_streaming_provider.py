@@ -75,7 +75,7 @@ def stream_response(provider, *, instructions, input_items, tools,
     Cancellation is cooperative between reads; a blocked read is bounded by
     the request timeout. No database resources are opened or held here.
     """
-    from agent_runtime import ProviderResponse, _log_provider_failure
+    from agent_runtime import ProviderResponse, _log_provider_failure, _provider_input
 
     if tool_choice not in ("none", "auto") or (tools and tool_choice != "none"):
         raise ValueError("Streaming requires a tools-disabled final model pass")
@@ -96,7 +96,7 @@ def stream_response(provider, *, instructions, input_items, tools,
             raise requests.Timeout("Agent stream deadline exceeded")
 
     payload = {
-        "model": provider.model, "instructions": instructions, "input": input_items,
+        "model": provider.model, "instructions": instructions, "input": _provider_input(input_items),
         "tools": api_tools, "tool_choice": tool_choice, "parallel_tool_calls": True,
         "store": False, "include": ["reasoning.encrypted_content"],
         "max_output_tokens": 2000, "stream": True,

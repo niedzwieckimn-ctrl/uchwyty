@@ -35,7 +35,7 @@ import business_read_models
 import internal_approval as approvals
 from cash_flow_module import (
     CASHFLOW_READ_OPERATION, business_read as cashflow_business_read,
-    cash_flow_overdue_invoices,
+    cash_flow_overdue_invoices, invoice_sales_units,
 )
 from inventory_analytics import build_replenishment_analysis, recommended_replenishments
 from fulfillment_readiness import calculate_fulfillment_readiness
@@ -261,6 +261,8 @@ _SEARCH_INPUT = {
         "customer_id": {"type": "integer", "minimum": 1, "maximum": 9_223_372_036_854_775_807},
     },
 }
+ORDER_SEARCH_INPUT = {**_SEARCH_INPUT, 'properties': {**_SEARCH_INPUT['properties'],
+    'date_field': {'type':'string', 'enum':['created_at','packed_at','shipped_at']}}}
 _GET_INPUT = {
     "type": "object", "additionalProperties": False, "properties": {
         "id": {"type": "integer", "minimum": 1, "maximum": 9_223_372_036_854_775_807},
@@ -361,7 +363,7 @@ CUSTOMER_GET_INPUT = {
 }
 SALES_SUMMARY_INPUT = {
     "type": "object", "additionalProperties": False, "properties": {
-        "period": _PERIOD, "date_from": _DATE, "date_to": _DATE,
+        "period": _ORDER_SUMMARY_PERIOD, "date_from": _DATE, "date_to": _DATE,
     },
 }
 SALES_SUMMARY_OUTPUT = {
@@ -372,6 +374,11 @@ SALES_SUMMARY_OUTPUT = {
         "date_to": {"type": ["string", "null"]}, "order_count": {"type": "integer"},
         "invoice_count": {"type": "integer"}, "by_currency": {"type": "array", "maxItems": 20},
         "top_customers": {"type": "array", "maxItems": 20},
+        "invoice_units": {"type": "integer"},
+        "quantity_basis": {"type": "string"},
+        "customer_count": {"type": "integer"},
+        "ranking_truncated": {"type": "boolean"},
+        "top_customers_by_units": {"type": "array", "maxItems": 20},
     },
 }
 INVENTORY_SUMMARY_INPUT = {"type": "object", "additionalProperties": False, "properties": {}}
@@ -670,9 +677,9 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
         REPLENISHMENT_INPUT, REPLENISHMENT_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
     "orders.search": BusinessOperationDefinition(
-        "orders.search", 1, "Wyszukuje zamówienia po numerze lub nazwie klienta (query), customer_id, product_id, statusie i okresie; limit=1 zwraca najnowszy pasujący rekord z customer_id. product_id pozwala ustalić ostatniego nabywcę produktu.",
+        "orders.search", 1, "Wyszukuje zamówienia po numerze lub nazwie klienta (query), customer_id, product_id, statusie i okresie. date_field wybiera datę created_at (złożenie), shipped_at (wysyłka), packed_at (pakowanie); limit=1 zwraca najnowsze według wybranej daty. Nie utożsamiaj daty złożenia z wysłaniem.",
         "orders.read_full", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
-        _SEARCH_INPUT, _RESULTS_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
+        ORDER_SEARCH_INPUT, _RESULTS_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
     "orders.get": BusinessOperationDefinition(
         "orders.get", 1, "Pobiera zamówienie z pozycjami po id/number albo najnowsze przez latest=true, opcjonalnie dla customer_id.",
@@ -742,19 +749,22 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
     ),
     search_analytics.OPERATION: BusinessOperationDefinition(
         search_analytics.OPERATION, 1,
-        "Zwraca tę samą projekcję intencji i agregaty, których używa panel wyszukiwania: modele, braki wyników, jawne wybory SKU i aliasy.",
+        "Zwraca pełne agregaty panelu wyszukiwań. models to rozpoznane modele; pustego models nie zastępuj rankingiem modeli z surowych fraz. phrase_ranking to osobno policzone frazy w całym okresie. Domyślnie bez szczegółowych intents; include_intents=true tylko do szczegółów. snapshot_id pozwala porównać odczyty.",
         "reports.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
         {"type":"object","additionalProperties":False,"properties":{
             "days":{"type":"integer","enum":[7,30,90]},
             "query":{"type":"string","minLength":1,"maxLength":120},
             "customer_id":{"type":"string","minLength":1,"maxLength":160},
             "result":{"type":"string","enum":["all","yes","no"]},
+            "include_intents":{"type":"boolean"},
             "limit":{"type":"integer","minimum":1,"maximum":200}}},
         {"type":"object","required":["ok","scope","complete","truncated","period","totals","models","missing","intents","aliases"],
          "properties":{"ok":{"type":"boolean"},"scope":{"type":"object"},
                        "complete":{"type":"boolean"},"truncated":{"type":"boolean"},
                        "period":{"type":"object"},"totals":{"type":"object"},
                        "models":{"type":"array"},"missing":{"type":"array"},
+                       "snapshot_id":{"type":"string"},"rankings_complete":{"type":"boolean"},
+                       "phrase_ranking":{"type":"array"},"phrase_count_basis":{"type":"string"},
                        "intents":{"type":"array","maxItems":200},"aliases":{"type":"object"}}},
         IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
@@ -807,7 +817,7 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
         CHINA_GET_INPUT, CHINA_GET_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
     "business.sales.summary": BusinessOperationDefinition(
-        "business.sales.summary", 1, "Zwraca podsumowanie sprzedaży za kontrolowany okres, osobno dla każdej waluty.",
+        "business.sales.summary", 1, "Sprzedaż, liczba sprzedanych sztuk i ranking klientów według faktur z okresu issue_date (także nieopłaconych), z tego samego źródła co panel Cash Flow. Kwoty walut oddzielnie. Osobne order_* dotyczą daty zamówienia. customer_count i ranking_truncated określają pełność rankingu.",
         "reports.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
         SALES_SUMMARY_INPUT, SALES_SUMMARY_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
@@ -1493,10 +1503,15 @@ def _order_filter(data: Mapping[str, Any]) -> tuple[str | None, str | None, list
         clauses.append("LOWER(o.status) IN ('confirmed','issued','packed','packed_partial','in_delivery','partially_shipped')")
     elif status:
         clauses.append("LOWER(o.status)=?"); params.append(status)
+    date_field = data.get('date_field') or 'created_at'
+    if date_field not in {'created_at', 'packed_at', 'shipped_at'}:
+        raise ControlledOperationError('INVALID_DATE_FIELD', 'Nieobsługiwana data zamówienia', status=DENIED)
+    if date_field != 'created_at':
+        clauses.append(f"TRIM(COALESCE(o.{date_field},''))<>''")
     if start:
-        clauses.append("SUBSTR(TRIM(o.created_at),1,10)>=?"); params.append(start)
+        clauses.append(f"SUBSTR(TRIM(o.{date_field}),1,10)>=?"); params.append(start)
     if end:
-        clauses.append("SUBSTR(TRIM(o.created_at),1,10)<=?"); params.append(end)
+        clauses.append(f"SUBSTR(TRIM(o.{date_field}),1,10)<=?"); params.append(end)
     return start, end, clauses, params
 
 
@@ -1512,16 +1527,18 @@ def _orders_search(data, actor, correlation_id, transaction_connection=None):
             clauses.append("(LOWER(o.order_no) LIKE ? OR LOWER(o.customer_name) LIKE ? OR LOWER(COALESCE(o.customer_email,'')) LIKE ?)")
             params.extend([f"%{query}%"] * 3)
         limit = _limit(data)
+        date_field = data.get('date_field') or 'created_at'
         rows = db.execute(
             f"""SELECT o.*, COUNT(oi.id) item_lines, COALESCE(SUM(oi.qty),0) item_qty
                  FROM orders o LEFT JOIN order_items oi ON oi.order_id=o.id
-                 WHERE {' AND '.join(clauses)} GROUP BY o.id ORDER BY o.created_at DESC,o.id DESC LIMIT ?""",
+                 WHERE {' AND '.join(clauses)} GROUP BY o.id ORDER BY o.{date_field} DESC,o.id DESC LIMIT ?""",
             (*params, limit + 1),
         ).fetchall()
         selected = rows[:limit]
         results = [{
             "id": int(r["id"]), "order_number": r["order_no"], "customer_id": r["customer_id"],
             "customer_name": r["customer_name"], "status": r["status"], "created_at": r["created_at"],
+            "shipped_at": r['shipped_at'], "packed_at": r['packed_at'],
             "currency": str(r["currency"] or "PLN").upper(), "item_lines": int(r["item_lines"]),
             "item_qty": int(r["item_qty"]), "totals": _order_totals(db, int(r["id"])),
         } for r in selected]
@@ -1888,10 +1905,11 @@ def _orders_fulfillment_readiness(data, actor, correlation_id, transaction_conne
 
 
 def _china_order_view(row, *, item_count=0, total_units=0):
+    from china_delivery_attention import readable_tracking_eta
     return {
         "id": int(row["id"]), "po_number": row["package_no"], "supplier": row["supplier"] or "",
         "order_status": row["status"] or "", "delivery_stage": row["tracking_status"] or "",
-        "delivery_substatus": row["tracking_substatus"] or "", "tracking_eta": row["tracking_eta"] or "",
+        "delivery_substatus": row["tracking_substatus"] or "", "tracking_eta": readable_tracking_eta(row["tracking_eta"]),
         "tracking_number": row["tracking"] or "", "carrier": row["tracking_carrier"] or "",
         "shipping_method": row["shipping_method"] or "", "ordered_at": row["ordered_at"] or "",
         "shipped_at": row["shipped_at"] or "", "arrived_at": row["arrived_at"] or "",
@@ -2072,8 +2090,30 @@ def _sales_summary(data, actor, correlation_id, transaction_connection=None):
                              WHERE {' AND '.join(invoice_where)} GROUP BY 1,2 ORDER BY invoice_net DESC LIMIT 20""", invoice_params).fetchall()
         top_customers = [{"customer": r["customer"], "currency": r["currency"],
                           "invoice_count": int(r["invoice_count"]), "invoice_net": _money(r["invoice_net"])} for r in top]
+        invoice_quantities = db.execute(f"""SELECT i.id,m.invoice_items_json,
+            COALESCE(NULLIF(TRIM(i.buyer_name),''),o.customer_name,'-') customer,
+            UPPER(COALESCE(i.currency,o.currency,'PLN')) currency
+            FROM invoices i LEFT JOIN orders o ON o.id=i.order_id
+            LEFT JOIN invoice_meta m ON m.invoice_id=i.id
+            WHERE {' AND '.join(invoice_where)} ORDER BY i.id""", invoice_params).fetchall()
+        quantities = {}
+        for row in invoice_quantities:
+            key = (row['customer'], row['currency'])
+            entry = quantities.setdefault(key, {'customer':key[0], 'currency':key[1],
+                                                'invoice_units':0, 'invoice_count':0})
+            entry['invoice_units'] += invoice_sales_units(db, row['id'], row['invoice_items_json'])
+            entry['invoice_count'] += 1
+        quantity_ranking = sorted(quantities.values(),
+                                  key=lambda row: (-row['invoice_units'], row['customer'], row['currency']))
+        for entry in top_customers:
+            entry['invoice_units'] = quantities[(entry['customer'], entry['currency'])]['invoice_units']
         return {"ok": True, "date_from": start, "date_to": end, "order_count": order_count,
-                "invoice_count": invoice_count, "by_currency": by_currency, "top_customers": top_customers}
+                "invoice_count": invoice_count, "by_currency": by_currency, "top_customers": top_customers,
+                "invoice_units": sum(row['invoice_units'] for row in quantity_ranking),
+                "quantity_basis": "invoice_issue_date",
+                "customer_count": len({row['customer'] for row in quantity_ranking}),
+                "ranking_truncated": len(quantity_ranking) > 20,
+                "top_customers_by_units": quantity_ranking[:20]}
     finally:
         if transaction_connection is None: db.close()
 

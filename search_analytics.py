@@ -193,6 +193,7 @@ def analytics_snapshot(b, *, days=30, query='', customer='', result='all', now=N
     start = datetime.combine(
         now.astimezone(WARSAW).date() - timedelta(days=days - 1),
         datetime.min.time(), WARSAW)
+    end = datetime.combine(now.astimezone(WARSAW).date() + timedelta(days=1), datetime.min.time(), WARSAW)
     store = Store(b)
     cat = catalog_for(b)
     # Full history is required before the date filter so a boundary cannot
@@ -202,7 +203,7 @@ def analytics_snapshot(b, *, days=30, query='', customer='', result='all', now=N
     normalized_query = key(query)
     filtered = [
         intent for intent in intents
-        if stamp(intent['started_at']) >= start and not intent['superseded']
+        if start <= stamp(intent['started_at']) < end and not intent['superseded']
         and (not customer or intent['customer_id'] == customer)
         and (not normalized_query or normalized_query in key(
             ' '.join(intent['raw_phrases']) + ' ' + intent['model_name'] + ' ' + intent['customer_name']))
@@ -246,11 +247,11 @@ def analytics_snapshot(b, *, days=30, query='', customer='', result='all', now=N
         row['suggestion'] = next(
             (name for name in cat.families.values() if suggestion and key(name) == suggestion[0]), '')
     return {
-        'days': days, 'start': start, 'events': events, 'intents': intents,
+        'days': days, 'start': start, 'end': end, 'events': events, 'intents': intents,
         'filtered': filtered, 'catalog': cat,
         'clients_all': sorted({(i['customer_id'], i['customer_name']) for i in intents}, key=lambda x:x[1]),
         'models': model_rows, 'clients': clients,
-        'missing': sorted(missing.values(), key=lambda row: -row['count']),
+        'missing': sorted(missing.values(), key=lambda row: (-row['count'], row['phrase'])),
         'trend': trend,
     }
 
@@ -263,7 +264,12 @@ def business_read(data, actor=None, correlation_id='', transaction_connection=No
         _backend, days=int(data.get('days') or 30), query=data.get('query') or '',
         customer=data.get('customer_id') or '', result=data.get('result') or 'all')
     limit = int(data.get('limit') or 100)
-    intents = sorted(snapshot['filtered'], key=lambda row: row['last_activity_at'], reverse=True)
+    intents = sorted(snapshot['filtered'], key=lambda row: (row['last_activity_at'], row['id']), reverse=True)
+    phrase_counts = Counter()
+    for row in intents:
+        phrase_counts.update({key(phrase) for phrase in row['raw_phrases'] if key(phrase)})
+    phrase_ranking = [{'phrase':phrase,'intent_count':count}
+                      for phrase,count in sorted(phrase_counts.items(), key=lambda item:(-item[1],item[0]))]
     public_models = [{
         'model_id': row['id'], 'model_name': row['name'], 'intent_count': row['count'],
         'customer_count': len(row['clients']), 'last_at': row['last'],
@@ -281,14 +287,22 @@ def business_read(data, actor=None, correlation_id='', transaction_connection=No
         'status': row['status'], 'raw_event_count': row['raw_count'],
         'explicit_sku_selections': [event['selected_sku'] for event in row['events']
                                     if event.get('selected_sku')],
-    } for row in intents[:limit]]
+    } for row in intents[:limit]] if data.get('include_intents') else []
+    snapshot_id = hashlib.sha256(json.dumps({
+        'start':snapshot['start'].isoformat(), 'end':snapshot['end'].isoformat(),
+        'intents':intents, 'rules':snapshot['catalog'].rules,
+    },ensure_ascii=False,sort_keys=True,default=str).encode()).hexdigest()
     return {
         'ok': True,
         'scope': {'kind': 'projected_analytics', 'entity_existence_authoritative': True,
                   'empty_means': 'no_matching_projected_search_intents'},
-        'complete': len(intents) <= limit, 'truncated': len(intents) > limit,
+        'complete': not data.get('include_intents') or len(intents) <= limit,
+        'truncated': bool(data.get('include_intents')) and len(intents) > limit,
+        'snapshot_id': snapshot_id, 'rankings_complete': True,
+        'phrase_ranking': phrase_ranking,
+        'phrase_count_basis': 'one_intent_per_distinct_normalized_phrase',
         'period': {'days': snapshot['days'], 'date_from': snapshot['start'].date().isoformat(),
-                   'date_to': datetime.now(WARSAW).date().isoformat()},
+                   'date_to': (snapshot['end'].date() - timedelta(days=1)).isoformat()},
         'totals': {'intents': len(snapshot['filtered']),
                    'active_customers': len(snapshot['clients']),
                    'no_result_intents': sum(row['no_result'] for row in snapshot['filtered'])},

@@ -32,6 +32,23 @@ def invoice_cash_flow_context(order_currency, invoice_items_json):
     return items, currency, rate
 
 
+def invoice_sales_units(db, invoice_id, invoice_items_json):
+    """Panel/agent quantity: invoice snapshot, with the existing allocation fallback.
+
+    Order creation date, status and paid flag do not alter an issued invoice's
+    quantity. This preserves the panel's treatment of invoice/correction rows;
+    it is not a new calculator based on current order_items.
+    """
+    items, _, _ = invoice_cash_flow_context('PLN', invoice_items_json)
+    units = sum(int(item.get('qty') or item.get('invoice_qty') or item.get('current_invoice_qty') or 0)
+                for item in items if isinstance(item, dict))
+    if units <= 0:
+        row = db.execute('SELECT COALESCE(SUM(qty),0) FROM invoice_allocations WHERE invoice_id=?',
+                         (int(invoice_id),)).fetchone()
+        units = int(row[0] or 0) if row else 0
+    return units
+
+
 CASH_FLOW_SETTING_KEYS = {
     "account_balance": "0",
     "monthly_zus": "0",
@@ -260,18 +277,7 @@ def calculate_cash_flow_snapshot(deps, *, current_time=None):
             if chart_row is not None:
                 chart_row["invoices"] += 1
                 chart_row["revenue"] += net
-                invoice_units = 0
-                invoice_units = sum(
-                    int(item.get("qty") or item.get("invoice_qty") or item.get("current_invoice_qty") or 0)
-                    for item in invoice_items
-                )
-                if invoice_units <= 0:
-                    cur.execute(
-                        "SELECT COALESCE(SUM(qty),0) AS qty FROM invoice_allocations WHERE invoice_id=?",
-                        (int(inv["id"]),),
-                    )
-                    allocation_row = cur.fetchone()
-                    invoice_units = int(allocation_row["qty"] or 0) if allocation_row else 0
+                invoice_units = invoice_sales_units(c, inv['id'], inv['invoice_items_json'])
                 chart_row["units"] += invoice_units
 
         if issue_d and issue_d.year == today.year and issue_d.month == today.month:

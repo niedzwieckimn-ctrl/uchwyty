@@ -93,6 +93,18 @@ _TTS_NUMBER = re.compile(r'''
     (?![\w]|[.,:/\\-][0-9])
 ''', re.VERBOSE)
 
+# An explicit currency makes a grouped amount distinguishable from an opaque
+# phone/tracking number. Match it before the conservative identifier protector.
+_TTS_MONEY = r'''
+    (?<![\w/\\.,:+-])(?P<money_sign>[-+\u2212]?)
+    (?P<money_whole>(?:[1-9][0-9]{0,2}(?:[\ \u00a0\u202f][0-9]{3}){1,2}
+        |[1-9][0-9]{0,2}(?:\.[0-9]{3}){1,2}|0|[1-9][0-9]{0,8}))
+    (?:[,.](?P<money_fraction>[0-9]{1,2}))?
+    [\ \u00a0\u202f]+(?P<money_currency>(?i:zł|PLN|EUR)|€)(?!\w)
+'''
+_TTS_TOKENS = re.compile(
+    '(?P<money>' + _TTS_MONEY + ')|(?P<protected>' + _TTS_PROTECTED.pattern + ')', re.VERBOSE)
+
 
 def _tts_plural(number, singular, few, many):
     if number == 1:
@@ -104,6 +116,11 @@ def _tts_integer(number):
     """Polish cardinal form for an unsigned, bounded spoken quantity."""
     if number < 20:
         return _TTS_SMALL[number]
+    if number >= 1_000_000:
+        millions, remainder = divmod(number, 1_000_000)
+        prefix = ('milion' if millions == 1 else
+                  _tts_integer(millions) + ' ' + _tts_plural(millions, 'milion', 'miliony', 'milionów'))
+        return prefix + (' ' + _tts_integer(remainder) if remainder else '')
     if number >= 1000:
         thousands, remainder = divmod(number, 1000)
         prefix = ('tysiąc' if thousands == 1 else
@@ -164,11 +181,31 @@ def normalize_tts_text(text: str) -> str:
         return _TTS_ABBREVIATION.sub(
             lambda match: fit(match.group(), _TTS_ABBREVIATIONS[match.group(1)]), fragment)
 
+    def money_words(match):
+        whole = int(re.sub(r'[\s.]', '', match['money_whole']))
+        euro = match['money_currency'].casefold() in {'eur', '€'}
+        words = _tts_integer(whole) + ' ' + (
+            'euro' if euro else _tts_plural(whole, 'złoty', 'złote', 'złotych'))
+        if match['money_fraction'] is not None:
+            cents = int(match['money_fraction'].ljust(2, '0'))
+            forms = ('cent', 'centy', 'centów') if euro else ('grosz', 'grosze', 'groszy')
+            words += ' i ' + _tts_integer(cents) + ' ' + _tts_plural(cents, *forms)
+        sign = match['money_sign']
+        words = ('minus ' if sign in {'-', '−'} else 'plus ' if sign == '+' else '') + words
+        return fit(match.group(), words)
+
     parts = []
     position = 0
-    for protected in _TTS_PROTECTED.finditer(source):
+    for protected in _TTS_TOKENS.finditer(source):
         parts.append(spoken_fragment(source[position:protected.start()]))
-        parts.append(protected.group())
+        if protected['money'] is not None:
+            parts.append(money_words(protected))
+        elif re.match(r'(?i)^(?:fvat|fv|faktur\w*|zamówieni\w*)\b', protected.group()):
+            # The conservative invoice/order clause protector may also contain
+            # a monetary amount. Expand explicit currency only, preserving IDs.
+            parts.append(re.sub(_TTS_MONEY, money_words, protected.group(), flags=re.VERBOSE))
+        else:
+            parts.append(protected.group())
         position = protected.end()
     parts.append(spoken_fragment(source[position:]))
     return ''.join(parts)

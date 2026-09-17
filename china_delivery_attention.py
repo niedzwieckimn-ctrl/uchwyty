@@ -3,6 +3,32 @@
 from __future__ import annotations
 
 from datetime import datetime
+import ast
+import json
+
+
+def readable_tracking_eta(value) -> str:
+    """Normalize legacy provider ETA objects at the READ boundary, without writes."""
+    if isinstance(value, str):
+        value = value.strip()
+        if value.startswith('{') and len(value) <= 2048:
+            try:
+                value = json.loads(value)
+            except (ValueError, TypeError):
+                try:
+                    value = ast.literal_eval(value)
+                except (ValueError, SyntaxError, TypeError, RecursionError):
+                    return ''
+        elif value.casefold() in {'none', 'null'} or value.startswith(('{', '[')):
+            return ''
+    if isinstance(value, dict):
+        dates = []
+        for key in ('from', 'to'):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip() and candidate.strip() not in dates:
+                dates.append(candidate.strip())
+        return ' – '.join(dates)
+    return value if isinstance(value, str) and len(value) <= 160 else ''
 
 
 PROBLEM_TRACKING_STATUSES = frozenset({

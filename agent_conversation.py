@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import json
 import logging
+import os
 import re
 import unicodedata
 import uuid
@@ -18,7 +19,7 @@ MAX_HISTORY_BYTES = 12000
 MAX_MEMORY_BYTES = 4000
 MAX_TERMS = 100
 ALWAYS_APPLY_RELEVANCE_TERM = '__always_apply__'
-SQLITE_MIGRATIONS = ('agent_runtime_history.sql', 'agent_durable_memory_sqlite.sql')
+SQLITE_MIGRATIONS = ('agent_runtime_history.sql', 'agent_durable_memory_sqlite.sql', 'agent_turn_owners_sqlite.sql')
 _connection_factory = None
 _remote_memory_enabled = None
 _remote_memory_select = None
@@ -114,11 +115,50 @@ def reset_conversation(human, ai, conversation_id):
         db.execute("UPDATE internal_agent_conversations SET state_json='{}', reset_at=? WHERE conversation_id=?", (_iso(_utc_now()), conversation_id))
     _audit('agent.conversation.reset', human, conversation_id, ai.actor_id)
 
+def _process_owner(pid=None):
+    """Linux kernel identity, never just a reusable PID. Fail closed elsewhere."""
+    pid = os.getpid() if pid is None else int(pid)
+    boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    stat = Path(f'/proc/{pid}/stat').read_text()
+    # comm (in parentheses) may contain spaces. starttime is field 22.
+    fields = stat.rsplit(')', 1)[1].split()
+    return {'boot': boot, 'pid': pid, 'start': fields[19]}
+
+
+def _owner_is_dead(owner):
+    try:
+        if not isinstance(owner, dict) or not all(owner.get(k) for k in ('boot', 'pid', 'start')):
+            return False
+        boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        if boot != owner['boot']:
+            return True
+        try:
+            current = _process_owner(owner['pid'])
+        except FileNotFoundError:
+            return True
+        return current != owner
+    except (OSError, ValueError, TypeError, IndexError):
+        return False
+
+
 def begin_turn(human, ai, cid, run_id, message):
     with connection() as db:
         db.execute('BEGIN IMMEDIATE')
         _owned(db, human, ai, cid)
         now = _utc_now()
+        abandoned = db.execute('''SELECT l.run_id,o.owner_json
+            FROM internal_agent_turn_leases l JOIN internal_agent_turn_owners o
+            ON o.conversation_id=l.conversation_id AND o.run_id=l.run_id
+            WHERE l.conversation_id=?''', (cid,)).fetchone()
+        if abandoned:
+            try:
+                owner = json.loads(abandoned['owner_json'])
+            except (ValueError, TypeError):
+                owner = None
+            if _owner_is_dead(owner):
+                db.execute('DELETE FROM internal_agent_turn_leases WHERE conversation_id=? AND run_id=?',
+                           (cid, abandoned['run_id']))
+                logger.warning('AI_TURN_ORPHAN_RECOVERED conversation_id=%s run_id=%s', cid, abandoned['run_id'])
         acquired = db.execute('''INSERT INTO internal_agent_turn_leases(conversation_id,run_id,expires_at)
             VALUES(?,?,?) ON CONFLICT(conversation_id) DO UPDATE SET
             run_id=excluded.run_id,expires_at=excluded.expires_at
@@ -126,6 +166,12 @@ def begin_turn(human, ai, cid, run_id, message):
             (cid, run_id, _iso(now+TURN_LEASE_TTL), _iso(now)))
         if acquired.rowcount != 1:
             raise ConversationBusy('Conversation is running')
+        try:
+            owner = _process_owner()
+        except (OSError, ValueError, TypeError, IndexError):
+            owner = None
+        db.execute('INSERT OR REPLACE INTO internal_agent_turn_owners(conversation_id,run_id,owner_json) VALUES(?,?,?)',
+                   (cid, run_id, json.dumps(owner)))
         db.execute('INSERT INTO internal_agent_turns(run_id,conversation_id,user_text,created_at) VALUES(?,?,?,?)',
             (run_id, cid, message, _iso(now)))
 
@@ -158,6 +204,7 @@ def finish_turn(human, ai, cid, run_id, answer, evidence):
         db.execute('UPDATE internal_agent_turns SET assistant_text=?,evidence_json=? WHERE run_id=? AND conversation_id=?',
             (answer, json.dumps(evidence,ensure_ascii=False,separators=(',',':')), run_id, cid))
         db.execute('DELETE FROM internal_agent_turn_leases WHERE conversation_id=? AND run_id=?', (cid,run_id))
+        db.execute('DELETE FROM internal_agent_turn_owners WHERE conversation_id=? AND run_id=?', (cid,run_id))
 
 
 def release_turn(human, ai, cid, run_id):
@@ -168,6 +215,7 @@ def release_turn(human, ai, cid, run_id):
         db.execute('BEGIN IMMEDIATE')
         _owned(db, human, ai, cid)
         db.execute('DELETE FROM internal_agent_turn_leases WHERE conversation_id=? AND run_id=?', (cid, run_id))
+        db.execute('DELETE FROM internal_agent_turn_owners WHERE conversation_id=? AND run_id=?', (cid, run_id))
 
 
 def _tokens(value):
