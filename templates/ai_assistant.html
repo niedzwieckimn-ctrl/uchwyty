@@ -365,6 +365,16 @@
         ? artifact.display_name : titles[artifact.type] || 'Szczegóły';
       card.appendChild(title);
       const grid = document.createElement('div'); grid.className = 'ai-artifact-grid';
+      const statusLabels = {
+        new:'Nowe', pending:'Oczekujące', confirmed:'Potwierdzone', packed:'Spakowane',
+        packedpartial:'Częściowo spakowane', shipped:'Wysłane', partiallyshipped:'Częściowo wysłane',
+        completed:'Zrealizowane', issued:'Wydane', cancelled:'Anulowane',
+        planned:'Planowane', ordered:'Zamówione', arrived:'Dostarczone', delivered:'Dostarczone',
+        paid:'Opłacona', unpaid:'Nieopłacona', overdue:'Po terminie',
+        intransit:'W drodze', in_transit:'W drodze', inforeceived:'Dane przesyłki przekazane',
+        outfordelivery:'W doręczeniu', availableforpickup:'Gotowe do odbioru',
+        notfound:'Brak danych śledzenia', exception:'Problem z dostawą', expired:'Śledzenie wygasło'
+      };
       for (const [key, label] of Object.entries(labels)) {
         if (artifact.type === 'inventory_count_card' && artifact.expected_quantity != null && !['expected_quantity','counted_quantity','difference'].includes(key)) continue;
         if (artifact.type === 'inventory_count_card' && artifact.matches === true && key === 'difference') continue;
@@ -373,7 +383,10 @@
         if (value === null || value === undefined || value === '' || typeof value === 'object') continue;
         const field = document.createElement('div'); const caption = document.createElement('span'); caption.textContent = label;
         const content = document.createElement('b');
-        content.textContent = key === 'difference' && Number(value) > 0 ? `+${value}` : String(value);
+        const statusKey = String(value).toLowerCase().replace(/[_ -]/g, '');
+        content.textContent = ['status','order_status','delivery_stage','payment_status'].includes(key)
+          ? statusLabels[statusKey] || String(value)
+          : key === 'difference' && Number(value) > 0 ? `+${value}` : String(value);
         field.append(caption, content); grid.appendChild(field);
       }
       if (artifact.type === 'inventory_count_card' && artifact.matches === true) {
