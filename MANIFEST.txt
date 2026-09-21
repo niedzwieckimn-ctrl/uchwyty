@@ -1,0 +1,32 @@
+BAZA: ZIP 41 + zaakceptowany stan aplikacyjny w work/zip41-phase2/uchwyty-main
+
+KOLEJNOSC WDROZENIA
+1. PRZED deployem wykonaj jednorazowo w Supabase SQL Editor:
+   migrations/ksef_scheduler_runs_supabase.sql
+2. Podmien app.py i run_ksef_batch.py.
+3. Dodaj ksef_scheduler.py.
+4. Wykonaj deploy bez zmiany Start Command i konfiguracji Gunicorna.
+
+PLIKI PRODUKCYJNE
+- app.py (podmiana)
+  SHA256 B892E8F5C100F19FDB6E45D8B1A5AD69A304C43F809A98034AE8F823257C55F9
+- run_ksef_batch.py (podmiana)
+  SHA256 30741F4B21501E57A45EC681B2E6171FC16FA766AC5CF29B356C7FA2769FE4B3
+- ksef_scheduler.py (nowy)
+  SHA256 4503A74CE187E312F95E9CCF6C7DDD3AD6F1342BA4D60C90E48FAF75BA2D6B0B
+- migrations/ksef_scheduler_runs_supabase.sql (nowy; wykonac przed deployem)
+  SHA256 4147D2B0E88E7C7FBBF1EE705EA233DF9AE3F2966CF51E4AA59385C6C240852E
+
+NIE ZAWIERA
+- gunicorn.conf.py ani zmian Gunicorna
+- zmian tras recznego KSeF
+- nowych sekretow
+- Render Cron
+- zmian danych faktur
+
+TESTY ZRODLOWE
+- test_ksef_scheduler.py
+  SHA256 3E602163C1442B172B943432805F328214F35CF298BD4BF152015BB813B23AF5
+  Wynik: 7 passed.
+- test_post_invoice_amendment.py -k ksef
+  Wynik: 9 passed.

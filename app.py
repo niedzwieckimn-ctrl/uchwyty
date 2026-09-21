@@ -986,6 +986,9 @@ def init_db():
     from inpost_pickups import initialize as initialize_pickups
     initialize_pickups(c)
     _startup_step("inpost_schema_initialized")
+    from ksef_scheduler import initialize as initialize_ksef_scheduler
+    initialize_ksef_scheduler(c)
+    _startup_step("ksef_scheduler_schema_initialized")
     initialize_internal_rbac_schema(c)
     _startup_step("rbac_init")
     initialize_internal_audit_schema(c)
@@ -8667,6 +8670,12 @@ import inpost_pickups as _inpost_pickups
 import sys as _pickup_sys
 _inpost_pickups.start_worker(_pickup_sys.modules[__name__])
 _startup_step("inpost_worker_init")
+
+# The scheduler runs in a daemon thread, while the durable claim coordinates
+# all application processes. It starts only after KSeF routes are registered.
+import ksef_scheduler as _ksef_scheduler
+_ksef_scheduler.start_worker(_pickup_sys.modules[__name__])
+_startup_step("ksef_scheduler_worker_init")
 
 
 def _send_audit_to_supabase(payload):
