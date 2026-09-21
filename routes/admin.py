@@ -1,4 +1,7 @@
-"""Mechanically extracted Flask routes; business logic is unchanged."""
+"""Mechanically extracted Flask routes; business logic is shared with agent READs."""
+
+import dashboard_read
+from fulfillment_readiness import calculate_fulfillment_readiness
 
 def register_routes(context):
     globals().update(context)
@@ -42,134 +45,36 @@ def register_routes(context):
     @app.get("/")
     def home():
         maybe_pull_shared_from_supabase(required=True)
-        # Historyczna reconciliacja działa po synchronizacji w tle, poza
-        # krytyczną ścieżką renderowania pulpitu.
-        c = conn()
-        cur = c.cursor()
-        cur.execute("SELECT COUNT(*) AS n FROM products WHERE COALESCE(archived,0)=0")
-        n_products = cur.fetchone()["n"]
-        cur.execute("SELECT COUNT(*) AS n FROM orders WHERE status IN ('new','packed','packed_partial','confirmed','in_delivery','shipped','partially_shipped')")
-        n_orders_current = cur.fetchone()["n"]
-        cur.execute("SELECT COUNT(*) AS n FROM china_packages WHERE status IN ('planned','ordered','shipped','problem')")
-        n_china_active = cur.fetchone()["n"]
-        cur.execute("SELECT COALESCE(SUM(qty),0) AS n FROM stock")
-        n_stock_qty = cur.fetchone()["n"]
-        cur.execute("""
-          SELECT COALESCE(SUM(ci.qty),0) AS n
-          FROM china_items ci
-          JOIN china_packages cp ON cp.id=ci.package_id
-          WHERE cp.status IN ('ordered', 'shipped', 'problem')
-        """)
-        n_in_delivery_qty = cur.fetchone()["n"]
+        dashboard = dashboard_read.build_dashboard_read(
+            conn, current_time=app_now(), overdue_invoice_rows=overdue_invoice_rows,
+            build_replenishment_analysis=build_replenishment_analysis,
+            recommended_replenishments=recommended_replenishments,
+            calculate_fulfillment_readiness=calculate_fulfillment_readiness,
+            order_display_no=order_display_no,
+        )
+        n_products = dashboard["products_count"]
+        n_orders_current = dashboard["current_orders"]
+        n_china_active = dashboard["active_china_orders"]
+        n_stock_qty = dashboard["stock_units"]
+        n_in_delivery_qty = dashboard["in_delivery_units"]
 
-        cur.execute("""
-          SELECT COALESCE(SUM(
-            (COALESCE(s.qty,0) + COALESCE(d.in_delivery_qty,0)) * COALESCE(
-            (
-              SELECT pr.net_price
-              FROM pricing pr
-              WHERE TRIM(LOWER(pr.model)) = TRIM(LOWER(p.sku))
-              ORDER BY pr.created_at DESC
-              LIMIT 1
-            ),
-            (
-              SELECT pr.net_price
-              FROM pricing pr
-              WHERE TRIM(LOWER(pr.model)) = TRIM(LOWER(p.model))
-              ORDER BY pr.created_at DESC
-              LIMIT 1
-            ), 0)
-          ), 0) AS v
-          FROM products p
-          LEFT JOIN stock s ON s.product_id=p.id
-          LEFT JOIN (
-            SELECT ci.product_id, SUM(ci.qty) AS in_delivery_qty
-            FROM china_items ci
-            JOIN china_packages cp ON cp.id=ci.package_id
-            WHERE cp.status IN ('ordered', 'shipped', 'problem')
-            GROUP BY ci.product_id
-          ) d ON d.product_id=p.id
-          WHERE COALESCE(p.archived,0)=0
-        """)
-
-        inventory_value_net = float(cur.fetchone()["v"] or 0)
-        cur.execute("SELECT COUNT(*) AS n FROM orders WHERE date(created_at)=date('now','localtime')")
-        n_orders_today = int(cur.fetchone()["n"] or 0)
-        # "Wydane dzisiaj" ma opisywac dzien faktycznego wydania przez
-        # fakturowanie, a nie dzien utworzenia zamowienia. Jedna faktura moze
-        # zawierac wiele pozycji (a nawet kilka zamowien), dlatego liczymy
-        # unikalne zamowienia na podstawie zapisanych alokacji faktury.
-        # Druga czesc UNION jest zgodnosciowym fallbackiem dla starszych faktur,
-        # ktore powstaly przed wprowadzeniem invoice_allocations.
-        cur.execute("""
-          SELECT COUNT(DISTINCT issued.order_id) AS n
-          FROM (
-            SELECT ia.order_id, ia.created_at AS issued_at
-            FROM invoice_allocations ia
-
-            UNION ALL
-
-            SELECT i.order_id, i.created_at AS issued_at
-            FROM invoices i
-            WHERE i.order_id IS NOT NULL
-              AND NOT EXISTS (
-                SELECT 1 FROM invoice_allocations ia2 WHERE ia2.invoice_id=i.id
-              )
-          ) issued
-          JOIN orders o ON o.id=issued.order_id
-          WHERE COALESCE(o.warehouse_issued,0)=1
-            AND date(issued.issued_at)=date('now','localtime')
-        """)
-        n_issued_today = int(cur.fetchone()["n"] or 0)
-        # The dashboard and AI share the same deterministic allocation rule.
-        from fulfillment_readiness import calculate_fulfillment_readiness
-        readiness = calculate_fulfillment_readiness(c)
-        issuable_orders = [row for row in readiness if row["ready"]]
-        n_issuable_today = len(issuable_orders)
-        issuable_order_labels = [
-            order_display_no(r["order_id"], r.get("created_at"), r.get("order_number"), r.get("note") or "")
-            for r in issuable_orders[:3]
-        ]
-        reorder_horizon_days = 60
-        try:
-            cur.execute("SELECT value FROM cash_flow_settings WHERE key='reorder_horizon_days'")
-            horizon_row = cur.fetchone()
-            reorder_horizon_days = int(float(horizon_row["value"])) if horizon_row else 60
-        except Exception:
-            reorder_horizon_days = 60
-        if reorder_horizon_days not in (45, 60, 90):
-            reorder_horizon_days = 60
-        cur.execute("""
-          SELECT o.id,o.order_no,o.customer_name,o.created_at,o.status,o.currency,
-                 COALESCE(SUM(oi.qty * COALESCE(oi.unit_net_price,pr.net_price,0)),0) AS total_net
-          FROM orders o
-          LEFT JOIN order_items oi ON oi.order_id=o.id
-          LEFT JOIN products p ON p.id=oi.product_id
-          LEFT JOIN pricing pr ON (TRIM(LOWER(pr.model))=TRIM(LOWER(p.model)) OR TRIM(LOWER(pr.model))=TRIM(LOWER(p.sku)))
-          GROUP BY o.id ORDER BY o.id DESC LIMIT 8
-        """)
-        recent_orders = [dict(r) for r in cur.fetchall()]
-        cur.execute("SELECT status,COUNT(*) AS n FROM orders GROUP BY status")
-        status_counts = {norm(r["status"]).lower(): int(r["n"] or 0) for r in cur.fetchall()}
-        status_new = sum(status_counts.get(x,0) for x in ("new","pending","unconfirmed"))
-        status_work = sum(status_counts.get(x,0) for x in ("confirmed","packed","packed_partial","in_delivery","shipped","partially_shipped","issued"))
-        status_done = status_counts.get("completed",0)
-        status_cancelled = status_counts.get("cancelled",0)
-        status_total = status_new + status_work + status_done + status_cancelled
+        inventory_value_net = dashboard["inventory_value"]
+        n_orders_today = dashboard["new_orders"]
+        n_issued_today = dashboard["issued_today"]
+        n_issuable_today = dashboard["ready_to_issue_today"]
+        issuable_order_labels = dashboard["ready_to_issue_labels"]
+        recent_orders = dashboard["recent_orders"]
+        status_counts = dashboard["status_counts"]
+        status_new = status_counts["new"]
+        status_work = status_counts["work"]
+        status_done = status_counts["completed"]
+        status_cancelled = status_counts["cancelled"]
+        status_total = status_counts["total"]
         status_divisor = max(1, status_total)
-        overdue_invoices = overdue_invoice_rows(c)
-        overdue_count = len(overdue_invoices)
-        overdue_total = sum(float(inv.get("total_gross") or 0) for inv in overdue_invoices)
-        c.close()
-
-        replenishment_analysis = build_replenishment_analysis(
-            conn, today=app_now().date(), horizon_days=reorder_horizon_days
-        )
-        all_replenishment_rows = recommended_replenishments(
-            replenishment_analysis, limit=max(10, len(replenishment_analysis))
-        )
-        replenishment_rows = all_replenishment_rows[:5]
-        replenishment_count = len(all_replenishment_rows)
+        overdue_count = dashboard["overdue_count"]
+        overdue_total = dashboard["overdue_amount"]
+        replenishment_rows = dashboard["replenishment_items"][:5]
+        replenishment_count = dashboard["replenishment_count"]
 
         tpl = r"""
         {% extends "base.html" %}
