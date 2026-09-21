@@ -1,6 +1,7 @@
 """Explicit conversation history and bounded LLM tool loop over Business Operations."""
 from __future__ import annotations
 from dataclasses import dataclass
+from datetime import date
 from concurrent.futures import ThreadPoolExecutor
 import json
 import hashlib
@@ -265,6 +266,10 @@ def _is_packing_history_read(value: str) -> bool:
             r'\b(?:przygotuj|utw[oó]rz|wygeneruj|generuj|spakuj|pakuj|zapakuj|wyślij|wyslij)\b',
             normalized):
         return False
+    if re.search(r'\b(?:co|jakie\s+produkty|ile\s+sztuk)\b.*\b(?:wysła\w*|wysla\w*|wysłan\w*|wyslan\w*|wyszło|wyszlo|poszło|poszlo|wysyłc\w*|wysylc\w*)\b', normalized):
+        return True
+    if re.search(r'\bco\s+(?:było|bylo|jest)\s+w\s+(?:tej\s+)?wysyłc\w*', normalized):
+        return True
     return bool(
         re.search(r'\b(?:odczytaj|pokaż|pokaz|przeczytaj)\b.*\blist[ęa]\s+pakow', normalized)
         or re.search(r'\b(?:daj|podaj)\b(?:\s+mi)?\s+.*\blist[ęa]\s+pakow', normalized)
@@ -294,6 +299,15 @@ def _packing_history_direct_selector(value: str) -> tuple[dict[str, Any] | None,
     order_number = _packing_history_order_number(value)
     if order_number:
         return {'order_number': order_number}, 'explicit_historical_order_number'
+    day = re.search(r'\b(\d{4}-\d{2}-\d{2}|\d{2}\.\d{2}\.\d{4})\b', str(value or ''))
+    if day:
+        raw = day.group(1)
+        try:
+            selected_day = (date.fromisoformat(raw) if '-' in raw else
+                            date.fromisoformat('-'.join(reversed(raw.split('.')))))
+        except ValueError:
+            return None, ''
+        return {'date': selected_day.isoformat()}, 'explicit_shipment_date'
     normalized = ' '.join(str(value or '').casefold().split()).strip(' ?!.')
     generic_latest = bool(
         re.fullmatch(
@@ -312,9 +326,13 @@ def _packing_history_direct_selector(value: str) -> tuple[dict[str, Any] | None,
         )
     )
     today = bool(re.search(r'\b(?:dziś|dzis|dzisiaj)\b', normalized))
+    if today and re.search(r'\b(?:wysła\w*|wysla\w*|poszło|poszlo|wyszło|wyszlo)\b', normalized):
+        return {'today': True}, 'explicit_today_shipment'
     if generic_latest:
         return ({'today': True}, 'explicit_today_packing_history') if today else (
             {'latest': True}, 'explicit_latest_packing_history')
+    if re.fullmatch(r'co\s+(?:wysłałem|wyslalem|wysłaliśmy|wyslalismy)', normalized):
+        return {'latest': True}, 'explicit_latest_shipment'
     return None, ''
 
 
@@ -336,6 +354,8 @@ def _is_packing_history_document_followup(value: str) -> bool:
 def _detect_read_intent(value: str) -> str:
     """Choose one primary read intent without another model round-trip."""
     normalized = ' '.join(str(value or '').casefold().split()).strip(' ?!.')
+    if re.search(r'\bco\s+(?:było|bylo|jest)\s+w\s+zam[oó]wieni\w*\b', normalized):
+        return 'order_contents'
     if _is_packing_history_read(normalized):
         return 'packing_history'
     if (
@@ -528,6 +548,7 @@ _SPECIALIST_READ_TOOLS = {
     'cashflow_analytics': frozenset({'cashflow.read'}),
     'outgoing_orders': frozenset({'orders.search', 'orders.get', 'orders.summary',
                                   'customers.search', 'customers.get'}),
+    'order_contents': frozenset({'orders.search', 'orders.get'}),
 }
 _SPECIALIST_READ_INSTRUCTIONS = '''
 Korzystaj z kontraktu wyspecjalizowanego READ. Nie zastępuj go surowymi encjami ani dawną odpowiedzią.
@@ -810,16 +831,32 @@ def _plain_response_text(value, *, speech=False):
 
 def _packing_history_answer(data: dict[str, Any]) -> str:
     """Render saved batch data without another model synthesis pass."""
-    heading = f"Lista pakowa (batch {int(data['batch_id'])}"
-    if str(data.get('created_at') or '').strip():
-        heading += f", {str(data['created_at']).strip()}"
-    lines = [heading + "):"]
+    if data.get('source') == 'order_items_fallback':
+        heading = 'Nie ma potwierdzonej listy pakowej. Pozycje zamówienia (fallback; niepotwierdzona zawartość wysyłki)'
+    elif data.get('source') == 'mixed_packing_and_order_items_fallback':
+        heading = 'Wysyłki z list pakowych oraz osobno oznaczone pozycje zamówień bez listy'
+    elif not data.get('verified', True):
+        return 'Nie mogę potwierdzić pełnej zawartości tej listy pakowej.'
+    elif data.get('document_type') == 'current':
+        heading = 'Bieżąca, zweryfikowana lista pakowa'
+    else:
+        heading = 'Historyczna, zweryfikowana lista pakowa'
+    if data.get('batch_id'):
+        heading += f" (batch {int(data['batch_id'])}"
+        if str(data.get('created_at') or '').strip():
+            heading += f", {str(data['created_at']).strip()}"
+        heading += ')'
+    lines = [heading + ':']
+    fallback_order_ids = set(data.get('fallback_order_ids') or ())
     current_order = None
     for row in data.get('allocations') or ():
         order_number = str(row.get('order_number') or '').strip()
         if order_number != current_order:
             current_order = order_number
-            lines.append(order_number or f"Zamówienie {int(row['order_id'])}")
+            label = order_number or f"Zamówienie {int(row['order_id'])}"
+            if int(row['order_id']) in fallback_order_ids:
+                label += ' (fallback: niepotwierdzona zawartość wysyłki)'
+            lines.append(label)
         sku = str(row.get('sku') or '').strip()
         model_name = str(row.get('model_name') or '').strip()
         note = str(row.get('note') or '').strip()
@@ -868,6 +905,10 @@ def _is_contextual_inventory_count_followup(value: str) -> bool:
 
 _FAST_INVENTORY_COUNT = re.compile(
     r'^\s*(\d{1,7})(?:\s*(?:szt\.?|sztuk))?\s*[.!?]?\s*$',
+    re.IGNORECASE,
+)
+_FAST_INVENTORY_NAMED_COUNT = re.compile(
+    r'^\s*(?:sprawdź\s+|sprawdz\s+)?(.{3,100}?)\s+(\d{1,7})(?:\s*(?:szt\.?|sztuk))?\s*[.!?]?\s*$',
     re.IGNORECASE,
 )
 
@@ -1109,6 +1150,9 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         # Existing aggregate fields remain stable for current diagnostics/clients.
         'context_build_ms':0.0, 'first_model_call_ms':0.0, 'business_operation_ms':0.0,
         'final_model_call_ms':0.0, 'total_ms':0.0, 'tool_calls_count':0,
+        'product_resolve_ms':0.0, 'inventory_read_ms':0.0,
+        'count_record_ms':0.0, 'approval_prepare_ms':0.0,
+        'inventory_adjust_ms':0.0, 'final_response_ms':0.0,
     }
     usage = {'input_tokens':0,'output_tokens':0}
     usage_available = False
@@ -1435,6 +1479,17 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
             packing_history_direct_arguments, packing_history_selection_reason = (
                 _packing_history_direct_selector(turn_message)
             )
+            if (not packing_history_direct_arguments
+                    and re.search(r'\b(?:tę|te|tej)\s+list[ęy]\s+pakow|\btej\s+wysyłc',
+                                  turn_message.casefold())):
+                if previous_turn_entities.get('order'):
+                    packing_history_direct_arguments = {
+                        'order_id': int(previous_turn_entities['order']), 'current': True}
+                    packing_history_selection_reason = 'trusted_current_order_document'
+                elif previous_turn_entities.get('invoice'):
+                    packing_history_direct_arguments = {
+                        'invoice_id': int(previous_turn_entities['invoice']), 'current': True}
+                    packing_history_selection_reason = 'trusted_current_invoice_document'
         import human_approval
         eligible_approvals = human_approval.pending(business_operations, conversation_id, human_actor) if message.strip() and execution_outcome is None else []
         timings['context_history_build_ms'] = round((time.perf_counter()-stage_started)*1000,2)
@@ -1600,15 +1655,45 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         # Keep the normal model path for every other message, including a
         # quantity without an active session or with ambiguous product context.
         fast_count_quantity = _fast_inventory_count_quantity(turn_message)
-        fast_product_id = previous_turn_entities.get('product')
-        if (fast_count_quantity is not None and fast_product_id
-                and not eligible_approvals and execution_outcome is None):
+        fast_product_id = None
+        fast_count_session = ''
+        named_count = _FAST_INVENTORY_NAMED_COUNT.fullmatch(turn_message)
+        named_product = (named_count.group(1).strip() if named_count else '')
+        if (execution_outcome is None and not eligible_approvals
+                and detected_intent in {'ambiguous', 'inventory_status', 'product_lookup'}):
             try:
-                fast_product_id = int(fast_product_id)
                 fast_count_session = business_operations.active_inventory_count_session(
                     ai_actor, human_actor, conversation_id)
             except Exception:
                 fast_count_session = ''
+            if fast_count_session and fast_count_quantity is not None:
+                fast_product_id = business_operations.inventory_count_active_product(
+                    ai_actor, human_actor, conversation_id)
+            if fast_count_session and (named_product or
+                    (fast_count_quantity is None and re.fullmatch(r'[\w\s.\-]{3,100}', turn_message))):
+                query = named_product or turn_message
+                t_resolve = time.perf_counter()
+                candidates = business_operations.resolve_inventory_count_product(
+                    ai_actor, human_actor, conversation_id, query)
+                timings['product_resolve_ms'] = round((time.perf_counter()-t_resolve)*1000,2)
+                if len(candidates) > 1:
+                    names = ', '.join(str(item['model'] or item['name'] or item['sku'])
+                                      for item in candidates)
+                    return finish('SUCCESS', f'Który produkt: {names}?', voice_response_mode='direct')
+                if len(candidates) == 1:
+                    fast_product_id = int(candidates[0]['id'])
+                    if named_count:
+                        fast_count_quantity = int(named_count.group(2))
+                    else:
+                        business_operations.set_inventory_count_active_product(
+                            ai_actor, human_actor, conversation_id, fast_product_id)
+                        name = str(candidates[0]['model'] or candidates[0]['name'] or candidates[0]['sku'])
+                        return finish('SUCCESS', f'{name}. Podaj liczbę sztuk.', voice_response_mode='direct')
+            if fast_count_session and fast_count_quantity is not None and not fast_product_id:
+                return finish('SUCCESS', 'Podaj produkt do kolejnego liczenia.',
+                              voice_response_mode='direct')
+        if (fast_count_quantity is not None and fast_product_id and fast_count_session
+                and not eligible_approvals and execution_outcome is None):
             if fast_count_session:
                 def fast_inventory_call(operation, arguments, *, read_only=False):
                     nonlocal current_stage
@@ -1643,6 +1728,11 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                         timings['business_operation_ms'] + elapsed, 2)
                     timings['tool_execution_ms'] = round(
                         timings['tool_execution_ms'] + elapsed, 2)
+                    stage_key = {'inventory.count.get_expected':'inventory_read_ms',
+                                 'inventory.count.record':'count_record_ms',
+                                 'inventory.adjust':'approval_prepare_ms'}.get(operation)
+                    if stage_key:
+                        timings[stage_key] = round(timings[stage_key] + elapsed, 2)
                     if read_only:
                         timings['supabase_business_reads_ms'] = round(
                             timings['supabase_business_reads_ms'] + elapsed, 2)
@@ -1725,10 +1815,11 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 )
                 difference = int(count_data.get('difference') or 0)
                 if difference == 0:
+                    t_final = time.perf_counter()
+                    answer = 'Zgodne. Następny produkt.'
+                    timings['final_response_ms'] = round((time.perf_counter()-t_final)*1000,2)
                     return finish(
-                        'SUCCESS',
-                        f'Policzono {display_name}: {fast_count_quantity} szt. '
-                        'Stan jest zgodny z systemem. Następny produkt.',
+                        'SUCCESS', answer,
                         voice_response_mode='direct',
                     )
 
@@ -1759,11 +1850,12 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                     except business_operations.ControlledOperationError:
                         pass
                     pending_approvals.append(approval)
+                    t_final = time.perf_counter()
+                    answer = (f'{display_name} — system {count_data["expected_quantity"]}, '
+                              f'policzono {fast_count_quantity}, różnica {difference:+d}. Zatwierdzić?')
+                    timings['final_response_ms'] = round((time.perf_counter()-t_final)*1000,2)
                     return finish(
-                        'SUCCESS',
-                        f'Policzono {display_name}: {fast_count_quantity} szt. '
-                        f'Różnica względem systemu: {difference:+d}. '
-                        'Czy zatwierdzić korektę? Decyzja czeka na zatwierdzenie.',
+                        'SUCCESS', answer,
                         voice_response_mode='direct',
                     )
                 return finish(
@@ -2163,6 +2255,13 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                     if current is None or current.permission_decision(definition.required_permission)==DENY:
                         return finish('DENIED','Brak uprawnień do operacji.','PERMISSION_DENIED')
                     if not definition.read_only and call.name != 'approval.decide':
+                        if (call.name == 'inventory.count.record'
+                                and not contextual_count
+                                and 'product' not in resolved_entities
+                                and re.search(r'\b(?:produkt\w*|model\w*|sku)\b', message.casefold())):
+                            return finish('DENIED',
+                                'Przed zapisem odczytaj ponownie wskazany produkt.',
+                                'ENTITY_SCOPE_REQUIRED')
                         continued_order_scope = (
                             bool(arguments.get('order_id'))
                             and previous_turn_entities.get('order') == arguments.get('order_id')
@@ -2277,6 +2376,9 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                         if expected_product_id:
                             resolved_entities['product'] = expected_product_id
                             ambiguous_entities.discard('product')
+                    if call.name == 'inventory.product.get' and (result.data or {}).get('id'):
+                        business_operations.set_inventory_count_active_product(
+                            ai_actor, human_actor, conversation_id, int(result.data['id']))
                     new_sources = build_artifact_sources(
                         call.name, result.data, conversation_id, run_id,
                     )

@@ -1449,14 +1449,40 @@ def api_ai_approval_decide(approval_id, decision):
             internal_approval.approve_request(approval_id, human)
         requester = load_actor_context(snapshot['requesting_actor_id'],
             delegated_by_actor_id=binding['human_id'], source='approval_execution')
+        adjustment_started = time.perf_counter()
         result = business_operations.execute_business_operation(requester, snapshot['operation'],
             json.loads(snapshot['safe_payload']), idempotency_key=execution['idempotency_key'], approval_id=approval_id)
+        adjustment_ms = round((time.perf_counter()-adjustment_started)*1000, 2)
         outcome = _approval_execution_outcome(approval_id)
         response = {
             'status': outcome['result']['status'],
             'execution_outcome': outcome,
             'conversation_id': conversation_id,
         }
+        # Only the deterministic remanent fast path skips a second model pass.
+        # The approval itself has already gone through the original execution gate.
+        if (snapshot['operation'] == 'inventory.adjust'
+                and str(execution['idempotency_key'] or '').endswith(':inventory-adjust')):
+            response_started = time.perf_counter()
+            if outcome['execution_status'] == 'SUCCESS' and _apply_stored_success_confirmation(
+                    response, outcome, 'SKIPPED_FAST_INVENTORY'):
+                response['message'] = response['speech_text'] = 'Gotowe. Następny.'
+            elif decision == 'reject':
+                response.update(message='Odrzucono korektę. Następny produkt.',
+                                speech_text='Odrzucono korektę. Następny produkt.',
+                                voice_response_mode='direct', model_status='SKIPPED')
+            else:
+                response.update(message='Nie zapisano korekty. Sprawdź stan produktu.',
+                                speech_text='Nie zapisano korekty. Sprawdź stan produktu.',
+                                voice_response_mode='direct', model_status='SKIPPED')
+            app.logger.info('AI_INVENTORY_APPROVAL_TIMING %s', json.dumps({
+                'inventory_adjust_ms': adjustment_ms,
+                'final_response_ms': round((time.perf_counter()-response_started)*1000, 2),
+                'total_ms': round((time.perf_counter()-request_received)*1000, 2),
+                'model_call_count': 0,
+                'execution_status': outcome['execution_status'],
+            }, sort_keys=True))
+            return jsonify(response)
         if conversation_id:
             try:
                 provider = AGENT_MODEL_PROVIDER or provider_from_env()

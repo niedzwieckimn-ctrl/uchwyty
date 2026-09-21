@@ -1,0 +1,796 @@
+--- a/app.py
++++ b/app.py
+@@ -1450,14 +1450,40 @@
+             internal_approval.approve_request(approval_id, human)
+         requester = load_actor_context(snapshot['requesting_actor_id'],
+             delegated_by_actor_id=binding['human_id'], source='approval_execution')
++        adjustment_started = time.perf_counter()
+         result = business_operations.execute_business_operation(requester, snapshot['operation'],
+             json.loads(snapshot['safe_payload']), idempotency_key=execution['idempotency_key'], approval_id=approval_id)
++        adjustment_ms = round((time.perf_counter()-adjustment_started)*1000, 2)
+         outcome = _approval_execution_outcome(approval_id)
+         response = {
+             'status': outcome['result']['status'],
+             'execution_outcome': outcome,
+             'conversation_id': conversation_id,
+         }
++        # Only the deterministic remanent fast path skips a second model pass.
++        # The approval itself has already gone through the original execution gate.
++        if (snapshot['operation'] == 'inventory.adjust'
++                and str(execution['idempotency_key'] or '').endswith(':inventory-adjust')):
++            response_started = time.perf_counter()
++            if outcome['execution_status'] == 'SUCCESS' and _apply_stored_success_confirmation(
++                    response, outcome, 'SKIPPED_FAST_INVENTORY'):
++                response['message'] = response['speech_text'] = 'Gotowe. Następny.'
++            elif decision == 'reject':
++                response.update(message='Odrzucono korektę. Następny produkt.',
++                                speech_text='Odrzucono korektę. Następny produkt.',
++                                voice_response_mode='direct', model_status='SKIPPED')
++            else:
++                response.update(message='Nie zapisano korekty. Sprawdź stan produktu.',
++                                speech_text='Nie zapisano korekty. Sprawdź stan produktu.',
++                                voice_response_mode='direct', model_status='SKIPPED')
++            app.logger.info('AI_INVENTORY_APPROVAL_TIMING %s', json.dumps({
++                'inventory_adjust_ms': adjustment_ms,
++                'final_response_ms': round((time.perf_counter()-response_started)*1000, 2),
++                'total_ms': round((time.perf_counter()-request_received)*1000, 2),
++                'model_call_count': 0,
++                'execution_status': outcome['execution_status'],
++            }, sort_keys=True))
++            return jsonify(response)
+         if conversation_id:
+             try:
+                 provider = AGENT_MODEL_PROVIDER or provider_from_env()
+--- a/agent_runtime.py
++++ b/agent_runtime.py
+@@ -1,6 +1,7 @@
+ """Explicit conversation history and bounded LLM tool loop over Business Operations."""
+ from __future__ import annotations
+ from dataclasses import dataclass
++from datetime import date
+ from concurrent.futures import ThreadPoolExecutor
+ import json
+ import hashlib
+@@ -265,6 +266,10 @@
+             r'\b(?:przygotuj|utw[oó]rz|wygeneruj|generuj|spakuj|pakuj|zapakuj|wyślij|wyslij)\b',
+             normalized):
+         return False
++    if re.search(r'\b(?:co|jakie\s+produkty|ile\s+sztuk)\b.*\b(?:wysła\w*|wysla\w*|wysłan\w*|wyslan\w*|wyszło|wyszlo|poszło|poszlo|wysyłc\w*|wysylc\w*)\b', normalized):
++        return True
++    if re.search(r'\bco\s+(?:było|bylo|jest)\s+w\s+(?:tej\s+)?wysyłc\w*', normalized):
++        return True
+     return bool(
+         re.search(r'\b(?:odczytaj|pokaż|pokaz|przeczytaj)\b.*\blist[ęa]\s+pakow', normalized)
+         or re.search(r'\b(?:daj|podaj)\b(?:\s+mi)?\s+.*\blist[ęa]\s+pakow', normalized)
+@@ -294,6 +299,15 @@
+     order_number = _packing_history_order_number(value)
+     if order_number:
+         return {'order_number': order_number}, 'explicit_historical_order_number'
++    day = re.search(r'\b(\d{4}-\d{2}-\d{2}|\d{2}\.\d{2}\.\d{4})\b', str(value or ''))
++    if day:
++        raw = day.group(1)
++        try:
++            selected_day = (date.fromisoformat(raw) if '-' in raw else
++                            date.fromisoformat('-'.join(reversed(raw.split('.')))))
++        except ValueError:
++            return None, ''
++        return {'date': selected_day.isoformat()}, 'explicit_shipment_date'
+     normalized = ' '.join(str(value or '').casefold().split()).strip(' ?!.')
+     generic_latest = bool(
+         re.fullmatch(
+@@ -312,9 +326,13 @@
+         )
+     )
+     today = bool(re.search(r'\b(?:dziś|dzis|dzisiaj)\b', normalized))
++    if today and re.search(r'\b(?:wysła\w*|wysla\w*|poszło|poszlo|wyszło|wyszlo)\b', normalized):
++        return {'today': True}, 'explicit_today_shipment'
+     if generic_latest:
+         return ({'today': True}, 'explicit_today_packing_history') if today else (
+             {'latest': True}, 'explicit_latest_packing_history')
++    if re.fullmatch(r'co\s+(?:wysłałem|wyslalem|wysłaliśmy|wyslalismy)', normalized):
++        return {'latest': True}, 'explicit_latest_shipment'
+     return None, ''
+ 
+ 
+@@ -336,6 +354,8 @@
+ def _detect_read_intent(value: str) -> str:
+     """Choose one primary read intent without another model round-trip."""
+     normalized = ' '.join(str(value or '').casefold().split()).strip(' ?!.')
++    if re.search(r'\bco\s+(?:było|bylo|jest)\s+w\s+zam[oó]wieni\w*\b', normalized):
++        return 'order_contents'
+     if _is_packing_history_read(normalized):
+         return 'packing_history'
+     if (
+@@ -528,6 +548,7 @@
+     'cashflow_analytics': frozenset({'cashflow.read'}),
+     'outgoing_orders': frozenset({'orders.search', 'orders.get', 'orders.summary',
+                                   'customers.search', 'customers.get'}),
++    'order_contents': frozenset({'orders.search', 'orders.get'}),
+ }
+ _SPECIALIST_READ_INSTRUCTIONS = '''
+ Korzystaj z kontraktu wyspecjalizowanego READ. Nie zastępuj go surowymi encjami ani dawną odpowiedzią.
+@@ -810,16 +831,32 @@
+ 
+ def _packing_history_answer(data: dict[str, Any]) -> str:
+     """Render saved batch data without another model synthesis pass."""
+-    heading = f"Lista pakowa (batch {int(data['batch_id'])}"
+-    if str(data.get('created_at') or '').strip():
+-        heading += f", {str(data['created_at']).strip()}"
+-    lines = [heading + "):"]
++    if data.get('source') == 'order_items_fallback':
++        heading = 'Nie ma potwierdzonej listy pakowej. Pozycje zamówienia (fallback; niepotwierdzona zawartość wysyłki)'
++    elif data.get('source') == 'mixed_packing_and_order_items_fallback':
++        heading = 'Wysyłki z list pakowych oraz osobno oznaczone pozycje zamówień bez listy'
++    elif not data.get('verified', True):
++        return 'Nie mogę potwierdzić pełnej zawartości tej listy pakowej.'
++    elif data.get('document_type') == 'current':
++        heading = 'Bieżąca, zweryfikowana lista pakowa'
++    else:
++        heading = 'Historyczna, zweryfikowana lista pakowa'
++    if data.get('batch_id'):
++        heading += f" (batch {int(data['batch_id'])}"
++        if str(data.get('created_at') or '').strip():
++            heading += f", {str(data['created_at']).strip()}"
++        heading += ')'
++    lines = [heading + ':']
++    fallback_order_ids = set(data.get('fallback_order_ids') or ())
+     current_order = None
+     for row in data.get('allocations') or ():
+         order_number = str(row.get('order_number') or '').strip()
+         if order_number != current_order:
+             current_order = order_number
+-            lines.append(order_number or f"Zamówienie {int(row['order_id'])}")
++            label = order_number or f"Zamówienie {int(row['order_id'])}"
++            if int(row['order_id']) in fallback_order_ids:
++                label += ' (fallback: niepotwierdzona zawartość wysyłki)'
++            lines.append(label)
+         sku = str(row.get('sku') or '').strip()
+         model_name = str(row.get('model_name') or '').strip()
+         note = str(row.get('note') or '').strip()
+@@ -868,6 +905,10 @@
+ 
+ _FAST_INVENTORY_COUNT = re.compile(
+     r'^\s*(\d{1,7})(?:\s*(?:szt\.?|sztuk))?\s*[.!?]?\s*$',
++    re.IGNORECASE,
++)
++_FAST_INVENTORY_NAMED_COUNT = re.compile(
++    r'^\s*(?:sprawdź\s+|sprawdz\s+)?(.{3,100}?)\s+(\d{1,7})(?:\s*(?:szt\.?|sztuk))?\s*[.!?]?\s*$',
+     re.IGNORECASE,
+ )
+ 
+@@ -1109,6 +1150,9 @@
+         # Existing aggregate fields remain stable for current diagnostics/clients.
+         'context_build_ms':0.0, 'first_model_call_ms':0.0, 'business_operation_ms':0.0,
+         'final_model_call_ms':0.0, 'total_ms':0.0, 'tool_calls_count':0,
++        'product_resolve_ms':0.0, 'inventory_read_ms':0.0,
++        'count_record_ms':0.0, 'approval_prepare_ms':0.0,
++        'inventory_adjust_ms':0.0, 'final_response_ms':0.0,
+     }
+     usage = {'input_tokens':0,'output_tokens':0}
+     usage_available = False
+@@ -1435,6 +1479,17 @@
+             packing_history_direct_arguments, packing_history_selection_reason = (
+                 _packing_history_direct_selector(turn_message)
+             )
++            if (not packing_history_direct_arguments
++                    and re.search(r'\b(?:tę|te|tej)\s+list[ęy]\s+pakow|\btej\s+wysyłc',
++                                  turn_message.casefold())):
++                if previous_turn_entities.get('order'):
++                    packing_history_direct_arguments = {
++                        'order_id': int(previous_turn_entities['order']), 'current': True}
++                    packing_history_selection_reason = 'trusted_current_order_document'
++                elif previous_turn_entities.get('invoice'):
++                    packing_history_direct_arguments = {
++                        'invoice_id': int(previous_turn_entities['invoice']), 'current': True}
++                    packing_history_selection_reason = 'trusted_current_invoice_document'
+         import human_approval
+         eligible_approvals = human_approval.pending(business_operations, conversation_id, human_actor) if message.strip() and execution_outcome is None else []
+         timings['context_history_build_ms'] = round((time.perf_counter()-stage_started)*1000,2)
+@@ -1600,15 +1655,45 @@
+         # Keep the normal model path for every other message, including a
+         # quantity without an active session or with ambiguous product context.
+         fast_count_quantity = _fast_inventory_count_quantity(turn_message)
+-        fast_product_id = previous_turn_entities.get('product')
+-        if (fast_count_quantity is not None and fast_product_id
+-                and not eligible_approvals and execution_outcome is None):
++        fast_product_id = None
++        fast_count_session = ''
++        named_count = _FAST_INVENTORY_NAMED_COUNT.fullmatch(turn_message)
++        named_product = (named_count.group(1).strip() if named_count else '')
++        if (execution_outcome is None and not eligible_approvals
++                and detected_intent in {'ambiguous', 'inventory_status', 'product_lookup'}):
+             try:
+-                fast_product_id = int(fast_product_id)
+                 fast_count_session = business_operations.active_inventory_count_session(
+                     ai_actor, human_actor, conversation_id)
+             except Exception:
+                 fast_count_session = ''
++            if fast_count_session and fast_count_quantity is not None:
++                fast_product_id = business_operations.inventory_count_active_product(
++                    ai_actor, human_actor, conversation_id)
++            if fast_count_session and (named_product or
++                    (fast_count_quantity is None and re.fullmatch(r'[\w\s.\-]{3,100}', turn_message))):
++                query = named_product or turn_message
++                t_resolve = time.perf_counter()
++                candidates = business_operations.resolve_inventory_count_product(
++                    ai_actor, human_actor, conversation_id, query)
++                timings['product_resolve_ms'] = round((time.perf_counter()-t_resolve)*1000,2)
++                if len(candidates) > 1:
++                    names = ', '.join(str(item['model'] or item['name'] or item['sku'])
++                                      for item in candidates)
++                    return finish('SUCCESS', f'Który produkt: {names}?', voice_response_mode='direct')
++                if len(candidates) == 1:
++                    fast_product_id = int(candidates[0]['id'])
++                    if named_count:
++                        fast_count_quantity = int(named_count.group(2))
++                    else:
++                        business_operations.set_inventory_count_active_product(
++                            ai_actor, human_actor, conversation_id, fast_product_id)
++                        name = str(candidates[0]['model'] or candidates[0]['name'] or candidates[0]['sku'])
++                        return finish('SUCCESS', f'{name}. Podaj liczbę sztuk.', voice_response_mode='direct')
++            if fast_count_session and fast_count_quantity is not None and not fast_product_id:
++                return finish('SUCCESS', 'Podaj produkt do kolejnego liczenia.',
++                              voice_response_mode='direct')
++        if (fast_count_quantity is not None and fast_product_id and fast_count_session
++                and not eligible_approvals and execution_outcome is None):
+             if fast_count_session:
+                 def fast_inventory_call(operation, arguments, *, read_only=False):
+                     nonlocal current_stage
+@@ -1643,6 +1728,11 @@
+                         timings['business_operation_ms'] + elapsed, 2)
+                     timings['tool_execution_ms'] = round(
+                         timings['tool_execution_ms'] + elapsed, 2)
++                    stage_key = {'inventory.count.get_expected':'inventory_read_ms',
++                                 'inventory.count.record':'count_record_ms',
++                                 'inventory.adjust':'approval_prepare_ms'}.get(operation)
++                    if stage_key:
++                        timings[stage_key] = round(timings[stage_key] + elapsed, 2)
+                     if read_only:
+                         timings['supabase_business_reads_ms'] = round(
+                             timings['supabase_business_reads_ms'] + elapsed, 2)
+@@ -1725,10 +1815,11 @@
+                 )
+                 difference = int(count_data.get('difference') or 0)
+                 if difference == 0:
++                    t_final = time.perf_counter()
++                    answer = 'Zgodne. Następny produkt.'
++                    timings['final_response_ms'] = round((time.perf_counter()-t_final)*1000,2)
+                     return finish(
+-                        'SUCCESS',
+-                        f'Policzono {display_name}: {fast_count_quantity} szt. '
+-                        'Stan jest zgodny z systemem. Następny produkt.',
++                        'SUCCESS', answer,
+                         voice_response_mode='direct',
+                     )
+ 
+@@ -1759,11 +1850,12 @@
+                     except business_operations.ControlledOperationError:
+                         pass
+                     pending_approvals.append(approval)
++                    t_final = time.perf_counter()
++                    answer = (f'{display_name} — system {count_data["expected_quantity"]}, '
++                              f'policzono {fast_count_quantity}, różnica {difference:+d}. Zatwierdzić?')
++                    timings['final_response_ms'] = round((time.perf_counter()-t_final)*1000,2)
+                     return finish(
+-                        'SUCCESS',
+-                        f'Policzono {display_name}: {fast_count_quantity} szt. '
+-                        f'Różnica względem systemu: {difference:+d}. '
+-                        'Czy zatwierdzić korektę? Decyzja czeka na zatwierdzenie.',
++                        'SUCCESS', answer,
+                         voice_response_mode='direct',
+                     )
+                 return finish(
+@@ -2163,6 +2255,13 @@
+                     if current is None or current.permission_decision(definition.required_permission)==DENY:
+                         return finish('DENIED','Brak uprawnień do operacji.','PERMISSION_DENIED')
+                     if not definition.read_only and call.name != 'approval.decide':
++                        if (call.name == 'inventory.count.record'
++                                and not contextual_count
++                                and 'product' not in resolved_entities
++                                and re.search(r'\b(?:produkt\w*|model\w*|sku)\b', message.casefold())):
++                            return finish('DENIED',
++                                'Przed zapisem odczytaj ponownie wskazany produkt.',
++                                'ENTITY_SCOPE_REQUIRED')
+                         continued_order_scope = (
+                             bool(arguments.get('order_id'))
+                             and previous_turn_entities.get('order') == arguments.get('order_id')
+@@ -2277,6 +2376,9 @@
+                         if expected_product_id:
+                             resolved_entities['product'] = expected_product_id
+                             ambiguous_entities.discard('product')
++                    if call.name == 'inventory.product.get' and (result.data or {}).get('id'):
++                        business_operations.set_inventory_count_active_product(
++                            ai_actor, human_actor, conversation_id, int(result.data['id']))
+                     new_sources = build_artifact_sources(
+                         call.name, result.data, conversation_id, run_id,
+                     )
+--- a/business_operations.py
++++ b/business_operations.py
+@@ -8,6 +8,7 @@
+ from __future__ import annotations
+ 
+ from dataclasses import asdict, dataclass, replace
++from difflib import SequenceMatcher
+ import hashlib
+ import json
+ import logging
+@@ -435,7 +436,10 @@
+         "customer_id": {"type": "integer", "minimum": 1, "maximum": 9_223_372_036_854_775_807},
+         "customer": {"type": "string", "minLength": 1, "maxLength": 160},
+         "today": {"type": "boolean"},
++        "date": {"type": "string", "minLength": 10, "maxLength": 10},
+         "latest": {"type": "boolean"},
++        "current": {"type": "boolean"},
++        "invoice_id": {"type": "integer", "minimum": 1},
+     },
+ }
+ _PACKING_HISTORY_ALLOCATION = {
+@@ -466,6 +470,16 @@
+         "complete": {"type": "boolean"},
+         "incomplete_fields": {"type": "array", "items": {"type": "string"}},
+         "history_source": {"type": "string"},
++        "invoice_id": {"type": ["integer", "null"]},
++        "packing_list_id": {"type": ["integer", "null"]},
++        "orders": {"type": "array", "maxItems": 500},
++        "all_items": {"type": "array", "maxItems": 500},
++        "total_units": {"type": "integer"},
++        "document_type": {"type": "string"},
++        "verified": {"type": "boolean"},
++        "source": {"type": "string"},
++        "shipments": {"type": "array", "maxItems": 100},
++        "fallback_order_ids": {"type": "array", "maxItems": 500, "items": {"type": "integer"}},
+         "customer": {
+             "type":"object", "additionalProperties":False,
+             "required":["id","name","email"],
+@@ -730,7 +744,7 @@
+     ),
+     packing_history.OPERATION: BusinessOperationDefinition(
+         packing_history.OPERATION, 1,
+-        "Odczytuje dokładną historyczną listę pakową po batch_id, wewnętrznym order_id, historycznym order_number, customer_id, dokładnej nazwie/e-mailu klienta, today=true albo latest=true. Źródłem prawdy jest utrwalony snapshot packing allocations; PDF jest opcjonalnym dokumentem i ma osobne pola dostępności oraz weryfikacji. Nie używa bieżących order_items, stanów, dostępności ani sum zamówień i nie zgaduje brakujących pól.",
++        "Odczytuje rzeczywistą zawartość wysyłki z listy pakowej dla batch_id, order_id, order_number, klienta, dziś lub ostatnio. current=true czyta bieżący dokument, np. wskazany w UI, a domyślnie niemodyfikowalny snapshot historyczny. Dopiero gdy lista nie istnieje, zwraca jawnie oznaczone order_items_fallback; nigdy nie zastępuje nimi niezweryfikowanej listy.",
+         "packing.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
+         PACKING_HISTORY_INPUT, PACKING_HISTORY_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
+     ),
+@@ -1007,6 +1021,13 @@
+     count_columns = {row['name'] for row in db.execute('PRAGMA table_info(internal_inventory_count_sessions)').fetchall()}
+     if 'conversation_id' not in count_columns:
+         db.execute("ALTER TABLE internal_inventory_count_sessions ADD COLUMN conversation_id TEXT NOT NULL DEFAULT ''")
++    if 'active_product_id' not in count_columns:
++        try:
++            db.execute("ALTER TABLE internal_inventory_count_sessions ADD COLUMN active_product_id INTEGER")
++        except sqlite3.OperationalError as exc:
++            # Two workers can inspect the old schema before either commits.
++            if 'duplicate column name' not in str(exc).lower():
++                raise
+     db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_inventory_count_open_owner_conversation
+                   ON internal_inventory_count_sessions(created_by,conversation_id)
+                   WHERE status='OPEN' AND conversation_id<>''""")
+@@ -2043,7 +2064,7 @@
+ 
+ def _packing_history_read(data):
+     try:
+-        return packing_history.read(data, connection_factory=_factory())
++        return packing_history.shipment_read(data, connection_factory=_factory())
+     except packing_history.PackingHistoryError as exc:
+         raise ControlledOperationError(exc.code, exc.safe_message) from exc
+ 
+@@ -2223,6 +2244,92 @@
+     finally: db.close()
+ 
+ 
++def inventory_count_active_product(ai_actor, human_actor, conversation_id):
++    """Only an open session, owned by this human and conversation, can supply a bare number."""
++    ai = _trusted_actor(ai_actor)
++    human = load_actor_context(human_actor.actor_id) if isinstance(human_actor, ActorContext) else None
++    if human is None or human.actor_type != 'HUMAN' or ai.delegated_by_actor_id != human.actor_id:
++        raise ControlledOperationError('UNTRUSTED_ACTOR', 'Brak zaufanego właściciela sesji', status=DENIED)
++    db = _factory()()
++    try:
++        _assert_count_conversation(db, ai, conversation_id)
++        row = db.execute("""SELECT active_product_id FROM internal_inventory_count_sessions
++                            WHERE created_by=? AND conversation_id=? AND status='OPEN'""",
++                         (human.actor_id, conversation_id)).fetchone()
++        return int(row['active_product_id']) if row and row['active_product_id'] else None
++    finally:
++        db.close()
++
++
++def set_inventory_count_active_product(ai_actor, human_actor, conversation_id, product_id):
++    """Remember one explicitly read product; never infer it from old conversation artifacts."""
++    ai = _trusted_actor(ai_actor)
++    human = load_actor_context(human_actor.actor_id) if isinstance(human_actor, ActorContext) else None
++    if human is None or human.actor_type != 'HUMAN' or ai.delegated_by_actor_id != human.actor_id:
++        raise ControlledOperationError('UNTRUSTED_ACTOR', 'Brak zaufanego właściciela sesji', status=DENIED)
++    if ai.permission_decision('inventory.read') == PERMISSION_DENY or human.permission_decision('inventory.read') == PERMISSION_DENY:
++        raise ControlledOperationError('PERMISSION_DENIED', 'Brak dostępu do produktu', status=DENIED)
++    db = _factory()()
++    try:
++        _assert_count_conversation(db, ai, conversation_id)
++        if not db.execute('SELECT 1 FROM products WHERE id=? AND COALESCE(archived,0)=0',
++                          (product_id,)).fetchone():
++            raise ControlledOperationError('PRODUCT_NOT_FOUND', 'Nie znaleziono produktu', status=CONFLICT)
++        changed = db.execute("""UPDATE internal_inventory_count_sessions SET active_product_id=?
++                              WHERE created_by=? AND conversation_id=? AND status='OPEN'""",
++                             (product_id, human.actor_id, conversation_id)).rowcount
++        db.commit()
++        return bool(changed)
++    finally:
++        db.close()
++
++
++def resolve_inventory_count_product(ai_actor, human_actor, conversation_id, query):
++    """Bounded local identity lookup for an open remanent, without replenishment analytics."""
++    ai = _trusted_actor(ai_actor)
++    human = load_actor_context(human_actor.actor_id) if isinstance(human_actor, ActorContext) else None
++    if human is None or human.actor_type != 'HUMAN' or ai.delegated_by_actor_id != human.actor_id:
++        raise ControlledOperationError('UNTRUSTED_ACTOR', 'Brak zaufanego właściciela sesji', status=DENIED)
++    if ai.permission_decision('inventory.read') == PERMISSION_DENY or human.permission_decision('inventory.read') == PERMISSION_DENY:
++        raise ControlledOperationError('PERMISSION_DENIED', 'Brak dostępu do produktu', status=DENIED)
++    def norm(value):
++        value = unicodedata.normalize('NFKD', str(value or '').casefold()).replace('ł', 'l')
++        return ' '.join(re.sub(r'[^a-z0-9]+', ' ', ''.join(ch for ch in value
++                        if not unicodedata.combining(ch))).split())
++    needle = norm(query)
++    if len(needle) < 3:
++        return []
++    db = _factory()()
++    try:
++        _assert_count_conversation(db, ai, conversation_id)
++        active = db.execute("""SELECT 1 FROM internal_inventory_count_sessions
++                               WHERE created_by=? AND conversation_id=? AND status='OPEN'""",
++                            (human.actor_id, conversation_id)).fetchone()
++        if not active:
++            return []
++        rows = db.execute("""SELECT id,sku,model,name,ean FROM products
++                             WHERE COALESCE(archived,0)=0""").fetchall()
++    finally:
++        db.close()
++    scored = []
++    for row in rows:
++        fields = [norm(row[key]) for key in ('sku', 'model', 'name', 'ean')]
++        exact = needle in fields or needle.replace(' ', '') in [field.replace(' ', '') for field in fields]
++        prefix = any(field.startswith(needle + ' ') for field in fields if field)
++        fuzzy = max((SequenceMatcher(None, needle, field).ratio()
++                     for field in fields if field and len(field) >= 4), default=0.0)
++        score = 3.0 if exact else 2.0 if prefix else fuzzy if fuzzy >= 0.88 else 0.0
++        if score:
++            scored.append((score, {'id': int(row['id']), 'sku': row['sku'] or '',
++                                    'model': row['model'] or '', 'name': row['name'] or ''}))
++    scored.sort(key=lambda item: (-item[0], item[1]['id']))
++    if not scored:
++        return []
++    best = scored[0][0]
++    return [record for score, record in scored if score == best or
++            (best < 2 and best - score < 0.08)][:5]
++
++
+ def inventory_adjustment_preview(ai_actor, human_actor, conversation_id, product_id):
+     """Trusted user-facing preview for an adjustment approval in the active session."""
+     ai = _trusted_actor(ai_actor)
+@@ -2426,6 +2533,8 @@
+                           data['expected_version'],status,data.get('note'),human_id,now))
+     except sqlite3.IntegrityError:
+         raise ControlledOperationError('COUNT_ALREADY_RECORDED','Produkt został już policzony w tej sesji',status=CONFLICT)
++    db.execute('UPDATE internal_inventory_count_sessions SET active_product_id=NULL WHERE session_id=?',
++               (data['count_session_id'],))
+     record_audit_event('inventory.count.record',result=SUCCESS,actor_context=actor,entity_type='product',entity_id=str(data['product_id']),
+         correlation_id=correlation_id,expected_version=data['expected_version'],entity_version_before=data['expected_version'],
+         entity_version_after=data['expected_version'],after_state={'count_item_id':cur.lastrowid,'expected_quantity':expected,
+@@ -2442,7 +2551,7 @@
+     unresolved=int(db.execute("SELECT COUNT(*) n FROM internal_inventory_count_items WHERE session_id=? AND status='PENDING_ADJUSTMENT'",(data['count_session_id'],)).fetchone()['n'])
+     if unresolved:
+         raise ControlledOperationError('UNRESOLVED_DISCREPANCIES','Nie można zakończyć remanentu z nierozwiązanymi rozbieżnościami',status=CONFLICT)
+-    db.execute("UPDATE internal_inventory_count_sessions SET status='COMPLETED',completed_at=? WHERE session_id=? AND status='OPEN'",(_now(),data['count_session_id']))
++    db.execute("UPDATE internal_inventory_count_sessions SET status='COMPLETED',active_product_id=NULL,completed_at=? WHERE session_id=? AND status='OPEN'",(_now(),data['count_session_id']))
+     record_audit_event('inventory.count.complete',result=SUCCESS,actor_context=actor,entity_type='inventory_count_session',entity_id=data['count_session_id'],
+         correlation_id=correlation_id,before_state={'status':'OPEN'},after_state={'status':'COMPLETED'},transaction_connection=db)
+     return {'ok':True,'count_id':data['count_session_id'],'status':'COMPLETED'}
+--- a/packing_history.py
++++ b/packing_history.py
+@@ -9,7 +9,7 @@
+ 
+ from __future__ import annotations
+ 
+-from datetime import datetime
++from datetime import date, datetime
+ from hashlib import sha256
+ from io import BytesIO
+ from pathlib import Path
+@@ -580,3 +580,287 @@
+         "history_source": "legacy_verified_document",
+         "customer": customer,
+     }
++
++
++def _shipment_shape(result: dict[str, Any], *, document_type: str,
++                    verified: bool, invoice_id: int | None = None) -> dict[str, Any]:
++    grouped: dict[int, dict[str, Any]] = {}
++    for item in result.get('allocations') or []:
++        order_id = int(item['order_id'])
++        order = grouped.setdefault(order_id, {
++            'order_id': order_id, 'order_number': item.get('order_number') or '', 'items': []})
++        order['items'].append(dict(item))
++    result.update(
++        packing_list_id=result.get('batch_id'), invoice_id=invoice_id,
++        orders=list(grouped.values()), all_items=list(result.get('allocations') or []),
++        total_units=int(result.get('total_qty') or 0),
++        document_type=document_type, verified=verified,
++        source=('order_items_fallback' if document_type == 'fallback'
++                else 'verified_packing_list' if verified else 'unverified_packing_list'),
++    )
++    return result
++
++
++def _current_invoice_document(db, invoice_id: int):
++    """Verify the existing invoice PDF against its saved many-order allocations."""
++    from app import _existing_packing_list_source
++    source = _existing_packing_list_source(invoice_id, include_content=True)
++    if not source:
++        return None
++    rows = db.execute('''SELECT ia.order_id,ia.order_item_id,ia.sku,ia.qty,o.order_no
++                           FROM invoice_allocations ia JOIN orders o ON o.id=ia.order_id
++                          WHERE ia.invoice_id=? ORDER BY ia.id''', (invoice_id,)).fetchall()
++    if not rows:
++        raise _not_verifiable('Bieżąca lista pakowa nie ma zapisanych alokacji faktury.')
++    try:
++        content = (Path(source['path']).read_bytes() if source['kind'] == 'local'
++                   else source['content'])
++    except (OSError, KeyError) as exc:
++        raise _not_verifiable('Nie można odczytać bieżącego dokumentu listy pakowej.') from exc
++    printed, lines, qty = _document_rows(content)
++    if lines != len(rows) or qty != sum(int(row['qty']) for row in rows) or len(printed) != len(rows):
++        raise _not_verifiable('Bieżący dokument nie odpowiada alokacjom faktury.')
++    keys = {}
++    for row in rows:
++        key = _stable_key(row['order_no'], row['sku'], row['qty'])
++        if key in keys:
++            raise _not_verifiable('Alokacje faktury nie mają jednoznacznych wierszy.')
++        keys[key] = row
++    allocations = []
++    for printed_row in printed:
++        key = _stable_key(printed_row['order_number'], printed_row['sku'], printed_row['packed_qty'])
++        row = keys.pop(key, None)
++        if row is None:
++            raise _not_verifiable('Pozycje bieżącego dokumentu nie odpowiadają alokacjom faktury.')
++        allocations.append({
++            'order_item_id': int(row['order_item_id']), 'order_id': int(row['order_id']),
++            **printed_row,
++        })
++    if keys:
++        raise _not_verifiable('Bieżący dokument nie zawiera wszystkich alokacji faktury.')
++    result = {
++        'ok': True, 'batch_id': 0, 'created_at': '',
++        'order_ids': sorted({int(row['order_id']) for row in rows}),
++        'allocations': allocations, 'total_lines': len(allocations),
++        'total_qty': int(qty), 'document_id': None, 'document_path': '',
++        'document_available': True, 'document_verified': True,
++        'complete': True, 'incomplete_fields': [],
++        'history_source': 'current_invoice_document',
++        'customer': {'id': None, 'name': '', 'email': ''},
++    }
++    return _shipment_shape(result, document_type='current', verified=True, invoice_id=invoice_id)
++
++
++def _order_items_fallback(db, data):
++    """Only a missing list may fall back to an explicitly labeled order view."""
++    if data.get('today') or data.get('date'):
++        target = (datetime.now(ZoneInfo('Europe/Warsaw')).date().isoformat()
++                  if data.get('today') else date.fromisoformat(str(data['date'])).isoformat())
++        orders = db.execute('''SELECT * FROM orders WHERE substr(shipped_at,1,10)=?
++                               ORDER BY shipped_at DESC,id DESC''', (target,)).fetchall()
++        excluded = set(data.get('exclude_order_ids') or ())
++        orders = [order for order in orders if int(order['id']) not in excluded]
++    elif data.get('order_id'):
++        order = db.execute('SELECT * FROM orders WHERE id=?', (int(data['order_id']),)).fetchone()
++    elif data.get('order_number'):
++        order = db.execute('SELECT * FROM orders WHERE order_no=?', (data['order_number'],)).fetchone()
++    elif data.get('customer_id'):
++        order = db.execute('SELECT * FROM orders WHERE customer_id=? ORDER BY shipped_at DESC,id DESC LIMIT 1',
++                           (int(data['customer_id']),)).fetchone()
++    elif data.get('customer'):
++        order = db.execute('''SELECT * FROM orders WHERE LOWER(customer_name)=LOWER(?)
++                              OR LOWER(customer_email)=LOWER(?)
++                              ORDER BY shipped_at DESC,id DESC LIMIT 1''',
++                           (data['customer'], data['customer'])).fetchone()
++    else:
++        order = db.execute('''SELECT * FROM orders WHERE shipped_at IS NOT NULL
++                              ORDER BY shipped_at DESC,id DESC LIMIT 1''').fetchone()
++    if not (data.get('today') or data.get('date')):
++        orders = [order] if order else []
++    if not orders:
++        return None
++    allocations = []
++    for order in orders:
++        items = db.execute('''SELECT oi.id,oi.order_id,oi.sku,oi.qty,p.model,p.name
++                                FROM order_items oi LEFT JOIN products p ON p.id=oi.product_id
++                               WHERE oi.order_id=? ORDER BY oi.id''', (order['id'],)).fetchall()
++        allocations.extend(dict(order_item_id=int(item['id']), order_id=int(item['order_id']),
++                                order_number=order['order_no'], sku=item['sku'] or '',
++                                model_name=item['model'] or item['name'] or '', note='',
++                                packed_qty=int(item['qty'])) for item in items)
++    result = {
++        'ok': True, 'batch_id': 0, 'created_at': order['shipped_at'] or '',
++        'order_ids': [int(order['id']) for order in orders], 'allocations': allocations,
++        'total_lines': len(allocations),
++        'total_qty': sum(item['packed_qty'] for item in allocations),
++        'document_id': None, 'document_path': '', 'document_available': False,
++        'document_verified': False, 'complete': False,
++        'incomplete_fields': ['packing_list'], 'history_source': 'order_items_fallback',
++        'customer': {'id': orders[0]['customer_id'] if len(orders) == 1 else None,
++                     'name': orders[0]['customer_name'] if len(orders) == 1 else '',
++                     'email': (orders[0]['customer_email'] or '') if len(orders) == 1 else ''},
++    }
++    return _shipment_shape(result, document_type='fallback', verified=False)
++
++
++def _invoice_for_missing_history(db, data):
++    """Find the existing invoice document for the selected order/customer."""
++    if data.get('order_id') or data.get('order_number'):
++        if data.get('order_id'):
++            order = db.execute('SELECT id FROM orders WHERE id=?',
++                               (int(data['order_id']),)).fetchone()
++        else:
++            order = db.execute('SELECT id FROM orders WHERE order_no=?',
++                               (data['order_number'],)).fetchone()
++        if not order:
++            return 0
++        row = db.execute('''SELECT DISTINCT i.id FROM invoices i
++                            LEFT JOIN invoice_allocations ia ON ia.invoice_id=i.id
++                           WHERE i.order_id=? OR ia.order_id=? ORDER BY i.id DESC LIMIT 1''',
++                         (int(order['id']), int(order['id']))).fetchone()
++    elif data.get('customer_id'):
++        row = db.execute('''SELECT i.id FROM invoices i JOIN orders o ON o.id=i.order_id
++                           WHERE o.customer_id=? ORDER BY i.id DESC LIMIT 1''',
++                         (int(data['customer_id']),)).fetchone()
++    elif data.get('customer'):
++        identities = db.execute('''SELECT DISTINCT COALESCE(customer_id,id) AS identity
++                                   FROM orders WHERE LOWER(customer_name)=LOWER(?)
++                                      OR LOWER(customer_email)=LOWER(?)''',
++                                (data['customer'], data['customer'])).fetchall()
++        if len(identities) > 1:
++            raise PackingHistoryError('PACKING_HISTORY_CUSTOMER_AMBIGUOUS',
++                                      'Wskaż klienta jednoznacznie.')
++        row = db.execute('''SELECT i.id FROM invoices i JOIN orders o ON o.id=i.order_id
++                           WHERE LOWER(o.customer_name)=LOWER(?)
++                              OR LOWER(o.customer_email)=LOWER(?)
++                           ORDER BY i.id DESC LIMIT 1''',
++                         (data['customer'], data['customer'])).fetchone()
++    else:
++        return 0
++    return int(row['id']) if row else 0
++
++
++def shipment_read(data: Mapping[str, Any], *, connection_factory) -> dict[str, Any]:
++    """Use existing packing evidence; report order data only on a genuine absence."""
++    db = connection_factory()
++    try:
++        if data.get('today') or data.get('date'):
++            try:
++                target = (datetime.now(ZoneInfo('Europe/Warsaw')).date().isoformat()
++                          if data.get('today') else date.fromisoformat(str(data['date'])).isoformat())
++            except ValueError as exc:
++                raise PackingHistoryError('INVALID_DATE', 'Data musi mieć format RRRR-MM-DD.') from exc
++            batches = db.execute('''SELECT DISTINCT pb.id FROM packing_batches pb
++                                    JOIN packing_allocations pa ON pa.batch_id=pb.id
++                                    JOIN orders o ON o.id=pa.order_id
++                                   WHERE substr(o.shipped_at,1,10)=?
++                                   ORDER BY pb.id DESC''', (target,)).fetchall()
++            if batches:
++                results = [shipment_read({'batch_id': int(row['id'])}, connection_factory=connection_factory)
++                           for row in batches]
++                covered = {order_id for item in results for order_id in item['order_ids']}
++                uncovered = _order_items_fallback(db, dict(data, exclude_order_ids=covered))
++                if uncovered:
++                    results.append(uncovered)
++                if len(results) == 1:
++                    return results[0]
++                combined = dict(results[0])
++                combined['batch_id'] = 0
++                combined['packing_list_id'] = None
++                combined['document_id'] = None
++                combined['invoice_id'] = None
++                combined['document_path'] = ''
++                combined['document_available'] = False
++                combined['order_ids'] = sorted({order_id for item in results for order_id in item['order_ids']})
++                combined['allocations'] = [line for item in results for line in item['allocations']]
++                combined['total_lines'] = len(combined['allocations'])
++                combined['total_qty'] = sum(item['total_qty'] for item in results)
++                combined['complete'] = all(item['complete'] for item in results)
++                combined['verified'] = all(item['verified'] for item in results)
++                combined['created_at'] = target
++                combined['fallback_order_ids'] = sorted({order_id for item in results
++                    if item['source'] == 'order_items_fallback' for order_id in item['order_ids']})
++                combined['shipments'] = [{'packing_list_id': item['packing_list_id'],
++                                          'order_ids': item['order_ids'], 'total_units': item['total_units']}
++                                         for item in results]
++                combined = _shipment_shape(combined, document_type='historical',
++                                           verified=combined['verified'])
++                if combined['fallback_order_ids']:
++                    combined['source'] = 'mixed_packing_and_order_items_fallback'
++                return combined
++            fallback = _order_items_fallback(db, data)
++            if fallback:
++                return fallback
++            raise PackingHistoryError('PACKING_HISTORY_NOT_FOUND', 'Nie znaleziono wysyłki z tego dnia.')
++        if data.get('current'):
++            invoice_id = int(data.get('invoice_id') or 0)
++            batch_id = 0
++            if data.get('order_id'):
++                current = db.execute('''SELECT document_id FROM fulfillment_documents
++                                        WHERE order_id=? AND kind='packing_list' ''',
++                                     (int(data['order_id']),)).fetchone()
++                batch_id = int(current['document_id']) if current else 0
++                if not invoice_id:
++                    invoice = db.execute('''SELECT i.id FROM invoices i
++                                           LEFT JOIN invoice_allocations ia ON ia.invoice_id=i.id
++                                          WHERE i.order_id=? OR ia.order_id=?
++                                          ORDER BY i.id DESC LIMIT 1''',
++                                         (int(data['order_id']), int(data['order_id']))).fetchone()
++                    invoice_id = int(invoice['id']) if invoice else 0
++            if batch_id:
++                result = read({'batch_id': batch_id}, connection_factory=connection_factory)
++                if not result.get('complete') or not result.get('document_verified'):
++                    raise _not_verifiable('Bieżący dokument listy pakowej nie jest zweryfikowany.')
++                from fulfillment_operations import state as fulfillment_state
++                for member_id in result['order_ids']:
++                    current_state = fulfillment_state({'order_id': member_id})['state']['packing_list']
++                    if (not current_state['current']
++                            or int(current_state['document_id'] or 0) != batch_id):
++                        raise _not_verifiable('Lista pakowa nie jest już bieżąca dla wszystkich zamówień.')
++                return _shipment_shape(result, document_type='current', verified=True,
++                                       invoice_id=invoice_id or None)
++            if invoice_id:
++                current_invoice = _current_invoice_document(db, invoice_id)
++                if current_invoice:
++                    return current_invoice
++            fallback = _order_items_fallback(db, data)
++            if fallback:
++                return fallback
++            raise PackingHistoryError('PACKING_HISTORY_NOT_FOUND', 'Nie znaleziono bieżącej listy pakowej.')
++        if data.get('invoice_id'):
++            batch = db.execute('SELECT id FROM packing_batches WHERE invoice_id=? ORDER BY id DESC LIMIT 1',
++                               (int(data['invoice_id']),)).fetchone()
++            if batch:
++                result = read({'batch_id': int(batch['id'])}, connection_factory=connection_factory)
++                return _shipment_shape(result, document_type='historical',
++                                       verified=bool(result['complete']), invoice_id=int(data['invoice_id']))
++            current_invoice = _current_invoice_document(db, int(data['invoice_id']))
++            if current_invoice:
++                return current_invoice
++            invoice = db.execute('SELECT order_id FROM invoices WHERE id=?',
++                                 (int(data['invoice_id']),)).fetchone()
++            fallback = _order_items_fallback(db, {'order_id': invoice['order_id']}) if invoice else None
++            if fallback:
++                return fallback
++            raise PackingHistoryError('PACKING_HISTORY_NOT_FOUND', 'Nie znaleziono listy pakowej tej faktury.')
++        try:
++            result = read(data, connection_factory=connection_factory)
++        except PackingHistoryError as exc:
++            if exc.code != 'PACKING_HISTORY_NOT_FOUND':
++                raise
++            invoice_id = _invoice_for_missing_history(db, data)
++            if invoice_id:
++                current_invoice = _current_invoice_document(db, invoice_id)
++                if current_invoice:
++                    return current_invoice
++            fallback = _order_items_fallback(db, data)
++            if fallback:
++                return fallback
++            raise
++        batch = db.execute('SELECT invoice_id FROM packing_batches WHERE id=?',
++                           (int(result['batch_id']),)).fetchone()
++        return _shipment_shape(result, document_type='historical',
++                               verified=bool(result['complete']),
++                               invoice_id=int(batch['invoice_id']) if batch and batch['invoice_id'] else None)
++    finally:
++        db.close()
+--- a/migrations/warehouse_operations.sql
++++ b/migrations/warehouse_operations.sql
+@@ -19,6 +19,7 @@
+     status TEXT NOT NULL DEFAULT 'OPEN' CHECK(status IN ('OPEN','COMPLETED','CANCELLED')),
+     created_by TEXT NOT NULL REFERENCES internal_actors(actor_id),
+     conversation_id TEXT NOT NULL DEFAULT '',
++    active_product_id INTEGER REFERENCES products(id),
+     created_at TEXT NOT NULL,
+     completed_at TEXT,
+     cancelled_at TEXT

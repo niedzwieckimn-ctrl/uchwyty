@@ -8,6 +8,7 @@ state for every execution.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
+from difflib import SequenceMatcher
 import hashlib
 import json
 import logging
@@ -435,7 +436,10 @@ PACKING_HISTORY_INPUT = {
         "customer_id": {"type": "integer", "minimum": 1, "maximum": 9_223_372_036_854_775_807},
         "customer": {"type": "string", "minLength": 1, "maxLength": 160},
         "today": {"type": "boolean"},
+        "date": {"type": "string", "minLength": 10, "maxLength": 10},
         "latest": {"type": "boolean"},
+        "current": {"type": "boolean"},
+        "invoice_id": {"type": "integer", "minimum": 1},
     },
 }
 _PACKING_HISTORY_ALLOCATION = {
@@ -466,6 +470,16 @@ PACKING_HISTORY_OUTPUT = {
         "complete": {"type": "boolean"},
         "incomplete_fields": {"type": "array", "items": {"type": "string"}},
         "history_source": {"type": "string"},
+        "invoice_id": {"type": ["integer", "null"]},
+        "packing_list_id": {"type": ["integer", "null"]},
+        "orders": {"type": "array", "maxItems": 500},
+        "all_items": {"type": "array", "maxItems": 500},
+        "total_units": {"type": "integer"},
+        "document_type": {"type": "string"},
+        "verified": {"type": "boolean"},
+        "source": {"type": "string"},
+        "shipments": {"type": "array", "maxItems": 100},
+        "fallback_order_ids": {"type": "array", "maxItems": 500, "items": {"type": "integer"}},
         "customer": {
             "type":"object", "additionalProperties":False,
             "required":["id","name","email"],
@@ -730,7 +744,7 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
     ),
     packing_history.OPERATION: BusinessOperationDefinition(
         packing_history.OPERATION, 1,
-        "Odczytuje dokładną historyczną listę pakową po batch_id, wewnętrznym order_id, historycznym order_number, customer_id, dokładnej nazwie/e-mailu klienta, today=true albo latest=true. Źródłem prawdy jest utrwalony snapshot packing allocations; PDF jest opcjonalnym dokumentem i ma osobne pola dostępności oraz weryfikacji. Nie używa bieżących order_items, stanów, dostępności ani sum zamówień i nie zgaduje brakujących pól.",
+        "Odczytuje rzeczywistą zawartość wysyłki z listy pakowej dla batch_id, order_id, order_number, klienta, dziś lub ostatnio. current=true czyta bieżący dokument, np. wskazany w UI, a domyślnie niemodyfikowalny snapshot historyczny. Dopiero gdy lista nie istnieje, zwraca jawnie oznaczone order_items_fallback; nigdy nie zastępuje nimi niezweryfikowanej listy.",
         "packing.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
         PACKING_HISTORY_INPUT, PACKING_HISTORY_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
@@ -1007,6 +1021,13 @@ def initialize_schema(db: sqlite3.Connection) -> None:
     count_columns = {row['name'] for row in db.execute('PRAGMA table_info(internal_inventory_count_sessions)').fetchall()}
     if 'conversation_id' not in count_columns:
         db.execute("ALTER TABLE internal_inventory_count_sessions ADD COLUMN conversation_id TEXT NOT NULL DEFAULT ''")
+    if 'active_product_id' not in count_columns:
+        try:
+            db.execute("ALTER TABLE internal_inventory_count_sessions ADD COLUMN active_product_id INTEGER")
+        except sqlite3.OperationalError as exc:
+            # Two workers can inspect the old schema before either commits.
+            if 'duplicate column name' not in str(exc).lower():
+                raise
     db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_inventory_count_open_owner_conversation
                   ON internal_inventory_count_sessions(created_by,conversation_id)
                   WHERE status='OPEN' AND conversation_id<>''""")
@@ -2043,7 +2064,7 @@ def _china_orders_summary(data, actor, correlation_id, transaction_connection=No
 
 def _packing_history_read(data):
     try:
-        return packing_history.read(data, connection_factory=_factory())
+        return packing_history.shipment_read(data, connection_factory=_factory())
     except packing_history.PackingHistoryError as exc:
         raise ControlledOperationError(exc.code, exc.safe_message) from exc
 
@@ -2221,6 +2242,92 @@ def active_inventory_count_session(ai_actor, human_actor, conversation_id):
                           ORDER BY created_at DESC LIMIT 1""",(human.actor_id,conversation_id)).fetchone()
         return str(row['session_id']) if row else ''
     finally: db.close()
+
+
+def inventory_count_active_product(ai_actor, human_actor, conversation_id):
+    """Only an open session, owned by this human and conversation, can supply a bare number."""
+    ai = _trusted_actor(ai_actor)
+    human = load_actor_context(human_actor.actor_id) if isinstance(human_actor, ActorContext) else None
+    if human is None or human.actor_type != 'HUMAN' or ai.delegated_by_actor_id != human.actor_id:
+        raise ControlledOperationError('UNTRUSTED_ACTOR', 'Brak zaufanego właściciela sesji', status=DENIED)
+    db = _factory()()
+    try:
+        _assert_count_conversation(db, ai, conversation_id)
+        row = db.execute("""SELECT active_product_id FROM internal_inventory_count_sessions
+                            WHERE created_by=? AND conversation_id=? AND status='OPEN'""",
+                         (human.actor_id, conversation_id)).fetchone()
+        return int(row['active_product_id']) if row and row['active_product_id'] else None
+    finally:
+        db.close()
+
+
+def set_inventory_count_active_product(ai_actor, human_actor, conversation_id, product_id):
+    """Remember one explicitly read product; never infer it from old conversation artifacts."""
+    ai = _trusted_actor(ai_actor)
+    human = load_actor_context(human_actor.actor_id) if isinstance(human_actor, ActorContext) else None
+    if human is None or human.actor_type != 'HUMAN' or ai.delegated_by_actor_id != human.actor_id:
+        raise ControlledOperationError('UNTRUSTED_ACTOR', 'Brak zaufanego właściciela sesji', status=DENIED)
+    if ai.permission_decision('inventory.read') == PERMISSION_DENY or human.permission_decision('inventory.read') == PERMISSION_DENY:
+        raise ControlledOperationError('PERMISSION_DENIED', 'Brak dostępu do produktu', status=DENIED)
+    db = _factory()()
+    try:
+        _assert_count_conversation(db, ai, conversation_id)
+        if not db.execute('SELECT 1 FROM products WHERE id=? AND COALESCE(archived,0)=0',
+                          (product_id,)).fetchone():
+            raise ControlledOperationError('PRODUCT_NOT_FOUND', 'Nie znaleziono produktu', status=CONFLICT)
+        changed = db.execute("""UPDATE internal_inventory_count_sessions SET active_product_id=?
+                              WHERE created_by=? AND conversation_id=? AND status='OPEN'""",
+                             (product_id, human.actor_id, conversation_id)).rowcount
+        db.commit()
+        return bool(changed)
+    finally:
+        db.close()
+
+
+def resolve_inventory_count_product(ai_actor, human_actor, conversation_id, query):
+    """Bounded local identity lookup for an open remanent, without replenishment analytics."""
+    ai = _trusted_actor(ai_actor)
+    human = load_actor_context(human_actor.actor_id) if isinstance(human_actor, ActorContext) else None
+    if human is None or human.actor_type != 'HUMAN' or ai.delegated_by_actor_id != human.actor_id:
+        raise ControlledOperationError('UNTRUSTED_ACTOR', 'Brak zaufanego właściciela sesji', status=DENIED)
+    if ai.permission_decision('inventory.read') == PERMISSION_DENY or human.permission_decision('inventory.read') == PERMISSION_DENY:
+        raise ControlledOperationError('PERMISSION_DENIED', 'Brak dostępu do produktu', status=DENIED)
+    def norm(value):
+        value = unicodedata.normalize('NFKD', str(value or '').casefold()).replace('ł', 'l')
+        return ' '.join(re.sub(r'[^a-z0-9]+', ' ', ''.join(ch for ch in value
+                        if not unicodedata.combining(ch))).split())
+    needle = norm(query)
+    if len(needle) < 3:
+        return []
+    db = _factory()()
+    try:
+        _assert_count_conversation(db, ai, conversation_id)
+        active = db.execute("""SELECT 1 FROM internal_inventory_count_sessions
+                               WHERE created_by=? AND conversation_id=? AND status='OPEN'""",
+                            (human.actor_id, conversation_id)).fetchone()
+        if not active:
+            return []
+        rows = db.execute("""SELECT id,sku,model,name,ean FROM products
+                             WHERE COALESCE(archived,0)=0""").fetchall()
+    finally:
+        db.close()
+    scored = []
+    for row in rows:
+        fields = [norm(row[key]) for key in ('sku', 'model', 'name', 'ean')]
+        exact = needle in fields or needle.replace(' ', '') in [field.replace(' ', '') for field in fields]
+        prefix = any(field.startswith(needle + ' ') for field in fields if field)
+        fuzzy = max((SequenceMatcher(None, needle, field).ratio()
+                     for field in fields if field and len(field) >= 4), default=0.0)
+        score = 3.0 if exact else 2.0 if prefix else fuzzy if fuzzy >= 0.88 else 0.0
+        if score:
+            scored.append((score, {'id': int(row['id']), 'sku': row['sku'] or '',
+                                    'model': row['model'] or '', 'name': row['name'] or ''}))
+    scored.sort(key=lambda item: (-item[0], item[1]['id']))
+    if not scored:
+        return []
+    best = scored[0][0]
+    return [record for score, record in scored if score == best or
+            (best < 2 and best - score < 0.08)][:5]
 
 
 def inventory_adjustment_preview(ai_actor, human_actor, conversation_id, product_id):
@@ -2426,6 +2533,8 @@ def _inventory_count_record(data, actor, correlation_id, transaction_connection=
                           data['expected_version'],status,data.get('note'),human_id,now))
     except sqlite3.IntegrityError:
         raise ControlledOperationError('COUNT_ALREADY_RECORDED','Produkt został już policzony w tej sesji',status=CONFLICT)
+    db.execute('UPDATE internal_inventory_count_sessions SET active_product_id=NULL WHERE session_id=?',
+               (data['count_session_id'],))
     record_audit_event('inventory.count.record',result=SUCCESS,actor_context=actor,entity_type='product',entity_id=str(data['product_id']),
         correlation_id=correlation_id,expected_version=data['expected_version'],entity_version_before=data['expected_version'],
         entity_version_after=data['expected_version'],after_state={'count_item_id':cur.lastrowid,'expected_quantity':expected,
@@ -2442,7 +2551,7 @@ def _inventory_count_complete(data, actor, correlation_id, transaction_connectio
     unresolved=int(db.execute("SELECT COUNT(*) n FROM internal_inventory_count_items WHERE session_id=? AND status='PENDING_ADJUSTMENT'",(data['count_session_id'],)).fetchone()['n'])
     if unresolved:
         raise ControlledOperationError('UNRESOLVED_DISCREPANCIES','Nie można zakończyć remanentu z nierozwiązanymi rozbieżnościami',status=CONFLICT)
-    db.execute("UPDATE internal_inventory_count_sessions SET status='COMPLETED',completed_at=? WHERE session_id=? AND status='OPEN'",(_now(),data['count_session_id']))
+    db.execute("UPDATE internal_inventory_count_sessions SET status='COMPLETED',active_product_id=NULL,completed_at=? WHERE session_id=? AND status='OPEN'",(_now(),data['count_session_id']))
     record_audit_event('inventory.count.complete',result=SUCCESS,actor_context=actor,entity_type='inventory_count_session',entity_id=data['count_session_id'],
         correlation_id=correlation_id,before_state={'status':'OPEN'},after_state={'status':'COMPLETED'},transaction_connection=db)
     return {'ok':True,'count_id':data['count_session_id'],'status':'COMPLETED'}
