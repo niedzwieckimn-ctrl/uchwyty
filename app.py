@@ -2918,6 +2918,11 @@ BUSINESS_FRESHNESS_GROUPS = {
                  ("cash_flow_settings", "key")],
     "china": [("products", "id"), ("china_packages", "id"), ("china_items", "id")],
     "sales": [("orders", "id"), ("order_items", "id"), ("invoices", "id"), ("invoice_meta", "invoice_id")],
+    "dashboard": [("products", "id"), ("stock", "product_id"), ("orders", "id"),
+                  ("order_items", "id"), ("invoice_allocations", "id"),
+                  ("invoices", "id"), ("invoice_meta", "invoice_id"),
+                  ("china_packages", "id"), ("china_items", "id"),
+                  ("pricing", "model"), ("cash_flow_settings", "key")],
 }
 BUSINESS_FRESHNESS_DATA_TABLES = {
     group: tuple(table for table, _conflict in specs if table != "cash_flow_settings")
@@ -2925,6 +2930,7 @@ BUSINESS_FRESHNESS_DATA_TABLES = {
 }
 BUSINESS_FRESHNESS_OPERATION_GROUP = {
     'business.query': 'inventory',
+    'dashboard.read': 'dashboard',
     'business.orders.state': 'inventory',
     'business.inventory.state': 'inventory',
     'business.finance.state': 'sales',

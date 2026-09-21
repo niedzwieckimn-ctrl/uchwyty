@@ -17,7 +17,7 @@ import orders_operational_state
 FEATURE_FLAG = "AGENT_HIGH_LEVEL_READ_MODELS_ENABLED"
 READ_OPERATIONS = frozenset({
     "business.orders.state", "business.inventory.state", "business.finance.state",
-    "business.deliveries.state", "business.daily.state",
+    "business.deliveries.state", "business.daily.state", "dashboard.read",
 })
 PLANNER_READ_OPERATIONS = READ_OPERATIONS | {"business.query"}
 MAX_SECTION_ITEMS = 50

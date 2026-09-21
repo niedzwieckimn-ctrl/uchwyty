@@ -32,6 +32,7 @@ import search_analytics
 import agent_conversation
 import business_query
 import business_read_models
+import dashboard_read
 import internal_approval as approvals
 from cash_flow_module import (
     CASHFLOW_READ_OPERATION, business_read as cashflow_business_read,
@@ -66,7 +67,7 @@ HIGH_LEVEL_READ_OPERATIONS = business_read_models.READ_OPERATIONS
 DIRECT_READ_RESULT_OPERATIONS = GENERIC_READ_OPERATIONS | HIGH_LEVEL_READ_OPERATIONS | {
     packing_history.OPERATION, payment_reminders.READ,
     search_analytics.OPERATION,
-    CASHFLOW_READ_OPERATION,
+    CASHFLOW_READ_OPERATION, "dashboard.read",
 }
 CAPABILITY_CONTRACTS = {
     packing_history.OPERATION: {
@@ -117,6 +118,7 @@ FRESHNESS_GROUP_BY_OPERATION = {
     "business.orders.state": "orders_state", "business.inventory.state": "inventory_state",
     "business.finance.state": "finance_state", "business.deliveries.state": "deliveries_state",
     "business.daily.state": "daily_state",
+    "dashboard.read": "dashboard",
     "inventory.product.search": "inventory", "inventory.product.get": "inventory", "inventory.summary": "inventory",
     "inventory.replenishment.ranking": "inventory",
     "orders.search": "orders", "orders.get": "orders", "orders.summary": "orders",
@@ -554,6 +556,27 @@ _ORDER_WRITE_OUTPUT = {'type': 'object', 'required': ['ok', 'order_id', 'version
     'properties': {'ok': {'type': 'boolean'}, 'order_id': {'type': 'integer'},
                    'version': {'type': 'integer'}, 'status': {'type': 'string'}, 'note_id': {'type': 'integer'}}}
 
+DASHBOARD_READ_INPUT = {
+    "type": "object", "additionalProperties": False,
+    "properties": {"include_items": {"type": "boolean"}},
+}
+DASHBOARD_READ_OUTPUT = {
+    "type": "object", "required": [
+        "ok", "read_model", "as_of", "complete", "truncated", "scope",
+        "inventory_value", "new_orders", "issued_today", "ready_to_issue_today",
+        "overdue_count", "overdue_amount", "replenishment_count", "replenishment_items",
+    ],
+    "properties": {
+        "ok": {"type": "boolean"}, "read_model": {"type": "string"},
+        "as_of": {"type": "string"}, "complete": {"type": "boolean"},
+        "truncated": {"type": "boolean"}, "scope": {"type": "object"},
+        "inventory_value": {"type": "number"}, "new_orders": {"type": "integer"},
+        "issued_today": {"type": "integer"}, "ready_to_issue_today": {"type": "integer"},
+        "overdue_count": {"type": "integer"}, "overdue_amount": {"type": "number"},
+        "replenishment_count": {"type": "integer"}, "replenishment_items": {"type": "array"},
+    },
+}
+
 OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
     "agent.terminology.search": BusinessOperationDefinition(
         "agent.terminology.search", 1, "Odczytuje zapisane znaczenie terminu firmy i wersję. Query jest fragmentem nazwy terminu, nie zdaniem do interpretacji.",
@@ -631,6 +654,13 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
         "Zwraca kompaktową listę działań wymaganych dziś: wysyłki, płatności, niepokryte braki i dostawy wymagające uwagi.",
         "business.generic_read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
         business_read_models.DAILY_STATE_INPUT, business_read_models.STATE_OUTPUT,
+        IDEMPOTENCY_NONE, "READ_STANDARD", True,
+    ),
+    "dashboard.read": BusinessOperationDefinition(
+        "dashboard.read", 1,
+        "Zwraca dokładne wartości kafelków głównego pulpitu: wartość magazynu, nowe i wydane dziś zamówienia, gotowe do wydania, zaległości oraz ranking uzupełnień. Korzysta z tej samej kalkulacji co dashboard.",
+        "inventory.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
+        DASHBOARD_READ_INPUT, DASHBOARD_READ_OUTPUT,
         IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
     "business.inventory.state": BusinessOperationDefinition(
@@ -1127,6 +1157,8 @@ def _entity(definition: BusinessOperationDefinition, data: Mapping[str, Any]) ->
         return "orders_operational_state", str(data.get("order_id") or data.get("customer_id") or "active"), None
     if definition.operation_name == "business.daily.state":
         return "daily_operational_state", "today", None
+    if definition.operation_name == "dashboard.read":
+        return "dashboard", "main", None
     if definition.operation_name == "business.inventory.state":
         return "inventory_operational_state", "current", None
     if definition.operation_name == "business.finance.state":
@@ -2549,6 +2581,16 @@ _HANDLERS: dict[str, Callable[[Mapping[str, Any], ActorContext, str, sqlite3.Con
         business_read_models.daily_state(
             data, actor, correlation_id, transaction_connection,
             connection_factory=_factory(),
+        ),
+    "dashboard.read": lambda data, actor, correlation_id, transaction_connection=None:
+        dashboard_read.build_dashboard_read(
+            _factory(), current_time=_business_now(),
+            overdue_invoice_rows=lambda db: cash_flow_overdue_invoices(
+                db, current_time=_business_now()),
+            build_replenishment_analysis=build_replenishment_analysis,
+            recommended_replenishments=recommended_replenishments,
+            calculate_fulfillment_readiness=calculate_fulfillment_readiness,
+            include_items=bool(data.get('include_items', True)),
         ),
     "business.inventory.state": lambda data, actor, correlation_id, transaction_connection=None:
         business_read_models.inventory_state(

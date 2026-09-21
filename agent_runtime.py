@@ -338,6 +338,16 @@ def _detect_read_intent(value: str) -> str:
     normalized = ' '.join(str(value or '').casefold().split()).strip(' ?!.')
     if _is_packing_history_read(normalized):
         return 'packing_history'
+    if (
+        re.search(r'\b(?:pulpit|dashboard)\b', normalized)
+        or re.search(r'\b(?:wartość|wartosc)\s+(?:magazynu|zapas\w*)\b', normalized)
+        or re.search(r'\b(?:nowe\s+zam[oó]wienia|wydane\s+(?:dziś|dzis|dzisiaj)|'
+                    r'(?:ile|co)\s+(?:dziś|dzis|dzisiaj)\s+wyda\w*|'
+                    r'(?:możesz|mozna|można)\s+(?:dziś|dzis|dzisiaj)?\s*wyda\w*|'
+                    r'co\s+trzeba\s+uzupełni\w*|mam\s+(?:jakieś|jakies)\s+zaległ\w*)\b',
+                    normalized)
+    ):
+        return 'dashboard_read'
     outgoing = re.search(r'\b(?:wysła\w*|wysla\w*|wysłan\w*|wyslan\w*|wydał\w*|wydal\w*|wydan\w*|poszło|poszlo|wyszło|wyszlo)\b', normalized)
     order_scope = re.search(r'\b(?:zam[oó]wieni\w*|klient\w*|przesył\w*|przesyl\w*)\b', normalized)
     if outgoing and (order_scope or re.search(r'\b(?:wysłałem|wyslalem|wysłaliśmy|wyslalismy)\b', normalized)):
@@ -512,6 +522,7 @@ _INTENT_TOOL_NAMES = {
 # Specialist reads already define the source of truth. Keep their contracts
 # when high-level read models are enabled instead of exposing raw alternatives.
 _SPECIALIST_READ_TOOLS = {
+    'dashboard_read': frozenset({'dashboard.read'}),
     'sales_analytics': frozenset({'business.sales.summary'}),
     'search_analytics': frozenset({'search.analytics.read'}),
     'cashflow_analytics': frozenset({'cashflow.read'}),
@@ -529,6 +540,8 @@ jeśli użytkownik pyta o frazy, i nazwij je frazami. Uwzględniaj complete/trun
 Dla wysyłek filtruj orders.search po date_field=shipped_at, dla pakowania po packed_at,
 a created_at tylko dla daty złożenia. „Wydane z magazynu” i „wysłane” nie są tym samym:
 gdy brak jednoznacznego zdarzenia, doprecyzuj, zamiast traktować brak snapshotu jako brak wydań.
+Pytania o pulpit, wartość magazynu, nowe lub wydane dziś zamówienia, zaległości i uzupełnienia
+obsługuj wyłącznie przez dashboard.read; podaj wartość z tego wyniku bez własnego przeliczania.
 '''
 
 
@@ -720,6 +733,7 @@ a tylko dla pytania łączącego dwa obszary maksymalnie dwa gotowe modele READ:
 - business.finance.state: należności, zaległości i podstawowa sprzedaż,
 - business.deliveries.state: aktywne P/O z Chin, ich pozycje, etapy i problemy,
 - business.daily.state: wyłącznie konkretne działania wymagane dzisiaj.
+- dashboard.read: dokładne wartości i ranking z głównego pulpitu.
 Nie ograniczaj nowego pytania do zakresu poprzedniej odpowiedzi, jeśli użytkownik rozszerza, koryguje lub zmienia
 obszar. Gotowy business.*.state jest ograniczonym widokiem operacyjnym, a nie pełnym katalogiem encji. Pusta sekcja
 oznacza brak wpisu w tym widoku i jego zakresie; nie dowodzi, że produkt, klient, zamówienie albo zdarzenie nie istnieje
@@ -850,6 +864,20 @@ def _is_contextual_inventory_count_followup(value: str) -> bool:
     if not normalized or re.search(r'\b(?:sprawdź|sprawdz|produkt|model|sku)\b', normalized, re.IGNORECASE):
         return False
     return bool(_CONTEXTUAL_INVENTORY_COUNT.match(normalized))
+
+
+_FAST_INVENTORY_COUNT = re.compile(
+    r'^\s*(\d{1,7})(?:\s*(?:szt\.?|sztuk))?\s*[.!?]?\s*$',
+    re.IGNORECASE,
+)
+
+
+def _fast_inventory_count_quantity(value: str) -> int | None:
+    """Accept only an unambiguous quantity-only remanent follow-up."""
+    match = _FAST_INVENTORY_COUNT.fullmatch(str(value or ''))
+    if not match:
+        return None
+    return int(match.group(1))
 
 
 def _memory_contract_text(value: str) -> str:
@@ -1566,6 +1594,186 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
             )
             return finish('SUCCESS', answer, voice_response_mode=(
                 'direct' if packing_history_document_followup else 'full_detail'))
+
+        # A quantity-only remanent follow-up is deterministic once the trusted
+        # previous turn identifies one product and an open count session exists.
+        # Keep the normal model path for every other message, including a
+        # quantity without an active session or with ambiguous product context.
+        fast_count_quantity = _fast_inventory_count_quantity(turn_message)
+        fast_product_id = previous_turn_entities.get('product')
+        if (fast_count_quantity is not None and fast_product_id
+                and not eligible_approvals and execution_outcome is None):
+            try:
+                fast_product_id = int(fast_product_id)
+                fast_count_session = business_operations.active_inventory_count_session(
+                    ai_actor, human_actor, conversation_id)
+            except Exception:
+                fast_count_session = ''
+            if fast_count_session:
+                def fast_inventory_call(operation, arguments, *, read_only=False):
+                    nonlocal current_stage
+                    current_stage = 'fast_inventory_operation'
+                    definition = business_operations.OPERATION_REGISTRY[operation]
+                    timings['tool_calls_count'] += 1
+                    _audit(
+                        'agent.tool_selected', ai_actor, run_id, correlation_id, SUCCESS,
+                        human_actor.actor_id, tool_name=operation,
+                        conversation_id=conversation_id, selection_reason='fast_inventory_count',
+                    )
+                    started_operation = time.perf_counter()
+                    try:
+                        result = business_operations.execute_business_operation(
+                            ai_actor, operation, arguments, correlation_id=correlation_id,
+                        )
+                    except Exception as exc:
+                        logger.error('AI_FAST_INVENTORY_OPERATION_FAILED %s', json.dumps({
+                            'agent_run_id': run_id, 'tool_name': operation,
+                            'exception_type': type(exc).__name__,
+                        }, sort_keys=True), exc_info=True)
+                        result = business_operations.OperationResult(
+                            status='FAILED', data=None, operation=operation,
+                            operation_version=definition.operation_version,
+                            execution_id='', request_id=ai_actor.request_id,
+                            correlation_id=correlation_id,
+                            error_code='DATA_UNAVAILABLE',
+                            safe_error_message='Nie udało się odczytać lub zapisać liczenia.',
+                        )
+                    elapsed = round((time.perf_counter() - started_operation) * 1000, 2)
+                    timings['business_operation_ms'] = round(
+                        timings['business_operation_ms'] + elapsed, 2)
+                    timings['tool_execution_ms'] = round(
+                        timings['tool_execution_ms'] + elapsed, 2)
+                    if read_only:
+                        timings['supabase_business_reads_ms'] = round(
+                            timings['supabase_business_reads_ms'] + elapsed, 2)
+                    _audit(
+                        'agent.tool_result', ai_actor, run_id, correlation_id,
+                        SUCCESS if result.status == 'SUCCESS' else FAILED,
+                        human_actor.actor_id, tool_name=operation,
+                        execution_id=result.execution_id, result_status=result.status,
+                        conversation_id=conversation_id,
+                    )
+                    payload = result.data if result.status == 'SUCCESS' else {
+                        'ok': False, 'status': result.status,
+                        'error_code': result.error_code,
+                        'error': result.safe_error_message,
+                    }
+                    call_id = 'fast-inventory-' + str(timings['tool_calls_count']) + '-' + run_id
+                    evidence.extend([
+                        {'type': 'function_call', 'call_id': call_id,
+                         'name': operation, 'arguments': json.dumps(
+                             arguments, ensure_ascii=False, separators=(',', ':'))},
+                        {'type': 'function_call_output', 'call_id': call_id,
+                         'output': json.dumps(payload, ensure_ascii=False, separators=(',', ':'))},
+                    ])
+                    if result.status == 'SUCCESS':
+                        chat_503_diagnostics['tool_calls_ok'] += 1
+                        if _artifact_builder and isinstance(result.data, dict):
+                            try:
+                                if operation == 'inventory.count.record':
+                                    artifacts[:] = [item for item in artifacts
+                                                     if item.get('type') != 'inventory_count_card']
+                                candidates = _artifact_builder(operation, result.data)
+                                if isinstance(candidates, list):
+                                    for candidate in candidates:
+                                        if (isinstance(candidate, dict) and len(artifacts) < 6
+                                                and candidate not in artifacts):
+                                            artifacts.append(candidate)
+                            except Exception:
+                                logger.exception('AI_ARTIFACT_BUILD_FAILED fast inventory')
+                        artifact_sources.extend(build_artifact_sources(
+                            operation, result.data, conversation_id, run_id))
+                    return result
+
+                expected_result = fast_inventory_call(
+                    'inventory.count.get_expected', {'product_id': fast_product_id},
+                    read_only=True,
+                )
+                if expected_result.status != 'SUCCESS':
+                    return finish(
+                        expected_result.status,
+                        expected_result.safe_error_message
+                        or 'Nie udało się odczytać aktualnego stanu produktu.',
+                        expected_result.error_code or 'DATA_UNAVAILABLE',
+                    )
+                expected_data = dict(expected_result.data or {})
+                try:
+                    expected_version = int(expected_data['version'])
+                except (KeyError, TypeError, ValueError):
+                    return finish('FAILED', 'Nie udało się ustalić wersji stanu produktu.',
+                                  'DATA_UNAVAILABLE')
+                count_result = fast_inventory_call(
+                    'inventory.count.record', {
+                        'product_id': fast_product_id,
+                        'count_session_id': fast_count_session,
+                        'conversation_id': conversation_id,
+                        'counted_quantity': fast_count_quantity,
+                        'expected_version': expected_version,
+                        'idempotency_key': run_id + ':inventory-count-record',
+                    },
+                )
+                if count_result.status != 'SUCCESS':
+                    return finish(
+                        count_result.status,
+                        count_result.safe_error_message or 'Nie udało się zapisać liczenia.',
+                        count_result.error_code or 'COUNT_RECORD_FAILED',
+                    )
+                count_data = dict(count_result.data or {})
+                display_name = str(
+                    count_data.get('model') or count_data.get('name')
+                    or count_data.get('sku') or fast_product_id
+                )
+                difference = int(count_data.get('difference') or 0)
+                if difference == 0:
+                    return finish(
+                        'SUCCESS',
+                        f'Policzono {display_name}: {fast_count_quantity} szt. '
+                        'Stan jest zgodny z systemem. Następny produkt.',
+                        voice_response_mode='direct',
+                    )
+
+                adjust_arguments = {
+                    'product_id': fast_product_id,
+                    'count_session_id': fast_count_session,
+                    'conversation_id': conversation_id,
+                    'expected_version': int(count_data.get('version') or expected_version),
+                    'idempotency_key': run_id + ':inventory-adjust',
+                }
+                adjust_result = fast_inventory_call('inventory.adjust', adjust_arguments)
+                if adjust_result.status == 'PENDING_APPROVAL':
+                    import human_approval
+                    human_approval.bind(
+                        business_operations, adjust_result.approval_id,
+                        conversation_id, human_actor, run_id,
+                    )
+                    approval = {
+                        'approval_id': adjust_result.approval_id,
+                        'operation': 'inventory.adjust',
+                        'expected_version': adjust_arguments['expected_version'],
+                        'product_id': fast_product_id,
+                        'count_session_id': fast_count_session,
+                    }
+                    try:
+                        approval.update(business_operations.inventory_adjustment_preview(
+                            ai_actor, human_actor, conversation_id, fast_product_id))
+                    except business_operations.ControlledOperationError:
+                        pass
+                    pending_approvals.append(approval)
+                    return finish(
+                        'SUCCESS',
+                        f'Policzono {display_name}: {fast_count_quantity} szt. '
+                        f'Różnica względem systemu: {difference:+d}. '
+                        'Czy zatwierdzić korektę? Decyzja czeka na zatwierdzenie.',
+                        voice_response_mode='direct',
+                    )
+                return finish(
+                    'SUCCESS',
+                    f'Policzono {display_name}: {fast_count_quantity} szt. '
+                    f'Różnica względem systemu: {difference:+d}. '
+                    'Nie utworzono korekty do zatwierdzenia: '
+                    + (adjust_result.safe_error_message or 'operacja była niedostępna.'),
+                    voice_response_mode='direct',
+                )
         while True:
             check_cancelled()
             current_stage = 'model_context_check'
