@@ -19,13 +19,10 @@ def candidates(now):
             WHERE i.publication_state='complete' AND substr(i.created_at,1,10)>=? ORDER BY i.id''',(start,))]
     finally:c.close()
     # Render cron is scheduled in UTC, while the business cut-off is Warsaw
-    # time. Requiring the exact local hour silently skipped every new invoice
-    # whenever the job reached the process at 18:00/19:00. At and after 17:00
-    # the daily run may safely catch up; KSeF attempt checkpoints prevent a
-    # second submission when an earlier result is uncertain.
+    # time. At and after 17:00 only invoices that have never been sent are eligible.
     after_daily_cutoff = now.hour >= 17
-    return [x['id'] for x in rows if not (x['ksef_number'] and x['mailed']) and
-            (after_daily_cutoff or x['ksef_number'] or x['status'] in ('sending','processing','unknown'))]
+    return [x['id'] for x in rows if after_daily_cutoff and
+            not x['ksef_number'] and (x['status'] is None or x['status'] in ('draft','ready'))]
 
 def main():
     now=datetime.now(ZoneInfo('Europe/Warsaw'))
