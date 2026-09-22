@@ -32,13 +32,12 @@ CREATE TABLE IF NOT EXISTS internal_inventory_count_items(
     counted_quantity INTEGER NOT NULL CHECK(counted_quantity >= 0),
     difference INTEGER NOT NULL,
     stock_version INTEGER NOT NULL CHECK(stock_version >= 0),
-    status TEXT NOT NULL CHECK(status IN ('MATCHED','PENDING_ADJUSTMENT','ADJUSTED')),
+    status TEXT NOT NULL CHECK(status IN ('MATCHED','PENDING_ADJUSTMENT','ADJUSTED','SUPERSEDED','COUNT_ONLY')),
     note TEXT,
     created_by TEXT NOT NULL REFERENCES internal_actors(actor_id),
     created_at TEXT NOT NULL,
     adjusted_execution_id TEXT,
-    adjusted_at TEXT,
-    UNIQUE(session_id, product_id)
+    adjusted_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_inventory_count_items_session
     ON internal_inventory_count_items(session_id, product_id);
