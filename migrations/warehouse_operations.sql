@@ -20,6 +20,9 @@ CREATE TABLE IF NOT EXISTS internal_inventory_count_sessions(
     created_by TEXT NOT NULL REFERENCES internal_actors(actor_id),
     conversation_id TEXT NOT NULL DEFAULT '',
     active_product_id INTEGER REFERENCES products(id),
+    voice_state TEXT NOT NULL DEFAULT 'WAIT_PRODUCT'
+        CHECK(voice_state IN ('WAIT_PRODUCT','WAIT_COUNT','WAIT_APPROVAL')),
+    pending_approval_id TEXT,
     created_at TEXT NOT NULL,
     completed_at TEXT,
     cancelled_at TEXT
