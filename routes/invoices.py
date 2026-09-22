@@ -703,18 +703,12 @@ def register_routes(context):
         selected_currency = norm(request.args.get("currency")).upper()
         selected_ksef = norm(request.args.get("ksef"))
         selected_sent = norm(request.args.get("sent"))
-        history_search_active = any((
-            q, selected_customer, selected_month, selected_payment,
-            selected_type, selected_currency, selected_ksef, selected_sent,
-        ))
-        default_limited = not history_search_active
+        recent_only = norm(request.args.get("period")) == "30d"
         cutoff_date = (app_now().date() - timedelta(days=30)).isoformat()
         c = conn()
         cur = c.cursor()
-        params = [] if history_search_active else [cutoff_date]
-        where = "" if history_search_active else "WHERE i.issue_date >= ?"
 
-        cur.execute(f"""
+        cur.execute("""
           SELECT
             i.*,
             COALESCE(m.pdf_path,'') AS pdf_path,
@@ -737,9 +731,8 @@ def register_routes(context):
           LEFT JOIN invoice_meta m ON m.invoice_id = i.id
           LEFT JOIN ksef_documents k ON k.invoice_id = i.id
           LEFT JOIN orders o ON o.id = i.order_id
-          {where}
           ORDER BY LOWER(COALESCE(i.buyer_name, o.customer_name, '')), i.issue_date DESC, i.id DESC
-        """, params)
+        """)
         rows = [dict(r) for r in cur.fetchall()]
         c.close()
 
@@ -759,7 +752,6 @@ def register_routes(context):
             due = norm(inv.get("payment_to"))[:10]
             inv["payment_status"] = "paid" if inv.get("paid") else ("overdue" if due and due < today else "unpaid")
             inv["payment_status_label"] = {"paid": "Zapłacona", "overdue": "Po terminie", "unpaid": "Nieopłacona"}[inv["payment_status"]]
-            inv["pdf_ok"] = 1 if (invoice_pdf_exists(inv.get("pdf_path", ""), inv.get("invoice_no", ""))[0] or inv.get("invoice_items_json")) else 0
 
         all_rows = list(rows)
         summary = {
@@ -783,7 +775,8 @@ def register_routes(context):
         currencies = sorted({inv["currency"] for inv in all_rows})
         query = q.casefold()
         rows = [inv for inv in all_rows if (
-            (not query or any(query in norm(inv.get(field)).casefold() for field in ("invoice_no", "customer_display", "source_order_no", "source_order_note")))
+            (not recent_only or norm(inv.get("issue_date"))[:10] >= cutoff_date)
+            and (not query or any(query in norm(inv.get(field)).casefold() for field in ("invoice_no", "customer_display", "source_order_no", "source_order_note")))
             and (not selected_customer or inv["customer_display"] == selected_customer)
             and (not selected_month or norm(inv.get("issue_date"))[:7] == selected_month)
             and (not selected_payment or (selected_payment == "open" and not inv.get("paid")) or inv["payment_status"] == selected_payment)
@@ -793,6 +786,15 @@ def register_routes(context):
             and (not selected_sent or (selected_sent == "sent" and inv.get("sent_to_client")) or (selected_sent == "unsent" and not inv.get("sent_to_client")))
         )]
         rows.sort(key=lambda inv: (norm(inv.get("issue_date")), int(inv.get("id") or 0)), reverse=True)
+        total_filtered = len(rows)
+        page_size = 50
+        page_count = max(1, (total_filtered + page_size - 1) // page_size) if view == "all" else 1
+        page = min(max(1, to_int(request.args.get("page"), 1)), page_count)
+        page_params = request.args.to_dict(flat=True)
+        page_params.pop("page", None)
+        page_params["view"] = view
+        if view == "all":
+            rows = rows[(page - 1) * page_size:page * page_size]
 
         notice = ""
         notice_error = False
@@ -861,7 +863,8 @@ def register_routes(context):
             selected_payment=selected_payment, selected_type=selected_type,
             selected_currency=selected_currency, selected_ksef=selected_ksef,
             selected_sent=selected_sent, notice=notice, notice_error=notice_error,
-            default_limited=default_limited, cutoff_date=cutoff_date,
+            recent_only=recent_only, total_filtered=total_filtered,
+            page=page, page_count=page_count, page_params=page_params,
         )
 
 
