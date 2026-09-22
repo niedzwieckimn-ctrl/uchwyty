@@ -420,6 +420,23 @@ def _detect_read_intent(value: str) -> str:
     return 'ambiguous'
 
 
+def _direct_physical_stock_query(value: str) -> str:
+    """Return a product phrase only for an unambiguous physical-stock question."""
+    normalized = ' '.join(str(value or '').strip().split()).strip(' ?!.')
+    folded = normalized.casefold()
+    if re.search(r'\b(?:dostępn\w*|dostepn\w*|rezerw\w*|zam[oó]wion\w*|dostaw\w*|w\s+drodze)\b', folded):
+        return ''
+    patterns = (
+        r'^(?:ile\s+(?:mamy|jest))\s+(.+)$',
+        r'^(?:jaki\s+jest\s+stan|sprawdź\s+stan|sprawdz\s+stan)\s+(?:fizyczny\s+)?(.+)$',
+    )
+    for pattern in patterns:
+        match = re.match(pattern, normalized, re.IGNORECASE)
+        if match:
+            return re.sub(r'\s+szt(?:uk|uki|uka)?$', '', match.group(1), flags=re.IGNORECASE).strip()
+    return ''
+
+
 _GENERIC_QUERY_INTENTS = frozenset({
     'daily_operational_summary', 'order_shortages', 'order_readiness',
     'incoming_deliveries', 'inventory_status', 'sales_analytics', 'overdue_payments',
@@ -1442,7 +1459,9 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         current = load_actor_context(human_actor.actor_id)
         if current is None or current.permission_decision(definition.required_permission) == DENY:
             return finish('DENIED','Brak uprawnień do operacji.','PERMISSION_DENIED')
-        call_id = 'packing-history-context-' + run_id
+        _audit('agent.requested', human_actor, run_id, correlation_id, SUCCESS,
+               human_actor.actor_id, conversation_id=conversation_id)
+        call_id = 'direct-business-read-' + run_id
         timings['tool_calls_count'] += 1
         _audit('agent.tool_selected',ai_actor,run_id,correlation_id,SUCCESS,
                human_actor.actor_id,tool_name=read_operation,
@@ -1474,10 +1493,12 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         ]
         evidence.extend(context_evidence)
         if result.status != 'SUCCESS':
+            direct_error = (read_operation == shipment_read.OPERATION
+                            or read_operation == 'inventory.product.search')
             return finish(
-                result.status if read_operation == shipment_read.OPERATION else 'SUCCESS', result.safe_error_message or
+                result.status if direct_error else 'SUCCESS', result.safe_error_message or
                 'Nie mam dostępu do konkretnej historycznej listy pakowej; nie będę rekonstruować jej z bieżących zamówień.',
-                result.error_code if read_operation == shipment_read.OPERATION else '', voice_response_mode='direct')
+                result.error_code if direct_error else '', voice_response_mode='direct')
         chat_503_diagnostics['tool_calls_ok'] += 1
         history_data = dict(result.data or {})
         if _artifact_builder:
@@ -1489,12 +1510,27 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 logger.exception('AI_ARTIFACT_BUILD_FAILED packing history')
         artifact_sources.extend(build_artifact_sources(
             read_operation, history_data, conversation_id, run_id))
-        answer = (
+        if read_operation == 'inventory.product.search' and arguments.get('physical_only') is True:
+            products = history_data.get('candidates') or []
+            if not products:
+                answer = 'Nie znalazłem produktu w aktualnym katalogu.'
+            elif len(products) == 1:
+                item = products[0]
+                label = item.get('model') or item.get('name') or item.get('sku')
+                answer = f'{label} — stan fizyczny {int(item.get("stock") or 0)} szt.'
+            else:
+                answer = (f'Znalazłem {len(products)} pasujące warianty. '
+                          'Podaj pełny model lub rozstaw.')
+            speech = answer
+            timings['display_text_ready_ms'] = round((time.perf_counter()-started)*1000,2)
+            timings['tts_text_ready_ms'] = round((time.perf_counter()-started)*1000,2)
+        else:
+            answer = (
             shipment_read.answer(history_data) if (read_operation == shipment_read.OPERATION) else
             'Oto istniejący historyczny dokument tej listy pakowej.'
             if document_followup else _packing_history_answer(history_data)
-        )
-        speech = shipment_read.speech(history_data) if read_operation == shipment_read.OPERATION else ''
+            )
+            speech = shipment_read.speech(history_data) if read_operation == shipment_read.OPERATION else ''
         if read_operation == shipment_read.OPERATION:
             timings['display_text_ready_ms'] = round((time.perf_counter()-started)*1000,2)
             timings['tts_text_ready_ms'] = round((time.perf_counter()-started)*1000,2)
@@ -1543,6 +1579,12 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
             selector = shipment_read.direct_selector(turn_message, today=business_operations._business_now().date())
             if selector:
                 return direct_business_read(shipment_read.OPERATION, selector)
+        if execution_outcome is None:
+            physical_query = _direct_physical_stock_query(turn_message)
+            if physical_query:
+                return direct_business_read('inventory.product.search', {
+                    'query': physical_query, 'physical_only': True,
+                })
         if execution_outcome is None and not shipment_read.is_question(turn_message):
             import human_approval
             import internal_approval
@@ -1555,10 +1597,20 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
             fast_count_session = business_operations.active_inventory_count_session(
                 ai_actor, human_actor, conversation_id)
             timings['session_lookup_ms'] = round((time.perf_counter()-lookup_started)*1000,2)
-            if fast_count_session:
+            command = inventory_voice_fast.parse(turn_message) if fast_count_session else None
+            command_matches_inventory = command is not None
+            if fast_count_session and command is not None and command.kind == 'product':
+                identities = [identity for identity, _quantity in command.interpretations]
+                if not identities:
+                    identities = [command.product_without_count or command.product]
+                command_matches_inventory = any(
+                    business_operations.resolve_inventory_voice_product(
+                        ai_actor, human_actor, conversation_id, identity, allow_typo=True)
+                    for identity in identities if identity
+                )
+            if fast_count_session and command_matches_inventory:
                 current_stage = 'inventory_voice_fast'
                 voice_mark('fast_path_detected')
-                command = inventory_voice_fast.parse(turn_message)
                 voice_mark('parse_done')
                 voice_state = business_operations.inventory_count_voice_state(
                     ai_actor, human_actor, conversation_id)
@@ -1765,19 +1817,42 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 resolved_identity = ''
                 if command.kind == 'product':
                     resolve_started = time.perf_counter()
-                    # A complete exact product name wins over the trailing-count interpretation.
-                    resolved_identity = command.product
-                    candidates = business_operations.resolve_inventory_voice_product(
-                        ai_actor, human_actor, conversation_id, resolved_identity, exact_only=True)
-                    if candidates and command.product_without_count != command.product:
-                        quantity = None
-                    elif not candidates:
-                        resolved_identity = command.product_without_count or command.product
+                    interpreted_exact = []
+                    interpreted_fallback = []
+                    for identity, interpreted_quantity in command.interpretations:
+                        matches = business_operations.resolve_inventory_voice_product(
+                            ai_actor, human_actor, conversation_id, identity, exact_only=True)
+                        interpreted_exact.extend(
+                            (item, identity, interpreted_quantity) for item in matches)
+                        if not matches:
+                            fallback = business_operations.resolve_inventory_voice_product(
+                                ai_actor, human_actor, conversation_id, identity, allow_typo=True)
+                            interpreted_fallback.extend(
+                                (item, identity, interpreted_quantity) for item in fallback)
+                    interpreted = interpreted_exact or interpreted_fallback
+                    unique_interpreted = {
+                        (int(item['id']), int(interpreted_quantity)): (item, identity, interpreted_quantity)
+                        for item, identity, interpreted_quantity in interpreted
+                    }
+                    if len(unique_interpreted) == 1:
+                        candidate, resolved_identity, quantity = next(iter(unique_interpreted.values()))
+                        candidates = [candidate]
+                    elif len(unique_interpreted) > 1:
+                        candidates = [item for item, _identity, _quantity in unique_interpreted.values()]
+                    else:
+                        # A complete exact product name wins over the trailing-count interpretation.
+                        resolved_identity = command.product
                         candidates = business_operations.resolve_inventory_voice_product(
-                            ai_actor, human_actor, conversation_id, resolved_identity)
+                            ai_actor, human_actor, conversation_id, resolved_identity, exact_only=True)
+                        if candidates and command.product_without_count != command.product:
+                            quantity = None
+                        elif not candidates:
+                            resolved_identity = command.product_without_count or command.product
+                            candidates = business_operations.resolve_inventory_voice_product(
+                                ai_actor, human_actor, conversation_id, resolved_identity, allow_typo=True)
                     timings['product_resolve_ms'] = round(
                         (time.perf_counter()-resolve_started)*1000, 2)
-                    if len(candidates) > 1:
+                    if len(candidates) > 1 or len(unique_interpreted) > 1:
                         return voice_finish('Nie znaleziono jednoznacznego produktu. Powtórz rozstaw lub wariant.',
                                             'Nie jestem pewien. Powtórz rozstaw.',
                                             state=voice_state['voice_state'],
@@ -1803,6 +1878,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                                       expected.error_code or 'INVENTORY_READ_FAILED')
                     product = expected.data
                     if resolved_identity and business_operations._product_match_rank(
+                            dict(product, id=product_id), resolved_identity) is None and business_operations._product_typo_rank(
                             dict(product, id=product_id), resolved_identity) is None:
                         return finish('CONFLICT', 'Dane produktu zmieniły się. Podaj produkt ponownie.', 'PRODUCT_CHANGED')
                     voice_mark('inventory_read_done')

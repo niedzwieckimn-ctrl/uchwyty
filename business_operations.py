@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
 import hashlib
+import inspect
 import json
 import logging
 import re
@@ -116,7 +117,7 @@ logger = logging.getLogger(__name__)
 
 # Data access stays outside operation handlers. The application injects a
 # per-operation freshness provider; this module never imports the Flask app.
-_freshness_provider: Callable[[str], Mapping[str, Any]] | None = None
+_freshness_provider: Callable[[str, Mapping[str, Any]], Mapping[str, Any]] | None = None
 _voice_inventory_refresh: Callable[[int], None] | None = None
 _write_success_observer: Callable[[str, Mapping[str, Any]], None] | None = None
 
@@ -140,7 +141,9 @@ FRESHNESS_GROUP_BY_OPERATION = {
 }
 
 
-def configure_freshness(provider: Callable[[str], Mapping[str, Any]] | None) -> None:
+def configure_freshness(
+    provider: Callable[[str, Mapping[str, Any]], Mapping[str, Any]] | None,
+) -> None:
     """Install the application-owned source-of-truth freshness boundary."""
     global _freshness_provider
     _freshness_provider = provider
@@ -237,7 +240,8 @@ PRODUCT_GET_OUTPUT = {
 PRODUCT_SEARCH_INPUT = {
     "type": "object", "additionalProperties": False, "required": ["query"],
     "properties": {"query": {"type": "string", "minLength": 1, "maxLength": 120},
-                   "include_image":{"type":"boolean"}},
+                   "include_image":{"type":"boolean"},
+                   "physical_only":{"type":"boolean"}},
 }
 _PRODUCT_FIELDS = {
     "type": "object", "additionalProperties": False,
@@ -1485,6 +1489,41 @@ def _product_match_rank(row, query, *, exact_only=False):
     return priority, fields[0], int(row['id'])
 
 
+def _one_edit_apart(left, right):
+    """Return True for one substitution, insertion or deletion in one catalog token."""
+    if left == right or abs(len(left) - len(right)) > 1:
+        return False
+    if len(left) == len(right):
+        return sum(a != b for a, b in zip(left, right)) == 1
+    if len(left) > len(right):
+        left, right = right, left
+    index = 0
+    while index < len(left) and left[index] == right[index]:
+        index += 1
+    return left[index:] == right[index + 1:]
+
+
+def _product_typo_rank(row, query):
+    """Catalog-driven STT fallback: permit one single-character token error."""
+    query_tokens = _voice_product_key(query).split()
+    if not query_tokens:
+        return None
+    fields = [_voice_product_key(row[field]) for field in ('sku', 'model', 'name', 'ean')]
+    best = None
+    for field_index, field in enumerate(fields):
+        field_tokens = field.split()
+        if len(query_tokens) != len(field_tokens):
+            continue
+        errors = sum(a != b for a, b in zip(query_tokens, field_tokens))
+        if errors != 1:
+            continue
+        if not all(a == b or _one_edit_apart(a, b) for a, b in zip(query_tokens, field_tokens)):
+            continue
+        candidate = (field_index, fields[0], int(row['id']))
+        best = candidate if best is None or candidate < best else best
+    return best
+
+
 def _product_search(data, actor, correlation_id, transaction_connection=None):
     query = " ".join(str(data["query"]).strip().casefold().split())
     tokens = [token for token in re.split(r"[^\w]+", query, flags=re.UNICODE) if token][:8]
@@ -1505,13 +1544,23 @@ def _product_search(data, actor, correlation_id, transaction_connection=None):
              if (rank := _product_match_rank(row, query)) is not None]
     found.sort(key=lambda item: item[0])
     selected = [row for _, row in found[:MAX_PRODUCT_SEARCH_RESULTS]]
-    metrics={int(item['id']):item for item in build_replenishment_analysis(_factory(),today=_business_now().date())}
-    candidates = [{"id": int(row["id"]), "sku": row["sku"] or "", "model": row["model"],
-                   "name": row["name"], "stock": int(row["stock"]),
-                   "ordered_quantity":int(metrics.get(int(row['id']),{}).get('reserved_qty') or 0),
-                   "incoming_quantity":int(metrics.get(int(row['id']),{}).get('incoming_qty') or 0),
-                   "available_for_customers":int(metrics.get(int(row['id']),{}).get('available_qty') or 0),
-                   "image_requested":data.get('include_image') is True} for row in selected]
+    physical_only = data.get('physical_only') is True
+    metrics = {} if physical_only else {
+        int(item['id']): item
+        for item in build_replenishment_analysis(_factory(), today=_business_now().date())
+    }
+    candidates = []
+    for row in selected:
+        candidate = {"id": int(row["id"]), "sku": row["sku"] or "", "model": row["model"],
+                     "name": row["name"], "stock": int(row["stock"])}
+        if not physical_only:
+            candidate.update(
+                ordered_quantity=int(metrics.get(int(row['id']), {}).get('reserved_qty') or 0),
+                incoming_quantity=int(metrics.get(int(row['id']), {}).get('incoming_qty') or 0),
+                available_for_customers=int(metrics.get(int(row['id']), {}).get('available_qty') or 0),
+                image_requested=data.get('include_image') is True,
+            )
+        candidates.append(candidate)
     return {"ok": True, "query": query, "candidates": candidates,
             "count": len(candidates), "truncated": len(found) > MAX_PRODUCT_SEARCH_RESULTS}
 
@@ -2388,7 +2437,7 @@ def _voice_product_key(value):
 
 
 def resolve_inventory_voice_product(ai_actor, human_actor, conversation_id, query,
-                                    *, prefix_hints=False, exact_only=False):
+                                    *, prefix_hints=False, exact_only=False, allow_typo=False):
     """Count identity uses the same token matcher as inventory.product.search."""
     ai = _trusted_actor(ai_actor)
     human = load_actor_context(human_actor.actor_id) if isinstance(human_actor, ActorContext) else None
@@ -2410,6 +2459,9 @@ def resolve_inventory_voice_product(ai_actor, human_actor, conversation_id, quer
                              WHERE COALESCE(archived,0)=0""").fetchall()
         ranked = [(rank, row) for row in rows
                   if (rank := _product_match_rank(row, query, exact_only=exact_only)) is not None]
+        if not ranked and allow_typo and not exact_only:
+            ranked = [(rank, row) for row in rows
+                      if (rank := _product_typo_rank(row, query)) is not None]
         ranked.sort(key=lambda item: item[0])
         # Never truncate to one result or choose a best score over an ambiguity.
         return [dict(id=int(row['id']), sku=row['sku'] or '', model=row['model'] or '',
@@ -3211,12 +3263,15 @@ def execute_business_operation(
         handler_started = time.perf_counter()
         freshness: Mapping[str, Any] = {}
         logger.info("BUSINESS_OPERATION_INPUT %s", json.dumps({
-            "operation": definition.operation_name, "args": _safe_diagnostic_args(data),
+            "operation": definition.operation_name, "correlation_id": row["correlation_id"],
+            "request_id": actor.request_id, "args": _safe_diagnostic_args(data),
         }, ensure_ascii=False, sort_keys=True))
         try:
             if (_freshness_provider and definition.operation_name in FRESHNESS_GROUP_BY_OPERATION
                     and not (definition.operation_name == 'inventory.count.get_expected' and _voice_inventory_refresh)):
-                freshness = _freshness_provider(definition.operation_name) or {}
+                parameter_count = len(inspect.signature(_freshness_provider).parameters)
+                freshness = (_freshness_provider(definition.operation_name, data)
+                             if parameter_count >= 2 else _freshness_provider(definition.operation_name)) or {}
             raw_output = _HANDLERS[definition.operation_name](data, actor, row["correlation_id"], None)
             try:
                 output = validate_output(definition, raw_output)

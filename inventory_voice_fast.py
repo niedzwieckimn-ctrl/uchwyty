@@ -56,24 +56,71 @@ class VoiceCommand:
     product_without_count: str = ''
     quantity: int | None = None
     decision: str = ''
+    raw_transcript: str = ''
+    interpretations: tuple[tuple[str, int], ...] = ()
+
+
+def _spoken_number(parts):
+    if not parts or any(_fold(part) not in _NUMBERS for part in parts):
+        return None
+    return sum(_NUMBERS[_fold(part)] for part in parts)
+
+
+def _trailing_number_interpretations(value):
+    """Split a final spoken-number run between product variant and counted qty.
+
+    The catalog decides which split is valid. This prevents e.g. 128 + 8 from
+    being flattened into 136 before the product identity is known.
+    """
+    parts = [part.strip('.,!?;:') for part in str(value or '').replace(',', ' ').split()]
+    parts = [part for part in parts if part]
+    if parts and _fold(parts[-1]) in _UNITS:
+        parts.pop()
+    if parts and _fold(parts[0]) == 'mam' and (len(parts) < 2 or _fold(parts[1]) not in _NUMBERS):
+        parts.pop(0)
+    start = len(parts)
+    while start and _fold(parts[start - 1]) in _NUMBERS:
+        start -= 1
+    run = parts[start:]
+    if len(run) < 2 or not parts[:start]:
+        return ()
+    options = []
+    for split in range(len(run) - 1, -1, -1):
+        product_number = _spoken_number(run[:split]) if split else None
+        quantity = _spoken_number(run[split:])
+        if quantity is None:
+            continue
+        product_parts = parts[:start] + ([str(product_number)] if product_number is not None else [])
+        product = normalize_transcript(' '.join(product_parts))
+        if product and re.search(r'[A-Za-zÀ-ž]', product):
+            options.append((product, quantity))
+    return tuple(dict.fromkeys(options))
 
 
 def parse(value):
-    text = normalize_transcript(value)
+    raw_transcript = str(value or '')
+    interpretations = _trailing_number_interpretations(raw_transcript)
+    if interpretations:
+        product, quantity = interpretations[0]
+        return VoiceCommand('product', product=product, product_without_count=product,
+                            quantity=quantity, raw_transcript=raw_transcript,
+                            interpretations=interpretations)
+    text = normalize_transcript(raw_transcript)
     folded = ' '.join(_fold(text).split())
     if folded in {'nastepny', 'nastepny produkt', 'dalej'}:
-        return VoiceCommand('next')
+        return VoiceCommand('next', raw_transcript=raw_transcript)
     if folded in {'koniec remanentu', 'zakoncz remanent'}:
-        return VoiceCommand('complete')
+        return VoiceCommand('complete', raw_transcript=raw_transcript)
     if folded in {'robimy remanent', 'rozpocznij remanent', 'remanent'}:
-        return VoiceCommand('start')
+        return VoiceCommand('start', raw_transcript=raw_transcript)
     if folded in _APPROVE | _REJECT:
-        return VoiceCommand('decision', decision='approve' if folded in _APPROVE else 'reject')
+        return VoiceCommand('decision', decision='approve' if folded in _APPROVE else 'reject',
+                            raw_transcript=raw_transcript)
     if not text or len(text) > 120:
         return None
     counted = re.fullmatch(r'(?:na polce (?:jest|lezy mi tylko)|jest ich tylko|naliczylem) (\d{1,7})(?: sztuk)?', folded)
     if counted:
-        return VoiceCommand('quantity', quantity=int(counted[1]))
+        return VoiceCommand('quantity', quantity=int(counted[1]), raw_transcript=raw_transcript)
     words = text.split()
     location_count = [_fold(word) for word in words[:3]] == ['mam', 'na', 'polce']
     if location_count:
@@ -82,14 +129,17 @@ def parse(value):
         words.pop(0)
         if words and _fold(words[0]) in {'produkt', 'produkty'}:
             words.pop(0)
+    if (words and _fold(words[0]) == 'mam' and len(words) > 1
+            and not words[1].isdigit()):
+        words.pop(0)
     if words and _fold(words[-1]) in _UNITS:
         words.pop()
     if not words:
         return None
     if len(words) == 1 and words[0].isdigit() and len(words[0]) <= 7:
-        return VoiceCommand('quantity', quantity=int(words[0]))
+        return VoiceCommand('quantity', quantity=int(words[0]), raw_transcript=raw_transcript)
     if len(words) == 1 and words[0].isdigit() and 8 <= len(words[0]) <= 14:
-        return VoiceCommand('product', product=words[0])
+        return VoiceCommand('product', product=words[0], raw_transcript=raw_transcript)
     # STT often puts the counted amount before the product, or after "mam".
     # Remove only these explicit count phrases; product numbers remain intact.
     quantity = None
@@ -114,20 +164,21 @@ def parse(value):
     if quantity is not None:
         product = ' '.join(product_words)
         if not product:
-            return VoiceCommand('quantity', quantity=quantity)
+            return VoiceCommand('quantity', quantity=quantity, raw_transcript=raw_transcript)
         if (not re.fullmatch(r'[\w .-]{3,100}', product)
                 or not re.search(r'[A-Za-zÀ-ž]', product)):
             return None
         return VoiceCommand('product', product=product,
-                            product_without_count=product, quantity=quantity)
+                            product_without_count=product, quantity=quantity,
+                            raw_transcript=raw_transcript)
     product = ' '.join(words)
     if not re.fullmatch(r'[\w .-]{3,100}', product) or not re.search(r'[A-Za-zÀ-ž]', product):
         return None
     if len(words) > 1 and words[-1].isdigit() and len(words[-1]) <= 7:
         return VoiceCommand('product', product=' '.join(words[:-1]) if location_count else product,
                             product_without_count=' '.join(words[:-1]),
-                            quantity=int(words[-1]))
-    return VoiceCommand('product', product=product)
+                            quantity=int(words[-1]), raw_transcript=raw_transcript)
+    return VoiceCommand('product', product=product, raw_transcript=raw_transcript)
 
 
 def difference_prompt(expected_quantity, difference):

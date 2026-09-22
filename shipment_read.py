@@ -39,7 +39,12 @@ def is_question(text):
     if (re.search(r'\b(?:lp|list\w*\s+pakow|li[śs]ci\w*\s+pakow)', value)
             and not re.search(r'\b(?:do|dla)\s+.+', value)):
         return False
-    return bool(re.search(r'\b(?:co|jakie|ile|pokaż|pokaz|odczytaj)\b', value) and re.search(
+    explicit_latest = bool(
+        re.search(r'\b(?:ostatni\w*|ostatnio)\b', value)
+        and re.search(r'\b(?:paczk\w*|przesył\w*|przesyl\w*|zam[oó]wieni\w*)\b', value)
+        and re.search(r'\b(?:wysła\w*|wysla\w*|wysył\w*|wysyl\w*)\b', value)
+    )
+    return explicit_latest or bool(re.search(r'\b(?:co|jakie|ile|pokaż|pokaz|odczytaj|sprawdź|sprawdz)\b', value) and re.search(
         r'\b(?:wysła\w*|wysla\w*|wysył\w*|wysyl\w*|przesył\w*|przesyl\w*|wyszło|wyszlo|poszło|poszlo|'
         r'było\s+w\s+pacz\w*|bylo\s+w\s+pacz\w*)\b', value))
 
@@ -82,7 +87,8 @@ def direct_selector(text, today=None):
     customer = re.search(r'\b(?:do|dla)\s+(.+)$', value)
     if customer and not order:
         return {'mode': 'customer', 'customer': customer[1]}
-    if order or re.search(r'\bostatni(?:ej|a|ą|e|o)\b', value) or re.fullmatch(r'co\s+(?:ostatnio\s+)?(?:wysłałem|wyslalem|wysłaliśmy|wyslalismy)', value):
+    if (order or re.search(r'\b(?:ostatni\w*|ostatnio)\b', value)
+            or re.fullmatch(r'co\s+(?:ostatnio\s+)?(?:wysłałem|wyslalem|wysłaliśmy|wyslalismy)', value)):
         return dict(mode='latest', **scope)
     return None
 

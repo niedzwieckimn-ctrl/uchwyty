@@ -445,7 +445,9 @@ _startup_step("audit_configured")
 configure_internal_approval(conn)
 _startup_step("approval_configured")
 configure_business_operations(conn)
-configure_business_operations_freshness(lambda operation_name: ensure_business_operation_freshness(operation_name))
+configure_business_operations_freshness(
+    lambda operation_name, input_data: ensure_business_operation_freshness(operation_name, input_data)
+)
 configure_voice_inventory_refresh(lambda product_id: refresh_inventory_voice_product(product_id))
 configure_write_success_observer(lambda operation_name, result: reconcile_business_freshness_after_write(operation_name, result))
 configure_artifact_builder(lambda operation_name, result: build_business_artifacts(operation_name, result))
@@ -2930,6 +2932,9 @@ BUSINESS_FRESHNESS_GROUPS = {
     "inventory": [("products", "id"), ("stock", "product_id"), ("orders", "id"),
                   ("order_items", "id"), ("invoice_allocations", "id"),
                   ("china_packages", "id"), ("china_items", "id")],
+    "inventory_catalog": [("products", "id"), ("stock", "product_id")],
+    "shipment": [("orders", "id"), ("order_items", "id"), ("invoices", "id"),
+                 ("invoice_meta", "invoice_id"), ("invoice_allocations", "id")],
     "orders": [("customers", "id"), ("products", "id"), ("orders", "id"), ("order_items", "id")],
     "fulfillment": [("products", "id"), ("stock", "product_id"), ("orders", "id"),
                     ("order_items", "id"), ("invoice_allocations", "id")],
@@ -2951,6 +2956,8 @@ BUSINESS_FRESHNESS_DATA_TABLES = {
 }
 BUSINESS_FRESHNESS_OPERATION_GROUP = {
     'shipment.read': 'shipment',
+    'shipment.snapshot': 'shipment',
+    'inventory.product.physical': 'inventory_catalog',
     'business.query': 'inventory',
     'dashboard.read': 'dashboard',
     'business.orders.state': 'inventory',
@@ -3020,17 +3027,19 @@ def reconcile_business_freshness_after_write(operation_name: str, _result: dict)
     from fulfillment_operations import WRITES as _fulfillment_writes
     if operation_name in _fulfillment_writes:
         completed_at = time.time()
-        for group in ('orders','inventory','fulfillment','invoices','fulfillment_workflow','invoice_amendment'):
+        for group in ('orders','inventory','inventory_catalog','fulfillment','invoices','shipment',
+                      'fulfillment_workflow','invoice_amendment'):
             _mark_business_freshness(group, completed_at)
         return
     if operation_name == 'invoices.remove':
         completed_at = time.time()
-        for group in ('orders', 'inventory', 'fulfillment', 'invoices', 'customers', 'sales', 'invoice_amendment', 'fulfillment_workflow'):
+        for group in ('orders', 'inventory', 'inventory_catalog', 'fulfillment', 'invoices',
+                      'shipment', 'customers', 'sales', 'invoice_amendment', 'fulfillment_workflow'):
             _mark_business_freshness(group, completed_at)
         return
     if operation_name == "orders.status.transition":
         completed_at = time.time()
-        for group in ('orders', 'inventory', 'fulfillment', 'customers'):
+        for group in ('orders', 'inventory', 'fulfillment', 'shipment', 'customers'):
             _mark_business_freshness(group, completed_at)
     elif operation_name == 'inventory.adjust':
         if supabase_enabled() and _result.get('product_id'):
@@ -3039,7 +3048,7 @@ def reconcile_business_freshness_after_write(operation_name: str, _result: dict)
             except Exception:
                 app.logger.warning('Korekta remanentowa zapisana lokalnie; synchronizacja Supabase nieudana',exc_info=True)
         completed_at = time.time()
-        for group in ('inventory','fulfillment'):
+        for group in ('inventory','inventory_catalog','fulfillment'):
             _mark_business_freshness(group, completed_at)
     elif operation_name == 'orders.packing.confirm':
         if supabase_enabled() and _result.get('order_id'):
@@ -3048,7 +3057,7 @@ def reconcile_business_freshness_after_write(operation_name: str, _result: dict)
             except Exception:
                 app.logger.warning('Pakowanie zapisane lokalnie; synchronizacja Supabase nieudana',exc_info=True)
         completed_at = time.time()
-        for group in ('orders','fulfillment'):
+        for group in ('orders','fulfillment','shipment'):
             _mark_business_freshness(group, completed_at)
 
 
@@ -3131,13 +3140,15 @@ def refresh_inventory_voice_product(product_id: int) -> None:
             db.close()
 
 
-def ensure_business_operation_freshness(operation_name: str) -> dict:
+def ensure_business_operation_freshness(operation_name: str, input_data=None) -> dict:
     """Synchronously establish a recent, group-scoped SQLite snapshot for one read."""
+    if (operation_name == 'inventory.product.search'
+            and isinstance(input_data, dict) and input_data.get('physical_only') is True):
+        operation_name = 'inventory.product.physical'
     if operation_name == 'shipment.read':
-        # Keep exactly the pre-V45 invoice/order freshness behavior. Packing
-        # evidence is an additional, insert-only reconciliation; it never enters
-        # the generic sync lists or delete-missing helper.
-        base = ensure_business_operation_freshness('invoices.removal.preview')
+        # Shipment identity and invoice contents have their own narrow snapshot.
+        # Packing evidence remains an additional, insert-only reconciliation.
+        base = ensure_business_operation_freshness('shipment.snapshot')
         packing_started = time.perf_counter()
         if supabase_enabled():
             import reconciliation_store
