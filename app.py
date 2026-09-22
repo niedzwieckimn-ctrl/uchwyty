@@ -2950,7 +2950,7 @@ BUSINESS_FRESHNESS_DATA_TABLES = {
     for group, specs in BUSINESS_FRESHNESS_GROUPS.items()
 }
 BUSINESS_FRESHNESS_OPERATION_GROUP = {
-    'shipment.read': 'invoice_amendment',
+    'shipment.read': 'shipment',
     'business.query': 'inventory',
     'dashboard.read': 'dashboard',
     'business.orders.state': 'inventory',
@@ -3133,6 +3133,31 @@ def refresh_inventory_voice_product(product_id: int) -> None:
 
 def ensure_business_operation_freshness(operation_name: str) -> dict:
     """Synchronously establish a recent, group-scoped SQLite snapshot for one read."""
+    if operation_name == 'shipment.read':
+        # Keep exactly the pre-V45 invoice/order freshness behavior. Packing
+        # evidence is an additional, insert-only reconciliation; it never enters
+        # the generic sync lists or delete-missing helper.
+        base = ensure_business_operation_freshness('invoices.removal.preview')
+        packing_started = time.perf_counter()
+        if supabase_enabled():
+            import reconciliation_store
+            records = supabase_select_rows('fulfillment_reconciliation', order_by='order_id',
+                extra_params={'select':'order_id,payload->packing_lists,payload->packing_batches,payload->packing_allocations,payload->packing_shipments'})
+            db = conn()
+            try:
+                db.execute('BEGIN IMMEDIATE')
+                for record in records:
+                    reconciliation_store.restore_packing_evidence(db, record)
+                db.commit()
+            except Exception as exc:
+                db.rollback()
+                raise ControlledOperationError('DATA_UNAVAILABLE',
+                    'Nie można potwierdzić trwałej historii pakowania wysyłki.') from exc
+            finally:
+                db.close()
+        return dict(base, freshness_group='shipment',
+                    packing_reconciliation_ms=round((time.perf_counter()-packing_started)*1000,2),
+                    packing_sources=['packing_lists','packing_batches','packing_allocations','packing_shipments'])
     group = BUSINESS_FRESHNESS_OPERATION_GROUP.get(operation_name)
     if not group:
         return {}

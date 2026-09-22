@@ -167,38 +167,7 @@ def restore(b, oid):
                     raise ValueError('Nieobsługiwana wersja metadanych realizacji.')
                 names = list(source)
                 c.execute(f'INSERT OR REPLACE INTO {table} ({",".join(names)}) VALUES ({",".join("?" for _ in names)})', tuple(source.values()))
-        for table in ('packing_batches', 'packing_allocations'):
-            for source in payload.get(table, []):
-                names = list(source)
-                columns = {r[1] for r in c.execute(f'PRAGMA table_info({table})')}
-                if not set(names) <= columns:
-                    raise ValueError('Nieobsługiwana wersja zawartości paczki.')
-                existing = c.execute(f'SELECT * FROM {table} WHERE id=?', (source['id'],)).fetchone()
-                if existing:
-                    immutable = ('batch_id', 'order_id', 'order_item_id', 'qty') if table == 'packing_allocations' else ('root_order_id', 'created_at')
-                    if any(existing[k] != source[k] for k in immutable):
-                        raise ValueError('Konflikt trwałego identyfikatora zawartości listy pakowej.')
-                    if table == 'packing_batches' and source.get('packing_list_id'):
-                        if existing['packing_list_id'] and existing['packing_list_id'] != source['packing_list_id']:
-                            raise ValueError('Batch należy już do innej logicznej listy pakowej.')
-                        if not existing['packing_list_id']:
-                            c.execute('UPDATE packing_batches SET packing_list_id=?,previous_batch_id=?,selection_hash=? WHERE id=?',
-                                      (source['packing_list_id'], source.get('previous_batch_id'), source.get('selection_hash'), source['id']))
-                c.execute(f'INSERT OR IGNORE INTO {table} ({",".join(names)}) VALUES ({",".join("?" for _ in names)})', tuple(source.values()))
-        for source in payload.get('packing_lists', []):
-            existing = c.execute('SELECT * FROM packing_lists WHERE packing_list_id=?', (source['packing_list_id'],)).fetchone()
-            if existing and existing['revision'] == source['revision'] and existing['current_batch_id'] != source['current_batch_id']:
-                raise ValueError('Konflikt bieżącej wersji listy pakowej.')
-            if not existing or existing['revision'] < source['revision']:
-                c.execute('''INSERT INTO packing_lists VALUES(?,?,?,?,?,?) ON CONFLICT(packing_list_id) DO UPDATE SET
-                             current_batch_id=excluded.current_batch_id,revision=excluded.revision,invoice_id=excluded.invoice_id''',
-                          tuple(source[k] for k in ('packing_list_id','root_order_id','invoice_id','current_batch_id','revision','created_at')))
-        for source in payload.get('packing_shipments', []):
-            existing = c.execute('SELECT final_batch_id FROM packing_shipments WHERE shipment_key=?', (source['shipment_key'],)).fetchone()
-            if existing and existing[0] != source['final_batch_id']:
-                raise ValueError('Konflikt finalnej zawartości wysyłki.')
-            c.execute('INSERT OR IGNORE INTO packing_shipments VALUES(?,?,?,?,?,?)',
-                      tuple(source[k] for k in ('shipment_key','packing_list_id','final_batch_id','confirmed_at','carrier','tracking')))
+        restore_packing_evidence(c, payload)
         for source in payload.get('fulfillment_document_history', []):
             source = dict(source)
             encoded = source.pop('pdf_base64', None)
@@ -235,3 +204,45 @@ def restore(b, oid):
         raise
     finally:
         c.close()
+
+
+def restore_packing_evidence(c, payload):
+    """Restore structural evidence only; never delete rows or regenerate a batch."""
+    for table in ('packing_batches', 'packing_allocations'):
+        for source in payload.get(table) or []:
+            names = list(source)
+            columns = {r[1] for r in c.execute(f'PRAGMA table_info({table})')}
+            if not set(names) <= columns:
+                raise ValueError('Nieobsługiwana wersja zawartości paczki.')
+            existing = c.execute(f'SELECT * FROM {table} WHERE id=?', (source['id'],)).fetchone()
+            if existing:
+                immutable = tuple(source) if table == 'packing_allocations' else ('root_order_id', 'created_at', 'invoice_id')
+                if any(existing[k] != source[k] for k in immutable):
+                    raise ValueError('Konflikt trwałego identyfikatora zawartości listy pakowej.')
+                if table == 'packing_batches' and source.get('packing_list_id'):
+                    if existing['packing_list_id'] and existing['packing_list_id'] != source['packing_list_id']:
+                        raise ValueError('Batch należy już do innej logicznej listy pakowej.')
+                    if not existing['packing_list_id']:
+                        c.execute('UPDATE packing_batches SET packing_list_id=?,previous_batch_id=?,selection_hash=? WHERE id=?',
+                                  (source['packing_list_id'], source.get('previous_batch_id'), source.get('selection_hash'), source['id']))
+            c.execute(f'INSERT OR IGNORE INTO {table} ({",".join(names)}) VALUES ({",".join("?" for _ in names)})', tuple(source.values()))
+    for source in payload.get('packing_lists') or []:
+        if not c.execute('SELECT 1 FROM packing_batches WHERE id=?', (source['current_batch_id'],)).fetchone():
+            raise ValueError('Brak bieżącego batcha w trwałej historii LP.')
+        existing = c.execute('SELECT * FROM packing_lists WHERE packing_list_id=?', (source['packing_list_id'],)).fetchone()
+        if existing and existing['revision'] == source['revision'] and existing['current_batch_id'] != source['current_batch_id']:
+            raise ValueError('Konflikt bieżącej wersji listy pakowej.')
+        if not existing or existing['revision'] < source['revision']:
+            c.execute('''INSERT INTO packing_lists VALUES(?,?,?,?,?,?) ON CONFLICT(packing_list_id) DO UPDATE SET
+                         current_batch_id=excluded.current_batch_id,revision=excluded.revision,invoice_id=excluded.invoice_id''',
+                      tuple(source[k] for k in ('packing_list_id','root_order_id','invoice_id','current_batch_id','revision','created_at')))
+    for source in payload.get('packing_shipments') or []:
+        batch = c.execute('SELECT packing_list_id FROM packing_batches WHERE id=?', (source['final_batch_id'],)).fetchone()
+        if (not batch or batch['packing_list_id'] != source['packing_list_id']
+                or not c.execute('SELECT 1 FROM packing_allocations WHERE batch_id=?', (source['final_batch_id'],)).fetchone()):
+            raise ValueError('Brak kompletnego finalnego batcha w trwałej historii wysyłki.')
+        existing = c.execute('SELECT * FROM packing_shipments WHERE shipment_key=?', (source['shipment_key'],)).fetchone()
+        if existing and any(existing[key] != value for key, value in source.items()):
+            raise ValueError('Konflikt finalnej zawartości wysyłki.')
+        c.execute('INSERT OR IGNORE INTO packing_shipments VALUES(?,?,?,?,?,?)',
+                  tuple(source[k] for k in ('shipment_key','packing_list_id','final_batch_id','confirmed_at','carrier','tracking')))

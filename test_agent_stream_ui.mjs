@@ -152,6 +152,48 @@ for (const voice of [false, true]) {
   });
 }
 
+test('inventory speech_ready starts short TTS before done and does not repeat it', async t => {
+  const stream = controlledStream(); const b = browser({chat:() => stream.response});
+  const started = performance.now();
+  const pending = b.submit('Cerne 128 BB 5', true); await flush();
+  assert.equal(JSON.parse(b.calls[0].options.body).voice_fast_mode, true);
+  stream.send(event('display_delta', {delta:'Cerne 128 BB — system 1, policzono 5, różnica +4.'})
+    + event('speech_ready', {tts_text:'System jeden. Różnica plus cztery. Zapisać?',
+      mode:'inventory_voice_fast'}));
+  await flush();
+  const ttsRequestMs = performance.now() - started;
+  assert.equal(b.calls.filter(call => call.url.endsWith('/synthesize')).length, 1);
+  assert.equal(b.elements.aiSend.disabled, true);
+  await new Promise(resolve => setTimeout(resolve, 30));
+  stream.send(event('done', {...finalData('Cerne 128 BB — system 1, policzono 5, różnica +4.'),
+    tts_text:'System jeden. Różnica plus cztery. Zapisać?', inventory_fast_trace_ms:{turn_complete:30}}));
+  await pending; await flush();
+  assert.equal(b.calls.filter(call => call.url.endsWith('/synthesize')).length, 1);
+  t.diagnostic(`Simulated browser: TTS request ${ttsRequestMs.toFixed(2)} ms, done ${(performance.now()-started).toFixed(2)} ms. No live STT or TTS call.`);
+});
+
+test('inventory fail-fast unlocks input and starts TTS before done', async t => {
+  const stream = controlledStream(); const b = browser({chat:() => stream.response});
+  const started = performance.now();
+  const pending = b.submit('Cerne 128 XB pięć', true); await flush();
+  stream.send(event('display_delta', {delta:'Nie znaleziono jednoznacznego produktu. Powtórz.'})
+    + event('speech_ready', {tts_text:'Nie znalazłem. Powtórz.',
+      mode:'inventory_voice_fast', retry_ready:true}));
+  await flush();
+  assert.equal(b.elements.aiSend.disabled, false);
+  assert.equal(b.calls.filter(call => call.url.endsWith('/synthesize')).length, 1);
+  assert.ok(b.logs.some(log => log.name === 'VOICE_FAST_INPUT_UNLOCKED'));
+  const unlockedMs = performance.now() - started;
+  assert.equal(b.elements.aiMessages.querySelectorAll('.assistant').length, 1);
+  b.elements.aiVoice.dispatch('click'); await flush();
+  assert.ok(b.logs.some(log => log.name === 'VOICE_CAPTURE_START'));
+  stream.send(event('done', {...finalData('Nie znaleziono jednoznacznego produktu. Powtórz.'),
+    tts_text:'Nie znalazłem. Powtórz.', inventory_fast_failure:'product_not_found'}));
+  await pending; await flush();
+  assert.equal(b.calls.filter(call => call.url.endsWith('/synthesize')).length, 1);
+  t.diagnostic(`Simulated fail-fast browser: input unlocked and TTS requested ${unlockedMs.toFixed(2)} ms after submit, before done. No live STT/TTS.`);
+});
+
 for (const failure of ['error', 'error-with-success-status', 'eof', 'invalid-json', 'invalid-utf8']) {
   test(`${failure} terminates visibly, preserves previous messages and never retries POST or starts TTS`, async () => {
     const stream = controlledStream(); let requests = 0;

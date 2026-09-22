@@ -368,10 +368,10 @@ def _is_packing_history_document_followup(value: str) -> bool:
 def _detect_read_intent(value: str) -> str:
     """Choose one primary read intent without another model round-trip."""
     normalized = ' '.join(str(value or '').casefold().split()).strip(' ?!.')
-    if re.search(r'\bco\s+(?:było|bylo|jest)\s+w\s+zam[oó]wieni\w*\b', normalized):
-        return 'order_contents'
     if shipment_read.is_question(normalized):
         return 'shipment_contents'
+    if re.search(r'\bco\s+(?:było|bylo|jest)\s+w\s+zam[oó]wieni\w*\b', normalized):
+        return 'order_contents'
     if _is_packing_history_read(normalized):
         return 'packing_history'
     if (
@@ -931,24 +931,6 @@ def _is_contextual_inventory_count_followup(value: str) -> bool:
     return bool(_CONTEXTUAL_INVENTORY_COUNT.match(normalized))
 
 
-_FAST_INVENTORY_COUNT = re.compile(
-    r'^\s*(\d{1,7})(?:\s*(?:szt\.?|sztuk))?\s*[.!?]?\s*$',
-    re.IGNORECASE,
-)
-_FAST_INVENTORY_NAMED_COUNT = re.compile(
-    r'^\s*(?:sprawdź\s+|sprawdz\s+)?(.{3,100}?)\s+(\d{1,7})(?:\s*(?:szt\.?|sztuk))?\s*[.!?]?\s*$',
-    re.IGNORECASE,
-)
-
-
-def _fast_inventory_count_quantity(value: str) -> int | None:
-    """Accept only an unambiguous quantity-only remanent follow-up."""
-    match = _FAST_INVENTORY_COUNT.fullmatch(str(value or ''))
-    if not match:
-        return None
-    return int(match.group(1))
-
-
 def _memory_contract_text(value: str) -> str:
     """Normalize status phrases without interpreting saved content."""
     normalized = unicodedata.normalize('NFKD', str(value or '')).casefold()
@@ -1045,7 +1027,8 @@ def _tool_descriptors(ai_actor, human_actor=None):
         if not item['read_only'] and item['name'] not in business_operations.SUPERVISED_WRITES | MEMORY_WRITES:
             continue
         definition = business_operations.OPERATION_REGISTRY[item['name']]
-        if human_actor and human_actor.permission_decision(definition.required_permission) == DENY:
+        if human_actor and any(human_actor.permission_decision(permission) == DENY
+                               for permission in business_operations.required_permissions(definition)):
             continue
         parameters = json.loads(json.dumps(item['input_schema']))
         if item['name'] in MEMORY_WRITES:
@@ -1179,6 +1162,8 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         # Existing aggregate fields remain stable for current diagnostics/clients.
         'context_build_ms':0.0, 'first_model_call_ms':0.0, 'business_operation_ms':0.0,
         'final_model_call_ms':0.0, 'total_ms':0.0, 'tool_calls_count':0,
+        'session_lookup_ms':0.0, 'tool_catalog_build_ms':0.0,
+        'display_text_ready_ms':0.0, 'tts_text_ready_ms':0.0, 'model_calls':0,
         'product_resolve_ms':0.0, 'inventory_read_ms':0.0,
         'count_record_ms':0.0, 'approval_prepare_ms':0.0,
         'inventory_adjust_ms':0.0, 'final_response_ms':0.0,
@@ -1452,6 +1437,71 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
 
     if not isinstance(human_actor,ActorContext) or human_actor.actor_type!='HUMAN':
         return finish('DENIED','Dostęp wymaga tożsamości pracownika.','HUMAN_REQUIRED')
+    def direct_business_read(read_operation, arguments, document_followup=False):
+        definition = business_operations.OPERATION_REGISTRY[read_operation]
+        current = load_actor_context(human_actor.actor_id)
+        if current is None or current.permission_decision(definition.required_permission) == DENY:
+            return finish('DENIED','Brak uprawnień do operacji.','PERMISSION_DENIED')
+        call_id = 'packing-history-context-' + run_id
+        timings['tool_calls_count'] += 1
+        _audit('agent.tool_selected',ai_actor,run_id,correlation_id,SUCCESS,
+               human_actor.actor_id,tool_name=read_operation,
+               conversation_id=conversation_id,
+               selection_reason='direct_structural_read')
+        operation_started = time.perf_counter()
+        result = business_operations.execute_business_operation(
+            ai_actor, read_operation, arguments, correlation_id=correlation_id)
+        elapsed = round((time.perf_counter()-operation_started)*1000,2)
+        timings['business_operation_ms'] = round(timings['business_operation_ms']+elapsed,2)
+        timings['tool_execution_ms'] = round(timings['tool_execution_ms']+elapsed,2)
+        timings['supabase_business_reads_ms'] = round(
+            timings['supabase_business_reads_ms']+elapsed,2)
+        _audit('agent.tool_result',ai_actor,run_id,correlation_id,
+               SUCCESS if result.status == 'SUCCESS' else FAILED,
+               human_actor.actor_id,tool_name=read_operation,
+               execution_id=result.execution_id,result_status=result.status,
+               conversation_id=conversation_id)
+        data = result.data if result.status == 'SUCCESS' else {
+            'ok':False, 'status':result.status, 'error_code':result.error_code,
+            'error':result.safe_error_message,
+        }
+        context_evidence = [
+            {'type':'function_call','call_id':call_id,
+             'name':read_operation,
+             'arguments':json.dumps(arguments,separators=(',',':'))},
+            {'type':'function_call_output','call_id':call_id,
+             'output':json.dumps(data,ensure_ascii=False,separators=(',',':'))},
+        ]
+        evidence.extend(context_evidence)
+        if result.status != 'SUCCESS':
+            return finish(
+                result.status if read_operation == shipment_read.OPERATION else 'SUCCESS', result.safe_error_message or
+                'Nie mam dostępu do konkretnej historycznej listy pakowej; nie będę rekonstruować jej z bieżących zamówień.',
+                result.error_code if read_operation == shipment_read.OPERATION else '', voice_response_mode='direct')
+        chat_503_diagnostics['tool_calls_ok'] += 1
+        history_data = dict(result.data or {})
+        if _artifact_builder:
+            try:
+                candidates = _artifact_builder(read_operation, history_data)
+                if isinstance(candidates, list):
+                    artifacts.extend(item for item in candidates if isinstance(item, dict))
+            except Exception:
+                logger.exception('AI_ARTIFACT_BUILD_FAILED packing history')
+        artifact_sources.extend(build_artifact_sources(
+            read_operation, history_data, conversation_id, run_id))
+        answer = (
+            shipment_read.answer(history_data) if (read_operation == shipment_read.OPERATION) else
+            'Oto istniejący historyczny dokument tej listy pakowej.'
+            if document_followup else _packing_history_answer(history_data)
+        )
+        speech = shipment_read.speech(history_data) if read_operation == shipment_read.OPERATION else ''
+        if read_operation == shipment_read.OPERATION:
+            timings['display_text_ready_ms'] = round((time.perf_counter()-started)*1000,2)
+            timings['tts_text_ready_ms'] = round((time.perf_counter()-started)*1000,2)
+        return finish('SUCCESS', answer,
+            speech_text=speech,
+            voice_response_mode=('direct' if (read_operation == shipment_read.OPERATION) or document_followup else 'full_detail'))
+
     trusted = load_actor_context(human_actor.actor_id,request_id=human_actor.request_id)
     if trusted is None or trusted.actor_type!='HUMAN' or trusted.permission_decision('inventory.read')!=ALLOW:
         return finish('DENIED','Brak dostępu do asystenta.','PERMISSION_DENIED')
@@ -1489,7 +1539,11 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                     normalized_text_sha256=hashlib.sha256(' '.join(turn_message.casefold().split()).encode()).hexdigest(),
                     text_length=len(turn_message))
         timings['acquire_turn_ms'] = round((time.perf_counter()-stage_started)*1000,2)
-        if voice_fast_mode and execution_outcome is None:
+        if execution_outcome is None and shipment_read.is_question(turn_message):
+            selector = shipment_read.direct_selector(turn_message, today=business_operations._business_now().date())
+            if selector:
+                return direct_business_read(shipment_read.OPERATION, selector)
+        if execution_outcome is None and not shipment_read.is_question(turn_message):
             import human_approval
             import internal_approval
 
@@ -1497,8 +1551,10 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 fast_voice_trace[stage] = round((time.perf_counter()-started)*1000, 2)
                 trace_phase(stage, model_calls=0)
 
+            lookup_started = time.perf_counter()
             fast_count_session = business_operations.active_inventory_count_session(
                 ai_actor, human_actor, conversation_id)
+            timings['session_lookup_ms'] = round((time.perf_counter()-lookup_started)*1000,2)
             if fast_count_session:
                 current_stage = 'inventory_voice_fast'
                 voice_mark('fast_path_detected')
@@ -1527,14 +1583,17 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                                 'inventory_read_ms', 'count_record_ms', 'approval_prepare_ms',
                                 'inventory_adjust_ms')), 2)
                     voice_mark('display_text_ready')
+                    timings['display_text_ready_ms'] = fast_voice_trace['display_text_ready']
+                    if emit is not None:
+                        display_emit('display_delta', {'delta':answer})
+                        emit('speech_ready', {'tts_text':speech, 'mode':'inventory_voice_fast',
+                                              'retry_ready':bool(failure)})
+                    voice_mark('speech_ready')
+                    timings['tts_text_ready_ms'] = fast_voice_trace['speech_ready']
                     result = finish('SUCCESS', answer, voice_response_mode='direct',
                                     inventory_tts=speech)
                     if result['status'] != 'SUCCESS':
                         return result
-                    if emit is not None:
-                        emit('speech_ready', {'tts_text': speech, 'mode': 'inventory_voice_fast',
-                                              'retry_ready':bool(failure)})
-                    voice_mark('speech_ready')
                     voice_mark('turn_complete')
                     result['inventory_fast_trace_ms'] = dict(fast_voice_trace)
                     result['inventory_fast_state'] = state
@@ -1641,6 +1700,14 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                         return voice_finish('Korekta odrzucona. Wynik liczenia zapisany, stan magazynu bez zmian.',
                                             'Odrzucono. Następny.', state='WAIT_PRODUCT')
                     if decision_data.get('execution_status') != 'SUCCESS':
+                        if decision_data.get('execution_status') in {'CONFLICT','DENIED','FAILED'}:
+                            business_operations.set_inventory_count_voice_state(
+                                ai_actor, human_actor, conversation_id, 'WAIT_PRODUCT')
+                            business_operations.set_inventory_count_active_product(
+                                ai_actor, human_actor, conversation_id, int(payload['product_id']))
+                            return voice_finish('Korekta nie została zapisana. Odczytam świeży stan przy ponownym liczeniu. Podaj ilość.',
+                                                'Nie zapisano. Policz ponownie.', state='WAIT_COUNT',
+                                                failure='adjust_not_saved')
                         return finish('FAILED', decision_data.get('error') or
                                       'Korekta nie została zapisana. Sprawdź stan przed ponowieniem.',
                                       'ADJUST_FAILED')
@@ -1654,7 +1721,8 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 if voice_state['voice_state'] == 'WAIT_APPROVAL':
                     old_approval = internal_approval.get_request_snapshot(
                         voice_state['pending_approval_id']) if voice_state['pending_approval_id'] else None
-                    if old_approval and old_approval['status'] not in {'PENDING', 'APPROVED'}:
+                    if old_approval and (old_approval['status'] not in {'PENDING', 'APPROVED'}
+                            or voice_state.get('pending_execution_status') in {'CONFLICT','DENIED','FAILED','SUCCESS'}):
                         business_operations.set_inventory_count_voice_state(
                             ai_actor, human_actor, conversation_id, 'WAIT_PRODUCT')
                         voice_state = business_operations.inventory_count_voice_state(
@@ -1667,6 +1735,21 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                     return voice_finish('Nie rozpoznano polecenia remanentu. Powtórz.',
                                         'Nie zrozumiałem. Powtórz.',
                                         state=voice_state['voice_state'], failure='parse_failed')
+
+                if command.kind == 'complete':
+                    completed = voice_call('inventory.count.complete', {
+                        'count_session_id':fast_count_session, 'conversation_id':conversation_id,
+                        'idempotency_key':run_id+':count-complete'}, phase='count_record_ms')
+                    return finish(completed.status,
+                        'Remanent zakończony.' if completed.status == 'SUCCESS' else completed.safe_error_message,
+                        completed.error_code or '', inventory_tts='Zakończono.' if completed.status == 'SUCCESS' else 'Sprawdź ekran.')
+                if command.kind in {'next', 'start'}:
+                    if command.kind == 'next':
+                        business_operations.set_inventory_count_voice_state(
+                            ai_actor, human_actor, conversation_id, 'WAIT_PRODUCT')
+                        voice_state['voice_state'] = 'WAIT_PRODUCT'
+                    return voice_finish('Remanent jest otwarty. Podaj produkt.', 'Podaj produkt.',
+                                        state=voice_state['voice_state'])
 
                 active_product = (voice_state['active_product_id']
                                   if voice_state['voice_state'] == 'WAIT_COUNT' else None)
@@ -1682,21 +1765,16 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 resolved_identity = ''
                 if command.kind == 'product':
                     resolve_started = time.perf_counter()
-                    resolved_identity = command.product_without_count or command.product
+                    # A complete exact product name wins over the trailing-count interpretation.
+                    resolved_identity = command.product
                     candidates = business_operations.resolve_inventory_voice_product(
-                        ai_actor, human_actor, conversation_id, resolved_identity)
-                    if quantity is not None and resolved_identity != command.product:
-                        full_identity = business_operations.resolve_inventory_voice_product(
-                            ai_actor, human_actor, conversation_id, command.product)
-                        if candidates and full_identity and {
-                                item['id'] for item in candidates} != {
-                                item['id'] for item in full_identity}:
-                            candidates = candidates + full_identity
-                        elif not candidates and full_identity:
-                            # The complete string is an exact product name, not a count.
-                            candidates = full_identity
-                            resolved_identity = command.product
-                            quantity = None
+                        ai_actor, human_actor, conversation_id, resolved_identity, exact_only=True)
+                    if candidates and command.product_without_count != command.product:
+                        quantity = None
+                    elif not candidates:
+                        resolved_identity = command.product_without_count or command.product
+                        candidates = business_operations.resolve_inventory_voice_product(
+                            ai_actor, human_actor, conversation_id, resolved_identity)
                     timings['product_resolve_ms'] = round(
                         (time.perf_counter()-resolve_started)*1000, 2)
                     if len(candidates) > 1:
@@ -1718,32 +1796,25 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                     product_id = int(candidates[0]['id'])
                     voice_mark('product_resolved')
                 if product_id is not None:
-                    read_started = time.perf_counter()
-                    product = business_operations.read_inventory_voice_product(
-                        ai_actor, human_actor, conversation_id, product_id,
-                        expected_identity=resolved_identity)
-                    timings['inventory_read_ms'] = round(
-                        (time.perf_counter()-read_started)*1000, 2)
+                    expected = voice_call('inventory.count.get_expected',
+                                          {'product_id':product_id}, phase='inventory_read_ms')
+                    if expected.status != 'SUCCESS':
+                        return finish(expected.status, expected.safe_error_message or 'Nie udało się odczytać stanu.',
+                                      expected.error_code or 'INVENTORY_READ_FAILED')
+                    product = expected.data
+                    if resolved_identity and business_operations._product_match_rank(
+                            dict(product, id=product_id), resolved_identity) is None:
+                        return finish('CONFLICT', 'Dane produktu zmieniły się. Podaj produkt ponownie.', 'PRODUCT_CHANGED')
                     voice_mark('inventory_read_done')
                     timings['supabase_business_reads_ms'] += timings['inventory_read_ms']
-                    timings['tool_calls_count'] += 1
-                    _audit('agent.tool_result', ai_actor, run_id, correlation_id, SUCCESS,
-                           human_actor.actor_id, tool_name='inventory.voice.product.read',
-                           conversation_id=conversation_id, product_id=product_id)
-                    evidence.extend([
-                        {'type':'function_call', 'call_id':'voice-read-'+run_id,
-                         'name':'inventory.voice.product.read',
-                         'arguments':json.dumps({'product_id':product_id})},
-                        {'type':'function_call_output', 'call_id':'voice-read-'+run_id,
-                         'output':json.dumps(product, ensure_ascii=False, separators=(',', ':'))},
-                    ])
                     display_name = str(product['model'] or product['name'] or product['sku'])
                     if quantity is None:
                         business_operations.set_inventory_count_active_product(
                             ai_actor, human_actor, conversation_id, product_id)
                         return voice_finish(
                             f'{display_name} — stan systemowy {product["expected_quantity"]} szt. Podaj policzoną ilość.',
-                            inventory_fast_voice.product_prompt(product), state='WAIT_COUNT')
+                            inventory_fast_voice.product_prompt(dict(product, model=(resolved_identity
+                                if resolved_identity and not resolved_identity.isdigit() else product['model']))), state='WAIT_COUNT')
                     counted = voice_call('inventory.count.record', {
                         'product_id':product_id, 'count_session_id':fast_count_session,
                         'conversation_id':conversation_id, 'counted_quantity':quantity,
@@ -1755,6 +1826,8 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                                       'Nie udało się zapisać liczenia.',
                                       counted.error_code or 'COUNT_RECORD_FAILED')
                     observed = counted.data or {}
+                    if _artifact_builder:
+                        artifacts.extend(_artifact_builder('inventory.count.record', observed) or [])
                     difference = int(observed['difference'])
                     if difference == 0:
                         return voice_finish(
@@ -1859,7 +1932,9 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         memory = agent_conversation.memory_for_model(human_actor,ai_actor,message)
         timings['memory_load_ms'] = round((time.perf_counter()-stage_started)*1000,2)
         stage_started = time.perf_counter()
+        catalog_started = time.perf_counter()
         tools = _tool_descriptors(ai_actor,human_actor)
+        timings['tool_catalog_build_ms'] = round((time.perf_counter()-catalog_started)*1000,2)
         high_level_read_enabled = (
             business_read_models.enabled()
             and any(item['name'] in business_read_models.READ_OPERATIONS for item in tools)
@@ -1955,291 +2030,9 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         packing_history_result = None
         packing_history_error = ''
         china_shortage_coverage_question = _is_china_shortage_coverage_question(turn_message)
-        if (shipment_read_requested and shipment_direct_arguments) or (packing_history_read and packing_history_direct_arguments):
-            read_operation = shipment_read.OPERATION if shipment_read_requested else PACKING_HISTORY_OPERATION
-            definition = business_operations.OPERATION_REGISTRY[read_operation]
-            current = load_actor_context(human_actor.actor_id)
-            if current is None or current.permission_decision(definition.required_permission) == DENY:
-                return finish('DENIED','Brak uprawnień do operacji.','PERMISSION_DENIED')
-            arguments = shipment_direct_arguments if shipment_read_requested else packing_history_direct_arguments
-            call_id = 'packing-history-context-' + run_id
-            timings['tool_calls_count'] += 1
-            _audit('agent.tool_selected',ai_actor,run_id,correlation_id,SUCCESS,
-                   human_actor.actor_id,tool_name=read_operation,
-                   conversation_id=conversation_id,
-                   selection_reason=packing_history_selection_reason)
-            operation_started = time.perf_counter()
-            result = business_operations.execute_business_operation(
-                ai_actor, read_operation, arguments, correlation_id=correlation_id)
-            elapsed = round((time.perf_counter()-operation_started)*1000,2)
-            timings['business_operation_ms'] = round(timings['business_operation_ms']+elapsed,2)
-            timings['tool_execution_ms'] = round(timings['tool_execution_ms']+elapsed,2)
-            timings['supabase_business_reads_ms'] = round(
-                timings['supabase_business_reads_ms']+elapsed,2)
-            _audit('agent.tool_result',ai_actor,run_id,correlation_id,
-                   SUCCESS if result.status == 'SUCCESS' else FAILED,
-                   human_actor.actor_id,tool_name=read_operation,
-                   execution_id=result.execution_id,result_status=result.status,
-                   conversation_id=conversation_id)
-            data = result.data if result.status == 'SUCCESS' else {
-                'ok':False, 'status':result.status, 'error_code':result.error_code,
-                'error':result.safe_error_message,
-            }
-            context_evidence = [
-                {'type':'function_call','call_id':call_id,
-                 'name':read_operation,
-                 'arguments':json.dumps(arguments,separators=(',',':'))},
-                {'type':'function_call_output','call_id':call_id,
-                 'output':json.dumps(data,ensure_ascii=False,separators=(',',':'))},
-            ]
-            evidence.extend(context_evidence)
-            if result.status != 'SUCCESS':
-                return finish(
-                    'SUCCESS', result.safe_error_message or
-                    'Nie mam dostępu do konkretnej historycznej listy pakowej; nie będę rekonstruować jej z bieżących zamówień.',
-                    voice_response_mode='direct')
-            chat_503_diagnostics['tool_calls_ok'] += 1
-            history_data = dict(result.data or {})
-            if _artifact_builder:
-                try:
-                    candidates = _artifact_builder(read_operation, history_data)
-                    if isinstance(candidates, list):
-                        artifacts.extend(item for item in candidates if isinstance(item, dict))
-                except Exception:
-                    logger.exception('AI_ARTIFACT_BUILD_FAILED packing history')
-            artifact_sources.extend(build_artifact_sources(
-                read_operation, history_data, conversation_id, run_id))
-            answer = (
-                shipment_read.answer(history_data) if shipment_read_requested else
-                'Oto istniejący historyczny dokument tej listy pakowej.'
-                if packing_history_document_followup else _packing_history_answer(history_data)
-            )
-            return finish('SUCCESS', answer,
-                speech_text=shipment_read.speech(history_data) if shipment_read_requested else '',
-                voice_response_mode=('direct' if shipment_read_requested or packing_history_document_followup else 'full_detail'))
-
-        # A quantity-only remanent follow-up is deterministic once the trusted
-        # previous turn identifies one product and an open count session exists.
-        # Keep the normal model path for every other message, including a
-        # quantity without an active session or with ambiguous product context.
-        fast_count_quantity = _fast_inventory_count_quantity(turn_message)
-        fast_product_id = None
-        named_count = _FAST_INVENTORY_NAMED_COUNT.fullmatch(turn_message)
-        named_product = (named_count.group(1).strip() if named_count else '')
-        if (execution_outcome is None and not eligible_approvals
-                and detected_intent in {'ambiguous', 'inventory_status', 'product_lookup'}):
-            try:
-                fast_count_session = business_operations.active_inventory_count_session(
-                    ai_actor, human_actor, conversation_id)
-            except Exception:
-                fast_count_session = ''
-            if fast_count_session and fast_count_quantity is not None:
-                fast_product_id = business_operations.inventory_count_active_product(
-                    ai_actor, human_actor, conversation_id)
-            if fast_count_session and (named_product or
-                    (fast_count_quantity is None and re.fullmatch(r'[\w\s.\-]{3,100}', turn_message))):
-                query = named_product or turn_message
-                t_resolve = time.perf_counter()
-                candidates = business_operations.resolve_inventory_count_product(
-                    ai_actor, human_actor, conversation_id, query)
-                timings['product_resolve_ms'] = round((time.perf_counter()-t_resolve)*1000,2)
-                if len(candidates) > 1:
-                    names = ', '.join(str(item['model'] or item['name'] or item['sku'])
-                                      for item in candidates)
-                    return finish('SUCCESS', f'Który produkt: {names}?', voice_response_mode='direct',
-                                  inventory_tts='Wybierz produkt.')
-                if len(candidates) == 1:
-                    fast_product_id = int(candidates[0]['id'])
-                    if named_count:
-                        fast_count_quantity = int(named_count.group(2))
-                    else:
-                        business_operations.set_inventory_count_active_product(
-                            ai_actor, human_actor, conversation_id, fast_product_id)
-                        name = str(candidates[0]['model'] or candidates[0]['name'] or candidates[0]['sku'])
-                        return finish('SUCCESS', f'{name}. Podaj liczbę sztuk.', voice_response_mode='direct',
-                                      inventory_tts=inventory_fast_voice.product_prompt(candidates[0]))
-            if fast_count_session and fast_count_quantity is not None and not fast_product_id:
-                return finish('SUCCESS', 'Podaj produkt do kolejnego liczenia.',
-                              voice_response_mode='direct')
-        if (fast_count_quantity is not None and fast_product_id and fast_count_session
-                and not eligible_approvals and execution_outcome is None):
-            if fast_count_session:
-                def fast_inventory_call(operation, arguments, *, read_only=False):
-                    nonlocal current_stage, fast_voice_operation, fast_voice_data
-                    current_stage = 'fast_inventory_operation'
-                    definition = business_operations.OPERATION_REGISTRY[operation]
-                    timings['tool_calls_count'] += 1
-                    _audit(
-                        'agent.tool_selected', ai_actor, run_id, correlation_id, SUCCESS,
-                        human_actor.actor_id, tool_name=operation,
-                        conversation_id=conversation_id, selection_reason='fast_inventory_count',
-                    )
-                    started_operation = time.perf_counter()
-                    try:
-                        result = business_operations.execute_business_operation(
-                            ai_actor, operation, arguments, correlation_id=correlation_id,
-                        )
-                    except Exception as exc:
-                        logger.error('AI_FAST_INVENTORY_OPERATION_FAILED %s', json.dumps({
-                            'agent_run_id': run_id, 'tool_name': operation,
-                            'exception_type': type(exc).__name__,
-                        }, sort_keys=True), exc_info=True)
-                        result = business_operations.OperationResult(
-                            status='FAILED', data=None, operation=operation,
-                            operation_version=definition.operation_version,
-                            execution_id='', request_id=ai_actor.request_id,
-                            correlation_id=correlation_id,
-                            error_code='DATA_UNAVAILABLE',
-                            safe_error_message='Nie udało się odczytać lub zapisać liczenia.',
-                        )
-                    elapsed = round((time.perf_counter() - started_operation) * 1000, 2)
-                    timings['business_operation_ms'] = round(
-                        timings['business_operation_ms'] + elapsed, 2)
-                    timings['tool_execution_ms'] = round(
-                        timings['tool_execution_ms'] + elapsed, 2)
-                    stage_key = {'inventory.count.get_expected':'inventory_read_ms',
-                                 'inventory.count.record':'count_record_ms',
-                                 'inventory.adjust':'approval_prepare_ms'}.get(operation)
-                    if stage_key:
-                        timings[stage_key] = round(timings[stage_key] + elapsed, 2)
-                    if read_only:
-                        timings['supabase_business_reads_ms'] = round(
-                            timings['supabase_business_reads_ms'] + elapsed, 2)
-                    _audit(
-                        'agent.tool_result', ai_actor, run_id, correlation_id,
-                        SUCCESS if result.status == 'SUCCESS' else FAILED,
-                        human_actor.actor_id, tool_name=operation,
-                        execution_id=result.execution_id, result_status=result.status,
-                        conversation_id=conversation_id,
-                    )
-                    payload = result.data if result.status == 'SUCCESS' else {
-                        'ok': False, 'status': result.status,
-                        'error_code': result.error_code,
-                        'error': result.safe_error_message,
-                    }
-                    call_id = 'fast-inventory-' + str(timings['tool_calls_count']) + '-' + run_id
-                    evidence.extend([
-                        {'type': 'function_call', 'call_id': call_id,
-                         'name': operation, 'arguments': json.dumps(
-                             arguments, ensure_ascii=False, separators=(',', ':'))},
-                        {'type': 'function_call_output', 'call_id': call_id,
-                         'output': json.dumps(payload, ensure_ascii=False, separators=(',', ':'))},
-                    ])
-                    if result.status == 'SUCCESS':
-                        fast_voice_operation, fast_voice_data = operation, dict(result.data or {})
-                        chat_503_diagnostics['tool_calls_ok'] += 1
-                        if _artifact_builder and isinstance(result.data, dict):
-                            try:
-                                if operation == 'inventory.count.record':
-                                    artifacts[:] = [item for item in artifacts
-                                                     if item.get('type') != 'inventory_count_card']
-                                candidates = _artifact_builder(operation, result.data)
-                                if isinstance(candidates, list):
-                                    for candidate in candidates:
-                                        if (isinstance(candidate, dict) and len(artifacts) < 6
-                                                and candidate not in artifacts):
-                                            artifacts.append(candidate)
-                            except Exception:
-                                logger.exception('AI_ARTIFACT_BUILD_FAILED fast inventory')
-                        artifact_sources.extend(build_artifact_sources(
-                            operation, result.data, conversation_id, run_id))
-                    return result
-
-                expected_result = fast_inventory_call(
-                    'inventory.count.get_expected', {'product_id': fast_product_id},
-                    read_only=True,
-                )
-                if expected_result.status != 'SUCCESS':
-                    return finish(
-                        expected_result.status,
-                        expected_result.safe_error_message
-                        or 'Nie udało się odczytać aktualnego stanu produktu.',
-                        expected_result.error_code or 'DATA_UNAVAILABLE',
-                    )
-                expected_data = dict(expected_result.data or {})
-                try:
-                    expected_version = int(expected_data['version'])
-                except (KeyError, TypeError, ValueError):
-                    return finish('FAILED', 'Nie udało się ustalić wersji stanu produktu.',
-                                  'DATA_UNAVAILABLE')
-                count_result = fast_inventory_call(
-                    'inventory.count.record', {
-                        'product_id': fast_product_id,
-                        'count_session_id': fast_count_session,
-                        'conversation_id': conversation_id,
-                        'counted_quantity': fast_count_quantity,
-                        'expected_version': expected_version,
-                        'idempotency_key': run_id + ':inventory-count-record',
-                    },
-                )
-                if count_result.status != 'SUCCESS':
-                    return finish(
-                        count_result.status,
-                        count_result.safe_error_message or 'Nie udało się zapisać liczenia.',
-                        count_result.error_code or 'COUNT_RECORD_FAILED',
-                    )
-                count_data = dict(count_result.data or {})
-                display_name = str(
-                    count_data.get('model') or count_data.get('name')
-                    or count_data.get('sku') or fast_product_id
-                )
-                difference = int(count_data.get('difference') or 0)
-                if difference == 0:
-                    t_final = time.perf_counter()
-                    answer = (f'{display_name} — system {count_data["expected_quantity"]}, '
-                              f'policzono {fast_count_quantity}. Stan zgodny.')
-                    timings['final_response_ms'] = round((time.perf_counter()-t_final)*1000,2)
-                    return finish(
-                        'SUCCESS', answer,
-                        voice_response_mode='direct',
-                        inventory_tts='Zgodne. Następny.',
-                    )
-
-                adjust_arguments = {
-                    'product_id': fast_product_id,
-                    'count_session_id': fast_count_session,
-                    'conversation_id': conversation_id,
-                    'expected_version': int(count_data.get('version') or expected_version),
-                    'idempotency_key': run_id + ':inventory-adjust',
-                }
-                adjust_result = fast_inventory_call('inventory.adjust', adjust_arguments)
-                if adjust_result.status == 'PENDING_APPROVAL':
-                    import human_approval
-                    human_approval.bind(
-                        business_operations, adjust_result.approval_id,
-                        conversation_id, human_actor, run_id,
-                    )
-                    approval = {
-                        'approval_id': adjust_result.approval_id,
-                        'operation': 'inventory.adjust',
-                        'expected_version': adjust_arguments['expected_version'],
-                        'product_id': fast_product_id,
-                        'count_session_id': fast_count_session,
-                    }
-                    try:
-                        approval.update(business_operations.inventory_adjustment_preview(
-                            ai_actor, human_actor, conversation_id, fast_product_id))
-                    except business_operations.ControlledOperationError:
-                        pass
-                    pending_approvals.append(approval)
-                    t_final = time.perf_counter()
-                    answer = (f'{display_name} — system {count_data["expected_quantity"]}, '
-                              f'policzono {fast_count_quantity}, różnica {difference:+d}. '
-                              'Korekta wymaga zatwierdzenia.')
-                    timings['final_response_ms'] = round((time.perf_counter()-t_final)*1000,2)
-                    return finish(
-                        'SUCCESS', answer,
-                        voice_response_mode='direct',
-                        inventory_tts=inventory_fast_voice.difference_prompt(difference),
-                    )
-                return finish(
-                    'SUCCESS',
-                    f'Policzono {display_name}: {fast_count_quantity} szt. '
-                    f'Różnica względem systemu: {difference:+d}. '
-                    'Nie utworzono korekty do zatwierdzenia: '
-                    + (adjust_result.safe_error_message or 'operacja była niedostępna.'),
-                    voice_response_mode='direct',
-                )
+        if packing_history_read and packing_history_direct_arguments:
+            return direct_business_read(PACKING_HISTORY_OPERATION, packing_history_direct_arguments,
+                                        packing_history_document_followup)
         while True:
             check_cancelled()
             current_stage = 'model_context_check'
@@ -2348,6 +2141,7 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                 else:
                     timings['second_model_pass_ms'] = round(timings['second_model_pass_ms']+elapsed,2)
                 model_calls += 1
+                timings['model_calls'] = model_calls
             if not isinstance(reply,ProviderResponse):
                 raise ValueError('Invalid provider response')
             if model_calls == 1:

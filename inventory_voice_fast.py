@@ -20,7 +20,7 @@ _NUMBERS = {
     'piecset': 500, 'szescset': 600, 'siedemset': 700,
     'osiemset': 800, 'dziewiecset': 900,
 }
-_UNITS = {'szt', 'sztuk', 'sztuki', 'sztuka'}
+_UNITS = {'szt', 'sztuk', 'sztuki', 'sztuka', 'sztuke'}
 _APPROVE = {'tak', 'zatwierdz', 'zapisz'}
 _REJECT = {'nie', 'odrzuc'}
 
@@ -61,22 +61,40 @@ class VoiceCommand:
 def parse(value):
     text = normalize_transcript(value)
     folded = ' '.join(_fold(text).split())
+    if folded in {'nastepny', 'nastepny produkt', 'dalej'}:
+        return VoiceCommand('next')
+    if folded in {'koniec remanentu', 'zakoncz remanent'}:
+        return VoiceCommand('complete')
+    if folded in {'robimy remanent', 'rozpocznij remanent', 'remanent'}:
+        return VoiceCommand('start')
     if folded in _APPROVE | _REJECT:
         return VoiceCommand('decision', decision='approve' if folded in _APPROVE else 'reject')
     if not text or len(text) > 120:
         return None
+    counted = re.fullmatch(r'(?:na polce (?:jest|lezy mi tylko)|jest ich tylko|naliczylem) (\d{1,7})(?: sztuk)?', folded)
+    if counted:
+        return VoiceCommand('quantity', quantity=int(counted[1]))
     words = text.split()
+    location_count = [_fold(word) for word in words[:3]] == ['mam', 'na', 'polce']
+    if location_count:
+        words = words[3:]
+    if words and _fold(words[0]) == 'sprawdz':
+        words.pop(0)
+        if words and _fold(words[0]) in {'produkt', 'produkty'}:
+            words.pop(0)
     if words and _fold(words[-1]) in _UNITS:
         words.pop()
     if not words:
         return None
     if len(words) == 1 and words[0].isdigit() and len(words[0]) <= 7:
         return VoiceCommand('quantity', quantity=int(words[0]))
+    if len(words) == 1 and words[0].isdigit() and 8 <= len(words[0]) <= 14:
+        return VoiceCommand('product', product=words[0])
     # STT often puts the counted amount before the product, or after "mam".
     # Remove only these explicit count phrases; product numbers remain intact.
     quantity = None
     product_words = words
-    if (len(words) >= 3 and _fold(words[0]) in {'mam', 'policzylem', 'policzylam'}
+    if (len(words) >= 2 and _fold(words[0]) in {'mam', 'policzylem', 'policzylam', 'policzono'}
             and words[1].isdigit() and len(words[1]) <= 7):
         quantity = int(words[1])
         offset = 2
@@ -89,8 +107,14 @@ def parse(value):
           and words[-1].isdigit() and len(words[-1]) <= 7):
         quantity = int(words[-1])
         product_words = words[:-2]
+    elif (len(words) >= 4 and [_fold(word) for word in words[-3:-1]] == ['na', 'polce']
+          and words[-1].isdigit() and len(words[-1]) <= 7):
+        quantity = int(words[-1])
+        product_words = words[:-3]
     if quantity is not None:
         product = ' '.join(product_words)
+        if not product:
+            return VoiceCommand('quantity', quantity=quantity)
         if (not re.fullmatch(r'[\w .-]{3,100}', product)
                 or not re.search(r'[A-Za-zÀ-ž]', product)):
             return None
@@ -100,12 +124,11 @@ def parse(value):
     if not re.fullmatch(r'[\w .-]{3,100}', product) or not re.search(r'[A-Za-zÀ-ž]', product):
         return None
     if len(words) > 1 and words[-1].isdigit() and len(words[-1]) <= 7:
-        return VoiceCommand('product', product=product,
+        return VoiceCommand('product', product=' '.join(words[:-1]) if location_count else product,
                             product_without_count=' '.join(words[:-1]),
                             quantity=int(words[-1]))
     return VoiceCommand('product', product=product)
 
 
 def difference_prompt(expected_quantity, difference):
-    return normalize_tts_text(
-        f'System {int(expected_quantity)}. Różnica {int(difference):+d}. Zapisać?')
+    return normalize_tts_text(f'Różnica {int(difference):+d}. Zatwierdzić?')

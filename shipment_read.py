@@ -12,10 +12,11 @@ from zoneinfo import ZoneInfo
 OPERATION = 'shipment.read'
 WARSAW = ZoneInfo('Europe/Warsaw')
 INPUT = {'type': 'object', 'additionalProperties': False, 'required': ['mode'], 'properties': {
-    'mode': {'type': 'string', 'enum': ['latest', 'date', 'customer']},
+    'mode': {'type': 'string', 'enum': ['latest', 'date', 'customer', 'tracking']},
     'date': {'type': 'string', 'minLength': 10, 'maxLength': 10},
     'customer_id': {'type': 'integer', 'minimum': 1},
     'customer': {'type': 'string', 'minLength': 1, 'maxLength': 160},
+    'tracking': {'type': 'string', 'minLength': 1, 'maxLength': 160},
     'order_number': {'type': 'string', 'minLength': 1, 'maxLength': 80},
 }}
 OUTPUT = {'type': 'object', 'additionalProperties': False,
@@ -34,13 +35,12 @@ def is_question(text):
     value = str(text or '').casefold()
     if re.search(r'\b(?:wyślij|wyslij|utw[oó]rz|wygeneruj|nadaj)\b', value):
         return False
-    if re.search(r'\bco\s+(?:było|bylo|jest)\s+w\s+zam[oó]wieni', value):
-        return False
     # Explicit LP questions keep the existing LP/current/history workflow.
-    if re.search(r'\b(?:lp|list\w*\s+pakow|li[śs]ci\w*\s+pakow)', value):
+    if (re.search(r'\b(?:lp|list\w*\s+pakow|li[śs]ci\w*\s+pakow)', value)
+            and not re.search(r'\b(?:do|dla)\s+.+', value)):
         return False
     return bool(re.search(r'\b(?:co|jakie|ile|pokaż|pokaz|odczytaj)\b', value) and re.search(
-        r'\b(?:wysła\w*|wysla\w*|wysyłc\w*|wysylc\w*|wyszło|wyszlo|poszło|poszlo|'
+        r'\b(?:wysła\w*|wysla\w*|wysył\w*|wysyl\w*|przesył\w*|przesyl\w*|wyszło|wyszlo|poszło|poszlo|'
         r'było\s+w\s+pacz\w*|bylo\s+w\s+pacz\w*)\b', value))
 
 
@@ -49,6 +49,12 @@ def direct_selector(text, today=None):
     value = ' '.join(str(text or '').casefold().split()).strip(' ?!.')
     today = today or datetime.now(WARSAW).date()
     scope = {}
+    tracking = re.search(r'\b(?:tracking(?:u)?|numerze(?:\s+tracking(?:u)?)?)\s*[:#]?\s*([\w-]+)', value)
+    if tracking:
+        # Preserve the caller's exact identifier, including case.
+        original = str(text or '')
+        exact = re.search(re.escape(tracking[1]), original, re.IGNORECASE)
+        return {'mode':'tracking', 'tracking':exact[0] if exact else tracking[1]}
     order = re.search(r'\bzam\s*[-–—]?\s*((?:\d[\s-]*){5,20})\b', value)
     if order:
         scope['order_number'] = 'ZAM-' + re.sub(r'\D', '', order[1])
@@ -76,7 +82,7 @@ def direct_selector(text, today=None):
     customer = re.search(r'\b(?:do|dla)\s+(.+)$', value)
     if customer and not order:
         return {'mode': 'customer', 'customer': customer[1]}
-    if order or re.fullmatch(r'co\s+(?:ostatnio\s+)?(?:wysłałem|wyslalem|wysłaliśmy|wyslalismy)', value):
+    if order or re.search(r'\bostatni(?:ej|a|ą|e|o)\b', value) or re.fullmatch(r'co\s+(?:ostatnio\s+)?(?:wysłałem|wyslalem|wysłaliśmy|wyslalismy)', value):
         return dict(mode='latest', **scope)
     return None
 
@@ -168,18 +174,23 @@ def _scope(items):
 
 
 def _invoice_candidates(db, order_ids):
-    sets = []
+    candidates = set()
     for oid in order_ids:
-        sets.append({r[0] for r in db.execute('''SELECT DISTINCT i.id FROM invoices i
-            LEFT JOIN invoice_allocations ia ON ia.invoice_id=i.id WHERE i.order_id=? OR ia.order_id=?''', (oid,oid))})
-    common = set.intersection(*sets) if sets else set()
-    return sorted(common or set.union(*sets)) if sets else []
+        candidates.update(r[0] for r in db.execute("""SELECT DISTINCT i.id FROM invoices i
+            LEFT JOIN invoice_allocations ia ON ia.invoice_id=i.id
+            WHERE i.publication_state='complete' AND (i.order_id=? OR ia.order_id=?)
+              AND (EXISTS(SELECT 1 FROM invoice_allocations a WHERE a.invoice_id=i.id)
+                   OR EXISTS(SELECT 1 FROM invoice_meta m WHERE m.invoice_id=i.id
+                             AND TRIM(COALESCE(m.invoice_items_json,'')) NOT IN ('','[]','null')))""", (oid, oid)))
+    return sorted(candidates)
 
 
 def read(data, *, connection_factory, packing_allowed=True):
     mode = data.get('mode')
-    if mode not in ('latest','date','customer'):
-        raise ShipmentReadError('Wskaż tryb odczytu wysyłki: latest, date albo customer.')
+    if mode not in ('latest','date','customer','tracking'):
+        raise ShipmentReadError('Wskaż tryb odczytu wysyłki: latest, date, customer albo tracking.')
+    if mode == 'tracking' and not data.get('tracking'):
+        raise ShipmentReadError('Podaj dokładny tracking wysyłki.')
     requested_day = None
     if mode == 'date':
         try:
@@ -247,23 +258,47 @@ def read(data, *, connection_factory, packing_allowed=True):
         for event in groups.values():
             if any(matches_order(r) for r in event['members']):
                 events.append(event)
-        events.sort(key=lambda e:(e['moment'],bool(e['final_packing_batch_id']),e['shipment_id']), reverse=True)
-        # Resolve invoice scope in the backend; the model cannot guess an invoice.
-        merged = {}
+        # Several final lists / order rows may describe the same physical parcel.
+        physical = {}
         for event in events:
-            candidates = [event['invoice_id']] if event['invoice_id'] else _invoice_candidates(db,[r['id'] for r in event['members']])
-            event['invoice_candidates'] = candidates
-            if len(candidates) == 1:
-                event['invoice_id'] = candidates[0]
-            key = (event['invoice_id'],event['shipped_at']) if not event['tracking'] and event['invoice_id'] else event['shipment_id']
-            if key not in merged:
-                merged[key] = event
-            elif not merged[key]['final_packing_batch_id'] and event['final_packing_batch_id']:
-                merged[key] = event
-            if mode != 'date':
-                break  # Never resolve invoices for the entire shipment history.
-        chosen = list(merged.values()) if mode == 'date' else list(merged.values())[:1]
+            if data.get('tracking') and event['tracking'] != data['tracking']:
+                continue
+            key = (event['carrier'], event['tracking']) if event['tracking'] else event['shipment_id']
+            if key not in physical:
+                event['final_packing_batch_ids'] = set()
+                event['explicit_invoice_ids'] = set()
+                physical[key] = event
+            target = physical[key]
+            target['members'] = list({r['id']:r for r in target['members'] + event['members']}.values())
+            if event['final_packing_batch_id']:
+                target['final_packing_batch_ids'].add(int(event['final_packing_batch_id']))
+            if event['invoice_id']:
+                target['explicit_invoice_ids'].add(int(event['invoice_id']))
+        events = sorted(physical.values(), key=lambda e:(e['moment'],e['shipment_id']), reverse=True)
+        chosen = events if mode == 'date' else events[:1]
+        for event in chosen:
+            candidates = set(_invoice_candidates(db, [r['id'] for r in event['members']]))
+            # An immutable invoice attached to another confirmed physical parcel
+            # cannot be inferred to belong to this parcel just from its order.
+            if 'packing_shipments' in tables:
+                other = {r[0] for r in db.execute("""SELECT DISTINCT pb.invoice_id
+                    FROM packing_shipments ps JOIN packing_batches pb ON pb.id=ps.final_batch_id
+                    WHERE pb.invoice_id IS NOT NULL AND ps.shipment_key<>?
+                      AND NOT (ps.tracking<>'' AND ps.tracking=? AND ps.carrier=?)""",
+                    (event['shipment_id'],event['tracking'],event['carrier']))}
+                candidates -= other - event['explicit_invoice_ids']
+            event['invoice_candidates'] = sorted(candidates)
+            event['invoice_id'] = next(iter(candidates)) if len(candidates) == 1 else None
         shipments = [_view(db,event,packing_allowed) for event in chosen]
+        owners = {}
+        for shipment in shipments:
+            for invoice_id in shipment.get('invoice_ids', []):
+                owners.setdefault(invoice_id, []).append(shipment)
+        for invoice_id, matches in owners.items():
+            if len(matches) > 1:
+                for shipment in matches:
+                    shipment.update(complete=False, items=[], total_units=0)
+                    shipment['issues'].append('Ta sama faktura wskazuje kilka wysyłek. Brak jednoznacznego podziału zawartości.')
         return dict(ok=True,mode=mode,shipments=shipments,count=len(shipments),
                     total_units=sum(s['total_units'] for s in shipments), complete=all(s['complete'] for s in shipments))
     finally:
@@ -276,26 +311,64 @@ def _view(db, event, packing_allowed):
     result.update(customer=dict(id=first['customer_id'],name=first['customer_name'] or '',email=first['customer_email'] or ''),
                   invoice_number='',orders=[],items=[],total_units=0,packing_verified=False,
                   packing_status='missing',final_packing_items=[],issues=[],complete=True,source=event['source'])
-    if len(event['invoice_candidates']) != 1:
-        result.update(complete=False,invoice_candidates=event['invoice_candidates'])
-        result['issues'].append('Brak jednoznacznego powiązania wysyłki z fakturą. Wymaga wyjaśnienia.')
+    result.update(invoice_ids=[], invoice_numbers=[], invoices=[])
+    batch_ids = sorted(event.get('final_packing_batch_ids') or [])
+    result['final_packing_batch_ids'] = batch_ids
+    final = []
+    if batch_ids and packing_allowed:
+        marks = ','.join('?' for _ in batch_ids)
+        final = [dict(order_id=r['order_id'],order_item_id=r['order_item_id'],sku=r['sku_snapshot'],
+                      name=r['model_name_snapshot'] or '',qty=r['qty']) for r in db.execute(
+                          f'SELECT * FROM packing_allocations WHERE batch_id IN ({marks}) ORDER BY id', batch_ids)]
+    if not event['invoice_candidates']:
+        result['complete'] = False
+        result['issues'].append('Brak kompletnej faktury powiązanej z wysyłką. Wymaga wyjaśnienia.')
         return result
-    try:
-        inv,items,source,conflicting_allocations = invoice_contents(db,event['invoice_id'])
-    except ShipmentReadError as exc:
-        result.update(complete=False)
-        result['issues'].append(str(exc))
-        return result
-    result.update(invoice_number=inv['invoice_no'],items=items,total_units=sum(i['qty'] for i in items),items_source=source)
-    result['customer']['name'] = inv['buyer_name'] or result['customer']['name']
-    result['orders'] = [dict(order_id=oid,order_number=next((i['order_number'] for i in items if i['order_id']==oid),'')) for oid in sorted({i['order_id'] for i in items})]
+    items, conflicting_allocations, sources = [], [], set()
+    members = {r['id'] for r in event['members']}
+    covered = set()
+    for invoice_id in event['invoice_candidates']:
+        try:
+            inv, lines, source, conflict = invoice_contents(db, invoice_id)
+        except ShipmentReadError as exc:
+            result['complete'] = False
+            result['issues'].append(str(exc))
+            continue
+        scope = {line['order_id'] for line in lines}
+        if not scope <= members:
+            result['complete'] = False
+            result['issues'].append('Faktura obejmuje zamówienia poza ustaloną wysyłką. Nie przypisuję całej faktury do tej paczki.')
+        covered.update(scope)
+        result['invoice_ids'].append(invoice_id)
+        result['invoice_numbers'].append(inv['invoice_no'])
+        result['invoices'].append(dict(id=invoice_id, number=inv['invoice_no'], items_source=source))
+        items.extend(dict(line, invoice_id=invoice_id) for line in lines)
+        conflicting_allocations.extend(conflict)
+        sources.add(source)
+    if covered != members:
+        result['complete'] = False
+        result['issues'].append('Nie wszystkie zamówienia wysyłki mają kompletne zapisane pozycje faktur.')
+    line_owners = {}
+    for item in items:
+        key = (item['order_id'], item['order_item_id'] or item['sku'])
+        line_owners.setdefault(key, set()).add(item['invoice_id'])
+    if (any(len(ids) > 1 and not ids <= event['explicit_invoice_ids'] for ids in line_owners.values())
+            and not (final and _scope(final) == _scope(items))):
+        result.update(complete=False, invoice_candidates=event['invoice_candidates'])
+        result['issues'].append('Kilka faktur dotyczy tych samych pozycji zamówienia bez jednoznacznego przypisania do paczki.')
+        items = []
+    identities = {str(r['customer_id'] or r['customer_email'] or r['customer_name']) for r in event['members']}
+    if len(identities) != 1:
+        result['complete'] = False
+        result['issues'].append('Ten sam tracking wskazuje różnych odbiorców. Wymaga wyjaśnienia.')
+        items = []
+    result.update(invoice_number=', '.join(result['invoice_numbers']), items=items,
+                  total_units=sum(i['qty'] for i in items), items_source='+'.join(sorted(sources)))
+    result['orders'] = [dict(order_id=oid,order_number=next((i['order_number'] for i in items if i['order_id']==oid),'')) for oid in sorted(covered)]
     if conflicting_allocations:
         result.update(complete=False,invoice_allocation_items=conflicting_allocations)
         result['issues'].append('Snapshot JSON faktury i alokacje faktury różnią się. Wymaga wyjaśnienia.')
-    if event['final_packing_batch_id'] and packing_allowed:
-        final = [dict(order_id=r['order_id'],order_item_id=r['order_item_id'],sku=r['sku_snapshot'],
-                      name=r['model_name_snapshot'] or '',qty=r['qty']) for r in db.execute(
-                          'SELECT * FROM packing_allocations WHERE batch_id=? ORDER BY id', (event['final_packing_batch_id'],))]
+    if batch_ids and packing_allowed:
         result['final_packing_items'] = final
         verified = bool(final) and _scope(final)==_scope(items)
         result.update(packing_verified=verified,packing_status='matched' if verified else 'discrepancy')
@@ -322,10 +395,10 @@ def answer(data):
             lines.append('Możliwe faktury (ID): '+', '.join(map(str,s['invoice_candidates']))+'.')
         if s['items']:
             lines.append(f"{len(s['items'])} pozycji, {s['total_units']} sztuk.")
-            lines.append('Wszystkie pozycje powiązanej faktury:')
+            lines.append('Wszystkie pozycje powiązanych faktur:')
             for item in s['items']:
                 lines.append(f"- {item['sku']} {item['name']} — {item['qty']} szt. ({item.get('order_number') or item['order_id']})")
-            lines.append(f"Razem na fakturze: {s['total_units']} sztuk.")
+            lines.append(f"Razem na fakturach: {s['total_units']} sztuk.")
         if s['packing_status']=='discrepancy':
             lines.append(f"Finalna LP, batch {s['final_packing_batch_id']}:")
             for item in s['final_packing_items']:

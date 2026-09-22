@@ -8,7 +8,6 @@ state for every execution.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
-from difflib import SequenceMatcher
 import hashlib
 import json
 import logging
@@ -122,7 +121,7 @@ _voice_inventory_refresh: Callable[[int], None] | None = None
 _write_success_observer: Callable[[str, Mapping[str, Any]], None] | None = None
 
 FRESHNESS_GROUP_BY_OPERATION = {
-    shipment_read.OPERATION: 'invoice_amendment',
+    shipment_read.OPERATION: 'shipment',
     "business.query": "inventory",
     "business.orders.state": "orders_state", "business.inventory.state": "inventory_state",
     "business.finance.state": "finance_state", "business.deliveries.state": "deliveries_state",
@@ -176,6 +175,7 @@ class BusinessOperationDefinition:
     audit_policy: str
     read_only: bool
     enabled: bool = True
+    additional_required_permissions: tuple[str, ...] = ()
 
     def __post_init__(self):
         if not re.fullmatch(r"[a-z][a-z0-9_.]{2,127}", self.operation_name):
@@ -773,6 +773,7 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
         'Odczytuje faktyczne wysyłki według shipped_at lub potwierdzonego zdarzenia, a ich zawartość z pełnych powiązanych faktur. mode=latest: ostatnia wysyłka; date: wszystkie wysyłki danego dnia; customer: ostatnia dla klienta. Finalna LP jest kontrolą zgodności. Rozbieżności i niejednoznaczne faktury są jawne. Nie odtwarza wysyłki z order_items.',
         'orders.read_full', approvals.GREEN, 'NONE', frozenset({'HUMAN','AI_AGENT'}),
         shipment_read.INPUT, shipment_read.OUTPUT, IDEMPOTENCY_NONE, 'READ_STANDARD', True,
+        additional_required_permissions=('invoices.read',),
     ),
     "invoices.search": BusinessOperationDefinition(
         "invoices.search", 1, "Wyszukuje faktury, opcjonalnie dla customer_id; payment_status=unpaid oznacza nieopłacone, a zaległe obsługuje invoices.overdue.",
@@ -915,7 +916,7 @@ _WAREHOUSE_OUTPUT = {'type':'object','additionalProperties':False,
         'ok':{'type':'boolean'}, 'product_id':{'type':'integer'}, 'order_id':{'type':'integer'},
         'count_id':{'type':'string'}, 'expected_quantity':{'type':'integer'},
         'counted_quantity':{'type':'integer'}, 'difference':{'type':'integer'},
-        'sku':{'type':'string'}, 'model':{'type':'string'}, 'name':{'type':'string'},
+        'sku':{'type':'string'}, 'model':{'type':'string'}, 'name':{'type':'string'}, 'ean':{'type':'string'},
         'version':{'type':'integer'}, 'status':{'type':'string'}, 'ready':{'type':'boolean'},
         'order_number':{'type':'string'}, 'order_status':{'type':'string'},
         'total_items':{'type':'integer'}, 'total_units':{'type':'integer'},
@@ -1462,6 +1463,28 @@ def _product_get(data, actor, correlation_id, transaction_connection=None):
             "image_requested":data.get('include_image') is True}
 
 
+def _product_match_rank(row, query, *, exact_only=False):
+    """One token matcher for catalog search and counting (ZIP42 matching rules)."""
+    query = _voice_product_key(query)
+    fields = [_voice_product_key(row[field]) for field in ('sku', 'model', 'name', 'ean')]
+    compact = query.replace(' ', '')
+    compact_fields = [field.replace(' ', '') for field in fields]
+    if not query:
+        return None
+    exact = query in fields or compact in compact_fields
+    if exact_only and not exact:
+        return None
+    combined = ' '.join(fields)
+    if not (exact or any(query in field for field in fields)
+            or any(compact in field for field in compact_fields)
+            or all(token in combined for token in query.split())):
+        return None
+    priority = (0 if query == fields[0] else 1 if exact else
+                2 if compact_fields[0].startswith(compact) else
+                3 if any(field.startswith(query) for field in fields[1:3]) else 4)
+    return priority, fields[0], int(row['id'])
+
+
 def _product_search(data, actor, correlation_id, transaction_connection=None):
     query = " ".join(str(data["query"]).strip().casefold().split())
     tokens = [token for token in re.split(r"[^\w]+", query, flags=re.UNICODE) if token][:8]
@@ -1478,31 +1501,8 @@ def _product_search(data, actor, correlation_id, transaction_connection=None):
         if transaction_connection is None:
             db.close()
 
-    query_compact = re.sub(r"[^\w]+", "", query, flags=re.UNICODE)
-
-    def rank(row):
-        fields = [" ".join(str(row[field] or "").strip().casefold().split())
-                  for field in ("sku", "model", "name", "ean")]
-        combined = " ".join(fields)
-        compact_fields = [re.sub(r"[^\w]+", "", value, flags=re.UNICODE) for value in fields]
-        direct = any(query in value for value in fields)
-        compact = bool(query_compact) and any(query_compact in value for value in compact_fields)
-        token_match = all(token in combined for token in tokens)
-        if not (direct or compact or token_match):
-            return None
-        if query == fields[0]:
-            priority = 0  # exact SKU
-        elif query in fields[1:3]:
-            priority = 1  # exact model or product family/name
-        elif fields[0].startswith(query) or (query_compact and compact_fields[0].startswith(query_compact)):
-            priority = 2  # SKU family, e.g. CH030
-        elif any(value.startswith(query) for value in fields[1:3]):
-            priority = 3
-        else:
-            priority = 4  # model + variant spread across fields
-        return priority, fields[0], int(row["id"])
-
-    found = [(match_rank, row) for row in catalog if (match_rank := rank(row)) is not None]
+    found = [(rank, row) for row in catalog
+             if (rank := _product_match_rank(row, query)) is not None]
     found.sort(key=lambda item: item[0])
     selected = [row for _, row in found[:MAX_PRODUCT_SEARCH_RESULTS]]
     metrics={int(item['id']):item for item in build_replenishment_analysis(_factory(),today=_business_now().date())}
@@ -2230,11 +2230,11 @@ def _order_version(db, order_id):
 
 def _validate_order_write(db, data, actor, definition):
     trusted = _trusted_actor(actor)
-    if trusted.permission_decision(definition.required_permission) == PERMISSION_DENY:
+    if any(trusted.permission_decision(permission) == PERMISSION_DENY for permission in required_permissions(definition)):
         raise ControlledOperationError('PERMISSION_DENIED', 'Permission został odebrany', status=DENIED)
     if actor.delegated_by_actor_id:
         human = load_actor_context(actor.delegated_by_actor_id)
-        if human is None or human.permission_decision(definition.required_permission) == PERMISSION_DENY:
+        if human is None or any(human.permission_decision(permission) == PERMISSION_DENY for permission in required_permissions(definition)):
             raise ControlledOperationError('PERMISSION_DENIED', 'Inicjator utracił permission', status=DENIED)
     if db.execute('SELECT id FROM orders WHERE id=?', (data['order_id'],)).fetchone() is None:
         raise ControlledOperationError('ORDER_NOT_FOUND', 'Nie znaleziono zamówienia', status=CONFLICT)
@@ -2322,8 +2322,10 @@ def inventory_count_voice_state(ai_actor, human_actor, conversation_id):
     db = _factory()()
     try:
         _assert_count_conversation(db, ai, conversation_id)
-        row = db.execute("""SELECT session_id,voice_state,active_product_id,pending_approval_id
-                            FROM internal_inventory_count_sessions
+        row = db.execute("""SELECT session_id,voice_state,active_product_id,pending_approval_id,
+                            (SELECT status FROM internal_operation_executions e
+                             WHERE e.approval_id=s.pending_approval_id LIMIT 1) AS pending_execution_status
+                            FROM internal_inventory_count_sessions s
                             WHERE created_by=? AND conversation_id=? AND status='OPEN'""",
                          (human.actor_id, conversation_id)).fetchone()
         return dict(row) if row else None
@@ -2386,8 +2388,8 @@ def _voice_product_key(value):
 
 
 def resolve_inventory_voice_product(ai_actor, human_actor, conversation_id, query,
-                                    *, prefix_hints=False):
-    """Exact local identity lookup; prefix hints only explain an incomplete name."""
+                                    *, prefix_hints=False, exact_only=False):
+    """Count identity uses the same token matcher as inventory.product.search."""
     ai = _trusted_actor(ai_actor)
     human = load_actor_context(human_actor.actor_id) if isinstance(human_actor, ActorContext) else None
     if human is None or human.actor_type != 'HUMAN' or ai.delegated_by_actor_id != human.actor_id:
@@ -2406,16 +2408,12 @@ def resolve_inventory_voice_product(ai_actor, human_actor, conversation_id, quer
             return []
         rows = db.execute("""SELECT id,sku,model,name,ean FROM products
                              WHERE COALESCE(archived,0)=0""").fetchall()
-        matches = [dict(id=int(row['id']), sku=row['sku'] or '', model=row['model'] or '',
-                        name=row['name'] or '') for row in rows
-                   if needle in {_voice_product_key(row[field])
-                                 for field in ('sku', 'model', 'name', 'ean')}]
-        if matches or not prefix_hints:
-            return matches
+        ranked = [(rank, row) for row in rows
+                  if (rank := _product_match_rank(row, query, exact_only=exact_only)) is not None]
+        ranked.sort(key=lambda item: item[0])
+        # Never truncate to one result or choose a best score over an ambiguity.
         return [dict(id=int(row['id']), sku=row['sku'] or '', model=row['model'] or '',
-                     name=row['name'] or '') for row in rows
-                if any(_voice_product_key(row[field]).startswith(needle + ' ')
-                       for field in ('sku', 'model', 'name', 'ean'))][:5]
+                     name=row['name'] or '', ean=row['ean'] or '') for _, row in ranked[:20]]
     finally:
         db.close()
 
@@ -2437,27 +2435,13 @@ def read_inventory_voice_product(ai_actor, human_actor, conversation_id, product
             raise ControlledOperationError('COUNT_SESSION_NOT_FOUND', 'Brak otwartej sesji remanentu', status=CONFLICT)
     finally:
         db.close()
-    if _voice_inventory_refresh:
-        _voice_inventory_refresh(int(product_id))
-    db = _factory()()
-    try:
-        row = db.execute("""SELECT p.id,p.sku,p.model,p.name,COALESCE(s.qty,0) qty
-                            FROM products p LEFT JOIN stock s ON s.product_id=p.id
-                            WHERE p.id=? AND COALESCE(p.archived,0)=0""",
-                         (int(product_id),)).fetchone()
-        if row is None:
-            raise ControlledOperationError('PRODUCT_NOT_FOUND', 'Nie znaleziono produktu', status=CONFLICT)
-        if expected_identity and _voice_product_key(expected_identity) not in {
-                _voice_product_key(row[field]) for field in ('sku', 'model', 'name')}:
-            raise ControlledOperationError('PRODUCT_CHANGED',
-                                           'Dane produktu zmieniły się. Podaj produkt ponownie.',
-                                           status=CONFLICT)
-        return {'ok':True, 'product_id':int(row['id']), 'sku':row['sku'] or '',
-                'model':row['model'] or '', 'name':row['name'] or '',
-                'expected_quantity':max(0, int(row['qty'] or 0)),
-                'version':_inventory_version(db, product_id), 'status':'READY'}
-    finally:
-        db.close()
+    result = execute_business_operation(ai, 'inventory.count.get_expected', {'product_id':int(product_id)})
+    if result.status != SUCCESS:
+        raise ControlledOperationError(result.error_code, result.safe_error_message, status=result.status)
+    product = result.data
+    if expected_identity and _product_match_rank(dict(product, id=product_id), expected_identity) is None:
+        raise ControlledOperationError('PRODUCT_CHANGED', 'Dane produktu zmieniły się. Podaj produkt ponownie.', status=CONFLICT)
+    return product
 
 
 def set_inventory_count_active_product(ai_actor, human_actor, conversation_id, product_id):
@@ -2485,49 +2469,8 @@ def set_inventory_count_active_product(ai_actor, human_actor, conversation_id, p
 
 
 def resolve_inventory_count_product(ai_actor, human_actor, conversation_id, query):
-    """Bounded local identity lookup for an open remanent, without replenishment analytics."""
-    ai = _trusted_actor(ai_actor)
-    human = load_actor_context(human_actor.actor_id) if isinstance(human_actor, ActorContext) else None
-    if human is None or human.actor_type != 'HUMAN' or ai.delegated_by_actor_id != human.actor_id:
-        raise ControlledOperationError('UNTRUSTED_ACTOR', 'Brak zaufanego właściciela sesji', status=DENIED)
-    if ai.permission_decision('inventory.read') == PERMISSION_DENY or human.permission_decision('inventory.read') == PERMISSION_DENY:
-        raise ControlledOperationError('PERMISSION_DENIED', 'Brak dostępu do produktu', status=DENIED)
-    def norm(value):
-        value = unicodedata.normalize('NFKD', str(value or '').casefold()).replace('ł', 'l')
-        return ' '.join(re.sub(r'[^a-z0-9]+', ' ', ''.join(ch for ch in value
-                        if not unicodedata.combining(ch))).split())
-    needle = norm(query)
-    if len(needle) < 3:
-        return []
-    db = _factory()()
-    try:
-        _assert_count_conversation(db, ai, conversation_id)
-        active = db.execute("""SELECT 1 FROM internal_inventory_count_sessions
-                               WHERE created_by=? AND conversation_id=? AND status='OPEN'""",
-                            (human.actor_id, conversation_id)).fetchone()
-        if not active:
-            return []
-        rows = db.execute("""SELECT id,sku,model,name,ean FROM products
-                             WHERE COALESCE(archived,0)=0""").fetchall()
-    finally:
-        db.close()
-    scored = []
-    for row in rows:
-        fields = [norm(row[key]) for key in ('sku', 'model', 'name', 'ean')]
-        exact = needle in fields or needle.replace(' ', '') in [field.replace(' ', '') for field in fields]
-        prefix = any(field.startswith(needle + ' ') for field in fields if field)
-        fuzzy = max((SequenceMatcher(None, needle, field).ratio()
-                     for field in fields if field and len(field) >= 4), default=0.0)
-        score = 3.0 if exact else 2.0 if prefix else fuzzy if fuzzy >= 0.88 else 0.0
-        if score:
-            scored.append((score, {'id': int(row['id']), 'sku': row['sku'] or '',
-                                    'model': row['model'] or '', 'name': row['name'] or ''}))
-    scored.sort(key=lambda item: (-item[0], item[1]['id']))
-    if not scored:
-        return []
-    best = scored[0][0]
-    return [record for score, record in scored if score == best or
-            (best < 2 and best - score < 0.08)][:5]
+    """Compatibility entry point: both callers share the catalog token matcher."""
+    return resolve_inventory_voice_product(ai_actor, human_actor, conversation_id, query)
 
 
 def inventory_adjustment_preview(ai_actor, human_actor, conversation_id, product_id):
@@ -2556,13 +2499,17 @@ def inventory_adjustment_preview(ai_actor, human_actor, conversation_id, product
         db.close()
 
 
+def required_permissions(definition):
+    return (definition.required_permission, *definition.additional_required_permissions)
+
+
 def _assert_operation_permission(actor, definition):
     trusted = _trusted_actor(actor)
-    if trusted.permission_decision(definition.required_permission) == PERMISSION_DENY:
+    if any(trusted.permission_decision(permission) == PERMISSION_DENY for permission in required_permissions(definition)):
         raise ControlledOperationError('PERMISSION_DENIED', 'Permission został odebrany', status=DENIED)
     if actor.delegated_by_actor_id:
         human = load_actor_context(actor.delegated_by_actor_id)
-        if human is None or human.permission_decision(definition.required_permission) == PERMISSION_DENY:
+        if human is None or any(human.permission_decision(permission) == PERMISSION_DENY for permission in required_permissions(definition)):
             raise ControlledOperationError('PERMISSION_DENIED', 'Inicjator utracił permission', status=DENIED)
 
 
@@ -2647,14 +2594,16 @@ def _validate_local_write(db, data, actor, definition):
 
 def _inventory_count_expected(data, actor, correlation_id, transaction_connection=None):
     del actor, correlation_id
+    if _voice_inventory_refresh and transaction_connection is None:
+        _voice_inventory_refresh(int(data["product_id"]))
     db = transaction_connection or _factory()()
     try:
-        row = db.execute('SELECT p.id,p.sku,p.model,p.name,COALESCE(s.qty,0) qty FROM products p LEFT JOIN stock s ON s.product_id=p.id WHERE p.id=?',
+        row = db.execute('SELECT p.id,p.sku,p.model,p.name,p.ean,COALESCE(s.qty,0) qty FROM products p LEFT JOIN stock s ON s.product_id=p.id WHERE p.id=? AND COALESCE(p.archived,0)=0',
                          (data['product_id'],)).fetchone()
         if row is None:
             raise ControlledOperationError('PRODUCT_NOT_FOUND', 'Nie znaleziono produktu', status=CONFLICT)
         return {'ok':True,'product_id':int(row['id']),'sku':row['sku'] or '',
-                'model':row['model'] or '', 'name':row['name'] or '',
+                'model':row['model'] or '', 'name':row['name'] or '', 'ean':row['ean'] or '',
                 'expected_quantity':max(0,int(row['qty'] or 0)),
                 'version':_inventory_version(db,data['product_id']),'status':'READY'}
     finally:
@@ -2977,7 +2926,7 @@ def _execute_local_approved(
                                      (execution_id,)).fetchone()
             if binding:
                 human = load_actor_context(binding['human_id'])
-                if human is None or human.permission_decision(definition.required_permission) == PERMISSION_DENY:
+                if human is None or any(human.permission_decision(permission) == PERMISSION_DENY for permission in required_permissions(definition)):
                     raise ControlledOperationError('PERMISSION_DENIED', 'Inicjator utracił permission', status=DENIED)
             current_version = _validate_local_write(db, data, actor, definition)
         else:
@@ -3124,12 +3073,14 @@ def execute_business_operation(
         policy = approvals.get_policy(definition.operation_name, definition.operation_version)
         if policy.permission != definition.required_permission or policy.risk_level != definition.risk_level:
             raise ControlledOperationError("REGISTRY_POLICY_MISMATCH", "Registry i polityka są niespójne", status=DENIED)
-        if actor.permission_decision(definition.required_permission) == PERMISSION_DENY:
+        if any(actor.permission_decision(permission) == PERMISSION_DENY for permission in required_permissions(definition)):
             raise ControlledOperationError("PERMISSION_DENIED", "Brak wymaganego permission", status=DENIED)
         if definition.idempotency_requirement == IDEMPOTENCY_REQUIRED and not SAFE_IDEMPOTENCY_KEY.fullmatch(idempotency_key or ""):
             raise ControlledOperationError("IDEMPOTENCY_KEY_REQUIRED", "Wymagany jest prawidłowy idempotency key", status=DENIED)
         if idempotency_key and not SAFE_IDEMPOTENCY_KEY.fullmatch(idempotency_key):
             raise ControlledOperationError("INVALID_IDEMPOTENCY_KEY", "Nieprawidłowy idempotency key", status=DENIED)
+        if definition.additional_required_permissions:
+            _assert_operation_permission(actor, definition)
         effective_key = "" if definition.idempotency_requirement == IDEMPOTENCY_NONE else idempotency_key
         fingerprint = _fingerprint(definition, actor, data)
         entity_type, entity_id, expected_version = _entity(definition, data)
@@ -3211,6 +3162,12 @@ def execute_business_operation(
                 from external_execution import queue_execution
                 queued = queue_execution(execution_id, actor, data, external_system="test")
                 return _result_from_row(_execution(execution_id))
+            if definition.operation_name == 'inventory.adjust':
+                # Refresh before the existing atomic version and approval checks.
+                fresh = execute_business_operation(actor, 'inventory.count.get_expected',
+                    {'product_id':data['product_id']}, correlation_id=correlation)
+                if fresh.status != SUCCESS:
+                    raise ControlledOperationError(fresh.error_code, fresh.safe_error_message, status=fresh.status)
             claimed = _transition(
                 execution_id, definition, actor, "RUNNING", "business_operation.started", SUCCESS,
                 started=True, expected_statuses=("PENDING_APPROVAL",),
@@ -3257,7 +3214,8 @@ def execute_business_operation(
             "operation": definition.operation_name, "args": _safe_diagnostic_args(data),
         }, ensure_ascii=False, sort_keys=True))
         try:
-            if _freshness_provider and definition.operation_name in FRESHNESS_GROUP_BY_OPERATION:
+            if (_freshness_provider and definition.operation_name in FRESHNESS_GROUP_BY_OPERATION
+                    and not (definition.operation_name == 'inventory.count.get_expected' and _voice_inventory_refresh)):
                 freshness = _freshness_provider(definition.operation_name) or {}
             raw_output = _HANDLERS[definition.operation_name](data, actor, row["correlation_id"], None)
             try:
@@ -3314,6 +3272,7 @@ def operation_descriptor(definition: BusinessOperationDefinition) -> dict[str, A
         "input_schema": definition.input_schema,
         "read_only": definition.read_only,
         "idempotency": definition.idempotency_requirement,
+        "required_permissions": list(required_permissions(definition)),
     }
     contract = CAPABILITY_CONTRACTS.get(definition.operation_name)
     if contract is not None:
@@ -3329,7 +3288,7 @@ def list_available_operations(actor_context: ActorContext) -> list[dict[str, Any
                 or _operation_feature_disabled(definition.operation_name)
                 or actor.actor_type not in definition.actor_types_allowed):
             continue
-        if actor.permission_decision(definition.required_permission) == PERMISSION_DENY:
+        if any(actor.permission_decision(permission) == PERMISSION_DENY for permission in required_permissions(definition)):
             continue
         try:
             policy = approvals.get_policy(definition.operation_name, definition.operation_version)
@@ -3337,6 +3296,11 @@ def list_available_operations(actor_context: ActorContext) -> list[dict[str, Any
             continue
         if policy.permission != definition.required_permission or policy.risk_level != definition.risk_level:
             continue
+        if definition.additional_required_permissions:
+            try:
+                _assert_operation_permission(actor, definition)
+            except ControlledOperationError:
+                continue
         visible.append(operation_descriptor(definition))
     return sorted(visible, key=lambda item: item["name"])
 

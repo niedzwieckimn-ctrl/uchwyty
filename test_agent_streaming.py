@@ -272,10 +272,12 @@ def test_streaming_preserves_same_turn_read_before_write_guard():
         received = list(frames(response))
     finally:
         response.close()
-    assert received[-1][0] == 'error'
-    assert received[-1][1]['error_code'] == 'ENTITY_SCOPE_REQUIRED'
-    assert not any(name in {'display_delta', 'speech_ready', 'done'} for name, _ in received)
+    # V45 rejects the unrecognized identity before a model can supply a hidden ID.
+    assert received[-1][0] == 'done'
+    assert received[-1][1]['inventory_fast_failure'] == 'product_not_found'
+    assert received[-1][1]['tool_calls'] == 0
     assert not read_rows('SELECT 1 FROM internal_inventory_count_items')
+    assert not read_rows('SELECT 1 FROM stock_adjustments')
 
 
 def test_cancel_during_inflight_write_completes_commit_audit_and_releases_lock(monkeypatch):
