@@ -19,6 +19,7 @@ import business_operations
 import business_query
 import business_read_models
 import inventory_fast_voice
+import inventory_voice_fast
 import shipment_read
 from agent_streaming import DisplayTextFilter, StreamCancelled
 from internal_audit import SUCCESS, FAILED, record_audit_event, sanitize_audit_text
@@ -1147,7 +1148,8 @@ def _trusted_post_write_confirmation(execution_outcome: dict[str, Any] | None) -
 
 def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModelProvider,
                    conversation_id: str = '', execution_outcome: dict[str, Any] | None = None,
-                   *, emit=None, cancelled=None, stream_trace=None) -> dict[str, Any]:
+                   *, emit=None, cancelled=None, stream_trace=None,
+                   voice_fast_mode=False) -> dict[str, Any]:
     started = time.perf_counter()
     stream_enabled = emit is not None and callable(getattr(provider, 'complete_stream', None))
     display_started = False
@@ -1204,6 +1206,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
     fast_count_session = ''
     fast_voice_operation = ''
     fast_voice_data = {}
+    fast_voice_trace = {}
     model_calls = 0
     generic_analytical_read = False
     ambiguous_business_read = False
@@ -1372,6 +1375,8 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         if status == 'SUCCESS' and (fast_voice_active or shipment_read_requested):
             result['display_text'] = answer
             result['tts_text'] = speech_text
+        if fast_voice_trace:
+            result['inventory_fast_trace_ms'] = dict(fast_voice_trace)
         if status != 'SUCCESS':
             result['_chat_503_diagnostics'] = {'stage':current_stage, **chat_503_diagnostics}
         return result
@@ -1484,6 +1489,225 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                     normalized_text_sha256=hashlib.sha256(' '.join(turn_message.casefold().split()).encode()).hexdigest(),
                     text_length=len(turn_message))
         timings['acquire_turn_ms'] = round((time.perf_counter()-stage_started)*1000,2)
+        if voice_fast_mode and execution_outcome is None:
+            import human_approval
+            import internal_approval
+
+            def voice_mark(stage):
+                fast_voice_trace[stage] = round((time.perf_counter()-started)*1000, 2)
+                trace_phase(stage, model_calls=0)
+
+            command = inventory_voice_fast.parse(turn_message)
+            fast_count_session = business_operations.active_inventory_count_session(
+                ai_actor, human_actor, conversation_id)
+            if fast_count_session and command is not None:
+                current_stage = 'inventory_voice_fast'
+                voice_mark('fast_path_detected')
+
+                def voice_finish(answer, speech, *, state):
+                    timings['final_response_ms'] = round(
+                        (time.perf_counter()-started)*1000 - sum(
+                            timings[key] for key in ('acquire_turn_ms', 'product_resolve_ms',
+                                'inventory_read_ms', 'count_record_ms', 'approval_prepare_ms',
+                                'inventory_adjust_ms')), 2)
+                    voice_mark('display_text_ready')
+                    if emit is not None:
+                        display_emit('display_delta', {'delta': answer})
+                        emit('speech_ready', {'tts_text': speech, 'mode': 'inventory_voice_fast'})
+                    result = finish('SUCCESS', answer, voice_response_mode='direct',
+                                    inventory_tts=speech)
+                    voice_mark('turn_complete')
+                    result['inventory_fast_trace_ms'] = dict(fast_voice_trace)
+                    result['inventory_fast_state'] = state
+                    result['inventory_fast_model_calls'] = 0
+                    return result
+
+                def voice_call(operation, arguments, *, phase):
+                    nonlocal fast_voice_operation, fast_voice_data
+                    timings['tool_calls_count'] += 1
+                    _audit('agent.tool_selected', ai_actor, run_id, correlation_id, SUCCESS,
+                           human_actor.actor_id, tool_name=operation,
+                           conversation_id=conversation_id,
+                           selection_reason='inventory_voice_fast')
+                    call_started = time.perf_counter()
+                    result = business_operations.execute_business_operation(
+                        ai_actor if operation != 'approval.decide' else human_actor,
+                        operation, arguments, correlation_id=correlation_id)
+                    elapsed = round((time.perf_counter()-call_started)*1000, 2)
+                    timings[phase] += elapsed
+                    timings['tool_execution_ms'] += elapsed
+                    timings['business_operation_ms'] += elapsed
+                    _audit('agent.tool_result', ai_actor, run_id, correlation_id,
+                           SUCCESS if result.status == 'SUCCESS' else FAILED,
+                           human_actor.actor_id, tool_name=operation,
+                           execution_id=result.execution_id, result_status=result.status,
+                           conversation_id=conversation_id)
+                    call_id = 'voice-inventory-' + str(timings['tool_calls_count']) + '-' + run_id
+                    evidence.extend([
+                        {'type':'function_call', 'call_id':call_id, 'name':operation,
+                         'arguments':json.dumps(arguments, ensure_ascii=False, separators=(',', ':'))},
+                        {'type':'function_call_output', 'call_id':call_id,
+                         'output':json.dumps(result.data if result.status == 'SUCCESS' else {
+                             'status':result.status, 'error_code':result.error_code,
+                         }, ensure_ascii=False, separators=(',', ':'))},
+                    ])
+                    if result.status == 'SUCCESS':
+                        fast_voice_operation, fast_voice_data = operation, dict(result.data or {})
+                        chat_503_diagnostics['tool_calls_ok'] += 1
+                    voice_mark({'inventory.count.record':'count_record_done',
+                                'inventory.adjust':'approval_ready',
+                                'approval.decide':'approval_decided'}.get(operation,
+                                'operation_done'))
+                    return result
+
+                eligible = human_approval.pending(business_operations, conversation_id, human_actor)
+                inventory_pending = []
+                for candidate in eligible:
+                    if candidate['operation'] != 'inventory.adjust':
+                        continue
+                    snapshot = internal_approval.get_request_snapshot(candidate['approval_id'])
+                    if snapshot and snapshot['status'] == 'PENDING':
+                        payload = json.loads(snapshot['safe_payload'])
+                        if payload.get('count_session_id') == fast_count_session:
+                            inventory_pending.append(candidate)
+                if inventory_pending:
+                    if len(eligible) != 1 or len(inventory_pending) != 1:
+                        return voice_finish('Na ekranie wybierz korektę do zatwierdzenia.',
+                                            'Wybierz korektę na ekranie.', state='WAIT_APPROVAL')
+                    if command.kind != 'decision':
+                        return voice_finish('Najpierw zatwierdź albo odrzuć korektę.',
+                                            'Zatwierdzić czy odrzucić?', state='WAIT_APPROVAL')
+                    approval_id = inventory_pending[0]['approval_id']
+                    snapshot = internal_approval.get_request_snapshot(approval_id)
+                    payload = json.loads(snapshot['safe_payload'])
+                    with human_approval.gesture(human_actor, eligible, run_id, conversation_id):
+                        decided = voice_call('approval.decide', {
+                            'approval_id':approval_id, 'decision':command.decision,
+                        }, phase='inventory_adjust_ms')
+                    if decided.status != 'SUCCESS':
+                        return finish(decided.status, decided.safe_error_message or
+                                      'Nie udało się wykonać decyzji.',
+                                      decided.error_code or 'APPROVAL_FAILED')
+                    decision_data = decided.data or {}
+                    decisions.append({'approval_id':approval_id, 'decision':command.decision})
+                    if command.decision == 'reject':
+                        if internal_approval.get_request_snapshot(approval_id)['status'] != 'REJECTED':
+                            return finish('FAILED', 'Nie udało się potwierdzić odrzucenia korekty.',
+                                          'APPROVAL_FAILED')
+                        return voice_finish('Korekta odrzucona. Wynik liczenia zapisany, stan magazynu bez zmian.',
+                                            'Odrzucono. Następny.', state='WAIT_PRODUCT')
+                    if decision_data.get('execution_status') != 'SUCCESS':
+                        return finish('FAILED', decision_data.get('error') or
+                                      'Korekta nie została zapisana. Sprawdź stan przed ponowieniem.',
+                                      'ADJUST_FAILED')
+                    new_qty = int((decision_data.get('outcome') or {}).get(
+                        'counted_quantity', payload.get('counted_quantity', 0)))
+                    return voice_finish(f'Korekta zapisana. Nowy stan: {new_qty} szt.',
+                                        'Zapisano. Następny.', state='WAIT_PRODUCT')
+
+                active_product = business_operations.inventory_count_active_product(
+                    ai_actor, human_actor, conversation_id)
+                if command.kind == 'decision':
+                    return voice_finish('Nie ma korekty oczekującej na decyzję. Podaj produkt.',
+                                        'Podaj produkt.', state='WAIT_PRODUCT')
+                if command.kind == 'quantity' and active_product is None:
+                    return voice_finish('Podaj produkt do kolejnego liczenia.',
+                                        'Jaki produkt?', state='WAIT_PRODUCT')
+
+                product_id = active_product if command.kind == 'quantity' else None
+                quantity = command.quantity
+                if command.kind == 'product':
+                    resolve_started = time.perf_counter()
+                    candidates = business_operations.resolve_inventory_voice_product(
+                        ai_actor, human_actor, conversation_id, command.product)
+                    if len(candidates) == 1:
+                        quantity = None  # A trailing number belongs to this exact product identity.
+                    elif not candidates and command.quantity is not None:
+                        candidates = business_operations.resolve_inventory_voice_product(
+                            ai_actor, human_actor, conversation_id,
+                            command.product_without_count)
+                    timings['product_resolve_ms'] = round(
+                        (time.perf_counter()-resolve_started)*1000, 2)
+                    if len(candidates) > 1:
+                        names = ', '.join(str(item['model'] or item['name'] or item['sku'])
+                                          for item in candidates[:5])
+                        return voice_finish(f'Który produkt: {names}?',
+                                            'Który produkt?', state='WAIT_PRODUCT')
+                    if not candidates:
+                        # Unclear identity follows the existing agent path.
+                        fast_count_session = ''
+                    else:
+                        product_id = int(candidates[0]['id'])
+                        voice_mark('product_resolved')
+                if product_id is not None:
+                    read_started = time.perf_counter()
+                    product = business_operations.read_inventory_voice_product(
+                        ai_actor, human_actor, conversation_id, product_id,
+                        expected_identity=(command.product if quantity is None else
+                                           command.product_without_count)
+                        if command.kind == 'product' else '')
+                    timings['inventory_read_ms'] = round(
+                        (time.perf_counter()-read_started)*1000, 2)
+                    voice_mark('inventory_read_done')
+                    timings['supabase_business_reads_ms'] += timings['inventory_read_ms']
+                    timings['tool_calls_count'] += 1
+                    _audit('agent.tool_result', ai_actor, run_id, correlation_id, SUCCESS,
+                           human_actor.actor_id, tool_name='inventory.voice.product.read',
+                           conversation_id=conversation_id, product_id=product_id)
+                    evidence.extend([
+                        {'type':'function_call', 'call_id':'voice-read-'+run_id,
+                         'name':'inventory.voice.product.read',
+                         'arguments':json.dumps({'product_id':product_id})},
+                        {'type':'function_call_output', 'call_id':'voice-read-'+run_id,
+                         'output':json.dumps(product, ensure_ascii=False, separators=(',', ':'))},
+                    ])
+                    display_name = str(product['model'] or product['name'] or product['sku'])
+                    if quantity is None:
+                        business_operations.set_inventory_count_active_product(
+                            ai_actor, human_actor, conversation_id, product_id)
+                        return voice_finish(
+                            f'{display_name} — stan systemowy {product["expected_quantity"]} szt. Podaj policzoną ilość.',
+                            inventory_fast_voice.product_prompt(product), state='WAIT_COUNT')
+                    counted = voice_call('inventory.count.record', {
+                        'product_id':product_id, 'count_session_id':fast_count_session,
+                        'conversation_id':conversation_id, 'counted_quantity':quantity,
+                        'expected_version':int(product['version']),
+                        'idempotency_key':run_id+':inventory-count-record',
+                    }, phase='count_record_ms')
+                    if counted.status != 'SUCCESS':
+                        return finish(counted.status, counted.safe_error_message or
+                                      'Nie udało się zapisać liczenia.',
+                                      counted.error_code or 'COUNT_RECORD_FAILED')
+                    observed = counted.data or {}
+                    difference = int(observed['difference'])
+                    if difference == 0:
+                        return voice_finish(
+                            f'{display_name} — system {observed["expected_quantity"]}, policzono {quantity}. Stan zgodny.',
+                            'Zgodne. Następny.', state='WAIT_PRODUCT')
+                    adjustment = voice_call('inventory.adjust', {
+                        'product_id':product_id, 'count_session_id':fast_count_session,
+                        'conversation_id':conversation_id,
+                        'expected_version':int(observed['version']),
+                        'idempotency_key':run_id+':inventory-adjust',
+                    }, phase='approval_prepare_ms')
+                    if adjustment.status != 'PENDING_APPROVAL':
+                        return finish(adjustment.status, adjustment.safe_error_message or
+                                      'Nie udało się przygotować korekty.',
+                                      adjustment.error_code or 'ADJUST_PREPARE_FAILED')
+                    human_approval.bind(business_operations, adjustment.approval_id,
+                                        conversation_id, human_actor, run_id)
+                    approval = {'approval_id':adjustment.approval_id,
+                                'operation':'inventory.adjust', 'product_id':product_id,
+                                'count_session_id':fast_count_session,
+                                'expected_version':int(observed['version'])}
+                    approval.update(business_operations.inventory_adjustment_preview(
+                        ai_actor, human_actor, conversation_id, product_id))
+                    pending_approvals.append(approval)
+                    return voice_finish(
+                        f'{display_name} — system {observed["expected_quantity"]}, policzono {quantity}, '
+                        f'różnica {difference:+d}. Korekta wymaga zatwierdzenia.',
+                        inventory_voice_fast.difference_prompt(
+                            observed['expected_quantity'], difference), state='WAIT_APPROVAL')
         stage_started = time.perf_counter()
         history = agent_conversation.history_for_model(human_actor,ai_actor,conversation_id,run_id)
         detected_intent = _contextual_read_intent(turn_message, history, detected_intent)

@@ -118,6 +118,7 @@ logger = logging.getLogger(__name__)
 # Data access stays outside operation handlers. The application injects a
 # per-operation freshness provider; this module never imports the Flask app.
 _freshness_provider: Callable[[str], Mapping[str, Any]] | None = None
+_voice_inventory_refresh: Callable[[int], None] | None = None
 _write_success_observer: Callable[[str, Mapping[str, Any]], None] | None = None
 
 FRESHNESS_GROUP_BY_OPERATION = {
@@ -144,6 +145,12 @@ def configure_freshness(provider: Callable[[str], Mapping[str, Any]] | None) -> 
     """Install the application-owned source-of-truth freshness boundary."""
     global _freshness_provider
     _freshness_provider = provider
+
+
+def configure_voice_inventory_refresh(provider: Callable[[int], None] | None) -> None:
+    """One-product freshness boundary used only by the trusted voice count path."""
+    global _voice_inventory_refresh
+    _voice_inventory_refresh = provider
 
 
 def configure_write_success_observer(
@@ -2289,6 +2296,79 @@ def inventory_count_active_product(ai_actor, human_actor, conversation_id):
                             WHERE created_by=? AND conversation_id=? AND status='OPEN'""",
                          (human.actor_id, conversation_id)).fetchone()
         return int(row['active_product_id']) if row and row['active_product_id'] else None
+    finally:
+        db.close()
+
+
+def _voice_product_key(value):
+    value = unicodedata.normalize('NFKD', str(value or '').casefold()).replace('ł', 'l')
+    return ' '.join(re.sub(r'[^a-z0-9]+', ' ', ''.join(
+        character for character in value if not unicodedata.combining(character))).split())
+
+
+def resolve_inventory_voice_product(ai_actor, human_actor, conversation_id, query):
+    """Exact local identity lookup; uncertainty belongs to the normal agent path."""
+    ai = _trusted_actor(ai_actor)
+    human = load_actor_context(human_actor.actor_id) if isinstance(human_actor, ActorContext) else None
+    if human is None or human.actor_type != 'HUMAN' or ai.delegated_by_actor_id != human.actor_id:
+        raise ControlledOperationError('UNTRUSTED_ACTOR', 'Brak zaufanego właściciela sesji', status=DENIED)
+    if ai.permission_decision('inventory.read') == PERMISSION_DENY or human.permission_decision('inventory.read') == PERMISSION_DENY:
+        raise ControlledOperationError('PERMISSION_DENIED', 'Brak dostępu do produktu', status=DENIED)
+    needle = _voice_product_key(query)
+    if len(needle) < 3:
+        return []
+    db = _factory()()
+    try:
+        _assert_count_conversation(db, ai, conversation_id)
+        if not db.execute("""SELECT 1 FROM internal_inventory_count_sessions
+                            WHERE created_by=? AND conversation_id=? AND status='OPEN'""",
+                          (human.actor_id, conversation_id)).fetchone():
+            return []
+        rows = db.execute("""SELECT id,sku,model,name,ean FROM products
+                             WHERE COALESCE(archived,0)=0""").fetchall()
+        return [dict(id=int(row['id']), sku=row['sku'] or '', model=row['model'] or '',
+                     name=row['name'] or '') for row in rows
+                if needle in {_voice_product_key(row[field]) for field in ('sku','model','name','ean')}]
+    finally:
+        db.close()
+
+
+def read_inventory_voice_product(ai_actor, human_actor, conversation_id, product_id, expected_identity=''):
+    """Fresh READ of only one product, its stock and its guarded local version."""
+    ai = _trusted_actor(ai_actor)
+    human = load_actor_context(human_actor.actor_id) if isinstance(human_actor, ActorContext) else None
+    if human is None or human.actor_type != 'HUMAN' or ai.delegated_by_actor_id != human.actor_id:
+        raise ControlledOperationError('UNTRUSTED_ACTOR', 'Brak zaufanego właściciela sesji', status=DENIED)
+    if ai.permission_decision('inventory.read') == PERMISSION_DENY or human.permission_decision('inventory.read') == PERMISSION_DENY:
+        raise ControlledOperationError('PERMISSION_DENIED', 'Brak dostępu do produktu', status=DENIED)
+    db = _factory()()
+    try:
+        _assert_count_conversation(db, ai, conversation_id)
+        if not db.execute("""SELECT 1 FROM internal_inventory_count_sessions
+                            WHERE created_by=? AND conversation_id=? AND status='OPEN'""",
+                          (human.actor_id, conversation_id)).fetchone():
+            raise ControlledOperationError('COUNT_SESSION_NOT_FOUND', 'Brak otwartej sesji remanentu', status=CONFLICT)
+    finally:
+        db.close()
+    if _voice_inventory_refresh:
+        _voice_inventory_refresh(int(product_id))
+    db = _factory()()
+    try:
+        row = db.execute("""SELECT p.id,p.sku,p.model,p.name,COALESCE(s.qty,0) qty
+                            FROM products p LEFT JOIN stock s ON s.product_id=p.id
+                            WHERE p.id=? AND COALESCE(p.archived,0)=0""",
+                         (int(product_id),)).fetchone()
+        if row is None:
+            raise ControlledOperationError('PRODUCT_NOT_FOUND', 'Nie znaleziono produktu', status=CONFLICT)
+        if expected_identity and _voice_product_key(expected_identity) not in {
+                _voice_product_key(row[field]) for field in ('sku', 'model', 'name')}:
+            raise ControlledOperationError('PRODUCT_CHANGED',
+                                           'Dane produktu zmieniły się. Podaj produkt ponownie.',
+                                           status=CONFLICT)
+        return {'ok':True, 'product_id':int(row['id']), 'sku':row['sku'] or '',
+                'model':row['model'] or '', 'name':row['name'] or '',
+                'expected_quantity':max(0, int(row['qty'] or 0)),
+                'version':_inventory_version(db, product_id), 'status':'READY'}
     finally:
         db.close()
 

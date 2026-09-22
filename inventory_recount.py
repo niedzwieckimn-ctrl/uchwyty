@@ -3,9 +3,12 @@
 
 def initialize(db):
     sql = db.execute("SELECT sql FROM sqlite_master WHERE name='internal_inventory_count_items'").fetchone()[0]
-    if 'SUPERSEDED' not in sql:
+    if 'SUPERSEDED' not in sql or 'COUNT_ONLY' not in sql:
         new_sql = sql.replace('internal_inventory_count_items', 'inventory_count_items_v2', 1)
-        new_sql = new_sql.replace("'ADJUSTED'", "'ADJUSTED','SUPERSEDED'")
+        if 'SUPERSEDED' not in sql:
+            new_sql = new_sql.replace("'ADJUSTED'", "'ADJUSTED','SUPERSEDED','COUNT_ONLY'")
+        else:
+            new_sql = new_sql.replace("'SUPERSEDED'", "'SUPERSEDED','COUNT_ONLY'", 1)
         new_sql = new_sql.replace(',\n    UNIQUE(session_id, product_id)', '')
         db.execute('SAVEPOINT inventory_recount_migration')
         try:

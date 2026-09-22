@@ -414,12 +414,6 @@ def _request_row(approval_id: str):
 
 
 def get_request_snapshot(approval_id: str) -> dict[str, Any] | None:
-    """Return trusted internal execution metadata; safe_payload is already sanitized."""
-    row = _request_row(approval_id)
-    return dict(row) if row is not None else None
-
-
-def get_request_snapshot(approval_id: str) -> dict[str, Any] | None:
     """Return a safe internal snapshot for orchestration; it grants no authority."""
     row = _request_row(approval_id)
     return dict(row) if row is not None else None
@@ -533,6 +527,15 @@ def reject_request(approval_id: str, approver_context: ActorContext, *, reason: 
             changed = db.execute(
                 "SELECT * FROM internal_approval_requests WHERE approval_id=?", (approval_id,)
             ).fetchone()
+            if changed['operation'] == 'inventory.adjust':
+                payload = json.loads(changed['safe_payload'])
+                # The observation remains durable, but a rejected correction
+                # must no longer block completion of the count session.
+                db.execute("""UPDATE internal_inventory_count_items SET status='COUNT_ONLY'
+                              WHERE session_id=? AND product_id=? AND stock_version=?
+                                AND status='PENDING_ADJUSTMENT'""",
+                           (payload['count_session_id'], int(payload['product_id']),
+                            int(payload['expected_version'])))
             _audit_transition(
                 "approval.rejected", changed, actor=approver, result=DENIED,
                 reason=reason, transaction_connection=db,

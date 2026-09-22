@@ -103,6 +103,7 @@ from business_operations import (
     ControlledOperationError,
     configure as configure_business_operations,
     configure_freshness as configure_business_operations_freshness,
+    configure_voice_inventory_refresh,
     configure_write_success_observer,
     execute_business_operation,
     initialize_schema as initialize_business_operations_schema,
@@ -445,6 +446,7 @@ configure_internal_approval(conn)
 _startup_step("approval_configured")
 configure_business_operations(conn)
 configure_business_operations_freshness(lambda operation_name: ensure_business_operation_freshness(operation_name))
+configure_voice_inventory_refresh(lambda product_id: refresh_inventory_voice_product(product_id))
 configure_write_success_observer(lambda operation_name, result: reconcile_business_freshness_after_write(operation_name, result))
 configure_artifact_builder(lambda operation_name, result: build_business_artifacts(operation_name, result))
 configure_agent_conversation(
@@ -1601,13 +1603,16 @@ def api_internal_ai_chat():
     human = current_actor_context()
     message = payload.get('message', '')
     conversation_id = str(payload.get('conversation_id') or '')
+    voice_fast_mode = payload.get('voice_fast_mode') is True
     if _agent_stream_requested():
         def run(emit, cancelled, trace):
             return run_agent_turn(human, message, provider, conversation_id=conversation_id,
-                                  emit=emit, cancelled=cancelled, stream_trace=trace)
+                                  emit=emit, cancelled=cancelled, stream_trace=trace,
+                                  voice_fast_mode=voice_fast_mode)
         return sse_response(run, lambda result: _finalize_ai_chat_result(result, message),
                             trace=StreamTrace(request_received))
-    result = run_agent_turn(human, message, provider, conversation_id=conversation_id)
+    result = run_agent_turn(human, message, provider, conversation_id=conversation_id,
+                            voice_fast_mode=voice_fast_mode)
     result, status_code = _finalize_ai_chat_result(result, message)
     return jsonify(result), status_code
 
@@ -3071,6 +3076,59 @@ def _pull_business_freshness_group(group: str) -> dict:
     completed_at = time.time()
     _mark_business_freshness(group, completed_at)
     return {"rows": {table: len(fetched[(table, conflict)]) for table, conflict in specs}, "completed_at": completed_at}
+
+
+def refresh_inventory_voice_product(product_id: int) -> None:
+    """Refresh one product and one stock row without touching inventory groups."""
+    if not supabase_enabled():
+        return
+    product_id = int(product_id)
+    local = conn()
+    try:
+        before = local.execute('SELECT version FROM internal_inventory_versions WHERE product_id=?',
+                               (product_id,)).fetchone()
+        before_version = int(before['version']) if before else 0
+    finally:
+        local.close()
+    products = supabase_select_rows('products', page_size=2,
+                                    extra_params={'id': f'eq.{product_id}'})
+    stocks = supabase_select_rows('stock', order_by='product_id', page_size=2,
+                                  extra_params={'product_id': f'eq.{product_id}'})
+    if len(products) != 1 or len(stocks) > 1:
+        raise ControlledOperationError('DATA_UNAVAILABLE', 'Nie można potwierdzić stanu produktu')
+    remote_qty = int(stocks[0]['qty']) if stocks else 0
+    if remote_qty < 0:
+        raise ControlledOperationError('DATA_UNAVAILABLE', 'Nie można potwierdzić stanu produktu')
+    with _supabase_full_io_lock:
+        db = conn()
+        try:
+            db.execute('BEGIN IMMEDIATE')
+            current = db.execute('SELECT version FROM internal_inventory_versions WHERE product_id=?',
+                                 (product_id,)).fetchone()
+            if (int(current['version']) if current else 0) != before_version:
+                raise ControlledOperationError('ENTITY_VERSION_CONFLICT', 'Stan produktu zmienił się podczas odczytu')
+            existing = db.execute('SELECT sku,model,name,ean,archived FROM products WHERE id=?',
+                                  (product_id,)).fetchone()
+            if existing is None:
+                raise ControlledOperationError('PRODUCT_NOT_FOUND', 'Nie znaleziono produktu')
+            remote = products[0]
+            db.execute('''UPDATE products SET sku=?,model=?,name=?,ean=?,archived=? WHERE id=?''',
+                       (remote.get('sku', existing['sku']), remote.get('model', existing['model']),
+                        remote.get('name', existing['name']), remote.get('ean', existing['ean']),
+                        remote.get('archived', existing['archived']), product_id))
+            stock = db.execute('SELECT qty FROM stock WHERE product_id=?', (product_id,)).fetchone()
+            if stocks and stock is None:
+                db.execute('INSERT INTO stock(product_id,qty) VALUES(?,?)', (product_id, remote_qty))
+            elif stocks and int(stock['qty']) != remote_qty:
+                db.execute('UPDATE stock SET qty=? WHERE product_id=?', (remote_qty, product_id))
+            elif not stocks and stock is not None:
+                db.execute('DELETE FROM stock WHERE product_id=?', (product_id,))
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
 
 
 def ensure_business_operation_freshness(operation_name: str) -> dict:
