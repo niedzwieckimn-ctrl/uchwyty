@@ -266,7 +266,8 @@
     ttsController = controller;
     const started = performance.now();
     let httpStatus;
-    voiceDiagnostic('VOICE_TTS_REQUEST_START', {stage:'tts_request'});
+    voiceDiagnostic('VOICE_TTS_REQUEST_START', {stage:'tts_request',
+      latency_ms:voiceRoundtripStarted ? Math.round(started - voiceRoundtripStarted) : undefined});
     try {
       const response = await fetch('/api/internal/ai/voice/synthesize', {
         method:'POST', credentials:'same-origin', headers:{'Content-Type':'application/json'},
@@ -283,6 +284,8 @@
         latency_ms:Math.round(performance.now() - started)});
       if (!blob.size) throw voiceError('TTS_EMPTY_AUDIO');
       if (blob.type !== 'audio/mpeg') throw voiceError('TTS_UNSUPPORTED_AUDIO');
+      voiceDiagnostic('VOICE_FIRST_AUDIO_READY', {stage:'first_audio_ready',
+        latency_ms:voiceRoundtripStarted ? Math.round(performance.now() - voiceRoundtripStarted) : undefined});
       if (controller.signal.aborted || ttsController !== controller) return;
       ttsController = null;
       playingBlob = blob;
@@ -543,9 +546,10 @@
         const rendered = performance.now();
         console.info('AGENT_STREAM_TIMING', JSON.stringify({event:'frontend_first_delta_rendered',
           turn_id:turnId, monotonic_ms:rendered, elapsed_ms:rendered - started}));
+        voiceDiagnostic('VOICE_DISPLAY_TEXT_READY', {stage:'display_text_ready',
+          latency_ms:Math.round(rendered - started)});
       }
-      // speech_ready and tool events are reserved. Stage 1 only renders text;
-      // the existing whole-response TTS starts once, after successful done.
+      // Tool events do not change the displayed answer.
     };
   }
 
@@ -564,20 +568,37 @@
     const isCurrent = () => generation === agentGeneration && agentController === controller;
     const timer = window.setTimeout(() => controller.abort(), 120000);
     const agentStarted = performance.now();
+    let earlySpeechStarted = false;
     try {
       const response = await fetch('/api/internal/ai/chat', {
         method: 'POST',
         credentials: 'same-origin',
         headers: {'Content-Type': 'application/json', 'Accept': acceptsAgentStream() ? 'text/event-stream' : 'application/json'},
-        body: JSON.stringify({message: message, conversation_id: conversationId}),
+        body: JSON.stringify({message: message, conversation_id: conversationId,
+          voice_fast_mode: fromVoice}),
         signal: controller.signal
       });
-      const data = await readAgentResponse(response,
-        agentDisplayHandler(loading, controller, generation, agentStarted), controller.signal);
+      const showAgentEvent = agentDisplayHandler(loading, controller, generation, agentStarted);
+      const data = await readAgentResponse(response, (event, value) => {
+        showAgentEvent(event, value);
+        if (fromVoice && event === 'speech_ready' && !earlySpeechStarted
+            && typeof value.tts_text === 'string' && value.tts_text.trim() && isCurrent()) {
+          earlySpeechStarted = true;
+          inventoryFastVoiceActive = true;
+          voiceDiagnostic('VOICE_FAST_TTS_READY', {stage:'tts_ready',
+            latency_ms:Math.round(performance.now() - agentStarted)});
+          playSpeech(value.tts_text, voiceRoundtripStarted);
+        }
+      }, controller.signal);
       if (!isCurrent()) return;
       if (controller.signal.aborted) throw new Error('AGENT_STREAM_CANCELLED');
       if (fromVoice) voiceDiagnostic('VOICE_AGENT_RESPONSE', {stage:'agent_response',
         http_status:response.status, latency_ms:Math.round(performance.now() - agentStarted)});
+      if (fromVoice && data.inventory_fast_trace_ms) {
+        voiceDiagnostic('VOICE_FAST_TURN_COMPLETE', {stage:'turn_complete',
+          latency_ms:Math.round(performance.now() - voiceRoundtripStarted)});
+        console.info('VOICE_FAST_BACKEND_TIMINGS', JSON.stringify(data.inventory_fast_trace_ms));
+      }
       if (typeof data.conversation_id === 'string') conversationId = data.conversation_id;
       loading.classList.toggle('ai-loading', false);
       for (const decision of data.decisions || []) {
@@ -700,7 +721,9 @@
         if (fromVoice) {
           inventoryFastVoiceActive = typeof data.tts_text === 'string' && Boolean(data.tts_text.trim());
           const spoken = inventoryFastVoiceActive ? data.tts_text : data.speech_text;
-          if (typeof spoken === 'string' && spoken.trim()) playSpeech(spoken, voiceRoundtripStarted);
+          if (!earlySpeechStarted && typeof spoken === 'string' && spoken.trim()) {
+            playSpeech(spoken, voiceRoundtripStarted);
+          }
         }
       }
     } catch (_error) {
@@ -765,6 +788,8 @@
       if (typeof data?.text !== 'string') throw voiceError('STT_INVALID_RESPONSE');
       if (!data.text.trim()) throw voiceError('STT_EMPTY_TRANSCRIPT');
       if (generation !== captureGeneration) return;
+      voiceDiagnostic('VOICE_STT_DONE', {stage:'stt_done',
+        latency_ms:Math.round(performance.now() - recordingStarted)});
       input.value = data.text.trim();
       await submitMessage(input.value, true, recordingStarted);
     } catch (error) {
