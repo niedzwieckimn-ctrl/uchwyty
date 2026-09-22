@@ -55,6 +55,7 @@
   const voiceDebug = document.getElementById('aiVoiceDebug');
   let busy = false;
   let conversationId = '';
+  let inventoryFastVoiceActive = false;
   let agentController = null;
   let agentGeneration = 0;
   let voiceState = 'ready';
@@ -657,6 +658,9 @@
                 : modelFailed ? 'Nie udało się odczytać pełnego wyniku. Sprawdź stan operacji przed ponowieniem.'
                 : response.ok ? 'Decyzja została zapisana.' : 'Nie udało się wykonać zmiany.';
               renderArtifacts(answer, result.artifacts);
+              if (inventoryFastVoiceActive && typeof result.tts_text === 'string' && result.tts_text.trim()) {
+                playSpeech(result.tts_text);
+              }
               if (!response.ok || result.status === 'NOOP') buttons.forEach(b => b.disabled = false);
             } catch (_) {
               if (!isCurrent()) return;
@@ -693,8 +697,10 @@
       } else {
         bubble.textContent = typeof data.message === 'string' ? data.message : 'Nie udało się odczytać odpowiedzi. Spróbuj ponownie.';
         renderArtifacts(loading, data.artifacts);
-        if (fromVoice && typeof data.speech_text === 'string' && data.speech_text.trim()) {
-          playSpeech(data.speech_text, voiceRoundtripStarted);
+        if (fromVoice) {
+          inventoryFastVoiceActive = typeof data.tts_text === 'string' && Boolean(data.tts_text.trim());
+          const spoken = inventoryFastVoiceActive ? data.tts_text : data.speech_text;
+          if (typeof spoken === 'string' && spoken.trim()) playSpeech(spoken, voiceRoundtripStarted);
         }
       }
     } catch (_error) {
@@ -879,6 +885,7 @@
     const previousConversation = conversationId;
     cancelAgentTurn();
     conversationId = '';
+    inventoryFastVoiceActive = false;
     stopSpeech();
     stopRecording(true);
     messages.querySelectorAll('.ai-message').forEach(node => node.remove());
