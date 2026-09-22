@@ -56,6 +56,7 @@
   let busy = false;
   let conversationId = '';
   let inventoryFastVoiceActive = false;
+  let inventoryFastRetryReady = false;
   let agentController = null;
   let agentGeneration = 0;
   let voiceState = 'ready';
@@ -556,6 +557,7 @@
   async function submitMessage(text, fromVoice = false, voiceRoundtripStarted = 0) {
     const message = text.trim();
     if (!message || busy) return;
+    inventoryFastRetryReady = false;
     setAgentBusy(true);
     addMessage('user', message);
     if (fromVoice) setVoiceState('agent');
@@ -587,6 +589,12 @@
           inventoryFastVoiceActive = true;
           voiceDiagnostic('VOICE_FAST_TTS_READY', {stage:'tts_ready',
             latency_ms:Math.round(performance.now() - agentStarted)});
+          if (value.retry_ready === true) {
+            inventoryFastRetryReady = true;
+            setAgentBusy(false);
+            voiceDiagnostic('VOICE_FAST_INPUT_UNLOCKED', {stage:'input_unlocked',
+              latency_ms:Math.round(performance.now() - agentStarted)});
+          }
           playSpeech(value.tts_text, voiceRoundtripStarted);
         }
       }, controller.signal);
@@ -886,7 +894,12 @@
   });
   examples.forEach(button => button.addEventListener('click', () => submitMessage(button.textContent || '')));
   voiceButton.addEventListener('click', () => {
-    if (voiceState === 'playing') stopSpeech();
+    if (inventoryFastRetryReady && ['playing','tts'].includes(voiceState)) {
+      inventoryFastRetryReady = false;
+      stopSpeech('replaced');
+      startRecording();
+    }
+    else if (voiceState === 'playing') stopSpeech();
     else if (voiceState === 'recording') stopRecording();
     else startRecording();
   });
@@ -911,6 +924,7 @@
     cancelAgentTurn();
     conversationId = '';
     inventoryFastVoiceActive = false;
+    inventoryFastRetryReady = false;
     stopSpeech();
     stopRecording(true);
     messages.querySelectorAll('.ai-message').forEach(node => node.remove());
