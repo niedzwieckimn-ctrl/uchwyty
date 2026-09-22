@@ -2306,7 +2306,8 @@ def _voice_product_key(value):
         character for character in value if not unicodedata.combining(character))).split())
 
 
-def resolve_inventory_voice_product(ai_actor, human_actor, conversation_id, query):
+def resolve_inventory_voice_product(ai_actor, human_actor, conversation_id, query,
+                                    *, prefix_hints=False):
     """Exact local identity lookup; uncertainty belongs to the normal agent path."""
     ai = _trusted_actor(ai_actor)
     human = load_actor_context(human_actor.actor_id) if isinstance(human_actor, ActorContext) else None
@@ -2326,9 +2327,15 @@ def resolve_inventory_voice_product(ai_actor, human_actor, conversation_id, quer
             return []
         rows = db.execute("""SELECT id,sku,model,name,ean FROM products
                              WHERE COALESCE(archived,0)=0""").fetchall()
+        exact = [row for row in rows if needle in {
+            _voice_product_key(row[field]) for field in ('sku','model','name','ean')}]
+        matching = exact
+        if prefix_hints and not exact:
+            matching = [row for row in rows if any(
+                _voice_product_key(row[field]).startswith(needle + ' ')
+                for field in ('sku','model','name','ean'))]
         return [dict(id=int(row['id']), sku=row['sku'] or '', model=row['model'] or '',
-                     name=row['name'] or '') for row in rows
-                if needle in {_voice_product_key(row[field]) for field in ('sku','model','name','ean')}]
+                     name=row['name'] or '') for row in matching]
     finally:
         db.close()
 

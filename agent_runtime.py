@@ -1497,12 +1497,13 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 fast_voice_trace[stage] = round((time.perf_counter()-started)*1000, 2)
                 trace_phase(stage, model_calls=0)
 
-            command = inventory_voice_fast.parse(turn_message)
             fast_count_session = business_operations.active_inventory_count_session(
                 ai_actor, human_actor, conversation_id)
-            if fast_count_session and command is not None:
+            if fast_count_session:
                 current_stage = 'inventory_voice_fast'
                 voice_mark('fast_path_detected')
+                command = inventory_voice_fast.parse(turn_message)
+                voice_mark('parse_done')
 
                 def voice_finish(answer, speech, *, state):
                     timings['final_response_ms'] = round(
@@ -1519,6 +1520,24 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                     voice_mark('turn_complete')
                     result['inventory_fast_trace_ms'] = dict(fast_voice_trace)
                     result['inventory_fast_state'] = state
+                    result['inventory_fast_model_calls'] = 0
+                    return result
+
+                def voice_fail(answer, speech, *, reason):
+                    """Finish the read-only failed turn before allowing an immediate retry."""
+                    voice_mark('resolver_failed')
+                    voice_mark('display_text_ready')
+                    result = finish('SUCCESS', answer, voice_response_mode='direct',
+                                    inventory_tts=speech)
+                    voice_mark('speech_ready')
+                    if emit is not None and result['status'] == 'SUCCESS':
+                        emit('speech_ready', {'tts_text':speech,
+                                              'mode':'inventory_voice_fast',
+                                              'retry_ready':True})
+                    voice_mark('turn_complete')
+                    result['inventory_fast_trace_ms'] = dict(fast_voice_trace)
+                    result['inventory_fast_state'] = 'WAIT_PRODUCT'
+                    result['inventory_fast_failure'] = reason
                     result['inventory_fast_model_calls'] = 0
                     return result
 
@@ -1574,7 +1593,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                     if len(eligible) != 1 or len(inventory_pending) != 1:
                         return voice_finish('Na ekranie wybierz korektę do zatwierdzenia.',
                                             'Wybierz korektę na ekranie.', state='WAIT_APPROVAL')
-                    if command.kind != 'decision':
+                    if command is None or command.kind != 'decision':
                         return voice_finish('Najpierw zatwierdź albo odrzuć korektę.',
                                             'Zatwierdzić czy odrzucić?', state='WAIT_APPROVAL')
                     approval_id = inventory_pending[0]['approval_id']
@@ -1605,6 +1624,10 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                     return voice_finish(f'Korekta zapisana. Nowy stan: {new_qty} szt.',
                                         'Zapisano. Następny.', state='WAIT_PRODUCT')
 
+                if command is None:
+                    return voice_fail('Nie rozpoznano jednoznacznej komendy remanentu. Powtórz.',
+                                      'Nie zrozumiałem. Powtórz.', reason='parse_failed')
+
                 active_product = business_operations.inventory_count_active_product(
                     ai_actor, human_actor, conversation_id)
                 if command.kind == 'decision':
@@ -1629,13 +1652,20 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                     timings['product_resolve_ms'] = round(
                         (time.perf_counter()-resolve_started)*1000, 2)
                     if len(candidates) > 1:
-                        names = ', '.join(str(item['model'] or item['name'] or item['sku'])
-                                          for item in candidates[:5])
-                        return voice_finish(f'Który produkt: {names}?',
-                                            'Który produkt?', state='WAIT_PRODUCT')
+                        return voice_fail('Nie znaleziono jednoznacznego produktu. Powtórz rozstaw lub wariant.',
+                                          'Nie jestem pewien. Powtórz rozstaw.',
+                                          reason='ambiguous_product')
                     if not candidates:
-                        # Unclear identity follows the existing agent path.
-                        fast_count_session = ''
+                        hints = business_operations.resolve_inventory_voice_product(
+                            ai_actor, human_actor, conversation_id,
+                            command.product_without_count or command.product,
+                            prefix_hints=True)
+                        if hints:
+                            return voice_fail('Nie znaleziono jednoznacznego wariantu. Powtórz rozstaw i kolor.',
+                                              'Nie jestem pewien. Powtórz rozstaw.',
+                                              reason='ambiguous_variant')
+                        return voice_fail('Nie znaleziono jednoznacznego produktu. Powtórz.',
+                                          'Nie znalazłem. Powtórz.', reason='product_not_found')
                     else:
                         product_id = int(candidates[0]['id'])
                         voice_mark('product_resolved')
