@@ -18,6 +18,7 @@ from agent_artifacts import build_artifact_sources
 import business_operations
 import business_query
 import business_read_models
+import shipment_read
 from agent_streaming import DisplayTextFilter, StreamCancelled
 from internal_audit import SUCCESS, FAILED, record_audit_event, sanitize_audit_text
 from internal_rbac import AI_OWNER_ASSISTANT_ACTOR_ID, ActorContext, load_actor_context, ALLOW, DENY
@@ -367,6 +368,8 @@ def _detect_read_intent(value: str) -> str:
     normalized = ' '.join(str(value or '').casefold().split()).strip(' ?!.')
     if re.search(r'\bco\s+(?:było|bylo|jest)\s+w\s+zam[oó]wieni\w*\b', normalized):
         return 'order_contents'
+    if shipment_read.is_question(normalized):
+        return 'shipment_contents'
     if _is_packing_history_read(normalized):
         return 'packing_history'
     if (
@@ -496,7 +499,7 @@ def _read_planning_mode(value: str, intent: str = '') -> str:
     """Classify READ planning without treating a regex intent as the whole plan."""
     normalized = ' '.join(str(value or '').casefold().split()).strip(' ?!.')
     intent = intent or _detect_read_intent(normalized)
-    if intent == 'packing_history':
+    if intent in {'packing_history', 'shipment_contents'}:
         return 'authoritative_history'
     investigative = bool(re.search(
         r'\b(?:kto\s+(?:ostatnio\s+)?(?:kupił|kupil|kupował|kupowal)|'
@@ -786,6 +789,14 @@ użytkownika. Jeśli tak, odpowiedz teraz. Jeśli brakuje konkretnego faktu, wyk
 który go dostarczy. Sukces techniczny narzędzia nie oznacza jeszcze kompletnej odpowiedzi. Pusta sekcja widoku
 operacyjnego nie potwierdza braku encji w pełnym systemie. Nie powtarzaj wcześniejszych argumentów i nie wykonuj WRITE.
 '''
+SHIPMENT_READ_INSTRUCTIONS = '''
+Pytanie dotyczy faktycznej wysyłki. Wywołaj tylko shipment.read, jeden raz.
+Wybór: shipped_at/potwierdzone zdarzenie; zawartość: wszystkie pozycje powiązanej faktury.
+Nie wybieraj zamówienia zrealizowanego ani faktury po issue_date. Nie zastępuj tego odczytem LP.
+Dla klienta przekaż znane customer_id albo nazwę w customer; nie wymyślaj identyfikatorów.
+Daty przekaż jako RRRR-MM-DD. Backend porównuje finalną LP i jawnie podaje rozbieżności.
+'''
+
 PACKING_HISTORY_READ_INSTRUCTIONS = '''
 To pytanie dotyczy listy pakowej lub paczki. Użyj wyłącznie
 orders.packing_history.get. Wskaż dokładnie jeden selektor: batch_id, wewnętrzny order_id,
@@ -1188,6 +1199,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
     read_planning_mode = _read_planning_mode(message, detected_intent)
     read_question_domains = sorted(_read_question_domains(message))
     packing_history_read = detected_intent == 'packing_history'
+    shipment_read_requested = detected_intent == 'shipment_contents'
     model_calls = 0
     generic_analytical_read = False
     ambiguous_business_read = False
@@ -1486,7 +1498,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         packing_history_document_followup = False
         packing_history_direct_arguments = None
         packing_history_selection_reason = ''
-        if (packing_history_context_batch_id and _is_packing_history_followup(turn_message)
+        if (not shipment_read_requested and packing_history_context_batch_id and _is_packing_history_followup(turn_message)
                 and not _packing_history_order_number(turn_message)):
             detected_intent = 'packing_history'
             packing_history_read = True
@@ -1520,6 +1532,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                     packing_history_direct_arguments = {'batch_id': int(packing_history_context_batch_id), 'mode': 'historical'}
                 elif packing_history_context_key and packing_history_selection_reason == 'trusted_batch_followup':
                     packing_history_direct_arguments = {'packing_list_key': packing_history_context_key, 'mode': mode}
+        shipment_direct_arguments = shipment_read.direct_selector(turn_message) if shipment_read_requested else None
         import human_approval
         eligible_approvals = human_approval.pending(business_operations, conversation_id, human_actor) if message.strip() and execution_outcome is None else []
         timings['context_history_build_ms'] = round((time.perf_counter()-stage_started)*1000,2)
@@ -1533,7 +1546,10 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
             and any(item['name'] in business_read_models.READ_OPERATIONS for item in tools)
         )
         generic_query_available = any(item['name'] == 'business.query' for item in tools)
-        if packing_history_read:
+        if shipment_read_requested:
+            tools = [item for item in tools if item['name'] == shipment_read.OPERATION]
+            high_level_read_enabled = False
+        elif packing_history_read:
             tools = _packing_history_tool_catalog(tools)
             high_level_read_enabled = False
         elif read_planning_mode == 'investigative_lookup':
@@ -1620,21 +1636,22 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         packing_history_result = None
         packing_history_error = ''
         china_shortage_coverage_question = _is_china_shortage_coverage_question(turn_message)
-        if packing_history_read and packing_history_direct_arguments:
-            definition = business_operations.OPERATION_REGISTRY[PACKING_HISTORY_OPERATION]
+        if (shipment_read_requested and shipment_direct_arguments) or (packing_history_read and packing_history_direct_arguments):
+            read_operation = shipment_read.OPERATION if shipment_read_requested else PACKING_HISTORY_OPERATION
+            definition = business_operations.OPERATION_REGISTRY[read_operation]
             current = load_actor_context(human_actor.actor_id)
             if current is None or current.permission_decision(definition.required_permission) == DENY:
                 return finish('DENIED','Brak uprawnień do operacji.','PERMISSION_DENIED')
-            arguments = packing_history_direct_arguments
+            arguments = shipment_direct_arguments if shipment_read_requested else packing_history_direct_arguments
             call_id = 'packing-history-context-' + run_id
             timings['tool_calls_count'] += 1
             _audit('agent.tool_selected',ai_actor,run_id,correlation_id,SUCCESS,
-                   human_actor.actor_id,tool_name=PACKING_HISTORY_OPERATION,
+                   human_actor.actor_id,tool_name=read_operation,
                    conversation_id=conversation_id,
                    selection_reason=packing_history_selection_reason)
             operation_started = time.perf_counter()
             result = business_operations.execute_business_operation(
-                ai_actor, PACKING_HISTORY_OPERATION, arguments, correlation_id=correlation_id)
+                ai_actor, read_operation, arguments, correlation_id=correlation_id)
             elapsed = round((time.perf_counter()-operation_started)*1000,2)
             timings['business_operation_ms'] = round(timings['business_operation_ms']+elapsed,2)
             timings['tool_execution_ms'] = round(timings['tool_execution_ms']+elapsed,2)
@@ -1642,7 +1659,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 timings['supabase_business_reads_ms']+elapsed,2)
             _audit('agent.tool_result',ai_actor,run_id,correlation_id,
                    SUCCESS if result.status == 'SUCCESS' else FAILED,
-                   human_actor.actor_id,tool_name=PACKING_HISTORY_OPERATION,
+                   human_actor.actor_id,tool_name=read_operation,
                    execution_id=result.execution_id,result_status=result.status,
                    conversation_id=conversation_id)
             data = result.data if result.status == 'SUCCESS' else {
@@ -1651,7 +1668,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
             }
             context_evidence = [
                 {'type':'function_call','call_id':call_id,
-                 'name':PACKING_HISTORY_OPERATION,
+                 'name':read_operation,
                  'arguments':json.dumps(arguments,separators=(',',':'))},
                 {'type':'function_call_output','call_id':call_id,
                  'output':json.dumps(data,ensure_ascii=False,separators=(',',':'))},
@@ -1666,14 +1683,15 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
             history_data = dict(result.data or {})
             if _artifact_builder:
                 try:
-                    candidates = _artifact_builder(PACKING_HISTORY_OPERATION, history_data)
+                    candidates = _artifact_builder(read_operation, history_data)
                     if isinstance(candidates, list):
                         artifacts.extend(item for item in candidates if isinstance(item, dict))
                 except Exception:
                     logger.exception('AI_ARTIFACT_BUILD_FAILED packing history')
             artifact_sources.extend(build_artifact_sources(
-                PACKING_HISTORY_OPERATION, history_data, conversation_id, run_id))
+                read_operation, history_data, conversation_id, run_id))
             answer = (
+                shipment_read.answer(history_data) if shipment_read_requested else
                 'Oto istniejący historyczny dokument tej listy pakowej.'
                 if packing_history_document_followup else _packing_history_answer(history_data)
             )
@@ -1927,7 +1945,9 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 model_instructions += _SPECIALIST_READ_INSTRUCTIONS
                 if detected_intent == 'sales_analytics':
                     model_instructions += _intent_read_instructions(detected_intent)
-            if packing_history_read:
+            if shipment_read_requested:
+                model_instructions += SHIPMENT_READ_INSTRUCTIONS
+            elif packing_history_read:
                 model_instructions += PACKING_HISTORY_READ_INSTRUCTIONS
             elif high_level_read_enabled:
                 model_instructions += HIGH_LEVEL_READ_MODEL_INSTRUCTIONS
@@ -2012,6 +2032,8 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
             usage['input_tokens'] += reply.input_tokens
             usage['output_tokens'] += reply.output_tokens
             if not reply.tool_calls:
+                if shipment_read_requested:
+                    return finish('SUCCESS', 'Wskaż datę wysyłki albo klienta, żebym mógł odczytać powiązaną fakturę.', voice_response_mode='direct')
                 if packing_history_read:
                     return finish(
                         'SUCCESS',
@@ -2052,6 +2074,8 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                 return finish('FAILED','Osiągnięto limit operacji. Zawęź pytanie.','TOOL_LIMIT_EXCEEDED')
             if any(call.name not in pass_allowed for call in reply.tool_calls):
                 return finish('DENIED','Ta operacja nie jest dostępna dla asystenta.','TOOL_NOT_ALLOWED')
+            if shipment_read_requested and len(reply.tool_calls) != 1:
+                return finish('FAILED','Odczyt wysyłki wymaga jednego zakresu: daty, klienta albo ostatniej wysyłki.','TOOL_LIMIT_EXCEEDED')
             v1_read_batch = (
                 high_level_read_enabled and bool(reply.tool_calls)
                 and len(reply.tool_calls) <= 2
@@ -2348,7 +2372,7 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                             arguments=business_operations._safe_diagnostic_args(arguments))
                 if result.status == 'SUCCESS':
                     chat_503_diagnostics['tool_calls_ok'] += 1
-                    if call.name == PACKING_HISTORY_OPERATION:
+                    if call.name in {PACKING_HISTORY_OPERATION, shipment_read.OPERATION}:
                         packing_history_result = dict(result.data or {})
                     if generic_analytical_read and call.name == 'business.query':
                         generic_read_diagnostics['result_cells'] += int((result.data or {}).get('result_cells') or 0)
@@ -2356,7 +2380,7 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                     chat_503_diagnostics['tool_calls_data_unavailable'] += 1
                     if generic_analytical_read and call.name == 'business.query':
                         generic_read_diagnostics['fallback_reason'] = 'query_unavailable'
-                if call.name == PACKING_HISTORY_OPERATION and result.status != 'SUCCESS':
+                if call.name in {PACKING_HISTORY_OPERATION, shipment_read.OPERATION} and result.status != 'SUCCESS':
                     packing_history_error = (
                         result.safe_error_message
                         or 'Nie mam dostępu do konkretnej historycznej listy pakowej; '
@@ -2453,6 +2477,8 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
             if green_read_round:
                 read_planning_rounds += 1
                 high_level_read_diagnostics['read_rounds'] = read_planning_rounds
+            if shipment_read_requested:
+                return finish('SUCCESS', shipment_read.answer(packing_history_result) if packing_history_result is not None else (packing_history_error or 'Nie udało się jednoznacznie odczytać faktury wysyłki.'), voice_response_mode='full_detail')
             if packing_history_read:
                 if packing_history_result is not None:
                     return finish(

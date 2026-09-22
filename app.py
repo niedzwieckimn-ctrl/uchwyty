@@ -2947,6 +2947,7 @@ BUSINESS_FRESHNESS_DATA_TABLES = {
     for group, specs in BUSINESS_FRESHNESS_GROUPS.items()
 }
 BUSINESS_FRESHNESS_OPERATION_GROUP = {
+    'shipment.read': 'invoice_amendment',
     'business.query': 'inventory',
     'dashboard.read': 'dashboard',
     'business.orders.state': 'inventory',

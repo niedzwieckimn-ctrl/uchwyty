@@ -28,6 +28,7 @@ import order_write
 import invoice_amendment
 import fulfillment_operations
 import packing_history
+import shipment_read
 import payment_reminders
 import search_analytics
 import agent_conversation
@@ -66,11 +67,16 @@ IDEMPOTENT_REPLAY_WAIT_SECONDS = 5.0
 GENERIC_READ_OPERATIONS = frozenset({"business.describe_schema", "business.query"})
 HIGH_LEVEL_READ_OPERATIONS = business_read_models.READ_OPERATIONS
 DIRECT_READ_RESULT_OPERATIONS = GENERIC_READ_OPERATIONS | HIGH_LEVEL_READ_OPERATIONS | {
-    packing_history.OPERATION, payment_reminders.READ,
+    packing_history.OPERATION, shipment_read.OPERATION, payment_reminders.READ,
     search_analytics.OPERATION,
     CASHFLOW_READ_OPERATION, "dashboard.read",
 }
 CAPABILITY_CONTRACTS = {
+    shipment_read.OPERATION: {
+        'implemented': True, 'authoritative_source': 'shipment_then_complete_invoice',
+        'empty_or_missing': 'SUCCESS_with_empty_shipments',
+        'incomplete': 'SUCCESS_with_explicit_issues', 'permission_denied': 'DENIED_PERMISSION_DENIED',
+    },
     packing_history.OPERATION: {
         "implemented": True,
         "authoritative_source": "packing_allocation_snapshot",
@@ -115,6 +121,7 @@ _freshness_provider: Callable[[str], Mapping[str, Any]] | None = None
 _write_success_observer: Callable[[str, Mapping[str, Any]], None] | None = None
 
 FRESHNESS_GROUP_BY_OPERATION = {
+    shipment_read.OPERATION: 'invoice_amendment',
     "business.query": "inventory",
     "business.orders.state": "orders_state", "business.inventory.state": "inventory_state",
     "business.finance.state": "finance_state", "business.deliveries.state": "deliveries_state",
@@ -754,6 +761,12 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
         "packing.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
         PACKING_HISTORY_INPUT, PACKING_HISTORY_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),
+    shipment_read.OPERATION: BusinessOperationDefinition(
+        shipment_read.OPERATION, 1,
+        'Odczytuje faktyczne wysyłki według shipped_at lub potwierdzonego zdarzenia, a ich zawartość z pełnych powiązanych faktur. mode=latest: ostatnia wysyłka; date: wszystkie wysyłki danego dnia; customer: ostatnia dla klienta. Finalna LP jest kontrolą zgodności. Rozbieżności i niejednoznaczne faktury są jawne. Nie odtwarza wysyłki z order_items.',
+        'orders.read_full', approvals.GREEN, 'NONE', frozenset({'HUMAN','AI_AGENT'}),
+        shipment_read.INPUT, shipment_read.OUTPUT, IDEMPOTENCY_NONE, 'READ_STANDARD', True,
+    ),
     "invoices.search": BusinessOperationDefinition(
         "invoices.search", 1, "Wyszukuje faktury, opcjonalnie dla customer_id; payment_status=unpaid oznacza nieopłacone, a zaległe obsługuje invoices.overdue.",
         "invoices.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
@@ -1196,6 +1209,8 @@ def _entity(definition: BusinessOperationDefinition, data: Mapping[str, Any]) ->
         selector = (data.get("batch_id") or data.get("order_id") or data.get("customer_id")
                     or data.get("customer") or "latest")
         return "packing_history", str(selector), None
+    if definition.operation_name == shipment_read.OPERATION:
+        return 'shipment', str(data.get('date') or data.get('customer_id') or data.get('customer') or 'latest'), None
     if definition.operation_name in {payment_reminders.READ, payment_reminders.WRITE}:
         return "invoice", str(data.get("invoice_id") or data.get("query") or "overdue"), None
     if definition.operation_name == search_analytics.OPERATION:
@@ -2075,6 +2090,17 @@ def _packing_history_read(data):
         raise ControlledOperationError(exc.code, exc.safe_message) from exc
 
 
+def _shipment_read(data, actor, correlation_id, transaction_connection=None):
+    human = load_actor_context(actor.delegated_by_actor_id) if actor.delegated_by_actor_id else actor
+    if actor.permission_decision('invoices.read') == PERMISSION_DENY or human is None or human.permission_decision('invoices.read') == PERMISSION_DENY:
+        raise ControlledOperationError('PERMISSION_DENIED', 'Brak uprawnień do odczytu faktury wysyłki.', status=DENIED)
+    packing_allowed = actor.permission_decision('packing.read') != PERMISSION_DENY and human.permission_decision('packing.read') != PERMISSION_DENY
+    try:
+        return shipment_read.read(data, connection_factory=_factory(), packing_allowed=packing_allowed)
+    except shipment_read.ShipmentReadError as exc:
+        raise ControlledOperationError('SHIPMENT_READ_UNRESOLVED', str(exc)) from exc
+
+
 def _customers_get(data, actor, correlation_id, transaction_connection=None):
     db = transaction_connection or _factory()()
     try:
@@ -2743,6 +2769,7 @@ _HANDLERS: dict[str, Callable[[Mapping[str, Any], ActorContext, str, sqlite3.Con
     "orders.fulfillment.readiness": _orders_fulfillment_readiness,
     packing_history.OPERATION: lambda data, actor, correlation_id, transaction_connection=None:
         _packing_history_read(data),
+    shipment_read.OPERATION: _shipment_read,
     payment_reminders.READ: payment_reminders.read,
     payment_reminders.WRITE: lambda *_args, **_kwargs: None,
     search_analytics.OPERATION: search_analytics.business_read,
