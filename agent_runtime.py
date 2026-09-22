@@ -18,6 +18,7 @@ from agent_artifacts import build_artifact_sources
 import business_operations
 import business_query
 import business_read_models
+import inventory_fast_voice
 import shipment_read
 from agent_streaming import DisplayTextFilter, StreamCancelled
 from internal_audit import SUCCESS, FAILED, record_audit_event, sanitize_audit_text
@@ -1200,6 +1201,9 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
     read_question_domains = sorted(_read_question_domains(message))
     packing_history_read = detected_intent == 'packing_history'
     shipment_read_requested = detected_intent == 'shipment_contents'
+    fast_count_session = ''
+    fast_voice_operation = ''
+    fast_voice_data = {}
     model_calls = 0
     generic_analytical_read = False
     ambiguous_business_read = False
@@ -1243,7 +1247,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
             # Diagnostics must not interrupt cleanup or alter a business result.
             pass
 
-    def _finish(status, answer, code='', speech_text='', voice_response_mode='adaptive'):
+    def _finish(status, answer, code='', speech_text='', voice_response_mode='adaptive', inventory_tts=''):
         nonlocal active, current_stage
         if any(item.get('type') == 'inventory_count_card' for item in artifacts):
             artifacts[:] = [item for item in artifacts if item.get('type') != 'product_card']
@@ -1253,12 +1257,21 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
             from voice_io import compact_speech_text
             voice_response_mode = (
                 voice_response_mode if voice_response_mode in VOICE_RESPONSE_MODES else 'adaptive')
-            speech_text = compact_speech_text(
-                answer,
-                existing_speech_text=speech_text,
-                user_message=turn_message,
-                voice_response_mode=voice_response_mode,
-            )
+            fast_voice_active = bool(fast_count_session or inventory_tts
+                or fast_voice_operation == 'inventory.count.session.start')
+            if fast_voice_active:
+                speech_text = inventory_tts or inventory_fast_voice.from_operation(
+                    fast_voice_operation, fast_voice_data,
+                    pending_adjustment=any(item.get('operation') == 'inventory.adjust'
+                                           for item in pending_approvals))
+                voice_response_mode = 'direct'
+            else:
+                speech_text = compact_speech_text(
+                    answer,
+                    existing_speech_text=speech_text,
+                    user_message=turn_message,
+                    voice_response_mode=voice_response_mode,
+                )
         else:
             voice_response_mode = 'direct'
             speech_text = _plain_response_text(answer, speech=True)
@@ -1356,11 +1369,14 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 'model':model_name,'usage':usage,'error_code':code,'timings':dict(timings),
                 'artifacts':artifacts, 'approvals':pending_approvals,
                 'pending_approvals':pending_approvals, 'decisions': decisions}
+        if status == 'SUCCESS' and fast_voice_active:
+            result['display_text'] = answer
+            result['tts_text'] = speech_text
         if status != 'SUCCESS':
             result['_chat_503_diagnostics'] = {'stage':current_stage, **chat_503_diagnostics}
         return result
 
-    def finish(status, answer, code='', speech_text='', voice_response_mode='adaptive'):
+    def finish(status, answer, code='', speech_text='', voice_response_mode='adaptive', inventory_tts=''):
         nonlocal active
         synthesis_status, synthesis_error_code = status, code
         used_stored_confirmation = bool(post_write_confirmation and status != 'SUCCESS')
@@ -1374,7 +1390,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
             status, answer, code = 'SUCCESS', post_write_confirmation, ''
             speech_text, voice_response_mode = '', 'direct'
         try:
-            result = _finish(status, answer, code, speech_text, voice_response_mode)
+            result = _finish(status, answer, code, speech_text, voice_response_mode, inventory_tts)
             if post_write_confirmation and result['status'] != 'SUCCESS':
                 used_stored_confirmation = True
                 synthesis_status = result['status']
@@ -1704,7 +1720,6 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         # quantity without an active session or with ambiguous product context.
         fast_count_quantity = _fast_inventory_count_quantity(turn_message)
         fast_product_id = None
-        fast_count_session = ''
         named_count = _FAST_INVENTORY_NAMED_COUNT.fullmatch(turn_message)
         named_product = (named_count.group(1).strip() if named_count else '')
         if (execution_outcome is None and not eligible_approvals
@@ -1727,7 +1742,8 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 if len(candidates) > 1:
                     names = ', '.join(str(item['model'] or item['name'] or item['sku'])
                                       for item in candidates)
-                    return finish('SUCCESS', f'Który produkt: {names}?', voice_response_mode='direct')
+                    return finish('SUCCESS', f'Który produkt: {names}?', voice_response_mode='direct',
+                                  inventory_tts='Wybierz produkt.')
                 if len(candidates) == 1:
                     fast_product_id = int(candidates[0]['id'])
                     if named_count:
@@ -1736,7 +1752,8 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                         business_operations.set_inventory_count_active_product(
                             ai_actor, human_actor, conversation_id, fast_product_id)
                         name = str(candidates[0]['model'] or candidates[0]['name'] or candidates[0]['sku'])
-                        return finish('SUCCESS', f'{name}. Podaj liczbę sztuk.', voice_response_mode='direct')
+                        return finish('SUCCESS', f'{name}. Podaj liczbę sztuk.', voice_response_mode='direct',
+                                      inventory_tts=inventory_fast_voice.product_prompt(candidates[0]))
             if fast_count_session and fast_count_quantity is not None and not fast_product_id:
                 return finish('SUCCESS', 'Podaj produkt do kolejnego liczenia.',
                               voice_response_mode='direct')
@@ -1744,7 +1761,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 and not eligible_approvals and execution_outcome is None):
             if fast_count_session:
                 def fast_inventory_call(operation, arguments, *, read_only=False):
-                    nonlocal current_stage
+                    nonlocal current_stage, fast_voice_operation, fast_voice_data
                     current_stage = 'fast_inventory_operation'
                     definition = business_operations.OPERATION_REGISTRY[operation]
                     timings['tool_calls_count'] += 1
@@ -1805,6 +1822,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                          'output': json.dumps(payload, ensure_ascii=False, separators=(',', ':'))},
                     ])
                     if result.status == 'SUCCESS':
+                        fast_voice_operation, fast_voice_data = operation, dict(result.data or {})
                         chat_503_diagnostics['tool_calls_ok'] += 1
                         if _artifact_builder and isinstance(result.data, dict):
                             try:
@@ -1864,11 +1882,13 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 difference = int(count_data.get('difference') or 0)
                 if difference == 0:
                     t_final = time.perf_counter()
-                    answer = 'Zgodne. Następny produkt.'
+                    answer = (f'{display_name} — system {count_data["expected_quantity"]}, '
+                              f'policzono {fast_count_quantity}. Stan zgodny.')
                     timings['final_response_ms'] = round((time.perf_counter()-t_final)*1000,2)
                     return finish(
                         'SUCCESS', answer,
                         voice_response_mode='direct',
+                        inventory_tts='Zgodne. Następny.',
                     )
 
                 adjust_arguments = {
@@ -1900,11 +1920,13 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                     pending_approvals.append(approval)
                     t_final = time.perf_counter()
                     answer = (f'{display_name} — system {count_data["expected_quantity"]}, '
-                              f'policzono {fast_count_quantity}, różnica {difference:+d}. Zatwierdzić?')
+                              f'policzono {fast_count_quantity}, różnica {difference:+d}. '
+                              'Korekta wymaga zatwierdzenia.')
                     timings['final_response_ms'] = round((time.perf_counter()-t_final)*1000,2)
                     return finish(
                         'SUCCESS', answer,
                         voice_response_mode='direct',
+                        inventory_tts=inventory_fast_voice.difference_prompt(difference),
                     )
                 return finish(
                     'SUCCESS',
@@ -2372,10 +2394,16 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                             arguments=business_operations._safe_diagnostic_args(arguments))
                 if result.status == 'SUCCESS':
                     chat_503_diagnostics['tool_calls_ok'] += 1
+                    if call.name in {'inventory.count.session.start', 'inventory.count.get_expected',
+                                     'inventory.count.record', 'inventory.count.complete',
+                                     'inventory.product.get'}:
+                        fast_voice_operation, fast_voice_data = call.name, dict(result.data or {})
                     if call.name in {PACKING_HISTORY_OPERATION, shipment_read.OPERATION}:
                         packing_history_result = dict(result.data or {})
                     if generic_analytical_read and call.name == 'business.query':
                         generic_read_diagnostics['result_cells'] += int((result.data or {}).get('result_cells') or 0)
+                elif call.name == 'inventory.adjust' and result.status == 'PENDING_APPROVAL':
+                    fast_voice_operation, fast_voice_data = call.name, dict(result.data or {})
                 elif result.error_code == 'DATA_UNAVAILABLE':
                     chat_503_diagnostics['tool_calls_data_unavailable'] += 1
                     if generic_analytical_read and call.name == 'business.query':

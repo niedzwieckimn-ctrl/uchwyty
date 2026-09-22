@@ -1452,18 +1452,14 @@ def api_ai_approval_decide(approval_id, decision):
         # The approval itself has already gone through the original execution gate.
         if (snapshot['operation'] == 'inventory.adjust'
                 and str(execution['idempotency_key'] or '').endswith(':inventory-adjust')):
+            from inventory_fast_voice import approval_response
             response_started = time.perf_counter()
-            if outcome['execution_status'] == 'SUCCESS' and _apply_stored_success_confirmation(
-                    response, outcome, 'SKIPPED_FAST_INVENTORY'):
-                response['message'] = response['speech_text'] = 'Gotowe. Następny.'
-            elif decision == 'reject':
-                response.update(message='Odrzucono korektę. Następny produkt.',
-                                speech_text='Odrzucono korektę. Następny produkt.',
-                                voice_response_mode='direct', model_status='SKIPPED')
-            else:
-                response.update(message='Nie zapisano korekty. Sprawdź stan produktu.',
-                                speech_text='Nie zapisano korekty. Sprawdź stan produktu.',
-                                voice_response_mode='direct', model_status='SKIPPED')
+            display_text, tts_text = approval_response(outcome, decision)
+            response.update(message=display_text, speech_text=tts_text,
+                            display_text=display_text, tts_text=tts_text,
+                            voice_response_mode='direct',
+                            model_status=('SUCCESS' if outcome['execution_status'] == 'SUCCESS'
+                                          else 'SKIPPED_FAST_INVENTORY'))
             app.logger.info('AI_INVENTORY_APPROVAL_TIMING %s', json.dumps({
                 'inventory_adjust_ms': adjustment_ms,
                 'final_response_ms': round((time.perf_counter()-response_started)*1000, 2),
@@ -1631,6 +1627,8 @@ def _finalize_ai_chat_result(result, user_message):
             user_message=user_message,
             voice_response_mode=result.get('voice_response_mode', 'adaptive'),
         )
+        if 'tts_text' in result:
+            result['tts_text'] = result['speech_text']
         app.logger.info('VOICE_SPEECH_TEXT_READY %s', json.dumps({
             'chars': len(result['speech_text']),
             'present': bool(result['speech_text']),
