@@ -1199,36 +1199,25 @@ def fulfillment_document_download(order_id, kind):
 @app.get('/api/internal/ai/documents/packing-lists/<int:invoice_id>')
 @require_permission('orders.read_full')
 def api_internal_ai_packing_list(invoice_id):
-    source = _existing_packing_list_source(invoice_id, include_content=True)
-    if not source:
-        abort(404)
-    if source['kind'] == 'local':
-        return send_file(
-            source['path'], mimetype='application/pdf', as_attachment=True,
-            download_name=source['filename'], conditional=True,
-        )
-    return send_file(
-        io.BytesIO(source['content']), mimetype='application/pdf', as_attachment=True,
-        download_name=source['filename'], conditional=True,
-    )
+    import packing_versions, packing_history, sys
+    try:
+        path, result = packing_versions.document(sys.modules[__name__], {'invoice_id': invoice_id, 'current': True})
+    except (packing_versions.PackingConflict, packing_history.PackingHistoryError) as exc:
+        abort(409, description=str(exc))
+    return send_file(path, mimetype='application/pdf', as_attachment=True, conditional=True)
 
 
 @app.get('/api/internal/ai/documents/packing-history/<int:batch_id>')
 @require_permission('packing.read')
 def api_internal_ai_packing_history_document(batch_id):
-    """Return an already-saved and reverified packing PDF; never generate one."""
-    import packing_history
+    """Serve the exact historical snapshot through the shared document adapter."""
+    import packing_history, packing_versions, sys
     try:
-        result = packing_history.read({'batch_id': batch_id}, connection_factory=conn)
+        path, result = packing_versions.document(sys.modules[__name__], {'batch_id': batch_id, 'mode': 'historical'})
     except packing_history.PackingHistoryError as exc:
         return jsonify(status='FAILED', error_code=exc.code, message=exc.safe_message), 404
-    if not result.get('document_available') or not result.get('document_path'):
-        return jsonify(
-            status='FAILED', error_code='PACKING_HISTORY_DOCUMENT_UNAVAILABLE',
-            message='Dane listy są dostępne, ale historyczny PDF nie jest dostępny.',
-        ), 404
     return send_file(
-        result['document_path'], mimetype='application/pdf', as_attachment=True,
+        path, mimetype='application/pdf', as_attachment=True,
         download_name=f'packing-list-{batch_id}.pdf', conditional=True,
     )
 
@@ -5059,6 +5048,13 @@ def save_packing_selection(
     fulfillment operation commit the batch, its allocations, order statuses
     and document records as one unit.
     """
+    import packing_versions
+    labels_db = connection or conn()
+    try:
+        packing_items = packing_versions.normalize_items(labels_db, packing_items) if packing_items else []
+    finally:
+        if connection is None:
+            labels_db.close()
     rows = []
     for item in packing_items or []:
         order_id = to_int(item.get("source_order_id") or item.get("order_id"), 0)
@@ -5155,6 +5151,7 @@ def load_open_packing_selection(root_order_id: int) -> dict:
     cur.execute(
         """SELECT id FROM packing_batches
            WHERE root_order_id=? AND invoice_id IS NULL
+             AND (packing_list_id IS NULL OR id IN (SELECT current_batch_id FROM packing_lists))
            ORDER BY id DESC LIMIT 1""",
         (int(root_order_id),),
     )
@@ -6340,6 +6337,11 @@ def missed_stock_issue_candidates(cur):
     return [dict(row) for row in cur.fetchall()]
 
 def _packed_package_orders(cur, order):
+    import packing_versions
+    current = packing_versions.current_for_order(cur, int(order['id']))
+    if current:
+        marks = ','.join('?' for _ in current['order_ids'])
+        return [dict(r) for r in cur.execute(f'SELECT * FROM orders WHERE id IN ({marks}) ORDER BY id', current['order_ids'])]
     packed_at = norm(order.get("packed_at"))
     recipient = _email_key(order.get("customer_email"))
     if not packed_at or not recipient:
@@ -6471,6 +6473,7 @@ def invoice_packing_list_email_attachment_for_orders(orders: list[dict]) -> dict
 
 def apply_verified_inpost_status(order: dict, shipment: dict) -> dict:
     """Apply an authenticated InPost status to all and only shipment members."""
+    import packing_versions, sys
     remote_status = norm((shipment or {}).get("status"))
     if not inpost_status_is_collected(remote_status):
         return {"ok": True, "ignored": "not_collected", "status": remote_status, "orders": []}
@@ -6480,14 +6483,33 @@ def apply_verified_inpost_status(order: dict, shipment: dict) -> dict:
     )
     c = conn()
     try:
+        c.execute('BEGIN IMMEDIATE')
         cur = c.cursor()
         package_rows = cur.execute(
             "SELECT * FROM orders WHERE inpost_shipment_id=? ORDER BY id", (shipment_id,)
         ).fetchall() if shipment_id else []
         package_orders = [dict(item) for item in package_rows] or [dict(order)]
         package_ids = [to_int(item.get("id"), 0) for item in package_orders]
+        shipment_key = 'inpost:' + (shipment_id or remote_tracking)
+        if not shipment_id and not remote_tracking:
+            raise packing_versions.PackingConflict('Brak identyfikatora potwierdzonej przesyłki.')
+        prior = c.execute("SELECT * FROM packing_shipments WHERE shipment_key=? OR (carrier='inpost' AND tracking<>'' AND tracking=?)",
+                          (shipment_key, remote_tracking)).fetchone()
+        if prior:
+            shipment_key = prior['shipment_key']
+        version_before = packing_versions.current_for_order(c, int(order['id']))
+        packing = (packing_versions.batch_result(c, prior['final_batch_id'], mode='final') if prior else
+                   packing_versions.ensure_current_for_shipment(sys.modules[__name__], c, int(order['id'])))
+        if prior:
+            package_ids = packing['order_ids']
+        if int(order['id']) not in packing['order_ids']:
+            raise packing_versions.PackingConflict('Przesyłka nie należy do tego zamówienia.')
         placeholders = ",".join("?" for _ in package_ids)
         shipped_at = now_iso()
+        packing_versions.confirm_shipment(c, batch_id=packing['batch_id'], shipment_key=shipment_key,
+            confirmed_at=shipped_at, carrier='inpost', tracking=remote_tracking, order_ids=package_ids)
+        packing_versions.stage_evidence(sys.modules[__name__], c, package_ids,
+            allow_replace=not version_before and not prior)
         cur.execute(
             f"""UPDATE orders SET
                 status=CASE
@@ -6510,6 +6532,7 @@ def apply_verified_inpost_status(order: dict, shipment: dict) -> dict:
 
     if supabase_enabled():
         try:
+            packing_versions.sync_evidence(sys.modules[__name__], package_ids)
             for package_order in package_orders:
                 supabase_update_rows("orders", {
                     "status": package_order.get("status"), "tracking_no": remote_tracking,
@@ -6525,7 +6548,9 @@ def apply_verified_inpost_status(order: dict, shipment: dict) -> dict:
     if event_keys and all(_email_event_already_ok(key) for key in event_keys):
         return {"ok": True, "duplicate": True, "status": remote_status, "orders": package_ids}
     try:
-        packing_attachment = invoice_packing_list_email_attachment_for_orders(package_orders)
+        packing_path, _ = packing_versions.document(sys.modules[__name__], {'batch_id': packing['batch_id'], 'mode': 'historical'})
+        with open(packing_path, 'rb') as packing_file:
+            packing_attachment = {'filename': 'lista_pakowa.pdf', 'content': packing_file.read()}
         email_result = _send_orders_shipped_email(package_orders, remote_tracking, "inpost", packing_attachment)
     except Exception as exc:
         app.logger.exception("InPost: nie udało się wysłać powiadomienia z listą pakowania")
@@ -7933,16 +7958,20 @@ def invoice_items_from_saved_json(invoice_id: int):
     c = conn()
     cur = c.cursor()
     cur.execute("""
-      SELECT oi.*, p.model, p.name,
+      SELECT oi.id,oi.order_id,oi.product_id,oi.sku,oi.currency,oi.unit_net_price,oi.unit_gross_price,
+             ia.qty, ia.order_item_id, ia.order_id AS source_order_id,
+             o.order_no AS source_order_no, o.note AS source_order_note, p.model, p.name,
              COALESCE(pr.net_price, 0) AS net_price,
              COALESCE(pr.gross_price, 0) AS gross_price,
-             (oi.qty * COALESCE(pr.net_price, 0)) AS line_value_net,
-             (oi.qty * COALESCE(pr.gross_price, 0)) AS line_value_gross
-      FROM order_items oi
+              (ia.qty * COALESCE(pr.net_price, 0)) AS line_value_net,
+              (ia.qty * COALESCE(pr.gross_price, 0)) AS line_value_gross
+      FROM invoice_allocations ia
+      JOIN order_items oi ON oi.id=ia.order_item_id AND oi.order_id=ia.order_id
+      JOIN orders o ON o.id=ia.order_id
       JOIN products p ON p.id=oi.product_id
       LEFT JOIN pricing pr ON (TRIM(LOWER(pr.model)) = TRIM(LOWER(p.model)) OR TRIM(LOWER(pr.model)) = TRIM(LOWER(p.sku)))
-      WHERE oi.order_id=(SELECT order_id FROM invoices WHERE id=?)
-      ORDER BY oi.id
+      WHERE ia.invoice_id=?
+      ORDER BY ia.id
     """, (invoice_id,))
     items = [dict(r) for r in cur.fetchall()]
     c.close()

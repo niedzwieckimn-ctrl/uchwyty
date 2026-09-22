@@ -62,6 +62,8 @@ def build_artifact_sources(
             'entity_id': int(result['batch_id']),
             'trusted_result_subset': {
                 'batch_id': int(result['batch_id']),
+                'packing_list_key': result.get('packing_list_key') or '',
+                'document_type': result.get('document_type') or 'historical',
                 'document_id': result.get('document_id'),
                 'customer': _fields(customer, ('id', 'name', 'email')),
                 'order_ids': list(result.get('order_ids') or [])[:20],

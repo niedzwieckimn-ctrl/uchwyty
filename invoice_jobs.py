@@ -7,16 +7,24 @@ def initialize(c):
         c.execute("ALTER TABLE invoices ADD COLUMN publication_state TEXT NOT NULL DEFAULT 'complete'")
     c.execute('''CREATE TABLE IF NOT EXISTS invoice_jobs(invoice_id INTEGER PRIMARY KEY REFERENCES invoices(id),
                 items_json TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'preparing',error TEXT,updated_at TEXT NOT NULL)''')
+    if 'packing_expected_batch' not in {r[1] for r in c.execute('PRAGMA table_info(invoice_jobs)')}:
+        c.execute('ALTER TABLE invoice_jobs ADD COLUMN packing_expected_batch INTEGER')
     c.commit()
 
 def stage(cur, invoice_id, items, now):
+    import packing_versions
+    inv = cur.execute('SELECT order_id FROM invoices WHERE id=?', (invoice_id,)).fetchone()
+    logical = packing_versions.resolve_list(cur, inv['order_id'], invoice_id) if inv else None
+    expected = int(logical['current_batch_id']) if logical else 0
     cur.execute("UPDATE invoices SET publication_state='preparing' WHERE id=?",(invoice_id,))
     cur.execute('''INSERT INTO invoice_jobs(invoice_id,items_json,state,updated_at) VALUES(?,?,'preparing',?)
           ON CONFLICT(invoice_id) DO UPDATE SET items_json=excluded.items_json,state='preparing',error=NULL,updated_at=excluded.updated_at''',
                 (invoice_id,json.dumps(items,ensure_ascii=False),now))
+    cur.execute('UPDATE invoice_jobs SET packing_expected_batch=? WHERE invoice_id=?', (expected, invoice_id))
 
 def finish(b, invoice_id):
     import invoice_stock
+    import packing_versions
     c=b.conn()
     try:
         job=c.execute('SELECT * FROM invoice_jobs WHERE invoice_id=?',(invoice_id,)).fetchone()
@@ -30,9 +38,10 @@ def finish(b, invoice_id):
     finally:
         c.close()
     try:
+        if job['state'] == 'ready':
+            packing_versions.sync_evidence(b, sorted({int(i.get('source_order_id') or i.get('order_id')) for i in items}))
         pdf,net,gross=b.generate_order_invoice_pdf(order,items,b.invoice_meta_payload(inv))
-        packing=b.generate_invoice_packing_list_pdf(order,items,b.invoice_meta_payload(inv),pdf)
-        path=b.upload_invoice_pdfs_to_supabase(invoice_id,inv['invoice_no'],pdf,packing)
+        path=b.upload_invoice_pdfs_to_supabase(invoice_id,inv['invoice_no'],pdf,None)
         if not path:
             raise ValueError('Brak potwierdzenia zapisu PDF')
         remote_stock=invoice_stock.apply_remote(b,invoice_id,items)
@@ -57,7 +66,15 @@ def finish(b, invoice_id):
             c.execute('''INSERT INTO invoice_meta(invoice_id,pdf_path,invoice_items_json,sent_to_client,seen_by_client,payment_reminder,paid,updated_at)
                          VALUES(?,?,?,0,0,0,0,?) ON CONFLICT(invoice_id) DO UPDATE SET pdf_path=excluded.pdf_path,
                          invoice_items_json=excluded.invoice_items_json,updated_at=excluded.updated_at''',
-                      (invoice_id,path,job['items_json'],b.now_iso()))
+                       (invoice_id,path,job['items_json'],b.now_iso()))
+            logical = packing_versions.resolve_list(c, inv['order_id'], invoice_id)
+            # A completed local publication may only be retried with identical data.
+            expected = job['packing_expected_batch']
+            if job['state'] == 'ready':
+                expected = int(logical['current_batch_id']) if logical else 0
+            batch_id = packing_versions.publish(b, c, inv['order_id'], items, None,
+                                                invoice_id=invoice_id, expected_current=expected)
+            packing = packing_versions.batch_result(c, batch_id)['document_path']
             c.execute("UPDATE invoices SET total_net=?,total_gross=?,publication_state='preparing' WHERE id=?",(net,gross,invoice_id))
             c.execute("UPDATE invoice_jobs SET state='ready',error=NULL,updated_at=? WHERE invoice_id=?",(b.now_iso(),invoice_id))
             c.commit()
@@ -65,6 +82,9 @@ def finish(b, invoice_id):
             c.rollback();raise
         finally:
             c.close()
+        packing_versions.sync_evidence(b, sorted({int(i.get('source_order_id') or i.get('order_id')) for i in items}))
+        if not b.upload_invoice_pdfs_to_supabase(invoice_id,inv['invoice_no'],pdf,packing):
+            raise ValueError('Brak potwierdzenia zapisu bieżącej listy pakowej')
         if b.supabase_enabled():
             c=b.conn()
             ids=[x[0] for x in c.execute("SELECT id FROM invoice_allocations WHERE invoice_id=?",(invoice_id,))]

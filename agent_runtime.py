@@ -271,6 +271,8 @@ def _is_packing_history_read(value: str) -> bool:
     if re.search(r'\bco\s+(?:było|bylo|jest)\s+w\s+(?:tej\s+)?wysyłc\w*', normalized):
         return True
     return bool(
+        re.search(r'\b(?:co|odczytaj|pokaż|pokaz)\b.*\b(?:lp|(?:list\w*|li[śs]ci\w*)\s+pakow)', normalized)
+        or
         re.search(r'\b(?:odczytaj|pokaż|pokaz|przeczytaj)\b.*\blist[ęa]\s+pakow', normalized)
         or re.search(r'\b(?:daj|podaj)\b(?:\s+mi)?\s+.*\blist[ęa]\s+pakow', normalized)
         or re.search(r'\bco\s+(?:było|bylo)\s+(?:w\s+paczk|w\s+paczc|na\s+(?:liście|liscie)\s+pakow|spakowan|wysłan|wyslan)', normalized)
@@ -334,6 +336,15 @@ def _packing_history_direct_selector(value: str) -> tuple[dict[str, Any] | None,
     if re.fullmatch(r'co\s+(?:wysłałem|wyslalem|wysłaliśmy|wyslalismy)', normalized):
         return {'latest': True}, 'explicit_latest_shipment'
     return None, ''
+
+
+def _packing_read_mode(value):
+    normalized = str(value or '').casefold()
+    if re.search(r'\b(?:poprzedni\w*|historyczn\w*|wcześniejsz\w*|wczesniejsz\w*)\b', normalized):
+        return 'historical'
+    if re.search(r'\b(?:wysła\w*|wysla\w*|wyszło|wyszlo|było\s+w\s+pacz\w*|bylo\s+w\s+pacz\w*)\b', normalized):
+        return 'shipment'
+    return 'current'
 
 
 def _is_packing_history_followup(value: str) -> bool:
@@ -776,11 +787,13 @@ który go dostarczy. Sukces techniczny narzędzia nie oznacza jeszcze kompletnej
 operacyjnego nie potwierdza braku encji w pełnym systemie. Nie powtarzaj wcześniejszych argumentów i nie wykonuj WRITE.
 '''
 PACKING_HISTORY_READ_INSTRUCTIONS = '''
-To pytanie dotyczy historycznej, już utworzonej listy pakowej lub paczki. Użyj wyłącznie
+To pytanie dotyczy listy pakowej lub paczki. Użyj wyłącznie
 orders.packing_history.get. Wskaż dokładnie jeden selektor: batch_id, wewnętrzny order_id,
 historyczny order_number, customer_id, customer, today=true albo latest=true. Numeru ZAM-... nigdy nie
 przekazuj jako order_id. Dla pytania bez wskazanego obiektu użyj latest=true. Nie używaj
 bieżących zamówień, order_items, dostępności ani statusów do rekonstrukcji zawartości paczki.
+Tryb odczytu wybiera backend: current dla aktualnej listy, historical dla wcześniejszej wersji,
+shipment dla zawartości wysyłki. Zachowaj całą listę, również zamówienia dodatkowe.
 Jeżeli historyczny odczyt nie jest dostępny albo narzędzie zwróci błąd, nie zgaduj zawartości.
 '''
 _MARKDOWN_RULE = re.compile(r'^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$',re.MULTILINE)
@@ -837,8 +850,10 @@ def _packing_history_answer(data: dict[str, Any]) -> str:
         heading = 'Wysyłki z list pakowych oraz osobno oznaczone pozycje zamówień bez listy'
     elif not data.get('verified', True):
         return 'Nie mogę potwierdzić pełnej zawartości tej listy pakowej.'
+    elif data.get('document_type') == 'final' and data.get('shipment_confirmed'):
+        heading = 'Potwierdzona zawartość wysyłki'
     elif data.get('document_type') == 'current':
-        heading = 'Bieżąca, zweryfikowana lista pakowa'
+        heading = 'Bieżąca lista pakowa — przygotowana zawartość, bez potwierdzenia wysyłki'
     else:
         heading = 'Historyczna, zweryfikowana lista pakowa'
     if data.get('batch_id'):
@@ -1466,10 +1481,13 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
             if len(entity_ids) == 1 and None not in entity_ids
         })
         packing_history_context_batch_id = previous_turn_entities.get('packing_batch')
+        packing_context = (previous_turn_sources.get('packing_batch') or [{}])[0].get('trusted_result_subset') or {}
+        packing_history_context_key = packing_context.get('packing_list_key')
         packing_history_document_followup = False
         packing_history_direct_arguments = None
         packing_history_selection_reason = ''
-        if packing_history_context_batch_id and _is_packing_history_followup(turn_message):
+        if (packing_history_context_batch_id and _is_packing_history_followup(turn_message)
+                and not _packing_history_order_number(turn_message)):
             detected_intent = 'packing_history'
             packing_history_read = True
             packing_history_document_followup = _is_packing_history_document_followup(turn_message)
@@ -1490,6 +1508,18 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                     packing_history_direct_arguments = {
                         'invoice_id': int(previous_turn_entities['invoice']), 'current': True}
                     packing_history_selection_reason = 'trusted_current_invoice_document'
+        if packing_history_read:
+            mode = _packing_read_mode(turn_message)
+            refers_to_previous = bool(re.search(r'\b(?:tę|te|tej|poprzedni\w*)\b', turn_message.casefold()))
+            if packing_history_context_key and refers_to_previous and not _packing_history_order_number(turn_message):
+                packing_history_direct_arguments = {'packing_list_key': packing_history_context_key}
+                packing_history_selection_reason = 'trusted_logical_packing_list'
+            if packing_history_direct_arguments:
+                packing_history_direct_arguments['mode'] = mode
+                if packing_history_document_followup:
+                    packing_history_direct_arguments = {'batch_id': int(packing_history_context_batch_id), 'mode': 'historical'}
+                elif packing_history_context_key and packing_history_selection_reason == 'trusted_batch_followup':
+                    packing_history_direct_arguments = {'packing_list_key': packing_history_context_key, 'mode': mode}
         import human_approval
         eligible_approvals = human_approval.pending(business_operations, conversation_id, human_actor) if message.strip() and execution_outcome is None else []
         timings['context_history_build_ms'] = round((time.perf_counter()-stage_started)*1000,2)
@@ -2108,6 +2138,8 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                     if not isinstance(arguments,dict):
                         raise ValueError('Tool arguments must be an object')
                     arguments = dict(arguments)
+                    if call.name == PACKING_HISTORY_OPERATION:
+                        arguments['mode'] = _packing_read_mode(turn_message)
                     fingerprint = call.name+json.dumps(arguments,sort_keys=True,ensure_ascii=False)
                     if fingerprint in seen:
                         return finish('FAILED','Model powtórzył tę samą operację.','REPEATED_TOOL_CALL')

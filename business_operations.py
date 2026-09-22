@@ -440,6 +440,8 @@ PACKING_HISTORY_INPUT = {
         "latest": {"type": "boolean"},
         "current": {"type": "boolean"},
         "invoice_id": {"type": "integer", "minimum": 1},
+        "packing_list_key": {"type": "string", "minLength": 1, "maxLength": 80},
+        "mode": {"type": "string", "enum": ["current", "historical", "shipment"]},
     },
 }
 _PACKING_HISTORY_ALLOCATION = {
@@ -472,6 +474,10 @@ PACKING_HISTORY_OUTPUT = {
         "history_source": {"type": "string"},
         "invoice_id": {"type": ["integer", "null"]},
         "packing_list_id": {"type": ["integer", "null"]},
+        "packing_list_key": {"type": "string"},
+        "shipment_confirmed": {"type": "boolean"},
+        "shipment_key": {"type": "string"},
+        "confirmed_at": {"type": "string"},
         "orders": {"type": "array", "maxItems": 500},
         "all_items": {"type": "array", "maxItems": 500},
         "total_units": {"type": "integer"},
@@ -744,7 +750,7 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
     ),
     packing_history.OPERATION: BusinessOperationDefinition(
         packing_history.OPERATION, 1,
-        "Odczytuje rzeczywistą zawartość wysyłki z listy pakowej dla batch_id, order_id, order_number, klienta, dziś lub ostatnio. current=true czyta bieżący dokument, np. wskazany w UI, a domyślnie niemodyfikowalny snapshot historyczny. Dopiero gdy lista nie istnieje, zwraca jawnie oznaczone order_items_fallback; nigdy nie zastępuje nimi niezweryfikowanej listy.",
+        "Odczytuje pełny zakres listy pakowej ze wszystkich źródłowych zamówień. mode=current: aktualna wersja; mode=historical: wskazany snapshot (packing_list_key: poprzednia wersja); mode=shipment: finalna wersja potwierdzonej wysyłki, a przed wysyłką jawnie oznaczona bieżąca LP. Nigdy nie zastępuje LP pozycjami pojedynczego zamówienia.",
         "packing.read", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
         PACKING_HISTORY_INPUT, PACKING_HISTORY_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
     ),

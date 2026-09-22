@@ -651,58 +651,6 @@ def _current_invoice_document(db, invoice_id: int):
     return _shipment_shape(result, document_type='current', verified=True, invoice_id=invoice_id)
 
 
-def _order_items_fallback(db, data):
-    """Only a missing list may fall back to an explicitly labeled order view."""
-    if data.get('today') or data.get('date'):
-        target = (datetime.now(ZoneInfo('Europe/Warsaw')).date().isoformat()
-                  if data.get('today') else date.fromisoformat(str(data['date'])).isoformat())
-        orders = db.execute('''SELECT * FROM orders WHERE substr(shipped_at,1,10)=?
-                               ORDER BY shipped_at DESC,id DESC''', (target,)).fetchall()
-        excluded = set(data.get('exclude_order_ids') or ())
-        orders = [order for order in orders if int(order['id']) not in excluded]
-    elif data.get('order_id'):
-        order = db.execute('SELECT * FROM orders WHERE id=?', (int(data['order_id']),)).fetchone()
-    elif data.get('order_number'):
-        order = db.execute('SELECT * FROM orders WHERE order_no=?', (data['order_number'],)).fetchone()
-    elif data.get('customer_id'):
-        order = db.execute('SELECT * FROM orders WHERE customer_id=? ORDER BY shipped_at DESC,id DESC LIMIT 1',
-                           (int(data['customer_id']),)).fetchone()
-    elif data.get('customer'):
-        order = db.execute('''SELECT * FROM orders WHERE LOWER(customer_name)=LOWER(?)
-                              OR LOWER(customer_email)=LOWER(?)
-                              ORDER BY shipped_at DESC,id DESC LIMIT 1''',
-                           (data['customer'], data['customer'])).fetchone()
-    else:
-        order = db.execute('''SELECT * FROM orders WHERE shipped_at IS NOT NULL
-                              ORDER BY shipped_at DESC,id DESC LIMIT 1''').fetchone()
-    if not (data.get('today') or data.get('date')):
-        orders = [order] if order else []
-    if not orders:
-        return None
-    allocations = []
-    for order in orders:
-        items = db.execute('''SELECT oi.id,oi.order_id,oi.sku,oi.qty,p.model,p.name
-                                FROM order_items oi LEFT JOIN products p ON p.id=oi.product_id
-                               WHERE oi.order_id=? ORDER BY oi.id''', (order['id'],)).fetchall()
-        allocations.extend(dict(order_item_id=int(item['id']), order_id=int(item['order_id']),
-                                order_number=order['order_no'], sku=item['sku'] or '',
-                                model_name=item['model'] or item['name'] or '', note='',
-                                packed_qty=int(item['qty'])) for item in items)
-    result = {
-        'ok': True, 'batch_id': 0, 'created_at': order['shipped_at'] or '',
-        'order_ids': [int(order['id']) for order in orders], 'allocations': allocations,
-        'total_lines': len(allocations),
-        'total_qty': sum(item['packed_qty'] for item in allocations),
-        'document_id': None, 'document_path': '', 'document_available': False,
-        'document_verified': False, 'complete': False,
-        'incomplete_fields': ['packing_list'], 'history_source': 'order_items_fallback',
-        'customer': {'id': orders[0]['customer_id'] if len(orders) == 1 else None,
-                     'name': orders[0]['customer_name'] if len(orders) == 1 else '',
-                     'email': (orders[0]['customer_email'] or '') if len(orders) == 1 else ''},
-    }
-    return _shipment_shape(result, document_type='fallback', verified=False)
-
-
 def _invoice_for_missing_history(db, data):
     """Find the existing invoice document for the selected order/customer."""
     if data.get('order_id') or data.get('order_number'):
@@ -741,126 +689,80 @@ def _invoice_for_missing_history(db, data):
 
 
 def shipment_read(data: Mapping[str, Any], *, connection_factory) -> dict[str, Any]:
-    """Use existing packing evidence; report order data only on a genuine absence."""
+    """One structural read; current, historical and shipped are explicit scopes."""
+    import packing_versions
     db = connection_factory()
     try:
-        if data.get('today') or data.get('date'):
-            try:
-                target = (datetime.now(ZoneInfo('Europe/Warsaw')).date().isoformat()
-                          if data.get('today') else date.fromisoformat(str(data['date'])).isoformat())
-            except ValueError as exc:
-                raise PackingHistoryError('INVALID_DATE', 'Data musi mieć format RRRR-MM-DD.') from exc
-            batches = db.execute('''SELECT DISTINCT pb.id FROM packing_batches pb
-                                    JOIN packing_allocations pa ON pa.batch_id=pb.id
-                                    JOIN orders o ON o.id=pa.order_id
-                                   WHERE substr(o.shipped_at,1,10)=?
-                                   ORDER BY pb.id DESC''', (target,)).fetchall()
-            if batches:
-                results = [shipment_read({'batch_id': int(row['id'])}, connection_factory=connection_factory)
-                           for row in batches]
-                covered = {order_id for item in results for order_id in item['order_ids']}
-                uncovered = _order_items_fallback(db, dict(data, exclude_order_ids=covered))
-                if uncovered:
-                    results.append(uncovered)
-                if len(results) == 1:
-                    return results[0]
-                combined = dict(results[0])
-                combined['batch_id'] = 0
-                combined['packing_list_id'] = None
-                combined['document_id'] = None
-                combined['invoice_id'] = None
-                combined['document_path'] = ''
-                combined['document_available'] = False
-                combined['order_ids'] = sorted({order_id for item in results for order_id in item['order_ids']})
-                combined['allocations'] = [line for item in results for line in item['allocations']]
-                combined['total_lines'] = len(combined['allocations'])
-                combined['total_qty'] = sum(item['total_qty'] for item in results)
-                combined['complete'] = all(item['complete'] for item in results)
-                combined['verified'] = all(item['verified'] for item in results)
-                combined['created_at'] = target
-                combined['fallback_order_ids'] = sorted({order_id for item in results
-                    if item['source'] == 'order_items_fallback' for order_id in item['order_ids']})
-                combined['shipments'] = [{'packing_list_id': item['packing_list_id'],
-                                          'order_ids': item['order_ids'], 'total_units': item['total_units']}
-                                         for item in results]
-                combined = _shipment_shape(combined, document_type='historical',
-                                           verified=combined['verified'])
-                if combined['fallback_order_ids']:
-                    combined['source'] = 'mixed_packing_and_order_items_fallback'
-                return combined
-            fallback = _order_items_fallback(db, data)
-            if fallback:
-                return fallback
-            raise PackingHistoryError('PACKING_HISTORY_NOT_FOUND', 'Nie znaleziono wysyłki z tego dnia.')
-        if data.get('current'):
-            invoice_id = int(data.get('invoice_id') or 0)
-            batch_id = 0
-            if data.get('order_id'):
-                current = db.execute('''SELECT document_id FROM fulfillment_documents
-                                        WHERE order_id=? AND kind='packing_list' ''',
-                                     (int(data['order_id']),)).fetchone()
-                batch_id = int(current['document_id']) if current else 0
-                if not invoice_id:
-                    invoice = db.execute('''SELECT i.id FROM invoices i
-                                           LEFT JOIN invoice_allocations ia ON ia.invoice_id=i.id
-                                          WHERE i.order_id=? OR ia.order_id=?
-                                          ORDER BY i.id DESC LIMIT 1''',
-                                         (int(data['order_id']), int(data['order_id']))).fetchone()
-                    invoice_id = int(invoice['id']) if invoice else 0
-            if batch_id:
-                result = read({'batch_id': batch_id}, connection_factory=connection_factory)
-                if not result.get('complete') or not result.get('document_verified'):
-                    raise _not_verifiable('Bieżący dokument listy pakowej nie jest zweryfikowany.')
-                from fulfillment_operations import state as fulfillment_state
-                for member_id in result['order_ids']:
-                    current_state = fulfillment_state({'order_id': member_id})['state']['packing_list']
-                    if (not current_state['current']
-                            or int(current_state['document_id'] or 0) != batch_id):
-                        raise _not_verifiable('Lista pakowa nie jest już bieżąca dla wszystkich zamówień.')
-                return _shipment_shape(result, document_type='current', verified=True,
-                                       invoice_id=invoice_id or None)
-            if invoice_id:
-                current_invoice = _current_invoice_document(db, invoice_id)
-                if current_invoice:
-                    return current_invoice
-            fallback = _order_items_fallback(db, data)
-            if fallback:
-                return fallback
-            raise PackingHistoryError('PACKING_HISTORY_NOT_FOUND', 'Nie znaleziono bieżącej listy pakowej.')
-        if data.get('invoice_id'):
-            batch = db.execute('SELECT id FROM packing_batches WHERE invoice_id=? ORDER BY id DESC LIMIT 1',
-                               (int(data['invoice_id']),)).fetchone()
-            if batch:
-                result = read({'batch_id': int(batch['id'])}, connection_factory=connection_factory)
-                return _shipment_shape(result, document_type='historical',
-                                       verified=bool(result['complete']), invoice_id=int(data['invoice_id']))
-            current_invoice = _current_invoice_document(db, int(data['invoice_id']))
-            if current_invoice:
-                return current_invoice
-            invoice = db.execute('SELECT order_id FROM invoices WHERE id=?',
-                                 (int(data['invoice_id']),)).fetchone()
-            fallback = _order_items_fallback(db, {'order_id': invoice['order_id']}) if invoice else None
-            if fallback:
-                return fallback
-            raise PackingHistoryError('PACKING_HISTORY_NOT_FOUND', 'Nie znaleziono listy pakowej tej faktury.')
-        try:
+        mode = data.get('mode') or ('current' if data.get('current') else 'historical')
+        if mode == 'historical':
+            if data.get('batch_id'):
+                managed = db.execute('SELECT packing_list_id FROM packing_batches WHERE id=?', (data['batch_id'],)).fetchone()
+                if managed and managed[0]:
+                    return packing_versions.batch_result(db, int(data['batch_id']))
+            if data.get('packing_list_key') or (data.get('mode') == 'historical' and not data.get('batch_id')):
+                current = packing_versions.select(db, data, mode='current')
+                if not current and data.get('packing_list_key'):
+                    raise PackingHistoryError('PACKING_HISTORY_NOT_FOUND', 'Nie znaleziono listy.')
+                if current:
+                    previous = db.execute('SELECT previous_batch_id FROM packing_batches WHERE id=?',
+                                          (current['batch_id'],)).fetchone()
+                    if not previous or not previous[0]:
+                        raise PackingHistoryError('PACKING_HISTORY_NOT_FOUND', 'Nie ma poprzedniej wersji tej listy.')
+                    return packing_versions.batch_result(db, previous[0])
+            if data.get('invoice_id'):
+                row = db.execute('SELECT id FROM packing_batches WHERE invoice_id=? ORDER BY id DESC LIMIT 1',
+                                 (data['invoice_id'],)).fetchone()
+                if not row:
+                    raise PackingHistoryError('PACKING_HISTORY_NOT_FOUND', 'Brak historycznej wersji listy tej faktury.')
+                data = {'batch_id': row[0]}
             result = read(data, connection_factory=connection_factory)
-        except PackingHistoryError as exc:
-            if exc.code != 'PACKING_HISTORY_NOT_FOUND':
-                raise
-            invoice_id = _invoice_for_missing_history(db, data)
-            if invoice_id:
-                current_invoice = _current_invoice_document(db, invoice_id)
-                if current_invoice:
-                    return current_invoice
-            fallback = _order_items_fallback(db, data)
-            if fallback:
-                return fallback
-            raise
-        batch = db.execute('SELECT invoice_id FROM packing_batches WHERE id=?',
-                           (int(result['batch_id']),)).fetchone()
-        return _shipment_shape(result, document_type='historical',
-                               verified=bool(result['complete']),
-                               invoice_id=int(batch['invoice_id']) if batch and batch['invoice_id'] else None)
+            row = db.execute('SELECT invoice_id,packing_list_id FROM packing_batches WHERE id=?',
+                             (result['batch_id'],)).fetchone()
+            result = _shipment_shape(result, document_type='historical', verified=bool(result['complete']),
+                                     invoice_id=row['invoice_id'] if row else None)
+            result['packing_list_key'] = row['packing_list_id'] or '' if row else ''
+            result['shipment_confirmed'] = False
+            return result
+        if mode == 'shipment':
+            result = packing_versions.select(db, data, mode='shipment')
+            if result:
+                return result
+            if data.get('today') or data.get('date'):
+                raise PackingHistoryError('FINAL_SHIPMENT_NOT_FOUND', 'Brak potwierdzonej zawartości wysyłki z tego dnia.')
+        if data.get('batch_id'):
+            batch = db.execute('SELECT packing_list_id FROM packing_batches WHERE id=?', (data['batch_id'],)).fetchone()
+            if batch and not batch[0]:
+                result = read({'batch_id': data['batch_id']}, connection_factory=connection_factory)
+                result = _shipment_shape(result, document_type='historical', verified=bool(result['complete']))
+                result.update(packing_list_key='', shipment_confirmed=False)
+                return result
+        result = packing_versions.select(db, data, mode='current')
+        if result:
+            return result
+        # Existing installations can read their complete saved invoice scope
+        # until the first explicit regeneration publishes a version. No READ writes.
+        invoice_id = int(data.get('invoice_id') or _invoice_for_missing_history(db, data) or 0)
+        if invoice_id:
+            result = packing_versions.legacy_invoice_result(db, invoice_id)
+            if result:
+                return result
+        if data.get('latest'):
+            legacy = db.execute('''SELECT pb.id FROM packing_batches pb JOIN fulfillment_documents fd
+                ON fd.kind='packing_list' AND fd.document_id=pb.id
+                WHERE pb.packing_list_id IS NULL ORDER BY pb.id DESC LIMIT 1''').fetchone()
+            if legacy:
+                result = read({'batch_id': legacy[0]}, connection_factory=connection_factory)
+                result = _shipment_shape(result, document_type='current', verified=bool(result['complete']))
+                result.update(packing_list_key='', shipment_confirmed=False)
+                return result
+        if data.get('order_id'):
+            row = db.execute("SELECT document_id FROM fulfillment_documents WHERE kind='packing_list' AND order_id=?",
+                             (data['order_id'],)).fetchone()
+            if row:
+                return packing_versions.batch_result(db, row[0], mode='current')
+        raise PackingHistoryError('PACKING_HISTORY_NOT_FOUND',
+                                  'Brak kompletnej listy pakowej. Zawartość zamówienia nie potwierdza zawartości wysyłki.')
+    except packing_versions.PackingConflict as exc:
+        raise PackingHistoryError('PACKING_SCOPE_CONFLICT', str(exc)) from exc
     finally:
         db.close()

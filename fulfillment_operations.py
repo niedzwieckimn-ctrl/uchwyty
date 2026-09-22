@@ -43,6 +43,8 @@ def configure(backend):
 def initialize(db):
     import reconciliation_store
     reconciliation_store.initialize(db)
+    import packing_versions
+    packing_versions.initialize(db)
     db.executescript('''
     CREATE TABLE IF NOT EXISTS order_shipping_requirements(order_id INTEGER PRIMARY KEY,
         payload TEXT NOT NULL, updated_at TEXT NOT NULL);
@@ -173,6 +175,20 @@ def version(s):
 
 
 def shipment_content(s):
+    packing = next((d for d in s['documents'] if d['kind'] == 'packing_list'), None)
+    batch = next((x for x in s['batches'] if packing and x['id'] == packing['document_id']), None)
+    if batch and batch.get('selection_hash'):
+        # Every member must describe the same package, including changes to a
+        # secondary order. Do not compare its individual hash to the root hash.
+        c = b.conn()
+        try:
+            members = sorted(r[0] for r in c.execute('SELECT DISTINCT order_id FROM packing_allocations WHERE batch_id=?', (batch['id'],)))
+            sources = {oid: snapshot(oid, c, include_package=False) for oid in members}
+            root = sources.get(batch['root_order_id']) or snapshot(batch['root_order_id'], c, include_package=False)
+            return _hash((batch['packing_list_id'], batch['selection_hash'],
+                          [(oid, sources[oid]['content_hash']) for oid in members], effective_receiver(root)))
+        finally:
+            c.close()
     if len(s['package_ids']) == 1:
         return s['content_hash']
     return _hash([(oid, s['content_hash'] if oid == s['order']['id'] else snapshot(oid, include_package=False)['content_hash']) for oid in s['package_ids']])
@@ -307,7 +323,8 @@ def preflight(name, data, actor=None):
         proof = fulfillment_adoption.document_proof(__import__(__name__), o['id']) if name == 'orders.documents.adopt' else fulfillment_adoption.shipment_proof(__import__(__name__), o['id'])
         if proof.get('status') != 'SAFE' or proof.get('fingerprint') != data['preview_fingerprint']:
             raise error('ADOPTION_CONFLICT', 'Adopcja wymaga zgodnego, kompletnego podglądu.', 'CONFLICT')
-    if name == 'orders.packing_list.generate' and not _has_open_current_packing(s, current):
+    if name == 'orders.packing_list.generate' and (
+            not _has_open_current_packing(s, current) or data.get('packing_scope_fingerprint')):
         proposal = packing_list_preview(o['id'])
         scope_supplied = any(
             key in data for key in ('packing_scope_fingerprint', 'packing_items', 'total_quantity')
@@ -384,6 +401,15 @@ def state(data, actor=None, correlation_id='', transaction_connection=None):
                        record.get('file_hash') == actual_file_hash)
         if kind == 'packing_list' and record:
             batch = next((x for x in s['batches'] if x['id'] == record['document_id']), None)
+            if batch and batch.get('packing_list_id'):
+                c = b.conn()
+                try:
+                    logical = c.execute('SELECT current_batch_id FROM packing_lists WHERE packing_list_id=?',
+                                        (batch['packing_list_id'],)).fetchone()
+                    current = bool(current
+                                   and logical and logical['current_batch_id'] == batch['id'])
+                finally:
+                    c.close()
             adopted = any(v['kind'] == 'documents' and json.loads(v['payload']).get('content_hash') == s['content_hash'] for v in s['verifications'])
             if (not batch and not adopted) or (batch and batch.get('invoice_id') and not any(i['id'] == batch['invoice_id'] for i in s['invoices'])):
                 current = False
@@ -648,36 +674,18 @@ def finalize_packing_list(
             member: snapshot(member, db, include_package=False)['content_hash']
             for member in order_ids
         }
-        batch_id = b.save_packing_selection(
-            root_order_id,
-            items,
-            connection=db,
-            reuse_matching=True,
-            reject_mismatched_open=True,
+        import packing_versions
+        batch_id = packing_versions.publish(
+            b, db, root_order_id, items, path,
+            expected_current=prepared.get('expected_current'),
         )
         if not batch_id:
             raise error('PACKING_SELECTION_EMPTY', 'Lista pakowa nie zawiera pozycji.')
-        source_path = Path(path)
-        archive_path = source_path.with_name(
-            f'{source_path.stem}_batch_{batch_id}{source_path.suffix}'
-        )
-        if not archive_path.exists():
-            archive_path.write_bytes(source_path.read_bytes())
-        path = str(archive_path)
+        path = packing_versions.batch_result(db, batch_id)['document_path']
         file_hash = _document_file_hash(path)
         if not file_hash:
             raise error('DOCUMENT_FILE_UNAVAILABLE', 'Nie można odczytać wygenerowanej listy pakowej.')
         packing_result = b.mark_orders_packed_transaction(db, order_ids, packing_items=items)
-        for member in order_ids:
-            save_document(
-                member,
-                'packing_list',
-                batch_id,
-                path,
-                connection=db,
-                content_hash=content_hashes[member],
-                file_hash=file_hash,
-            )
         record_audit_event(
             'orders.packing_list.generate',
             result='SUCCESS',
@@ -704,6 +712,7 @@ def finalize_packing_list(
 
     # Remote sync and e-mail are retry-safe and run only after the complete
     # local state exists.  Their helpers contain their own failure handling.
+    packing_versions.sync_evidence(b, order_ids)
     b.complete_orders_packed_side_effects(packing_result, packing_path=path)
     return batch_id
 
@@ -855,7 +864,7 @@ def perform(name, data, actor, *, correlation_id='', approval_id='', before_stat
         args = (oid,) if name.endswith('.add') else (oid, data['item_id'])
         _check_response(method(*args, request=request_view(form={'product_id': data.get('product_id'), 'qty': data.get('quantity')}), structured=True))
     elif name == 'orders.packing_list.generate':
-        if _has_open_current_packing(s, current):
+        if _has_open_current_packing(s, current) and not data.get('packing_scope_fingerprint'):
             return state(data)
         proposal = packing_list_preview(oid)
         scope_supplied = any(
@@ -937,7 +946,14 @@ def perform(name, data, actor, *, correlation_id='', approval_id='', before_stat
         ok, path = b.invoice_pdf_exists(inv.get('pdf_path', ''), inv.get('invoice_no', ''))
         if not ok:
             raise error('INVOICE_PDF_UNAVAILABLE', 'Faktura została zapisana, ale jej PDF nie jest dostępny lokalnie. Wznów przygotowanie dokumentu.')
-        save_document(oid, 'invoice', result['invoice_id'], path)
+        c = b.conn()
+        try:
+            members = [r[0] for r in c.execute('SELECT DISTINCT order_id FROM invoice_allocations WHERE invoice_id=?', (result['invoice_id'],))]
+            for member in members or [oid]:
+                save_document(member, 'invoice', result['invoice_id'], path, connection=c)
+            c.commit()
+        finally:
+            c.close()
     elif name == 'shipping.shipment.create':
         if current['shipment']['exists']:
             return state(data)
