@@ -96,7 +96,8 @@ def register_routes(context):
             order = dict(row)
             package_orders = _packed_package_orders(cur, order)
             awaiting_invoice = bool(cur.execute(
-                "SELECT 1 FROM packing_batches WHERE root_order_id=? AND invoice_id IS NULL LIMIT 1",
+                """SELECT 1 FROM packing_batches WHERE root_order_id=? AND invoice_id IS NULL
+                   AND (packing_list_id IS NULL OR id IN (SELECT current_batch_id FROM packing_lists)) LIMIT 1""",
                 (order_id,),
             ).fetchone())
         finally:
@@ -359,6 +360,7 @@ def register_routes(context):
 
     @app.post("/orders/<int:order_id>/shipped")
     def order_mark_shipped(order_id):
+        import packing_versions, sys
         tracking_no = re.sub(r"\s+", "", norm(request.form.get("tracking_no")))
         carrier = norm(request.form.get("carrier")).lower()
         notify_customer = request.form.get("notify_customer", "1") == "1"
@@ -377,32 +379,31 @@ def register_routes(context):
             if not row:
                 abort(404)
             order = dict(row)
-            package_orders = [order]
-            packed_at = norm(order.get("packed_at"))
-            recipient_key = _email_key(order.get("customer_email"))
-            if packed_at and recipient_key:
-                cur.execute(
-                    """SELECT * FROM orders
-                       WHERE packed_at=?
-                         AND LOWER(TRIM(COALESCE(customer_email,'')))=?
-                         AND LOWER(COALESCE(status,'')) NOT IN ('cancelled','issued','completed')
-                       ORDER BY id""",
-                    (packed_at, recipient_key),
-                )
-                grouped_rows = [dict(item) for item in cur.fetchall()]
-                if grouped_rows:
-                    package_orders = grouped_rows
-            package_order_ids = [to_int(item.get("id"), 0) for item in package_orders]
-            try:
-                packing_attachment = invoice_packing_list_email_attachment_for_orders(package_orders)
-            except Exception as exc:
-                return redirect(url_for(
-                    "order_view",
-                    order_id=order_id,
-                    shipment_email_error=("Nie udało się przygotować listy pakowania: " + str(exc))[:240],
-                ))
+            backend = sys.modules.get('app') or sys.modules['__main__']
+            c.execute('BEGIN IMMEDIATE')
+            version_before = packing_versions.current_for_order(c, order_id)
+            shipment_key = carrier + ':' + (str(order.get('inpost_shipment_id') or '') if carrier == 'inpost' and order.get('inpost_shipment_id') else tracking_no)
+            prior = c.execute('SELECT * FROM packing_shipments WHERE shipment_key=? OR (carrier=? AND tracking=?)',
+                              (shipment_key, carrier, tracking_no)).fetchone()
+            if prior:
+                shipment_key = prior['shipment_key']
+            packing = (packing_versions.batch_result(c, prior['final_batch_id'], mode='final') if prior else
+                       packing_versions.ensure_current_for_shipment(backend, c, order_id))
+            package_order_ids = packing['order_ids']
+            if order_id not in package_order_ids:
+                raise packing_versions.PackingConflict('Numer przesyłki jest przypisany do innego zakresu zamówień.')
+            package_orders = [dict(r) for r in c.execute(
+                'SELECT * FROM orders WHERE id IN (' + ','.join('?' for _ in package_order_ids) + ') ORDER BY id',
+                package_order_ids)]
+            with open(packing['document_path'], 'rb') as packing_file:
+                packing_attachment = {'filename': 'lista_pakowa.pdf', 'content': packing_file.read()}
             placeholders = ",".join(["?"] * len(package_order_ids))
             shipped_at = now_iso()
+            packing_versions.confirm_shipment(c, batch_id=packing['batch_id'],
+                shipment_key=shipment_key, confirmed_at=shipped_at,
+                carrier=carrier, tracking=tracking_no, order_ids=package_order_ids)
+            packing_versions.stage_evidence(backend, c, package_order_ids,
+                allow_replace=not version_before and not prior)
             # Status wysyłki nie zmienia magazynu. Stan schodzi dopiero podczas
             # pełnego zafakturowania zamówienia w finalize_fully_invoiced_orders().
             cur.execute(
@@ -420,12 +421,16 @@ def register_routes(context):
             cur.execute(f"SELECT * FROM orders WHERE id IN ({placeholders}) ORDER BY id", tuple(package_order_ids))
             package_orders = [dict(item) for item in cur.fetchall()]
             order = next((item for item in package_orders if to_int(item.get("id"), 0) == order_id), package_orders[0])
+        except (packing_versions.PackingConflict, OSError) as exc:
+            c.rollback()
+            return str(exc), 409
         finally:
             c.close()
 
         if supabase_enabled():
             try:
                 # Nie wysyłamy całego rekordu. Jedna brakująca w chmurze kolumna
+                packing_versions.sync_evidence(backend, package_order_ids)
                 # opcjonalnego modułu mogłaby odrzucić PATCH i po kolejnym pullu
                 # cofnąć status oraz tracking do wartości sprzed wysyłki.
                 for package_order in package_orders:
@@ -520,6 +525,9 @@ def register_routes(context):
         if not order_row:
             c.close()
             return "Nie znaleziono zamowienia", 404
+        import packing_versions
+        logical = packing_versions.resolve_list(c, order_id)
+        expected_current = int(logical['current_batch_id']) if logical else 0
         candidate_orders = [dict(order_row)]
         recipient = _email_key(order_row["customer_email"])
         if recipient:
@@ -671,13 +679,15 @@ def register_routes(context):
         }
         if not defer_persistence:
             meta["packing_document_token"] = uuid.uuid4().hex
-        pack_path = generate_invoice_packing_list_pdf(order_row, items, meta)
+        # The published PDF is rendered once from the newly saved batch's READ.
+        pack_path = None
         if defer_persistence:
             return {
                 'ok': True,
                 'path': pack_path,
                 'order_ids': packed_order_ids,
                 'items': items,
+                'expected_current': expected_current,
             }
 
         # PDF is prepared first.  The batch, allocations and statuses then use
@@ -686,38 +696,17 @@ def register_routes(context):
         packing_db = conn()
         try:
             packing_db.execute("BEGIN IMMEDIATE")
-            packing_state["batch_id"] = save_packing_selection(
-                order_id,
-                items,
-                connection=packing_db,
-                reuse_matching=True,
-                reject_mismatched_open=True,
-            )
+            import sys
+            backend = sys.modules.get('app') or sys.modules['__main__']
+            packing_state["batch_id"] = packing_versions.publish(
+                backend, packing_db, order_id, items, pack_path,
+                expected_current=expected_current)
             packing_result = mark_orders_packed_transaction(
                 packing_db,
                 packed_order_ids,
                 packing_items=items,
             )
-            packing_file_hash = fulfillment_operations._document_file_hash(pack_path)
-            if not packing_file_hash:
-                raise RuntimeError("Nie można odczytać wygenerowanej listy pakowej")
-            persisted_paths = set()
-            for member in packed_order_ids:
-                persisted_document = fulfillment_operations.save_document(
-                    member,
-                    "packing_list",
-                    packing_state["batch_id"],
-                    pack_path,
-                    connection=packing_db,
-                    content_hash=fulfillment_operations.snapshot(
-                        member, packing_db, include_package=False
-                    )["content_hash"],
-                    file_hash=packing_file_hash,
-                )
-                persisted_paths.add(persisted_document["path"])
-            if len(persisted_paths) != 1:
-                raise RuntimeError("Niejednoznaczna historyczna lista pakowa")
-            pack_path = persisted_paths.pop()
+            pack_path = packing_versions.batch_result(packing_db, packing_state['batch_id'])['document_path']
             packing_db.commit()
         except Exception:
             packing_db.rollback()
@@ -725,6 +714,7 @@ def register_routes(context):
         finally:
             packing_db.close()
         session["latest_packing_selection"] = packing_state
+        packing_versions.sync_evidence(backend, packed_order_ids)
         complete_orders_packed_side_effects(packing_result, packing_path=pack_path)
         if structured:
             return {'ok': True, 'path': pack_path, 'batch_id': packing_state['batch_id'], 'order_ids': packed_order_ids}
@@ -755,42 +745,15 @@ def register_routes(context):
 
     @app.get("/invoices/<int:invoice_id>/packing-list")
     def invoice_packing_list_download_admin(invoice_id):
-        inv = load_invoice_with_meta(invoice_id)
-        if not inv:
-            return "Nie znaleziono faktury", 404
+        import packing_versions, packing_history, sys
+        backend = sys.modules.get('app') or sys.modules['__main__']
+        try:
+            path, _result = packing_versions.document(backend, {'invoice_id': invoice_id, 'current': True})
+        except (packing_versions.PackingConflict, packing_history.PackingHistoryError) as exc:
+            return str(exc), 409
+        return send_file(path, mimetype='application/pdf', as_attachment=True,
+                         download_name=os.path.basename(path))
 
-        c = conn()
-        cur = c.cursor()
-        cur.execute("SELECT * FROM orders WHERE id=?", (inv["order_id"],))
-        o = cur.fetchone()
-        c.close()
-        if not o:
-            return "Brak powiązanego zamówienia", 404
-
-        items = invoice_items_from_saved_json(invoice_id)
-        if not items:
-            return "Brak pozycji faktury", 400
-
-        ok_pdf, invoice_abs_path = invoice_pdf_exists(inv.get("pdf_path", ""), inv.get("invoice_no", ""))
-        pack_path = packing_list_pdf_path_for_invoice(invoice_abs_path if ok_pdf else "", inv.get("invoice_no") or f"FV_{invoice_id}")
-        pack_path = generate_invoice_packing_list_pdf(o, items, invoice_meta_payload(inv), invoice_abs_path if ok_pdf else "")
-        mark_orders_packed([
-            int(item.get("source_order_id") or item.get("order_id") or inv.get("order_id") or 0)
-            for item in items
-        ], packing_path=pack_path, packing_items=items)
-        if supabase_enabled():
-            try:
-                packing_ref = supabase_storage_upload_file(
-                    pack_path,
-                    invoice_packing_storage_object_path(invoice_id, inv.get("invoice_no") or f"FV_{invoice_id}"),
-                    content_type="application/pdf",
-                )
-                data, filename = supabase_storage_download_bytes(packing_ref)
-                return send_file(io.BytesIO(data), mimetype="application/pdf", as_attachment=True, download_name=filename)
-            except Exception:
-                pass
-
-        return send_file(pack_path, mimetype="application/pdf", as_attachment=True, download_name=os.path.basename(pack_path))
 
 
     exported = {'persist_inpost_result': persist_inpost_result, 'order_packing_list_download_admin_service': order_packing_list_download_admin_service, 'order_inpost_create_service': order_inpost_create_service, 'order_inpost_create': order_inpost_create, 'order_inpost_label': order_inpost_label, 'inpost_dispatch_order': inpost_dispatch_order, 'order_mark_shipped': order_mark_shipped, 'order_packing_list_download_admin': order_packing_list_download_admin, 'invoice_packing_list_download_admin': invoice_packing_list_download_admin}

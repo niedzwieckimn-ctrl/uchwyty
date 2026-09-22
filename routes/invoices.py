@@ -352,8 +352,10 @@ def register_routes(context):
                     except ValueError as exc:
                         return str(exc), 409
                     packing_path = generate_invoice_packing_list_pdf(o, invoice_items, packing_meta)
-                    mark_orders_packed(packed_order_ids, packing_path=packing_path, packing_items=invoice_items)
-                    batch_id = save_packing_selection(order_id, invoice_items)
+                    import fulfillment_operations
+                    batch_id = fulfillment_operations.finalize_packing_list(order_id, {
+                        'path': packing_path, 'items': invoice_items, 'order_ids': sorted(set(packed_order_ids)),
+                    })
                     session["latest_packing_selection"] = load_open_packing_selection(order_id)
                     return redirect(url_for("order_invoice", order_id=order_id, from_packing="1"))
             # Allocate only on an actual valid issue request, not on GET.
@@ -1241,6 +1243,7 @@ def register_routes(context):
 
     @app.post("/invoices/<int:invoice_id>/regenerate")
     def invoice_regenerate_admin(invoice_id):
+        import packing_versions, sys
         inv = load_invoice_with_meta(invoice_id)
         if not inv:
             return "Nie znaleziono faktury", 404
@@ -1249,6 +1252,8 @@ def register_routes(context):
         cur = c.cursor()
         cur.execute("SELECT * FROM orders WHERE id=?", (inv["order_id"],))
         o = cur.fetchone()
+        logical = packing_versions.resolve_list(c, inv['order_id'], invoice_id)
+        expected_batch = int(logical['current_batch_id']) if logical else 0
         c.close()
         if not o:
             return "Brak powiÄ…zanego zamĂłwienia", 404
@@ -1272,7 +1277,12 @@ def register_routes(context):
             if corrected:
                 items = corrected
         pdf_path, total_net, total_gross = generate_order_invoice_pdf(o, items, meta)
-        packing_pdf_path = generate_invoice_packing_list_pdf(o, items, meta, pdf_path)
+        backend = sys.modules.get('app') or sys.modules['__main__']
+        try:
+            packing_versions.publish_invoice(backend, invoice_id, items, None, expected_current=expected_batch)
+        except packing_versions.PackingConflict as exc:
+            return str(exc), 409
+        packing_pdf_path, _packing = packing_versions.document(backend, {'invoice_id': invoice_id, 'current': True})
         stored_pdf_path = upload_invoice_pdfs_to_supabase(invoice_id, inv["invoice_no"], pdf_path, packing_pdf_path)
 
         current_meta = load_invoice_meta(invoice_id) or {}

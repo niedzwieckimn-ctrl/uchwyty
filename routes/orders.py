@@ -713,10 +713,10 @@ def register_routes(context):
           FROM invoices i
           LEFT JOIN invoice_meta m ON m.invoice_id=i.id
           LEFT JOIN ksef_documents k ON k.invoice_id=i.id
-          WHERE i.order_id=?
+          WHERE i.order_id=? OR EXISTS(SELECT 1 FROM invoice_allocations ia WHERE ia.invoice_id=i.id AND ia.order_id=?)
           ORDER BY i.id DESC
           LIMIT 1
-        """, (order_id,))
+        """, (order_id,order_id))
         invoice_row = cur.fetchone()
         c.close()
 
