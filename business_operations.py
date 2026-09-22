@@ -1054,6 +1054,19 @@ def initialize_schema(db: sqlite3.Connection) -> None:
             # Two workers can inspect the old schema before either commits.
             if 'duplicate column name' not in str(exc).lower():
                 raise
+    if 'voice_state' not in count_columns:
+        try:
+            db.execute("ALTER TABLE internal_inventory_count_sessions ADD COLUMN voice_state TEXT NOT NULL DEFAULT 'WAIT_PRODUCT'")
+            db.execute("UPDATE internal_inventory_count_sessions SET voice_state='WAIT_COUNT' WHERE active_product_id IS NOT NULL AND status='OPEN'")
+        except sqlite3.OperationalError as exc:
+            if 'duplicate column name' not in str(exc).lower():
+                raise
+    if 'pending_approval_id' not in count_columns:
+        try:
+            db.execute("ALTER TABLE internal_inventory_count_sessions ADD COLUMN pending_approval_id TEXT")
+        except sqlite3.OperationalError as exc:
+            if 'duplicate column name' not in str(exc).lower():
+                raise
     db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS uq_inventory_count_open_owner_conversation
                   ON internal_inventory_count_sessions(created_by,conversation_id)
                   WHERE status='OPEN' AND conversation_id<>''""")
@@ -2300,6 +2313,72 @@ def inventory_count_active_product(ai_actor, human_actor, conversation_id):
         db.close()
 
 
+def inventory_count_voice_state(ai_actor, human_actor, conversation_id):
+    """Read the durable voice step for this human's open count session."""
+    ai = _trusted_actor(ai_actor)
+    human = load_actor_context(human_actor.actor_id) if isinstance(human_actor, ActorContext) else None
+    if human is None or human.actor_type != 'HUMAN' or ai.delegated_by_actor_id != human.actor_id:
+        raise ControlledOperationError('UNTRUSTED_ACTOR', 'Brak zaufanego właściciela sesji', status=DENIED)
+    db = _factory()()
+    try:
+        _assert_count_conversation(db, ai, conversation_id)
+        row = db.execute("""SELECT session_id,voice_state,active_product_id,pending_approval_id
+                            FROM internal_inventory_count_sessions
+                            WHERE created_by=? AND conversation_id=? AND status='OPEN'""",
+                         (human.actor_id, conversation_id)).fetchone()
+        return dict(row) if row else None
+    finally:
+        db.close()
+
+
+def set_inventory_count_voice_state(ai_actor, human_actor, conversation_id, state,
+                                    approval_id=None):
+    """Commit a voice transition before a prompt can be sent to the user."""
+    if state not in {'WAIT_PRODUCT', 'WAIT_APPROVAL'}:
+        raise ValueError('Unsupported inventory voice transition')
+    ai = _trusted_actor(ai_actor)
+    human = load_actor_context(human_actor.actor_id) if isinstance(human_actor, ActorContext) else None
+    if human is None or human.actor_type != 'HUMAN' or ai.delegated_by_actor_id != human.actor_id:
+        raise ControlledOperationError('UNTRUSTED_ACTOR', 'Brak zaufanego właściciela sesji', status=DENIED)
+    db = _factory()()
+    try:
+        _assert_count_conversation(db, ai, conversation_id)
+        session = db.execute("""SELECT session_id,pending_approval_id FROM internal_inventory_count_sessions
+                                WHERE created_by=? AND conversation_id=? AND status='OPEN'""",
+                             (human.actor_id, conversation_id)).fetchone()
+        if not session:
+            raise ControlledOperationError('COUNT_SESSION_NOT_FOUND', 'Brak otwartej sesji remanentu', status=CONFLICT)
+        if state == 'WAIT_APPROVAL':
+            approval = db.execute("""SELECT a.status,a.operation,a.safe_payload
+                                     FROM internal_conversation_approvals c
+                                     JOIN internal_approval_requests a ON a.approval_id=c.approval_id
+                                     WHERE c.approval_id=? AND c.conversation_id=? AND c.human_id=?""",
+                                  (approval_id, conversation_id, human.actor_id)).fetchone()
+            if (not approval or approval['status'] != 'PENDING'
+                    or approval['operation'] != 'inventory.adjust'
+                    or json.loads(approval['safe_payload']).get('count_session_id') != session['session_id']):
+                raise ControlledOperationError('APPROVAL_NOT_PENDING',
+                                               'Korekta nie oczekuje na decyzję.', status=CONFLICT)
+        elif session['pending_approval_id']:
+            pending = db.execute("SELECT status FROM internal_approval_requests WHERE approval_id=?",
+                                 (session['pending_approval_id'],)).fetchone()
+            if pending and pending['status'] == 'PENDING':
+                raise ControlledOperationError('APPROVAL_PENDING',
+                                               'Najpierw rozstrzygnij korektę.', status=CONFLICT)
+        changed = db.execute("""UPDATE internal_inventory_count_sessions
+                               SET voice_state=?,pending_approval_id=?,active_product_id=NULL
+                               WHERE session_id=? AND status='OPEN'""",
+                            (state, approval_id if state == 'WAIT_APPROVAL' else None,
+                             session['session_id'])).rowcount
+        if changed != 1:
+            raise ControlledOperationError('COUNT_SESSION_NOT_FOUND', 'Brak otwartej sesji remanentu', status=CONFLICT)
+        db.commit()
+        return {'session_id': session['session_id'], 'voice_state': state,
+                'pending_approval_id': approval_id if state == 'WAIT_APPROVAL' else None}
+    finally:
+        db.close()
+
+
 def _voice_product_key(value):
     value = unicodedata.normalize('NFKD', str(value or '').casefold()).replace('ł', 'l')
     return ' '.join(re.sub(r'[^a-z0-9]+', ' ', ''.join(
@@ -2308,7 +2387,7 @@ def _voice_product_key(value):
 
 def resolve_inventory_voice_product(ai_actor, human_actor, conversation_id, query,
                                     *, prefix_hints=False):
-    """Exact local identity lookup; uncertainty belongs to the normal agent path."""
+    """Exact local identity lookup; prefix hints only explain an incomplete name."""
     ai = _trusted_actor(ai_actor)
     human = load_actor_context(human_actor.actor_id) if isinstance(human_actor, ActorContext) else None
     if human is None or human.actor_type != 'HUMAN' or ai.delegated_by_actor_id != human.actor_id:
@@ -2327,15 +2406,16 @@ def resolve_inventory_voice_product(ai_actor, human_actor, conversation_id, quer
             return []
         rows = db.execute("""SELECT id,sku,model,name,ean FROM products
                              WHERE COALESCE(archived,0)=0""").fetchall()
-        exact = [row for row in rows if needle in {
-            _voice_product_key(row[field]) for field in ('sku','model','name','ean')}]
-        matching = exact
-        if prefix_hints and not exact:
-            matching = [row for row in rows if any(
-                _voice_product_key(row[field]).startswith(needle + ' ')
-                for field in ('sku','model','name','ean'))]
+        matches = [dict(id=int(row['id']), sku=row['sku'] or '', model=row['model'] or '',
+                        name=row['name'] or '') for row in rows
+                   if needle in {_voice_product_key(row[field])
+                                 for field in ('sku', 'model', 'name', 'ean')}]
+        if matches or not prefix_hints:
+            return matches
         return [dict(id=int(row['id']), sku=row['sku'] or '', model=row['model'] or '',
-                     name=row['name'] or '') for row in matching]
+                     name=row['name'] or '') for row in rows
+                if any(_voice_product_key(row[field]).startswith(needle + ' ')
+                       for field in ('sku', 'model', 'name', 'ean'))][:5]
     finally:
         db.close()
 
@@ -2394,8 +2474,9 @@ def set_inventory_count_active_product(ai_actor, human_actor, conversation_id, p
         if not db.execute('SELECT 1 FROM products WHERE id=? AND COALESCE(archived,0)=0',
                           (product_id,)).fetchone():
             raise ControlledOperationError('PRODUCT_NOT_FOUND', 'Nie znaleziono produktu', status=CONFLICT)
-        changed = db.execute("""UPDATE internal_inventory_count_sessions SET active_product_id=?
-                              WHERE created_by=? AND conversation_id=? AND status='OPEN'""",
+        changed = db.execute("""UPDATE internal_inventory_count_sessions
+                               SET active_product_id=?,voice_state='WAIT_COUNT',pending_approval_id=NULL
+                               WHERE created_by=? AND conversation_id=? AND status='OPEN'""",
                              (product_id, human.actor_id, conversation_id)).rowcount
         db.commit()
         return bool(changed)
@@ -2652,7 +2733,9 @@ def _inventory_count_record(data, actor, correlation_id, transaction_connection=
                           data['expected_version'],status,data.get('note'),human_id,now))
     except sqlite3.IntegrityError:
         raise ControlledOperationError('COUNT_ALREADY_RECORDED','Produkt został już policzony w tej sesji',status=CONFLICT)
-    db.execute('UPDATE internal_inventory_count_sessions SET active_product_id=NULL WHERE session_id=?',
+    db.execute("""UPDATE internal_inventory_count_sessions
+                  SET active_product_id=NULL,voice_state='WAIT_PRODUCT',pending_approval_id=NULL
+                  WHERE session_id=?""",
                (data['count_session_id'],))
     record_audit_event('inventory.count.record',result=SUCCESS,actor_context=actor,entity_type='product',entity_id=str(data['product_id']),
         correlation_id=correlation_id,expected_version=data['expected_version'],entity_version_before=data['expected_version'],
@@ -2670,7 +2753,7 @@ def _inventory_count_complete(data, actor, correlation_id, transaction_connectio
     unresolved=int(db.execute("SELECT COUNT(*) n FROM internal_inventory_count_items WHERE session_id=? AND status='PENDING_ADJUSTMENT'",(data['count_session_id'],)).fetchone()['n'])
     if unresolved:
         raise ControlledOperationError('UNRESOLVED_DISCREPANCIES','Nie można zakończyć remanentu z nierozwiązanymi rozbieżnościami',status=CONFLICT)
-    db.execute("UPDATE internal_inventory_count_sessions SET status='COMPLETED',active_product_id=NULL,completed_at=? WHERE session_id=? AND status='OPEN'",(_now(),data['count_session_id']))
+    db.execute("UPDATE internal_inventory_count_sessions SET status='COMPLETED',active_product_id=NULL,voice_state='WAIT_PRODUCT',pending_approval_id=NULL,completed_at=? WHERE session_id=? AND status='OPEN'",(_now(),data['count_session_id']))
     record_audit_event('inventory.count.complete',result=SUCCESS,actor_context=actor,entity_type='inventory_count_session',entity_id=data['count_session_id'],
         correlation_id=correlation_id,before_state={'status':'OPEN'},after_state={'status':'COMPLETED'},transaction_connection=db)
     return {'ok':True,'count_id':data['count_session_id'],'status':'COMPLETED'}

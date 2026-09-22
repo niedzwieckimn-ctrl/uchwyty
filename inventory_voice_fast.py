@@ -72,6 +72,30 @@ def parse(value):
         return None
     if len(words) == 1 and words[0].isdigit() and len(words[0]) <= 7:
         return VoiceCommand('quantity', quantity=int(words[0]))
+    # STT often puts the counted amount before the product, or after "mam".
+    # Remove only these explicit count phrases; product numbers remain intact.
+    quantity = None
+    product_words = words
+    if (len(words) >= 3 and _fold(words[0]) in {'mam', 'policzylem', 'policzylam'}
+            and words[1].isdigit() and len(words[1]) <= 7):
+        quantity = int(words[1])
+        offset = 2
+        if offset < len(words) and _fold(words[offset]) in _UNITS:
+            offset += 1
+        if [_fold(word) for word in words[offset:offset + 2]] == ['na', 'stanie']:
+            offset += 2
+        product_words = words[offset:]
+    elif (len(words) >= 3 and _fold(words[-2]) == 'mam'
+          and words[-1].isdigit() and len(words[-1]) <= 7):
+        quantity = int(words[-1])
+        product_words = words[:-2]
+    if quantity is not None:
+        product = ' '.join(product_words)
+        if (not re.fullmatch(r'[\w .-]{3,100}', product)
+                or not re.search(r'[A-Za-zÀ-ž]', product)):
+            return None
+        return VoiceCommand('product', product=product,
+                            product_without_count=product, quantity=quantity)
     product = ' '.join(words)
     if not re.fullmatch(r'[\w .-]{3,100}', product) or not re.search(r'[A-Za-zÀ-ž]', product):
         return None

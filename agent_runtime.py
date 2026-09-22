@@ -1504,41 +1504,43 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 voice_mark('fast_path_detected')
                 command = inventory_voice_fast.parse(turn_message)
                 voice_mark('parse_done')
+                voice_state = business_operations.inventory_count_voice_state(
+                    ai_actor, human_actor, conversation_id)
 
-                def voice_finish(answer, speech, *, state):
+                def voice_finish(answer, speech, *, state, failure=''):
+                    saved_state = business_operations.inventory_count_voice_state(
+                        ai_actor, human_actor, conversation_id)
+                    if (not saved_state or saved_state['voice_state'] != state
+                            or (state == 'WAIT_APPROVAL'
+                                and not saved_state['pending_approval_id'])):
+                        return finish('FAILED', 'Nie udało się utrwalić kroku remanentu. Powtórz.',
+                                      'INVENTORY_VOICE_STATE_NOT_SAVED')
+                    if state == 'WAIT_APPROVAL':
+                        saved_approval = internal_approval.get_request_snapshot(
+                            saved_state['pending_approval_id'])
+                        if not saved_approval or saved_approval['status'] != 'PENDING':
+                            return finish('CONFLICT', 'Korekta nie oczekuje już na decyzję.',
+                                          'APPROVAL_NOT_PENDING')
                     timings['final_response_ms'] = round(
                         (time.perf_counter()-started)*1000 - sum(
                             timings[key] for key in ('acquire_turn_ms', 'product_resolve_ms',
                                 'inventory_read_ms', 'count_record_ms', 'approval_prepare_ms',
                                 'inventory_adjust_ms')), 2)
                     voice_mark('display_text_ready')
-                    if emit is not None:
-                        display_emit('display_delta', {'delta': answer})
-                        emit('speech_ready', {'tts_text': speech, 'mode': 'inventory_voice_fast'})
                     result = finish('SUCCESS', answer, voice_response_mode='direct',
                                     inventory_tts=speech)
+                    if result['status'] != 'SUCCESS':
+                        return result
+                    if emit is not None:
+                        emit('speech_ready', {'tts_text': speech, 'mode': 'inventory_voice_fast',
+                                              'retry_ready':bool(failure)})
+                    voice_mark('speech_ready')
                     voice_mark('turn_complete')
                     result['inventory_fast_trace_ms'] = dict(fast_voice_trace)
                     result['inventory_fast_state'] = state
                     result['inventory_fast_model_calls'] = 0
-                    return result
-
-                def voice_fail(answer, speech, *, reason):
-                    """Finish the read-only failed turn before allowing an immediate retry."""
-                    voice_mark('resolver_failed')
-                    voice_mark('display_text_ready')
-                    result = finish('SUCCESS', answer, voice_response_mode='direct',
-                                    inventory_tts=speech)
-                    voice_mark('speech_ready')
-                    if emit is not None and result['status'] == 'SUCCESS':
-                        emit('speech_ready', {'tts_text':speech,
-                                              'mode':'inventory_voice_fast',
-                                              'retry_ready':True})
-                    voice_mark('turn_complete')
-                    result['inventory_fast_trace_ms'] = dict(fast_voice_trace)
-                    result['inventory_fast_state'] = 'WAIT_PRODUCT'
-                    result['inventory_fast_failure'] = reason
-                    result['inventory_fast_model_calls'] = 0
+                    if failure:
+                        result['inventory_fast_failure'] = failure
                     return result
 
                 def voice_call(operation, arguments, *, phase):
@@ -1579,6 +1581,9 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                                 'operation_done'))
                     return result
 
+                if not voice_state:
+                    return finish('CONFLICT', 'Sesja remanentu została zamknięta. Rozpocznij ponownie.',
+                                  'COUNT_SESSION_CLOSED')
                 eligible = human_approval.pending(business_operations, conversation_id, human_actor)
                 inventory_pending = []
                 for candidate in eligible:
@@ -1589,19 +1594,37 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                         payload = json.loads(snapshot['safe_payload'])
                         if payload.get('count_session_id') == fast_count_session:
                             inventory_pending.append(candidate)
-                if inventory_pending:
-                    if len(eligible) != 1 or len(inventory_pending) != 1:
-                        return voice_finish('Na ekranie wybierz korektę do zatwierdzenia.',
-                                            'Wybierz korektę na ekranie.', state='WAIT_APPROVAL')
+                selected_pending = next((item for item in inventory_pending
+                    if item['approval_id'] == voice_state['pending_approval_id']), None)
+                if not selected_pending and len(inventory_pending) == 1:
+                    selected_pending = inventory_pending[0]
+                if not selected_pending and len(inventory_pending) > 1:
+                    if command is not None and command.kind == 'product':
+                        matches = business_operations.resolve_inventory_voice_product(
+                            ai_actor, human_actor, conversation_id, command.product)
+                        if len(matches) == 1:
+                            selected_pending = next((item for item in inventory_pending
+                                if str(item['entity_id']) == str(matches[0]['id'])), None)
+                    if not selected_pending:
+                        return voice_finish('Czeka kilka korekt. Podaj nazwę produktu do decyzji.',
+                                            'Którego produktu?', state=voice_state['voice_state'])
+                if selected_pending:
+                    approval_id = selected_pending['approval_id']
+                    if (voice_state['voice_state'] != 'WAIT_APPROVAL'
+                            or voice_state['pending_approval_id'] != approval_id):
+                        business_operations.set_inventory_count_voice_state(
+                            ai_actor, human_actor, conversation_id, 'WAIT_APPROVAL', approval_id)
+                        voice_state = business_operations.inventory_count_voice_state(
+                            ai_actor, human_actor, conversation_id)
                     if command is None or command.kind != 'decision':
                         return voice_finish('Najpierw zatwierdź albo odrzuć korektę.',
-                                            'Zatwierdzić czy odrzucić?', state='WAIT_APPROVAL')
-                    approval_id = inventory_pending[0]['approval_id']
+                                            'Powiedz tak albo nie.', state='WAIT_APPROVAL')
                     snapshot = internal_approval.get_request_snapshot(approval_id)
                     payload = json.loads(snapshot['safe_payload'])
                     with human_approval.gesture(human_actor, eligible, run_id, conversation_id):
                         decided = voice_call('approval.decide', {
                             'approval_id':approval_id, 'decision':command.decision,
+                            'selected_explicitly':len(eligible) > 1,
                         }, phase='inventory_adjust_ms')
                     if decided.status != 'SUCCESS':
                         return finish(decided.status, decided.safe_error_message or
@@ -1613,6 +1636,8 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                         if internal_approval.get_request_snapshot(approval_id)['status'] != 'REJECTED':
                             return finish('FAILED', 'Nie udało się potwierdzić odrzucenia korekty.',
                                           'APPROVAL_FAILED')
+                        business_operations.set_inventory_count_voice_state(
+                            ai_actor, human_actor, conversation_id, 'WAIT_PRODUCT')
                         return voice_finish('Korekta odrzucona. Wynik liczenia zapisany, stan magazynu bez zmian.',
                                             'Odrzucono. Następny.', state='WAIT_PRODUCT')
                     if decision_data.get('execution_status') != 'SUCCESS':
@@ -1621,61 +1646,82 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                                       'ADJUST_FAILED')
                     new_qty = int((decision_data.get('outcome') or {}).get(
                         'counted_quantity', payload.get('counted_quantity', 0)))
+                    business_operations.set_inventory_count_voice_state(
+                        ai_actor, human_actor, conversation_id, 'WAIT_PRODUCT')
                     return voice_finish(f'Korekta zapisana. Nowy stan: {new_qty} szt.',
                                         'Zapisano. Następny.', state='WAIT_PRODUCT')
 
-                if command is None:
-                    return voice_fail('Nie rozpoznano jednoznacznej komendy remanentu. Powtórz.',
-                                      'Nie zrozumiałem. Powtórz.', reason='parse_failed')
+                if voice_state['voice_state'] == 'WAIT_APPROVAL':
+                    old_approval = internal_approval.get_request_snapshot(
+                        voice_state['pending_approval_id']) if voice_state['pending_approval_id'] else None
+                    if old_approval and old_approval['status'] not in {'PENDING', 'APPROVED'}:
+                        business_operations.set_inventory_count_voice_state(
+                            ai_actor, human_actor, conversation_id, 'WAIT_PRODUCT')
+                        voice_state = business_operations.inventory_count_voice_state(
+                            ai_actor, human_actor, conversation_id)
+                    else:
+                        return finish('CONFLICT', 'Nie udało się odnaleźć oczekującej korekty. Powtórz.',
+                                      'APPROVAL_NOT_PENDING')
 
-                active_product = business_operations.inventory_count_active_product(
-                    ai_actor, human_actor, conversation_id)
+                if command is None:
+                    return voice_finish('Nie rozpoznano polecenia remanentu. Powtórz.',
+                                        'Nie zrozumiałem. Powtórz.',
+                                        state=voice_state['voice_state'], failure='parse_failed')
+
+                active_product = (voice_state['active_product_id']
+                                  if voice_state['voice_state'] == 'WAIT_COUNT' else None)
                 if command.kind == 'decision':
-                    return voice_finish('Nie ma korekty oczekującej na decyzję. Podaj produkt.',
-                                        'Podaj produkt.', state='WAIT_PRODUCT')
+                    return voice_finish('Nie ma korekty oczekującej na decyzję.',
+                                        'Nie ma korekty.', state=voice_state['voice_state'])
                 if command.kind == 'quantity' and active_product is None:
                     return voice_finish('Podaj produkt do kolejnego liczenia.',
-                                        'Jaki produkt?', state='WAIT_PRODUCT')
+                                        'Jaki produkt?', state=voice_state['voice_state'])
 
                 product_id = active_product if command.kind == 'quantity' else None
                 quantity = command.quantity
+                resolved_identity = ''
                 if command.kind == 'product':
                     resolve_started = time.perf_counter()
+                    resolved_identity = command.product_without_count or command.product
                     candidates = business_operations.resolve_inventory_voice_product(
-                        ai_actor, human_actor, conversation_id, command.product)
-                    if len(candidates) == 1:
-                        quantity = None  # A trailing number belongs to this exact product identity.
-                    elif not candidates and command.quantity is not None:
-                        candidates = business_operations.resolve_inventory_voice_product(
-                            ai_actor, human_actor, conversation_id,
-                            command.product_without_count)
+                        ai_actor, human_actor, conversation_id, resolved_identity)
+                    if quantity is not None and resolved_identity != command.product:
+                        full_identity = business_operations.resolve_inventory_voice_product(
+                            ai_actor, human_actor, conversation_id, command.product)
+                        if candidates and full_identity and {
+                                item['id'] for item in candidates} != {
+                                item['id'] for item in full_identity}:
+                            candidates = candidates + full_identity
+                        elif not candidates and full_identity:
+                            # The complete string is an exact product name, not a count.
+                            candidates = full_identity
+                            resolved_identity = command.product
+                            quantity = None
                     timings['product_resolve_ms'] = round(
                         (time.perf_counter()-resolve_started)*1000, 2)
                     if len(candidates) > 1:
-                        return voice_fail('Nie znaleziono jednoznacznego produktu. Powtórz rozstaw lub wariant.',
-                                          'Nie jestem pewien. Powtórz rozstaw.',
-                                          reason='ambiguous_product')
+                        return voice_finish('Nie znaleziono jednoznacznego produktu. Powtórz rozstaw lub wariant.',
+                                            'Nie jestem pewien. Powtórz rozstaw.',
+                                            state=voice_state['voice_state'],
+                                            failure='ambiguous_product')
                     if not candidates:
                         hints = business_operations.resolve_inventory_voice_product(
-                            ai_actor, human_actor, conversation_id,
-                            command.product_without_count or command.product,
+                            ai_actor, human_actor, conversation_id, resolved_identity,
                             prefix_hints=True)
-                        if hints:
-                            return voice_fail('Nie znaleziono jednoznacznego wariantu. Powtórz rozstaw i kolor.',
-                                              'Nie jestem pewien. Powtórz rozstaw.',
-                                              reason='ambiguous_variant')
-                        return voice_fail('Nie znaleziono jednoznacznego produktu. Powtórz.',
-                                          'Nie znalazłem. Powtórz.', reason='product_not_found')
-                    else:
-                        product_id = int(candidates[0]['id'])
-                        voice_mark('product_resolved')
+                        voice_mark('resolver_failed')
+                        return voice_finish(
+                            'Nie znaleziono jednoznacznego produktu. Powtórz rozstaw lub wariant.'
+                            if hints else 'Nie znaleziono jednoznacznego produktu. Powtórz.',
+                            'Nie jestem pewien. Powtórz rozstaw.' if hints else
+                            'Nie znalazłem. Powtórz.', state=voice_state['voice_state'],
+                            failure='ambiguous_variant' if hints else 'product_not_found')
+                    product_id = int(candidates[0]['id'])
+                    voice_mark('product_resolved')
                 if product_id is not None:
                     read_started = time.perf_counter()
                     product = business_operations.read_inventory_voice_product(
                         ai_actor, human_actor, conversation_id, product_id,
-                        expected_identity=(command.product if quantity is None else
-                                           command.product_without_count)
-                        if command.kind == 'product' else '')
+                        expected_identity=resolved_identity)
                     timings['inventory_read_ms'] = round(
                         (time.perf_counter()-read_started)*1000, 2)
                     voice_mark('inventory_read_done')
@@ -1722,10 +1768,13 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                     }, phase='approval_prepare_ms')
                     if adjustment.status != 'PENDING_APPROVAL':
                         return finish(adjustment.status, adjustment.safe_error_message or
-                                      'Nie udało się przygotować korekty.',
-                                      adjustment.error_code or 'ADJUST_PREPARE_FAILED')
+                                       'Nie udało się przygotować korekty.',
+                                       adjustment.error_code or 'ADJUST_PREPARE_FAILED')
                     human_approval.bind(business_operations, adjustment.approval_id,
                                         conversation_id, human_actor, run_id)
+                    business_operations.set_inventory_count_voice_state(
+                        ai_actor, human_actor, conversation_id, 'WAIT_APPROVAL',
+                        adjustment.approval_id)
                     approval = {'approval_id':adjustment.approval_id,
                                 'operation':'inventory.adjust', 'product_id':product_id,
                                 'count_session_id':fast_count_session,

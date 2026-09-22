@@ -39,7 +39,7 @@ def from_operation(operation, data, *, pending_adjustment=False):
         return 'Zatwierdzić?'
     if operation in {'inventory.product.get', 'inventory.count.get_expected'}:
         return product_prompt(data)
-    return 'Sprawdź ekran.'
+    return 'Powtórz.'
 
 
 def approval_response(outcome, decision):
@@ -55,4 +55,4 @@ def approval_response(outcome, decision):
     if decision == 'reject':
         return ('Korekta odrzucona. Wynik remanentu pozostaje zapisany, '
                 'magazyn nie został zmieniony.', 'Odrzucono. Następny.')
-    return 'Nie zapisano korekty. Sprawdź stan produktu.', 'Nie zapisano. Sprawdź ekran.'
+    return 'Nie zapisano korekty. Sprawdź stan produktu.', 'Nie zapisano. Powtórz.'
