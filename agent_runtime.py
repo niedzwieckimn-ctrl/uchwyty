@@ -1369,7 +1369,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 'model':model_name,'usage':usage,'error_code':code,'timings':dict(timings),
                 'artifacts':artifacts, 'approvals':pending_approvals,
                 'pending_approvals':pending_approvals, 'decisions': decisions}
-        if status == 'SUCCESS' and fast_voice_active:
+        if status == 'SUCCESS' and (fast_voice_active or shipment_read_requested):
             result['display_text'] = answer
             result['tts_text'] = speech_text
         if status != 'SUCCESS':
@@ -1711,8 +1711,9 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 'Oto istniejący historyczny dokument tej listy pakowej.'
                 if packing_history_document_followup else _packing_history_answer(history_data)
             )
-            return finish('SUCCESS', answer, voice_response_mode=(
-                'direct' if packing_history_document_followup else 'full_detail'))
+            return finish('SUCCESS', answer,
+                speech_text=shipment_read.speech(history_data) if shipment_read_requested else '',
+                voice_response_mode=('direct' if shipment_read_requested or packing_history_document_followup else 'full_detail'))
 
         # A quantity-only remanent follow-up is deterministic once the trusted
         # previous turn identifies one product and an open count session exists.
@@ -2506,7 +2507,10 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                 read_planning_rounds += 1
                 high_level_read_diagnostics['read_rounds'] = read_planning_rounds
             if shipment_read_requested:
-                return finish('SUCCESS', shipment_read.answer(packing_history_result) if packing_history_result is not None else (packing_history_error or 'Nie udało się jednoznacznie odczytać faktury wysyłki.'), voice_response_mode='full_detail')
+                return finish('SUCCESS',
+                    shipment_read.answer(packing_history_result) if packing_history_result is not None else (packing_history_error or 'Nie udało się jednoznacznie odczytać faktury wysyłki.'),
+                    speech_text=shipment_read.speech(packing_history_result) if packing_history_result is not None else 'Nie udało się odczytać wysyłki.',
+                    voice_response_mode='direct')
             if packing_history_read:
                 if packing_history_result is not None:
                     return finish(

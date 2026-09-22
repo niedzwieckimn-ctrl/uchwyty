@@ -312,13 +312,16 @@ def answer(data):
         return 'Nie znalazłem potwierdzonej wysyłki w podanym zakresie.'
     lines = []
     for s in data['shipments']:
-        lines.append(f"Wysyłka: {s['shipped_at']} — {s['customer']['name']}")
-        lines.append(f"Faktura: {s['invoice_number'] or 'nieustalona'}; tracking: {s['tracking'] or 'brak'}.")
+        lines.append(f"Wysyłka: {s['shipped_at']}")
+        lines.append(f"Klient: {s['customer']['name']}")
+        lines.append(f"Faktura: {s['invoice_number'] or 'nieustalona'}")
+        lines.append(f"Tracking: {s['tracking'] or 'brak'}")
         for issue in s['issues']:
             lines.append('Wymaga wyjaśnienia: '+issue)
         if s.get('invoice_candidates'):
             lines.append('Możliwe faktury (ID): '+', '.join(map(str,s['invoice_candidates']))+'.')
         if s['items']:
+            lines.append(f"{len(s['items'])} pozycji, {s['total_units']} sztuk.")
             lines.append('Wszystkie pozycje powiązanej faktury:')
             for item in s['items']:
                 lines.append(f"- {item['sku']} {item['name']} — {item['qty']} szt. ({item.get('order_number') or item['order_id']})")
@@ -341,3 +344,70 @@ def answer(data):
         label = 'Łącznie według powiązanych faktur' if data['complete'] else 'Suma odczytanych pozycji faktur (dane wymagają wyjaśnienia)'
         lines.append(f"{label}: {data['total_units']} sztuk.")
     return '\n'.join(lines).strip()
+
+
+_SPEECH_MONTHS = ('stycznia', 'lutego', 'marca', 'kwietnia', 'maja', 'czerwca',
+                  'lipca', 'sierpnia', 'września', 'października', 'listopada', 'grudnia')
+
+
+def _speech_date(value, *, include_time=True):
+    raw = str(value or '')
+    try:
+        moment = _moment(raw)
+    except ShipmentReadError:
+        return ''
+    label = f'{moment.day} {_SPEECH_MONTHS[moment.month - 1]}'
+    if include_time and re.search(r'[T ]\d{2}:\d{2}', raw):
+        label += f' o {moment:%H:%M}'
+    return label
+
+
+def _speech_plural(number, singular, few, many):
+    return singular if number == 1 else few if number % 10 in (2, 3, 4) and number % 100 not in (12, 13, 14) else many
+
+
+def _speech_items(items):
+    """Brief human product names only; never read invoice, order or SKU identifiers."""
+    names = Counter()
+    for item in items:
+        name = ' '.join(str(item.get('name') or '').split())
+        sku = str(item.get('sku') or '').strip()
+        if (not name or name.casefold() == sku.casefold() or len(name) > 32
+                or not re.fullmatch(r'[\w .-]+', name, re.UNICODE)
+                or re.search(r'\d{5,}', name)):
+            return ''
+        names[name.title() if name.isupper() else name] += int(item.get('qty') or 0)
+    if not 1 <= len(names) <= 4:
+        return ''
+    parts = [f'{name} {quantity}' for name, quantity in names.items()]
+    return ', '.join(parts[:-1]) + (' i ' if len(parts) > 1 else '') + parts[-1] + '.'
+
+
+def speech(data):
+    """Deterministic, short voice summary of structured shipment.read data."""
+    shipments = data.get('shipments') or []
+    if not shipments:
+        return 'Nie znalazłem potwierdzonej wysyłki w podanym zakresie.'
+    if not data.get('complete', True) or any(not s.get('complete', True) for s in shipments):
+        return 'Dane wysyłki wymagają wyjaśnienia. Szczegóły są na ekranie.'
+    if len(shipments) > 1:
+        day = _speech_date(shipments[0].get('shipped_at'), include_time=False)
+        count = len(shipments)
+        total = sum(int(s.get('total_units') or 0) for s in shipments)
+        prefix = f'{day} ' if day else ''
+        return (f'{prefix}wysłano {count} {_speech_plural(count, "wysyłkę", "wysyłki", "wysyłek")}, '
+                f'łącznie {total} {_speech_plural(total, "sztukę", "sztuki", "sztuk")}. Szczegóły są na ekranie.')
+    shipment = shipments[0]
+    day = _speech_date(shipment.get('shipped_at'))
+    prefix = f'{day} ' if day else ''
+    quantity = int(shipment.get('total_units') or 0)
+    positions = len(shipment.get('items') or [])
+    result = (f'{prefix}wysłano {quantity} {_speech_plural(quantity, "sztukę", "sztuki", "sztuk")} '
+              f'w {positions} {_speech_plural(positions, "pozycji", "pozycjach", "pozycjach")}.')
+    customer = ' '.join(str((shipment.get('customer') or {}).get('name') or '').split())
+    if customer and len(customer) <= 50 and '@' not in customer and '/' not in customer:
+        result += f' Odbiorca: {customer.title() if customer.isupper() else customer}.'
+    summary = _speech_items(shipment.get('items') or [])
+    if summary:
+        result += ' ' + summary
+    return result
