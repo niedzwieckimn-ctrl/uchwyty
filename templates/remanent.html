@@ -1,0 +1,99 @@
+{% extends 'base.html' %}
+{% block content %}
+<style>
+.rem-grid{display:grid;gap:14px}.rem-card{background:#fff;border:1px solid #e7eaf2;border-radius:16px;padding:18px}
+.rem-row{display:flex;gap:9px;align-items:end;flex-wrap:wrap}.rem-row label{display:grid;gap:4px;font-size:12px}
+.rem-row input,.rem-row select{padding:9px;max-width:225px}.rem-row button{padding:9px 14px}
+.rem-scroll{max-width:100%;overflow:auto}.rem-table{border-collapse:collapse;min-width:1550px;font-size:11px}
+.rem-table th,.rem-table td{border-bottom:1px solid #e7eaf2;padding:8px 7px;text-align:right;white-space:nowrap}
+.rem-table th:first-child,.rem-table td:first-child{text-align:left}.rem-error{color:#aa1735;font-weight:700}
+.rem-note{color:#64748b;font-size:12px}.rem-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:9px}
+.rem-summary div{background:#f4f7fc;border-radius:10px;padding:9px}.rem-summary b{display:block;margin-top:5px}
+</style>
+<div class="rem-grid">
+ <div class="rem-card"><h1>Remanent</h1>
+ {% if error %}<p class="rem-error">{{ error }}</p>{% endif %}
+ {% if not remanent %}
+  <form method="post" action="{{ url_for('remanent_new') }}" class="rem-row">
+   <label>Rok <input type="number" name="year" min="2000" max="2100" value="{{ today[:4] }}" required></label>
+   <button class="btn primary">Nowy remanent</button>
+  </form>
+  <div class="rem-scroll"><table class="rem-table" style="min-width:700px"><tr><th>Numer</th><th>Rok</th><th>Etap</th><th>Rozpoczęcie</th><th>Zamknięcie</th><th>Sztuki fizyczne</th><th>Wartość PLN</th><th>PDF</th></tr>
+  {% for s in sessions %}<tr><td><a href="{{ url_for('remanent_detail',session_id=s.session_id) }}">{{ s.remanent_no }}</a></td><td>{{ s.inventory_year }}</td><td>{{ 'zamknięty' if s.status=='COMPLETED' else ('roboczy' if s.phase=='DRAFT' else 'w trakcie') }}</td><td>{{ s.snapshot_at or '—' }}</td><td>{{ s.completed_at or '—' }}</td><td>{{ s.counted_units if s.status=='COMPLETED' else '—' }}</td><td>{{ s.counted_value if s.status=='COMPLETED' else '—' }}</td><td>{% if s.status=='COMPLETED' %}<a href="{{ url_for('remanent_pdf',session_id=s.session_id,kind='internal') }}">Raport</a>{% endif %}</td></tr>
+  {% else %}<tr><td colspan="8">Brak remanentów.</td></tr>{% endfor %}</table></div>
+ {% else %}
+  <p>Numer: <b>{{ remanent.remanent_no }}</b> · Rok: {{ remanent.inventory_year }} ·
+   Stan na: <b>{{ remanent.as_of_date or 'ustal przy rozpoczęciu' }}</b> ·
+   Status: <b>{{ 'zamknięty' if remanent.status=='COMPLETED' else ('roboczy' if remanent.phase=='DRAFT' else 'w trakcie') }}</b></p>
+  <p class="rem-note">Utworzono: {{ remanent.created_at }} · Rozpoczęto: {{ remanent.snapshot_at or '—' }} · Zamknięto: {{ remanent.completed_at or '—' }}</p>
+  <a class="btn" href="{{ url_for('remanent_index') }}">Historia remanentów</a>
+  {% if remanent.status=='COMPLETED' %}
+   <a class="btn primary" href="{{ url_for('remanent_pdf',session_id=remanent.session_id,kind='internal') }}">PDF remanentu</a>
+   <a class="btn primary" href="{{ url_for('remanent_pdf',session_id=remanent.session_id,kind='sheet') }}">Arkusz spisu z natury</a>
+  {% endif %}
+ {% endif %}
+ </div>
+ {% if remanent and remanent.phase=='DRAFT' %}
+ <div class="rem-card"><h2>Dane źródłowe przed rozpoczęciem</h2>
+ <p class="rem-note">Brak stanu 1 stycznia = 0. Brak potwierdzenia kompletności zakupów = wynik dokumentowy nieustalony. Zmiany po rozpoczęciu nie zmieniają snapshotu.</p>
+ <form method="post" action="{{ url_for('remanent_entry',session_id=remanent.session_id) }}" class="rem-row">
+  <label>SKU <input name="sku" list="remanent-skus" required></label><datalist id="remanent-skus">{% for p in products %}<option value="{{ p.sku }}">{{ p.name }}</option>{% endfor %}</datalist>
+  <label>Rodzaj <select name="kind"><option value="opening">Stan 01.01</option><option value="historical_sales_manual">Sprzedaż historyczna ręczna</option><option value="historical_purchase_manual">Zakup historyczny ręczny</option><option value="unit_value_manual">Zatwierdzona cena jednostkowa</option></select></label>
+  <label>Początek okresu <input type="date" name="period_start" value="{{ remanent.inventory_year }}-01-01" required></label>
+  <label>Koniec okresu <input type="date" name="period_end"></label>
+  <label>Ilość <input type="number" min="0" name="quantity" value="0" required></label>
+  <label>Cena 1 szt. PLN <input name="unit_value_pln" inputmode="decimal" placeholder="np. 12,50"></label>
+  <label>Źródło <input name="source" placeholder="np. Fakturownia" required></label>
+  <label>Nr dokumentu <input name="document_no"></label><label>Notatka <input name="note"></label>
+  <button class="btn primary">Dodaj wpis</button>
+ </form>
+ <p class="rem-note">Dla stanu początkowego ustaw obie daty na 1 stycznia. Błędny wpis wycofaj z uzasadnieniem; zapis pozostanie w historii.</p>
+ <h3>Import CSV — najpierw podgląd</h3>
+ <form method="post" enctype="multipart/form-data" action="{{ url_for('remanent_csv_preview',session_id=remanent.session_id) }}" class="rem-row">
+  <label>Źródło <select name="kind"><option value="historical_purchase_import">Zakupy historyczne</option><option value="historical_sales_import">Sprzedaż historyczna</option></select></label>
+  <label>Od <input type="date" name="period_start" value="{{ remanent.inventory_year }}-01-01" required></label>
+  <label>Do <input type="date" name="period_end" value="{{ today }}" required></label>
+  <label>Plik UTF-8 <input type="file" name="file" accept=".csv,text/csv" required></label>
+  <button class="btn">Sprawdź CSV</button>
+ </form>
+ <p class="rem-note">Kolumny: sku,quantity,date,unit_value_pln,document_no,line_value_pln. Import nie zmienia fizycznego magazynu.</p>
+ {% if preview %}<div class="rem-card"><h3>Podgląd importu</h3>
+  <p>Rozpoznano: {{ preview.matched }} · SKU bez dopasowania: {{ preview.unmatched }} · Duplikat pliku: {{ preview.duplicates }} · Błędy: {{ preview.problems|length }} · Sztuki: {{ preview.quantity }} · Wartość PLN: {{ preview.value_pln }}</p>
+  {% for problem in preview.problems %}<p class="rem-error">Wiersz {{ problem.line }} ({{ problem.sku or '—' }}): {{ problem.error }}</p>{% endfor %}
+  {% if not preview.problems and not preview.duplicates %}<form method="post" enctype="multipart/form-data" action="{{ url_for('remanent_csv_confirm',session_id=remanent.session_id) }}" class="rem-row">
+   <input type="hidden" name="kind" value="{{ preview.kind }}"><input type="hidden" name="period_start" value="{{ preview.start }}"><input type="hidden" name="period_end" value="{{ preview.end }}"><input type="hidden" name="sha256" value="{{ preview.sha256 }}">
+   <label>Wybierz ponownie ten sam plik <input type="file" name="file" accept=".csv,text/csv" required></label><button class="btn primary">Potwierdź import</button>
+  </form>{% endif %}</div>{% endif %}
+ <h3>Historia wpisów</h3><div class="rem-scroll"><table class="rem-table" style="min-width:870px"><tr><th>SKU</th><th>Typ</th><th>Okres</th><th>Ilość</th><th>Cena PLN</th><th>Źródło / dokument</th><th>Użytkownik</th><th>Status</th></tr>
+ {% for e in entries %}<tr><td>{{ e.sku }}</td><td>{{ e.kind }}</td><td>{{ e.period_start }} – {{ e.period_end }}</td><td>{{ e.quantity }}</td><td>{{ e.unit_value_pln or '—' }}</td><td>{{ e.source }} {{ e.document_no }}</td><td>{{ e.created_by }}</td><td>{% if e.voided_at %}wycofany: {{ e.void_reason }}{% else %}<form method="post" action="{{ url_for('remanent_void',session_id=remanent.session_id,entry_id=e.id) }}" class="rem-row"><input name="reason" placeholder="powód wycofania" required><button class="btn">Wycofaj</button></form>{% endif %}</td></tr>{% endfor %}</table></div>
+ <h3>Potwierdź kompletność zakupów</h3><form method="post" action="{{ url_for('remanent_coverage',session_id=remanent.session_id) }}" class="rem-row">
+  <label>Do dnia <input type="date" name="as_of_date" value="{{ today }}" required></label>
+  <label><input type="checkbox" name="confirmed" value="yes" required> Potwierdzam wszystkie zakupy i świadomie potwierdzam zero tam, gdzie nie było zakupów</label>
+  <button class="btn">Zapisz potwierdzenie</button>
+ </form>
+ <h3>Rozpocznij i zamroź źródła</h3><form method="post" action="{{ url_for('remanent_start',session_id=remanent.session_id) }}" class="rem-row">
+  <label>Data stanu <input type="date" name="as_of_date" value="{{ today }}" required></label><button class="btn primary">Rozpocznij remanent</button>
+ </form></div>
+ {% endif %}
+ {% if remanent and remanent.phase!='DRAFT' %}
+ <div class="rem-card"><h2>Podsumowanie snapshotu</h2><div class="rem-summary">
+ {% for label,key in [('01.01 szt.','opening_stock'),('Zakupy szt.','purchases_total'),('Sprzedaż szt.','sales_total'),('Dokumenty szt.','document_stock'),('Dokumenty PLN','document_value'),('Fizycznie szt.','counted_qty'),('Fizycznie PLN','counted_value'),('Niedobory szt.','shortage_qty'),('Niedobory PLN','shortage_value'),('Nadwyżki szt.','surplus_qty'),('Nadwyżki PLN','surplus_value'),('Różnica netto szt.','difference_qty'),('Różnica netto PLN','difference_value'),('SKU','sku_count'),('Policzone','counted_count'),('Niepoliczone','uncounted_count')] %}
+ <div>{{ label }}<b>{{ totals[key] if totals[key] is not none else 'nieustalone' }}</b></div>{% endfor %}
+ </div></div>
+ <div class="rem-card"><h2>Pozycje SKU</h2><div class="rem-scroll"><table class="rem-table">
+ <tr><th>SKU / model / nazwa</th><th>01.01</th><th>Zakupy hist.</th><th>Zakupy app</th><th>Zakupy razem</th><th>Sprzedaż hist. ręczna</th><th>Sprzedaż hist. CSV</th><th>Sprzedaż app</th><th>Sprzedaż razem</th><th>Stan dokument.</th><th>System start</th><th>Ostatni spis</th><th>Policzono</th><th>Różn. dok.</th><th>Różn. system</th><th>Cena PLN</th><th>Dokument. PLN</th><th>Fizycznie PLN</th><th>Różnica PLN</th></tr>
+ {% for i in items %}<tr><td><b>{{ i.sku }}</b><br>{{ i.model }} {{ i.name }}{% if i.variant %} · wariant {{ i.variant }}{% endif %}</td><td>{{ i.opening_stock }}</td><td>{{ i.historical_purchases }}</td><td>{{ i.purchases_from_app }}</td><td>{{ i.purchases_total if i.purchases_total is not none else '?' }}</td><td>{{ i.historical_sales_manual }}</td><td>{{ i.historical_sales_import }}</td><td>{{ i.sales_from_app }}</td><td>{{ i.sales_total }}</td><td>{{ i.document_stock if i.document_stock is not none else '?' }}</td><td>{{ i.system_stock_at_start }}</td><td>{{ i.last_inventory_count if i.last_inventory_count is not none else '—' }}</td><td>{{ i.counted_qty if i.counted_qty is not none else '—' }}{% if i.assumed_zero %} (0 przyjęte){% endif %}</td><td>{{ i.difference_document_vs_count if i.difference_document_vs_count is not none else '?' }}</td><td>{{ i.difference_system_vs_count if i.difference_system_vs_count is not none else '—' }}</td><td>{{ i.unit_value_pln or '?' }}</td><td>{{ i.document_stock_value or '?' }}</td><td>{{ i.counted_stock_value or '—' }}</td><td>{{ i.difference_value or '?' }}</td></tr>{% endfor %}
+ </table></div></div>
+ {% if remanent.status=='OPEN' %}
+ <div class="rem-card"><h2>Zapisz liczenie</h2><form method="post" action="{{ url_for('remanent_count',session_id=remanent.session_id) }}" class="rem-row">
+  <label>SKU <input name="sku" list="count-skus" required></label><datalist id="count-skus">{% for i in items %}<option value="{{ i.sku }}">{{ i.name }}</option>{% endfor %}</datalist>
+  <label>Policzono sztuk <input type="number" name="counted_qty" min="0" required></label><button class="btn primary">Zapisz fizyczny wynik</button></form>
+ <p class="rem-note">Zapis liczenia nie zmienia stanu magazynu. Ewentualna korekta wymaga istniejącej ścieżki zatwierdzenia.</p>
+ <h2>Zamknij remanent</h2><form method="post" action="{{ url_for('remanent_close',session_id=remanent.session_id) }}" class="rem-row">
+  <label><input type="checkbox" name="confirmed" value="yes" required> Potwierdzam zamknięcie i widoczne różnice</label>
+  {% if totals.uncounted_count %}<label><input type="checkbox" name="uncounted_zero" value="yes"> Świadomie przyjmuję 0 szt. dla {{ totals.uncounted_count }} niepoliczonych SKU</label>{% endif %}
+  <button class="btn primary">Zamknij</button></form></div>
+ {% endif %}
+ {% endif %}
+</div>
+{% endblock %}
