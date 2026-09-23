@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "annual-inventory-engine"
+version = "0.3.0"
+description = "Lokalna aplikacja Windows do rocznego rozliczenia"
+requires-python = ">=3.11"
+dependencies = ["SQLAlchemy==2.0.54", "alembic==1.20.0", "PySide6==6.11.2"]
+
+[tool.setuptools.package-data]
+annual_inventory = ["persistence/migrations/env.py", "persistence/migrations/versions/*.py"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

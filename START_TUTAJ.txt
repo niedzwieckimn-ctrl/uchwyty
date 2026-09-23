@@ -1,0 +1,17 @@
+ROCZNE ROZLICZENIE — WERSJA TESTOWA ETAP 4 (KOD ŹRÓDŁOWY)
+
+Ta paczka zawiera kod źródłowy, nie gotowy program EXE. Do uruchomienia
+potrzebne są Python 3.12 i zależności z pyproject.toml. Instrukcje dla
+programisty oraz sposób zasilenia kontroli snapshotem są w README.md.
+
+Przy pierwszym otwarciu zbudowanego programu dane użytkownika powstaną w:
+%LOCALAPPDATA%\RoczneRozliczenie
+
+Katalog aplikacji i katalog danych są oddzielne. Wymiana kodu/programu na
+nowszy nie usuwa bazy ani zapisanych PDF.
+
+Jeśli aplikacja zgłosi błąd startu, zajrzyj do:
+%LOCALAPPDATA%\RoczneRozliczenie\logs\app.log
+
+To wersja testowa. Przed użyciem na jedynych egzemplarzach ważnych danych
+zachowaj kopię plików źródłowych i katalogu danych aplikacji.
