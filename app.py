@@ -191,7 +191,7 @@ except Exception as exc:
 BASE_URL = "http://192.168.68.103:5000"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(APP_DIR, "data")
+DATA_DIR = os.path.abspath(os.environ.get("APP_DATA_DIR") or os.path.join(APP_DIR, "data"))
 DB_PATH = os.path.join(DATA_DIR, "app.db")
 
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -1003,6 +1003,9 @@ def init_db():
     _startup_step("approval_init")
     initialize_business_operations_schema(c)
     _startup_step("business_operations_init")
+    from remanent import initialize_schema as initialize_remanent_schema
+    initialize_remanent_schema(c)
+    _startup_step("remanent_schema_initialized")
     initialize_agent_conversation_schema(c)
     _startup_step("agent_conversation_init")
     initialize_external_execution_schema(c)
@@ -2261,6 +2264,7 @@ SUPABASE_SYNC_TABLES = [
     ("china_packages", "id"),
     ("china_stock_receipts", "package_id"),
     ("china_items", "id"),
+    ("china_documents", "id"),
     ("pricing", "model"),
     ("pricing_eur", "sku"),
     ("company_profile", "id"),
@@ -2301,6 +2305,7 @@ SUPABASE_PULL_TABLES = [
     ("stock", "product_id"),
     ("order_items", "id"),
     ("china_items", "id"),
+    ("china_documents", "id"),
     ("invoices", "id"),
     ("invoice_meta", "invoice_id"),
     ("invoice_allocations", "id"),
@@ -5769,7 +5774,8 @@ BASE = r"""
       <a href="{{ url_for('ksef_dashboard') }}">KSeF</a>
       <a class="{% if request.endpoint == 'client_searches' %}active{% endif %}" href="{{ url_for('client_searches') }}">Wyszukiwania</a>
       <a href="{{ url_for('stock') }}">Stan magazynu</a>
-      <a href="{{ url_for('china') }}">Chiny / P/O</a>
+      <a href="{{ url_for('remanent_index') }}">Remanent</a>
+      <a href="{{ url_for('china') }}">Import</a>
       <a href="{{ url_for('order_scan') }}">Skan QR</a>
       <a class="nav-ai {% if request.endpoint == 'ai_assistant' %}active{% endif %}" href="{{ url_for('ai_assistant') }}">Asystent AI</a>
       <div class="nav-dropdown">
@@ -8793,6 +8799,9 @@ for _routes_module in (routes_admin, routes_customers, routes_orders, routes_inv
     globals().update(_routes_module.register_routes(globals()))
 if "client_searches_v2" in globals():
     app.view_functions["client_searches"] = client_searches_v2
+
+import remanent as _remanent
+_remanent.register_routes(app, {"conn": conn, "BASE_URL": BASE_URL, "DB_PATH": DB_PATH})
 
 import search_analytics as _search_analytics
 import sys as _search_sys

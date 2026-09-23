@@ -6,6 +6,7 @@ from flask import request, redirect, url_for
 from flask import render_template_string
 
 from inventory_analytics import build_replenishment_analysis, recommended_replenishments
+from invoice_sales import invoice_rows, invoice_lines
 
 
 # Stały, świadomie uproszczony kurs używany wyłącznie w analizie Cash flow.
@@ -39,9 +40,9 @@ def invoice_sales_units(db, invoice_id, invoice_items_json):
     quantity. This preserves the panel's treatment of invoice/correction rows;
     it is not a new calculator based on current order_items.
     """
-    items, _, _ = invoice_cash_flow_context('PLN', invoice_items_json)
-    units = sum(int(item.get('qty') or item.get('invoice_qty') or item.get('current_invoice_qty') or 0)
-                for item in items if isinstance(item, dict))
+    lines, _ = invoice_lines(db, {'id': invoice_id,
+                                  'invoice_items_json': invoice_items_json}, resolve_skus=False)
+    units = sum(qty for _pid, _sku, qty in lines)
     if units <= 0:
         row = db.execute('SELECT COALESCE(SUM(qty),0) FROM invoice_allocations WHERE invoice_id=?',
                          (int(invoice_id),)).fetchone()
@@ -199,19 +200,7 @@ def calculate_cash_flow_snapshot(deps, *, current_time=None):
     c = conn()
     cur = c.cursor()
 
-    cur.execute("""
-      SELECT i.*,
-             COALESCE(m.paid,0) AS paid,
-             m.paid_at,
-             COALESCE(m.payment_reminder,0) AS payment_reminder,
-             m.invoice_items_json,
-             COALESCE(o.currency,'PLN') AS order_currency
-      FROM invoices i
-      LEFT JOIN invoice_meta m ON m.invoice_id=i.id
-      LEFT JOIN orders o ON o.id=i.order_id
-      ORDER BY COALESCE(i.payment_to, i.issue_date) ASC, i.id DESC
-    """)
-    invoices_rows = cur.fetchall()
+    invoices_rows = invoice_rows(c)
     overdue_invoice_ids = {
         int(row["id"])
         for row in cash_flow_overdue_invoices(c, current_time=app_now())
@@ -288,8 +277,7 @@ def calculate_cash_flow_snapshot(deps, *, current_time=None):
         if issue_d and issue_d >= today - timedelta(days=30):
             last_30_net += net
             last_30_profit += net * 0.60
-            for item in invoice_items:
-                sold_30_qty += int(item.get("qty") or item.get("invoice_qty") or item.get("current_invoice_qty") or 0)
+            sold_30_qty += invoice_sales_units(c, inv['id'], inv['invoice_items_json'])
 
         if paid:
             paid_d = parse_date_safe(inv["paid_at"]) or issue_d

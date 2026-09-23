@@ -1905,9 +1905,11 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                     if _artifact_builder:
                         artifacts.extend(_artifact_builder('inventory.count.record', observed) or [])
                     difference = int(observed['difference'])
+                    document_note = (f' Stan dokumentowy: {observed["document_stock"]}.'
+                                     if observed.get('document_stock') is not None else '')
                     if difference == 0:
                         return voice_finish(
-                            f'{display_name} — system {observed["expected_quantity"]}, policzono {quantity}. Stan zgodny.',
+                            f'{display_name} — system {observed["expected_quantity"]}, policzono {quantity}. Stan zgodny.{document_note}',
                             'Zgodne. Następny.', state='WAIT_PRODUCT')
                     adjustment = voice_call('inventory.adjust', {
                         'product_id':product_id, 'count_session_id':fast_count_session,
@@ -1933,7 +1935,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                     pending_approvals.append(approval)
                     return voice_finish(
                         f'{display_name} — system {observed["expected_quantity"]}, policzono {quantity}, '
-                        f'różnica {difference:+d}. Korekta wymaga zatwierdzenia.',
+                        f'różnica {difference:+d}. Korekta wymaga zatwierdzenia.{document_note}',
                         inventory_voice_fast.difference_prompt(
                             observed['expected_quantity'], difference), state='WAIT_APPROVAL')
         stage_started = time.perf_counter()

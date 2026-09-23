@@ -920,6 +920,9 @@ _WAREHOUSE_OUTPUT = {'type':'object','additionalProperties':False,
         'ok':{'type':'boolean'}, 'product_id':{'type':'integer'}, 'order_id':{'type':'integer'},
         'count_id':{'type':'string'}, 'expected_quantity':{'type':'integer'},
         'counted_quantity':{'type':'integer'}, 'difference':{'type':'integer'},
+        'document_stock':{'type':['integer','null']},
+        'last_inventory_count':{'type':['integer','null']},
+        'difference_document_vs_count':{'type':['integer','null']},
         'sku':{'type':'string'}, 'model':{'type':'string'}, 'name':{'type':'string'}, 'ean':{'type':'string'},
         'version':{'type':'integer'}, 'status':{'type':'string'}, 'ready':{'type':'boolean'},
         'order_number':{'type':'string'}, 'order_status':{'type':'string'},
@@ -2202,7 +2205,7 @@ def _sales_summary(data, actor, correlation_id, transaction_connection=None):
     try:
         start, end = _date_bounds(data, default_period="this_month")
         order_where, order_params = ["1=1"], []
-        invoice_where, invoice_params = ["1=1"], []
+        invoice_where, invoice_params = ["COALESCE(i.publication_state,'complete')='complete'"], []
         if start:
             order_where.append("SUBSTR(TRIM(o.created_at),1,10)>=?"); order_params.append(start)
             invoice_where.append("SUBSTR(TRIM(i.issue_date),1,10)>=?"); invoice_params.append(start)
@@ -2322,11 +2325,27 @@ def _assert_count_session(db, data, actor, *, require_open=True):
     if session['created_by'] != _human_actor_id(actor):
         raise ControlledOperationError('COUNT_SESSION_ACCESS_DENIED','Sesja remanentu należy do innego pracownika',status=DENIED)
     conversation_id = data.get('conversation_id')
-    if conversation_id and session['conversation_id'] != conversation_id:
+    if conversation_id and session['conversation_id'] != conversation_id and session['inventory_year'] is None:
         raise ControlledOperationError('COUNT_SESSION_ACCESS_DENIED','Sesja remanentu należy do innej rozmowy',status=DENIED)
     if require_open and session['status'] != 'OPEN':
         raise ControlledOperationError('COUNT_SESSION_CLOSED','Sesja remanentu nie jest otwarta',status=CONFLICT)
+    if require_open and session['inventory_year'] is not None and session['phase'] != 'IN_PROGRESS':
+        raise ControlledOperationError('COUNT_SESSION_DRAFT','Rozpocznij remanent na ekranie przed liczeniem',status=CONFLICT)
     return session
+
+
+def _open_count_session(db, owner_id, conversation_id):
+    """The active yearly count takes precedence over an ordinary voice session."""
+    row = db.execute("""SELECT * FROM internal_inventory_count_sessions
+                        WHERE created_by=? AND status='OPEN' AND inventory_year IS NOT NULL
+                          AND phase='IN_PROGRESS' ORDER BY created_at DESC LIMIT 1""",
+                     (owner_id,)).fetchone()
+    if row:
+        return row
+    return db.execute("""SELECT * FROM internal_inventory_count_sessions
+                         WHERE created_by=? AND conversation_id=? AND status='OPEN'
+                           AND inventory_year IS NULL ORDER BY created_at DESC LIMIT 1""",
+                      (owner_id, conversation_id)).fetchone()
 
 
 def active_inventory_count_session(ai_actor, human_actor, conversation_id):
@@ -2338,9 +2357,7 @@ def active_inventory_count_session(ai_actor, human_actor, conversation_id):
     db=_factory()()
     try:
         _assert_count_conversation(db,ai,conversation_id)
-        row=db.execute("""SELECT session_id FROM internal_inventory_count_sessions
-                          WHERE created_by=? AND conversation_id=? AND status='OPEN'
-                          ORDER BY created_at DESC LIMIT 1""",(human.actor_id,conversation_id)).fetchone()
+        row=_open_count_session(db,human.actor_id,conversation_id)
         return str(row['session_id']) if row else ''
     finally: db.close()
 
@@ -2354,9 +2371,7 @@ def inventory_count_active_product(ai_actor, human_actor, conversation_id):
     db = _factory()()
     try:
         _assert_count_conversation(db, ai, conversation_id)
-        row = db.execute("""SELECT active_product_id FROM internal_inventory_count_sessions
-                            WHERE created_by=? AND conversation_id=? AND status='OPEN'""",
-                         (human.actor_id, conversation_id)).fetchone()
+        row = _open_count_session(db,human.actor_id,conversation_id)
         return int(row['active_product_id']) if row and row['active_product_id'] else None
     finally:
         db.close()
@@ -2371,13 +2386,14 @@ def inventory_count_voice_state(ai_actor, human_actor, conversation_id):
     db = _factory()()
     try:
         _assert_count_conversation(db, ai, conversation_id)
-        row = db.execute("""SELECT session_id,voice_state,active_product_id,pending_approval_id,
-                            (SELECT status FROM internal_operation_executions e
-                             WHERE e.approval_id=s.pending_approval_id LIMIT 1) AS pending_execution_status
-                            FROM internal_inventory_count_sessions s
-                            WHERE created_by=? AND conversation_id=? AND status='OPEN'""",
-                         (human.actor_id, conversation_id)).fetchone()
-        return dict(row) if row else None
+        row = _open_count_session(db,human.actor_id,conversation_id)
+        if not row:
+            return None
+        result = dict(row)
+        pending = db.execute("SELECT status FROM internal_operation_executions WHERE approval_id=? LIMIT 1",
+                             (row['pending_approval_id'],)).fetchone() if row['pending_approval_id'] else None
+        result['pending_execution_status'] = pending['status'] if pending else None
+        return result
     finally:
         db.close()
 
@@ -2394,9 +2410,7 @@ def set_inventory_count_voice_state(ai_actor, human_actor, conversation_id, stat
     db = _factory()()
     try:
         _assert_count_conversation(db, ai, conversation_id)
-        session = db.execute("""SELECT session_id,pending_approval_id FROM internal_inventory_count_sessions
-                                WHERE created_by=? AND conversation_id=? AND status='OPEN'""",
-                             (human.actor_id, conversation_id)).fetchone()
+        session = _open_count_session(db,human.actor_id,conversation_id)
         if not session:
             raise ControlledOperationError('COUNT_SESSION_NOT_FOUND', 'Brak otwartej sesji remanentu', status=CONFLICT)
         if state == 'WAIT_APPROVAL':
@@ -2451,9 +2465,7 @@ def resolve_inventory_voice_product(ai_actor, human_actor, conversation_id, quer
     db = _factory()()
     try:
         _assert_count_conversation(db, ai, conversation_id)
-        if not db.execute("""SELECT 1 FROM internal_inventory_count_sessions
-                            WHERE created_by=? AND conversation_id=? AND status='OPEN'""",
-                          (human.actor_id, conversation_id)).fetchone():
+        if not _open_count_session(db,human.actor_id,conversation_id):
             return []
         rows = db.execute("""SELECT id,sku,model,name,ean FROM products
                              WHERE COALESCE(archived,0)=0""").fetchall()
@@ -2481,9 +2493,7 @@ def read_inventory_voice_product(ai_actor, human_actor, conversation_id, product
     db = _factory()()
     try:
         _assert_count_conversation(db, ai, conversation_id)
-        if not db.execute("""SELECT 1 FROM internal_inventory_count_sessions
-                            WHERE created_by=? AND conversation_id=? AND status='OPEN'""",
-                          (human.actor_id, conversation_id)).fetchone():
+        if not _open_count_session(db,human.actor_id,conversation_id):
             raise ControlledOperationError('COUNT_SESSION_NOT_FOUND', 'Brak otwartej sesji remanentu', status=CONFLICT)
     finally:
         db.close()
@@ -2510,10 +2520,11 @@ def set_inventory_count_active_product(ai_actor, human_actor, conversation_id, p
         if not db.execute('SELECT 1 FROM products WHERE id=? AND COALESCE(archived,0)=0',
                           (product_id,)).fetchone():
             raise ControlledOperationError('PRODUCT_NOT_FOUND', 'Nie znaleziono produktu', status=CONFLICT)
+        session = _open_count_session(db,human.actor_id,conversation_id)
         changed = db.execute("""UPDATE internal_inventory_count_sessions
                                SET active_product_id=?,voice_state='WAIT_COUNT',pending_approval_id=NULL
-                               WHERE created_by=? AND conversation_id=? AND status='OPEN'""",
-                             (product_id, human.actor_id, conversation_id)).rowcount
+                               WHERE session_id=? AND status='OPEN'""",
+                             (product_id, session['session_id'] if session else '')).rowcount
         db.commit()
         return bool(changed)
     finally:
@@ -2534,14 +2545,15 @@ def inventory_adjustment_preview(ai_actor, human_actor, conversation_id, product
     db=_factory()()
     try:
         _assert_count_conversation(db,ai,conversation_id)
+        session = _open_count_session(db,human.actor_id,conversation_id)
         row=db.execute('''SELECT p.sku,p.model,p.name,i.expected_quantity,i.counted_quantity,i.difference
                             FROM internal_inventory_count_sessions s
                             JOIN internal_inventory_count_items i ON i.session_id=s.session_id
                             JOIN products p ON p.id=i.product_id
-                           WHERE s.created_by=? AND s.conversation_id=? AND s.status='OPEN'
+                           WHERE s.created_by=? AND s.session_id=? AND s.status='OPEN'
                              AND i.product_id=? AND i.status='PENDING_ADJUSTMENT'
                            ORDER BY i.item_id DESC LIMIT 1''',
-                       (human.actor_id,conversation_id,int(product_id))).fetchone()
+                       (human.actor_id,session['session_id'] if session else '',int(product_id))).fetchone()
         if row is None:
             raise ControlledOperationError('COUNT_DISCREPANCY_NOT_PENDING','Brak nierozwiązanej rozbieżności dla produktu',status=CONFLICT)
         display_name=str(row['model'] or row['name'] or row['sku'] or '').strip()
@@ -2664,6 +2676,18 @@ def _inventory_count_expected(data, actor, correlation_id, transaction_connectio
 
 def _inventory_count_session_start(data, actor, correlation_id, transaction_connection=None):
     db=transaction_connection; human_id=_human_actor_id(actor)
+    remanent = db.execute("""SELECT session_id,phase FROM internal_inventory_count_sessions
+                             WHERE created_by=? AND status='OPEN' AND inventory_year IS NOT NULL
+                             ORDER BY created_at DESC LIMIT 1""", (human_id,)).fetchone()
+    if remanent and remanent['phase'] != 'IN_PROGRESS':
+        raise ControlledOperationError('COUNT_SESSION_DRAFT',
+            'Rozpocznij przygotowany remanent na ekranie przed liczeniem',status=CONFLICT)
+    if remanent:
+        session_id = str(remanent['session_id'])
+        record_audit_event('inventory.count.session.start',result=SUCCESS,actor_context=actor,
+            entity_type='inventory_count_session',entity_id=session_id,correlation_id=correlation_id,
+            after_state={'status':'OPEN','created_by':human_id},transaction_connection=db)
+        return {'ok':True,'count_id':session_id,'status':'OPEN'}
     existing=db.execute("""SELECT session_id FROM internal_inventory_count_sessions
                            WHERE created_by=? AND conversation_id=? AND status='OPEN'
                            ORDER BY created_at DESC LIMIT 1""",(human_id,data['conversation_id'])).fetchone()
@@ -2717,6 +2741,18 @@ def _inventory_count_summary(data, actor, correlation_id, transaction_connection
 def _inventory_count_record(data, actor, correlation_id, transaction_connection=None):
     db=transaction_connection; now=_now(); human_id=_human_actor_id(actor)
     import inventory_recount
+
+    session = _assert_count_session(db, data, actor)
+    if session is None:
+        raise ControlledOperationError('COUNT_SESSION_NOT_FOUND','Nie znaleziono sesji remanentu',status=CONFLICT)
+    snapshot = None
+    if session['inventory_year'] is not None:
+        snapshot = db.execute('''SELECT document_stock,last_inventory_count FROM internal_remanent_snapshots
+                                 WHERE session_id=? AND product_id=?''',
+                              (data['count_session_id'],data['product_id'])).fetchone()
+        if snapshot is None:
+            raise ControlledOperationError('COUNT_PRODUCT_NOT_IN_SNAPSHOT',
+                'Produkt nie należy do zamrożonego arkusza remanentu',status=CONFLICT)
     inventory_recount.supersede(db, data['count_session_id'], data['product_id'])
     data = dict(data, expected_version=_inventory_version(db, data['product_id']))
     db.execute('''INSERT OR IGNORE INTO internal_inventory_count_sessions(
@@ -2746,11 +2782,19 @@ def _inventory_count_record(data, actor, correlation_id, transaction_connection=
             'model':stock_row['model'] or '','name':stock_row['name'] or '',
             'count_id':data['count_session_id'],
             'expected_quantity':expected,'counted_quantity':data['counted_quantity'],'difference':difference,
-            'version':data['expected_version'],'status':status}
+            'version':data['expected_version'],'status':status,
+            'document_stock':snapshot['document_stock'] if snapshot else None,
+            'last_inventory_count':snapshot['last_inventory_count'] if snapshot else None,
+            'difference_document_vs_count':int(data['counted_quantity'])-int(snapshot['document_stock'])
+                if snapshot and snapshot['document_stock'] is not None else None}
 
 
 def _inventory_count_complete(data, actor, correlation_id, transaction_connection=None):
     db=transaction_connection
+    if db.execute('''SELECT 1 FROM internal_inventory_count_sessions WHERE session_id=?
+                     AND inventory_year IS NOT NULL''',(data['count_session_id'],)).fetchone():
+        raise ControlledOperationError('REMANENT_CLOSE_ON_SCREEN',
+            'Zamknij pełny remanent na ekranie po sprawdzeniu danych źródłowych',status=CONFLICT)
     unresolved=int(db.execute("SELECT COUNT(*) n FROM internal_inventory_count_items WHERE session_id=? AND status='PENDING_ADJUSTMENT'",(data['count_session_id'],)).fetchone()['n'])
     if unresolved:
         raise ControlledOperationError('UNRESOLVED_DISCREPANCIES','Nie można zakończyć remanentu z nierozwiązanymi rozbieżnościami',status=CONFLICT)

@@ -51,15 +51,33 @@ class Catalog:
     def __init__(self, products, rules=()):
         self.products = [dict(p) for p in products]
         self.families = {}
+        legacy_names = {}
         for p in self.products:
-            name = str(p.get('name') or '').strip()
-            # Empty names and SKU-looking names are not a reliable product family.
-            if not name or re.match(r'^CH\d+[-\d]', name, re.I):
+            model = str(p.get('model') or '').strip()
+            display = str(p.get('name') or '').strip()
+            sku = str(p.get('sku') or '').strip()
+            # A base model code groups its colour/size variants. A full SKU is
+            # only a variant identifier, so use a genuine catalogue name then.
+            model_key = model if model and key(model) != key(sku) and not re.match(
+                r'^CH\d+-', model, re.I) else ''
+            name_key = display if display and key(display) != key(sku) and not re.match(
+                r'^CH\d+-', display, re.I) else ''
+            identity = model_key or name_key
+            if not identity:
                 p['family_id'] = None
                 continue
-            p['family_id'] = family_id(name)
-            self.families.setdefault(p['family_id'], name)
-        self.rules = {r['phrase']: r for r in rules}
+            p['family_id'] = family_id(identity)
+            self.families.setdefault(p['family_id'], name_key or model_key)
+            if name_key:
+                legacy_names.setdefault(family_id(name_key), set()).add(p['family_id'])
+        # Existing alias rules used a hash of the display name. Keep them
+        # usable when that name unambiguously maps to a model code.
+        legacy_ids = {old: next(iter(ids)) for old, ids in legacy_names.items() if len(ids) == 1}
+        self.rules = {}
+        for rule in rules:
+            current = dict(rule)
+            current['model_id'] = legacy_ids.get(current.get('model_id'), current.get('model_id'))
+            self.rules[current['phrase']] = current
 
     def resolve(self, query, selected=None):
         q = key(query)
@@ -95,7 +113,7 @@ def project(events, now=None):
         gap = (at - stamp(prev['last_activity_at'])).total_seconds() if prev else WINDOW + 1
         same_model = prev and e.get('model_id') and prev['model_id'] == e['model_id']
         # Prefix typing can settle into a result, but ambiguous phrases keep their own unresolved record.
-        same_edit = prev and not prev['model_id'] and not e.get('model_id') and (
+        same_edit = prev and (not prev['model_id'] or prev['model_id'] == e.get('model_id')) and (
             prev['events'][-1].get('edit_id') == e.get('edit_id') and e.get('edit_id') and
             (key(e['query']).startswith(key(prev['query'])) or key(prev['query']).startswith(key(e['query'])))
         )
@@ -114,6 +132,8 @@ def project(events, now=None):
             intents.append(intent)
             current[cid] = intent
         intent['events'].append(e)
+        if e.get('model_id') and not intent['model_id']:
+            intent['model_id'], intent['model_name'] = e['model_id'], e['model_name']
         intent.update(last_activity_at=e['created_at'], query=e['query'], results_count=e['results_count'], resolution=e['resolution'])
     for intent in intents:
         intent['raw_phrases'] = list(dict.fromkeys(e['query'] for e in intent['events']))
@@ -199,6 +219,14 @@ def analytics_snapshot(b, *, days=30, query='', customer='', result='all', now=N
     # Full history is required before the date filter so a boundary cannot
     # split one typing/editing chain into two intents.
     events = store.rows('event')
+    # Reproject immutable historical events against the current catalog. This
+    # repairs earlier unresolved records without inserting another event or
+    # changing the intent count.
+    for event in events:
+        selected_sku = key(event.get('selected_sku'))
+        selected = next((p['id'] for p in cat.products if selected_sku and
+                         key(p.get('sku')) == selected_sku), None)
+        event.update(cat.resolve(event.get('query'), selected))
     intents = project(events, now)
     normalized_query = key(query)
     filtered = [

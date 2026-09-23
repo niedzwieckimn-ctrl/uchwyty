@@ -55,6 +55,7 @@ PERMISSIONS = {
     "inventory.adjust": "Korekta stanu fizycznego",
     "inventory.catalog_manage": "Zarządzanie katalogiem produktów",
     "inventory.pricing_manage": "Zarządzanie cennikami",
+    "inventory.remanent_manage": "Zarządzanie dokumentacją remanentu",
     "inventory.assets_manage": "Zarządzanie zdjęciami produktów",
     "inventory.replenishment_read": "Odczyt analizy uzupełnień",
     "inventory.discrepancy_report": "Zgłoszenie rozbieżności magazynowej",

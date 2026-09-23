@@ -8,6 +8,7 @@ import json
 import re
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 
 
 API_BASE = "https://api.17track.net/track/v2.4"
@@ -112,20 +113,49 @@ def parse_tracking_payload(payload: dict) -> dict:
     status = latest.get("status") if isinstance(latest, dict) else latest
     substatus = latest.get("sub_status") if isinstance(latest, dict) else ""
     providers = (track_info.get("tracking") or {}).get("providers") or []
-    provider = providers[-1] if providers else {}
-    events = provider.get("events") or track_info.get("events") or []
-    last_event = events[-1] if events else {}
+    candidates = []
+    for provider in providers:
+        for event in provider.get("events") or []:
+            if isinstance(event, dict):
+                candidates.append((event, provider))
+    if not candidates:
+        candidates = [(event, {}) for event in track_info.get("events") or []
+                      if isinstance(event, dict)]
+
+    def event_time(event):
+        for field in ("time_utc", "time_iso"):
+            raw = event.get(field)
+            if raw:
+                try:
+                    value = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+                    if value.tzinfo is not None:
+                        return value.astimezone(timezone.utc)
+                except ValueError:
+                    pass
+        return None
+
+    timed = [(event_time(event), event, provider) for event, provider in candidates]
+    timed = [item for item in timed if item[0] is not None]
+    if timed:
+        _, last_event, provider = max(timed, key=lambda item: item[0])
+    else:
+        last_event, provider = ({}, {})
+    events = [event for _, event, _ in sorted(timed, key=lambda item: item[0], reverse=True)[:8]]
     carrier = provider.get("provider") or data.get("carrier") or ""
     if isinstance(carrier, dict):
         carrier = carrier.get("name") or carrier.get("key") or ""
+    description = str(last_event.get("description") or "").strip()
+    location = str(last_event.get("location") or "").strip()
+    if location:
+        description = f"{description} — {location}" if description else location
     return {
         "number": str(data.get("number") or "").strip(),
         "carrier_code": data.get("carrier"),
         "carrier": str(carrier or ""),
         "status": str(status or ""),
         "substatus": str(substatus or ""),
-        "last_event": str(last_event.get("description") or last_event.get("location") or ""),
-        "last_update": str(last_event.get("time_iso") or last_event.get("time_utc") or data.get("track_info_latest_time") or ""),
-        "events": events[-8:],
+        "last_event": description,
+        "last_update": str(last_event.get("time_iso") or last_event.get("time_utc") or ""),
+        "events": events,
         "eta": str((track_info.get("time_metrics") or {}).get("estimated_delivery_date") or ""),
     }
