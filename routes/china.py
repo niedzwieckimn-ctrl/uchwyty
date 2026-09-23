@@ -110,6 +110,11 @@ def register_routes(context):
         document_rows = [dict(row) for row in cur.execute(
             "SELECT * FROM china_documents ORDER BY id DESC"
         ).fetchall()]
+        if supabase_enabled() and not document_rows:
+            hydrate_china_table("china_documents")
+            document_rows = [dict(row) for row in cur.execute(
+                "SELECT * FROM china_documents ORDER BY id DESC"
+            ).fetchall()]
         c.close()
 
         contents = {}
@@ -201,7 +206,7 @@ def register_routes(context):
                     alert_metrics[attention["metric"]] += 1
 
         suppliers = sorted({norm(p.get("supplier")) for p in all_packs if norm(p.get("supplier"))})
-        return render_template("china_list.html", title="Chiny (P/O)", packs=filtered, kpis=kpis,
+        return render_template("china_list.html", title="Import", packs=filtered, kpis=kpis,
             alerts=alerts, alert_metrics=alert_metrics, suppliers=suppliers, contents=contents,
             tracking_api_enabled=tracking_enabled())
 
@@ -471,40 +476,94 @@ def register_routes(context):
 
     @app.post("/china/<int:package_id>/documents")
     def china_document_upload(package_id):
+        if (os.environ.get("RENDER") and not supabase_enabled()
+                and (not os.environ.get("APP_DATA_DIR")
+                     or os.environ.get("REMANENT_PERSISTENCE_READY") != "1")):
+            return redirect(url_for("china", document_error="Przed zapisem PDF potwierdź trwały dysk APP_DATA_DIR lub skonfiguruj prywatny Supabase Storage."))
         uploaded = request.files.get("document")
         if not uploaded or not norm(uploaded.filename):
-            return "Wybierz dokument PDF", 400
+            return redirect(url_for("china", document_error="Wybierz dokument PDF."))
         original_name = os.path.basename(norm(uploaded.filename))[:180]
         document_type = norm(request.form.get("document_type")).lower()
         if document_type not in {"invoice", "zc429", "order"}:
-            return "Wybierz typ dokumentu: Faktura, ZC429 lub Zamówienie", 400
+            return redirect(url_for("china", document_error="Wybierz typ dokumentu: Faktura, ZC429 lub Zamówienie."))
         if not original_name.lower().endswith(".pdf"):
-            return "Do przesyłki można dodać wyłącznie dokument PDF", 400
+            return redirect(url_for("china", document_error="Do przesyłki można dodać wyłącznie dokument PDF."))
         data = uploaded.read(10 * 1024 * 1024 + 1)
         if not data or len(data) > 10 * 1024 * 1024:
-            return "Dokument PDF musi mieć maksymalnie 10 MB", 413
+            return redirect(url_for("china", document_error="Dokument PDF musi mieć maksymalnie 10 MB."))
         if not data.startswith(b"%PDF-"):
-            return "Wybrany plik nie jest prawidłowym dokumentem PDF", 400
+            return redirect(url_for("china", document_error="Wybrany plik nie jest prawidłowym dokumentem PDF."))
         c = conn()
         if not c.execute("SELECT 1 FROM china_packages WHERE id=?", (package_id,)).fetchone():
             c.close(); abort(404)
+        stored_name = f"po_{package_id}_{uuid.uuid4().hex}.pdf"
         docs_dir = os.path.join(os.path.dirname(DB_PATH), "china_documents")
         os.makedirs(docs_dir, exist_ok=True)
-        stored_name = f"po_{package_id}_{uuid.uuid4().hex}.pdf"
-        stored_path = os.path.join(docs_dir, stored_name)
-        with open(stored_path, "wb") as handle:
-            handle.write(data)
-        c.execute("INSERT INTO china_documents(package_id,original_name,document_type,stored_path,size_bytes,created_at) VALUES(?,?,?,?,?,?)",
-                  (package_id, original_name, document_type, stored_path, len(data), now_iso()))
-        c.commit(); c.close()
+        local_path = os.path.join(docs_dir, stored_name)
+        stored_path = ""
+        document_id = None
+        try:
+            with open(local_path, "wb") as handle:
+                handle.write(data)
+            stored_path = (supabase_storage_upload_file(local_path, f"china_documents/{stored_name}")
+                           if supabase_enabled() else local_path)
+            c.execute("INSERT INTO china_documents(package_id,original_name,document_type,stored_path,size_bytes,created_at) VALUES(?,?,?,?,?,?)",
+                      (package_id, original_name, document_type, stored_path, len(data), now_iso()))
+            document_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+            c.commit()
+            if supabase_enabled():
+                sync_local_rows_to_supabase("china_documents", "id", [document_id])
+                try:
+                    os.remove(local_path)
+                except OSError:
+                    app.logger.warning("Nie udało się usunąć tymczasowej kopii PDF %s", local_path)
+        except Exception:
+            c.rollback()
+            if document_id is not None:
+                c.execute("DELETE FROM china_documents WHERE id=?", (document_id,))
+                c.commit()
+            if parse_supabase_storage_ref(stored_path):
+                try:
+                    supabase_storage_delete(stored_path)
+                except Exception:
+                    app.logger.exception("Nie udało się wycofać osieroconego pliku %s", stored_name)
+            if os.path.isfile(local_path):
+                try:
+                    os.remove(local_path)
+                except OSError:
+                    app.logger.exception("Nie udało się usunąć lokalnej kopii %s", stored_name)
+            app.logger.exception("Nie udało się zapisać dokumentu przesyłki %s", package_id)
+            return redirect(url_for("china", document_error="Nie udało się trwale zapisać dokumentu. Sprawdź konfigurację Storage i migrację bazy."))
+        finally:
+            c.close()
         return redirect(url_for("china", document_uploaded=1))
+
+    def local_document_path(stored_path):
+        if os.path.isfile(stored_path):
+            return stored_path
+        # Existing rows may refer to the old instance path. An operator can
+        # restore those files into APP_DATA_DIR/china_documents with the same names.
+        restored = os.path.join(os.path.dirname(DB_PATH), "china_documents", os.path.basename(stored_path))
+        return restored if os.path.isfile(restored) else stored_path
 
     @app.get("/china/documents/<int:document_id>")
     def china_document_download(document_id):
         c = conn(); row = c.execute("SELECT * FROM china_documents WHERE id=?", (document_id,)).fetchone(); c.close()
-        if not row or not os.path.isfile(row["stored_path"]):
+        if not row:
             abort(404)
-        return send_file(row["stored_path"], mimetype="application/pdf", as_attachment=False,
+        if parse_supabase_storage_ref(row["stored_path"]):
+            try:
+                content, _ = supabase_storage_download_bytes(row["stored_path"])
+            except Exception:
+                app.logger.exception("Nie udało się pobrać dokumentu przesyłki %s", document_id)
+                return "Nie udało się pobrać dokumentu z magazynu plików", 503
+            return send_file(io.BytesIO(content), mimetype="application/pdf", as_attachment=False,
+                             download_name=row["original_name"])
+        local_path = local_document_path(row["stored_path"])
+        if not os.path.isfile(local_path):
+            return "Plik dokumentu nie jest dostępny na tym serwerze", 503
+        return send_file(local_path, mimetype="application/pdf", as_attachment=False,
                          download_name=row["original_name"])
 
     @app.post("/china/documents/<int:document_id>/delete")
@@ -512,11 +571,19 @@ def register_routes(context):
         c = conn(); row = c.execute("SELECT stored_path FROM china_documents WHERE id=?", (document_id,)).fetchone()
         if not row:
             c.close(); abort(404)
+        if supabase_enabled():
+            try:
+                supabase_delete_rows("china_documents", {"id": document_id})
+            except Exception:
+                c.close()
+                return "Nie udało się usunąć dokumentu z trwałej bazy", 503
         c.execute("DELETE FROM china_documents WHERE id=?", (document_id,)); c.commit(); c.close()
         try:
-            if os.path.isfile(row["stored_path"]):
-                os.remove(row["stored_path"])
-        except OSError:
+            if parse_supabase_storage_ref(row["stored_path"]):
+                supabase_storage_delete(row["stored_path"])
+            elif os.path.isfile(local_document_path(row["stored_path"])):
+                os.remove(local_document_path(row["stored_path"]))
+        except Exception:
             app.logger.exception("Nie udało się usunąć dokumentu P/O %s", document_id)
         return redirect(url_for("china", document_deleted=1))
 

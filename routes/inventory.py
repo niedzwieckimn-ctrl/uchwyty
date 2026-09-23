@@ -1,5 +1,7 @@
 """Mechanically extracted Flask routes; business logic is unchanged."""
 
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+
 def register_routes(context):
     globals().update(context)
 
@@ -7,6 +9,9 @@ def register_routes(context):
     @app.get("/pricing")
     def pricing():
         maybe_pull_shared_from_supabase()
+        price_list = request.args.get("list", "pln")
+        if price_list not in {"pln", "eur"}:
+            price_list = "pln"
         q = norm(request.args.get("q"))
         eur_imported = max(0, int(to_float(request.args.get("eur_imported"), 0)))
         eur_import_error = norm(request.args.get("eur_import_error"))
@@ -80,32 +85,35 @@ def register_routes(context):
 
           <div class="card">
             <form method="get" class="grid3" style="margin-bottom:10px;">
+              <input type="hidden" name="list" value="{{ price_list }}">
               <input name="q" value="{{ q }}" placeholder="Szukaj modelu">
               <button class="btn primary" type="submit">Szukaj</button>
-              <a class="btn" href="{{ url_for('pricing') }}">WyczyĹ›Ä‡</a>
+              <a class="btn" href="{{ url_for('pricing', list=price_list) }}">Wyczyść</a>
             </form>
-            <h2>Pozycje cennika</h2>
+            <nav class="flex" aria-label="Waluta cennika"><a class="btn" href="{{url_for('pricing',list='pln',q=q)}}">PLN</a><a class="btn" href="{{url_for('pricing',list='eur',q=q)}}">EUR</a></nav>
+            {% if request.args.get('saved') %}<p role="status">Cena została zapisana.</p>{% endif %}
+            {% if price_list == 'pln' %}
+            <h2>Cennik Polska — PLN</h2><p class="muted">Netto i brutto są dwiema zapisanymi cenami PLN.</p>
             <table>
-              <thead><tr><th>Model</th><th>Netto</th><th>Brutto</th></tr></thead>
+              <thead><tr><th>Model / SKU</th><th>Netto PLN</th><th>Brutto PLN</th><th>Edycja</th></tr></thead>
               <tbody>
                 {% for r in rows %}
                   <tr>
                     <td><b>{{ r['model'] }}</b></td>
                     <td>{{ "%.2f"|format(r['net_price']) }}</td>
                     <td>{{ "%.2f"|format(r['gross_price']) }}</td>
+                    <td><form method="post" action="{{url_for('pricing_update')}}" class="flex"><input type="hidden" name="list" value="pln"><input type="hidden" name="key" value="{{r['model']}}"><input name="first" aria-label="Netto PLN dla {{r['model']}}" value="{{'%.2f'|format(r['net_price'])}}" required><input name="second" aria-label="Brutto PLN dla {{r['model']}}" value="{{'%.2f'|format(r['gross_price'])}}" required><button class="btn">Zapisz</button></form></td>
                   </tr>
                 {% endfor %}
                 {% if not rows %}
-                  <tr><td colspan="3" class="muted">Brak pozycji cennika.</td></tr>
+                  <tr><td colspan="4" class="muted">Brak pozycji cennika.</td></tr>
                 {% endif %}
               </tbody>
             </table>
-          </div>
-
-          <div class="card">
-            <h2>Pozycje cennika UE</h2>
+            {% else %}
+            <h2>Cennik UE — EUR</h2><p class="muted">PREIS EUR to cena transakcyjna B2B. UVP EUR to osobna cena sugerowana; nie jest kwotą brutto z VAT.</p>
             <table>
-              <thead><tr><th>SKU</th><th>EAN</th><th>Cena EUR</th><th>UVP EUR</th></tr></thead>
+              <thead><tr><th>SKU</th><th>EAN</th><th>PREIS EUR</th><th>UVP EUR</th><th>Edycja</th></tr></thead>
               <tbody>
                 {% for r in eur_rows %}
                   <tr>
@@ -113,13 +121,15 @@ def register_routes(context):
                     <td>{{ r['ean'] or '-' }}</td>
                     <td>{{ "%.2f"|format(r['price_eur']) }} EUR</td>
                     <td>{{ "%.2f"|format(r['uvp_eur']) }} EUR</td>
+                    <td><form method="post" action="{{url_for('pricing_update')}}" class="flex"><input type="hidden" name="list" value="eur"><input type="hidden" name="key" value="{{r['sku']}}"><input name="first" aria-label="PREIS EUR dla {{r['sku']}}" value="{{'%.2f'|format(r['price_eur'])}}" required><input name="second" aria-label="UVP EUR dla {{r['sku']}}" value="{{'%.2f'|format(r['uvp_eur'])}}" required><button class="btn">Zapisz</button></form></td>
                   </tr>
                 {% endfor %}
                 {% if not eur_rows %}
-                  <tr><td colspan="4" class="muted">Cennik UE nie został jeszcze zaimportowany.</td></tr>
+                  <tr><td colspan="5" class="muted">Cennik UE nie został jeszcze zaimportowany.</td></tr>
                 {% endif %}
               </tbody>
             </table>
+            {% endif %}
           </div>
         {% endblock %}
         """
@@ -134,7 +144,55 @@ def register_routes(context):
             eur_imported=eur_imported,
             eur_import_error=eur_import_error,
             eur_local_saved=eur_local_saved,
+            price_list=price_list,
         )
+
+    @app.post("/pricing/update")
+    def pricing_update():
+        price_list = request.form.get("list")
+        key_value = norm(request.form.get("key"))
+        if price_list not in {"pln", "eur"} or not key_value:
+            return "Nieprawidłowa pozycja cennika", 400
+        def amount(raw):
+            value = Decimal(str(raw).strip().replace(",", "."))
+            if not value.is_finite() or value < 0 or value > Decimal("999999999"):
+                raise ValueError()
+            return float(value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+        try:
+            first, second = amount(request.form.get("first")), amount(request.form.get("second"))
+        except (InvalidOperation, ValueError):
+            return "Podaj poprawne, nieujemne kwoty z maksymalnie dwoma miejscami po przecinku", 400
+        table, identity, fields = (("pricing", "model", ("net_price", "gross_price"))
+                                   if price_list == "pln" else
+                                   ("pricing_eur", "sku", ("price_eur", "uvp_eur")))
+        c = conn()
+        try:
+            row = c.execute(f"SELECT * FROM {table} WHERE {identity}=?", (key_value,)).fetchone()
+            if row is None:
+                return "Pozycja cennika nie istnieje", 404
+            updated = dict(row)
+            updated[fields[0]], updated[fields[1]] = first, second
+            if price_list == "eur":
+                updated["updated_at"] = now_iso()
+            if supabase_enabled():
+                supabase_upsert_rows(table, [updated], identity)
+            c.execute(f"UPDATE {table} SET {fields[0]}=?,{fields[1]}=?" +
+                      (",updated_at=?" if price_list == "eur" else "") +
+                      f" WHERE {identity}=?",
+                      (first, second, updated["updated_at"], key_value) if price_list == "eur"
+                      else (first, second, key_value))
+            c.commit()
+            from internal_audit import SUCCESS, try_record_audit_event
+            try_record_audit_event("inventory.pricing.update", result=SUCCESS,
+                actor_context=current_actor_context(), entity_type=table,
+                entity_id=key_value, before_state={field: row[field] for field in fields},
+                after_state={field: updated[field] for field in fields})
+        except Exception:
+            app.logger.exception("Nie udało się zapisać ceny")
+            return "Nie udało się trwale zapisać ceny", 503
+        finally:
+            c.close()
+        return redirect(url_for("pricing", list=price_list, q=key_value, saved=1))
 
 
 
