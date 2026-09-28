@@ -58,7 +58,10 @@
   let inventoryFastVoiceActive = false;
   let inventoryFastRetryReady = false;
   let agentController = null;
+  let recoveryController = null;
   let agentGeneration = 0;
+  let typedMessageGeneration = 0;
+  let recordingTypedGeneration = 0;
   let voiceState = 'ready';
   let captureGeneration = 0;
   let recordingStarted = 0;
@@ -82,6 +85,7 @@
   const voiceLabels = {
     ready:'Voice: gotowy', recording:'Voice: słucham...', requesting:'Voice: przetwarzam...',
     transcribing:'Voice: przetwarzam...', agent:'Voice: przetwarzam...',
+    transcript_ready:'Voice: rozpoznany tekst czeka w polu wiadomości',
     tts:'Voice: przygotowuję odpowiedź…', playing:'Voice: odtwarzanie…',
     stt_error:'Voice: błąd STT', agent_error:'Voice: błąd agenta',
     tts_error:'Voice: tekst OK, błąd TTS',
@@ -428,6 +432,31 @@
     return 'Nie udało się teraz pobrać odpowiedzi. Spróbuj ponownie.';
   }
 
+  function agentDiagnostic(stage, {response, data = {}, trace = {}, transport = false, timeout = false} = {}) {
+    // Deliberately omit messages, transcripts, tool arguments, response bodies and headers.
+    const code = /^[A-Z][A-Z0-9_]{0,63}$/.test(data.error_code || '') ? data.error_code : '';
+    const categories = new Set(['gate', 'model', 'provider', 'transport', 'runtime']);
+    let category = categories.has(data.failure_category) ? data.failure_category : 'runtime';
+    if (transport) category = 'transport';
+    else if (categories.has(data.failure_category)) category = data.failure_category;
+    else if (data.status === 'DENIED' || [401, 403, 409, 429].includes(response?.status)) category = 'gate';
+    else if (code.startsWith('PROVIDER_')) category = 'provider';
+    else if (['MODEL_FAILED', 'MODEL_NOT_CONFIGURED', 'RESPONSE_TOO_LARGE', 'REPEATED_TOOL_CALL'].includes(code)
+        || data.model_status === 'FAILED') category = 'model';
+    const entry = {stage, category, timeout};
+    if (Number.isInteger(response?.status)) entry.http_status = response.status;
+    for (const [key, value] of Object.entries({error_code:code, status:data.status,
+      model_status:data.model_status, synthesis_error_code:data.synthesis_error_code,
+      execution_status:data.execution_outcome?.execution_status})) {
+      if (typeof value === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(value)) entry[key] = value;
+    }
+    for (const [key, value] of Object.entries({turn_id:trace.turn_id,
+      agent_run_id:data.agent_run_id, request_id:data.request_id})) {
+      if (typeof value === 'string' && /^[a-zA-Z0-9_-]{1,96}$/.test(value)) entry[key] = value;
+    }
+    console.info('AI_CLIENT_ERROR', JSON.stringify(entry));
+  }
+
   function setAgentBusy(value) {
     busy = value;
     send.disabled = value;
@@ -439,6 +468,8 @@
     agentGeneration += 1;
     if (agentController) agentController.abort();
     agentController = null;
+    if (recoveryController) recoveryController.abort();
+    recoveryController = null;
     setAgentBusy(false);
   }
 
@@ -501,40 +532,70 @@
     }
   }
 
-  async function recoverApprovedExecution(approvalId) {
+  async function recoverApprovedExecution(approvalId, recoveryConversation, isCurrent) {
+    if (!isCurrent()) return null;
+    const controller = new AbortController();
+    recoveryController = controller;
     const deadline = Date.now() + 60000;
-    while (Date.now() < deadline) {
-      try {
-        const query = conversationId ? `?conversation_id=${encodeURIComponent(conversationId)}` : '';
-        const response = await fetch(
-          `/api/internal/ai/approvals/${encodeURIComponent(approvalId)}/outcome${query}`,
-          {method:'GET', credentials:'same-origin', headers:{'Accept':'application/json'}}
-        );
-        const result = await response.json().catch(() => ({}));
-        if (response.ok && result.status === 'SUCCESS'
-            && typeof result.message === 'string' && result.message
-            && result.turn_released !== false) {
-          return result;
+    // This timer also interrupts a pending fetch or response body, not just polling.
+    const timer = window.setTimeout(() => controller.abort(), 60000);
+    const active = () => isCurrent() && !controller.signal.aborted && Date.now() < deadline;
+    try {
+      while (active()) {
+        try {
+          const query = recoveryConversation ? `?conversation_id=${encodeURIComponent(recoveryConversation)}` : '';
+          const response = await fetch(
+            `/api/internal/ai/approvals/${encodeURIComponent(approvalId)}/outcome${query}`,
+            {method:'GET', credentials:'same-origin', headers:{'Accept':'application/json'}, signal:controller.signal}
+          );
+          if (!active()) return null;
+          const result = await response.json().catch(() => ({}));
+          if (!active()) return null;
+          if (response.ok && result.status === 'SUCCESS'
+              && typeof result.message === 'string' && result.message
+              && result.turn_released !== false) {
+            return result;
+          }
+          const executionStatus = result.execution_outcome?.execution_status;
+          if (['FAILED', 'DENIED', 'CONFLICT'].includes(executionStatus)) return null;
+          if ([401, 403, 404].includes(response.status)) {
+            agentDiagnostic('approval_recovery', {response, data:result});
+            return null;
+          }
+        } catch (_) {
+          if (!active()) break;
         }
-        const executionStatus = result.execution_outcome?.execution_status;
-        if (['FAILED', 'DENIED', 'CONFLICT'].includes(executionStatus)) return null;
-      } catch (_) {}
-      await new Promise(resolve => window.setTimeout(resolve, 500));
+        await new Promise(resolve => {
+          let pause;
+          const finish = () => {
+            window.clearTimeout(pause);
+            controller.signal.removeEventListener('abort', finish);
+            resolve();
+          };
+          controller.signal.addEventListener('abort', finish, {once:true});
+          pause = window.setTimeout(finish, Math.min(500, Math.max(0, deadline - Date.now())));
+          if (!active()) finish();
+        });
+      }
+      if (isCurrent()) agentDiagnostic('approval_recovery', {transport:true, timeout:true});
+      return null;
+    } finally {
+      window.clearTimeout(timer);
+      if (recoveryController === controller) recoveryController = null;
     }
-    return null;
   }
 
   function acceptsAgentStream() {
     return typeof ReadableStream !== 'undefined' && typeof TextDecoder !== 'undefined';
   }
 
-  function agentDisplayHandler(row, controller, generation, started) {
+  function agentDisplayHandler(row, controller, generation, started, trace = {}) {
     const bubble = row.querySelector('.ai-bubble');
     let displayText = '', firstDeltaRendered = false, turnId = '';
     return (event, value) => {
       if (generation !== agentGeneration || agentController !== controller || controller.signal.aborted) return;
       if (event === 'turn_started') {
-        if (typeof value.turn_id === 'string') turnId = value.turn_id;
+        if (typeof value.turn_id === 'string') trace.turn_id = turnId = value.turn_id;
         if (typeof value.conversation_id === 'string') conversationId = value.conversation_id;
       }
       if (event !== 'display_delta' || typeof value.delta !== 'string' || !value.delta) return;
@@ -557,6 +618,10 @@
   async function submitMessage(text, fromVoice = false, voiceRoundtripStarted = 0) {
     const message = text.trim();
     if (!message || busy) return;
+    if (!fromVoice) {
+      typedMessageGeneration += 1;
+      if (voiceState === 'transcript_ready') setVoiceState('ready');
+    }
     inventoryFastRetryReady = false;
     setAgentBusy(true);
     addMessage('user', message);
@@ -571,8 +636,10 @@
     const timer = window.setTimeout(() => controller.abort(), 120000);
     const agentStarted = performance.now();
     let earlySpeechStarted = false;
+    let response;
+    const trace = {};
     try {
-      const response = await fetch('/api/internal/ai/chat', {
+      response = await fetch('/api/internal/ai/chat', {
         method: 'POST',
         credentials: 'same-origin',
         headers: {'Content-Type': 'application/json', 'Accept': acceptsAgentStream() ? 'text/event-stream' : 'application/json'},
@@ -580,7 +647,7 @@
           voice_fast_mode: fromVoice}),
         signal: controller.signal
       });
-      const showAgentEvent = agentDisplayHandler(loading, controller, generation, agentStarted);
+      const showAgentEvent = agentDisplayHandler(loading, controller, generation, agentStarted, trace);
       const data = await readAgentResponse(response, (event, value) => {
         showAgentEvent(event, value);
         if (fromVoice && event === 'speech_ready' && !earlySpeechStarted
@@ -653,26 +720,33 @@
             const generation = ++agentGeneration;
             agentController = controller;
             const isCurrent = () => generation === agentGeneration && agentController === controller;
+            const approvalConversation = conversationId;
             const timer = window.setTimeout(() => controller.abort(), 120000);
             const started = performance.now();
             const answer = addMessage('assistant', 'Asystent sprawdza dane...', 'ai-loading');
             const answerBubble = answer.querySelector('.ai-bubble');
+            let response;
+            const trace = {};
             try {
-              const response = await fetch(`/api/internal/ai/approvals/${encodeURIComponent(approval.approval_id)}/${action}`, {
+              response = await fetch(`/api/internal/ai/approvals/${encodeURIComponent(approval.approval_id)}/${action}`, {
                 method: 'POST', credentials: 'same-origin', headers: {'Content-Type': 'application/json',
                   'Accept':acceptsAgentStream() ? 'text/event-stream' : 'application/json'},
-                body: JSON.stringify({conversation_id: conversationId}), signal:controller.signal
+                body: JSON.stringify({conversation_id: approvalConversation}), signal:controller.signal
               });
               let result = await readAgentResponse(response,
-                agentDisplayHandler(answer, controller, generation, started), controller.signal);
+                agentDisplayHandler(answer, controller, generation, started, trace), controller.signal);
               if (!isCurrent()) return;
               if (controller.signal.aborted) throw new Error('AGENT_STREAM_CANCELLED');
               const storedSuccess = result.execution_outcome?.execution_status === 'SUCCESS'
                 && result.execution_outcome?.result?.status === 'SUCCESS';
+              if (!response.ok || result._streamFailed || (result.model_status && result.model_status !== 'SUCCESS')) {
+                agentDiagnostic('approval_result', {response, data:result, trace});
+              }
               if (storedSuccess && (result._streamFailed
                   || (result.model_status && result.model_status !== 'SUCCESS')
                   || typeof result.message !== 'string')) {
-                const recovered = await recoverApprovedExecution(approval.approval_id);
+                const recovered = await recoverApprovedExecution(approval.approval_id, approvalConversation, isCurrent);
+                if (!isCurrent()) return;
                 if (recovered) result = recovered;
               }
               if (typeof result.conversation_id === 'string') conversationId = result.conversation_id;
@@ -693,8 +767,9 @@
               if (!response.ok || result.status === 'NOOP') buttons.forEach(b => b.disabled = false);
             } catch (_) {
               if (!isCurrent()) return;
+              agentDiagnostic('approval_transport', {response, trace, transport:true, timeout:controller.signal.aborted});
               const recovered = action === 'approve'
-                ? await recoverApprovedExecution(approval.approval_id) : null;
+                ? await recoverApprovedExecution(approval.approval_id, approvalConversation, isCurrent) : null;
               if (!isCurrent()) return;
               answer.classList.toggle('ai-loading', false);
               if (recovered) {
@@ -720,6 +795,7 @@
         }
       }
       if (!response.ok || data._streamFailed || data.status !== 'SUCCESS') {
+        agentDiagnostic('chat_result', {response, data, trace});
         loading.classList.toggle('error', true);
         bubble.textContent = friendlyError(response, data);
         if (fromVoice) setVoiceState('agent_error');
@@ -736,6 +812,7 @@
       }
     } catch (_error) {
       if (!isCurrent()) return;
+      agentDiagnostic('chat_transport', {response, trace, transport:true, timeout:controller.signal.aborted});
       loading.classList.toggle('ai-loading', false);
       loading.classList.toggle('error', true);
       bubble.textContent = 'Nie udało się odczytać pełnego wyniku. Sprawdź stan operacji przed ponowieniem.';
@@ -798,24 +875,36 @@
       if (generation !== captureGeneration) return;
       voiceDiagnostic('VOICE_STT_DONE', {stage:'stt_done',
         latency_ms:Math.round(performance.now() - recordingStarted)});
-      input.value = data.text.trim();
+      const transcript = data.text.trim();
+      if (busy || recordingTypedGeneration !== typedMessageGeneration || input.value.trim()) {
+        // A typed interaction takes priority. Keep speech as an explicit draft,
+        // including any text the user has started typing; never auto-send it later.
+        const draft = input.value.trim();
+        input.value = draft && draft !== transcript ? `${draft}\n${transcript}` : transcript;
+        setVoiceState('transcript_ready');
+        voiceDiagnostic('VOICE_TRANSCRIPT_DEFERRED', {stage:'stt_done'});
+        if (!busy) input.focus();
+        return;
+      }
+      input.value = transcript;
       await submitMessage(input.value, true, recordingStarted);
     } catch (error) {
       if (controller.signal.aborted || generation !== captureGeneration) return;
       voiceDiagnostic('VOICE_STT_ERROR', {stage, ...details, http_status:httpStatus,
         latency_ms:Math.round(performance.now() - started), error_code:error.voiceCode || 'STT_NETWORK_ERROR'});
       setVoiceState('stt_error');
-      input.disabled = false;
-      input.focus();
+      input.disabled = busy;
+      if (!busy) input.focus();
     } finally {
       if (sttController === controller) sttController = null;
     }
   }
 
   async function startRecording() {
-    if (busy || !['ready','stt_error','agent_error','tts_error','playback_error'].includes(voiceState)) return;
+    if (busy || !['ready','transcript_ready','stt_error','agent_error','tts_error','playback_error'].includes(voiceState)) return;
     if (playingAudio || playingUrl) stopSpeech('replaced');
     const generation = ++captureGeneration;
+    recordingTypedGeneration = typedMessageGeneration;
     const started = performance.now();
     let stage = 'capture_support';
     voiceDiagnostic('VOICE_CAPTURE_START', {stage});

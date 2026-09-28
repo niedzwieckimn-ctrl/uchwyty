@@ -1,0 +1,115 @@
+{% extends 'base.html' %}
+{% block content %}
+<style>
+.source-grid{display:grid;gap:16px}.source-card{background:#fff;border:1px solid #e0e6ee;border-radius:14px;padding:20px}.source-card h2{margin-top:0}.source-row{display:flex;gap:12px;flex-wrap:wrap;align-items:end}.source-row label{display:grid;gap:5px}.source-row input,.source-row select{padding:9px;max-width:320px}.source-note{color:#526176;font-size:13px}.source-error{color:#a71937;font-weight:700}.source-ok{color:#136a40}.source-scroll{overflow:auto}.source-table{border-collapse:collapse;width:100%;font-size:13px}.source-table td,.source-table th{text-align:left;border-bottom:1px solid #e2e7ef;padding:9px;vertical-align:top}.source-table th{background:#f3f6fa}.source-amount{font-variant-numeric:tabular-nums;white-space:nowrap}.source-choice{margin-top:12px;padding:12px;background:#f3f6fa;border-radius:8px}.source-choice fieldset{border:0;padding:10px 0;margin:0}.source-choice select{padding:9px;max-width:100%}.source-receipt{display:flex;flex-wrap:wrap;gap:12px;padding:10px 0;border-bottom:1px solid #dfe5ee}.source-receipt input[type=number]{width:90px;padding:6px}.source-choice [hidden]{display:none!important}.source-meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px}.source-meta dt{font-size:12px;color:#526176}.source-meta dd{margin:3px 0 8px;overflow-wrap:anywhere}.source-actions{display:flex;flex-wrap:wrap;gap:10px;margin-top:14px}
+.source-grid{grid-template-columns:minmax(0,1fr)}.source-card{min-width:0}
+</style>
+<div class="source-grid">
+ <section class="source-card"><h1>Uzgodnienie kosztów i dostaw</h1>
+ <p><strong>{{ remanent.remanent_no }}</strong> · Rok {{ remanent.inventory_year }} · {{ 'zamknięty' if remanent.status=='COMPLETED' else ('szkic' if remanent.phase=='DRAFT' else 'liczenie w toku') }}</p>
+ <a class="btn" href="{{ url_for('remanent_detail',session_id=remanent.session_id) }}">Wróć do spisu</a>
+ {% if remanent.status=='COMPLETED' %}<a class="btn primary" href="{{ url_for('remanent_sources_export',session_id=remanent.session_id) }}">Eksport zamkniętego wyniku JSON</a>{% endif %}
+ {% if error %}<p class="source-error" role="alert">{{ error }}</p>{% endif %}
+ {% if saved %}<p class="source-ok" role="status">Zapisano. Fizyczny stan magazynu nie został zmieniony.</p>{% endif %}
+ <p>Datę dokumentu/importu i datę fizycznego przyjęcia rozliczamy osobno. SKU wskazuje produkt; powiązanie z dostawą wymaga Twojej decyzji.</p>
+ </section>
+
+ <section class="source-card"><h2>Metoda wyceny i podstawa kosztów</h2>
+ {% if settings %}<p>Wybrano: <strong>średnia ważona okresowa</strong> · {{ basis_labels.get(settings.basis,settings.basis) }}.</p>{% if settings.manual_basis_confirmed %}<p>Potwierdzono zgodność podstawy ręcznie wpisanych kosztów.</p>{% endif %}{% else %}<p>Metoda nie została jeszcze wybrana.</p>{% endif %}
+ <p class="source-note">Wybór technicznej metody wyceny nie oznacza automatycznej akceptacji podatkowej.</p>
+ {% if remanent.phase=='DRAFT' %}
+ <form method="post" action="{{ url_for('remanent_sources_method',session_id=remanent.session_id) }}" class="source-row">
+ <label>Metoda <select name="method" required><option value="">Wybierz metodę</option><option value="periodic_weighted_average">Średnia ważona okresowa</option></select></label>
+ <label>Podstawa kosztów <select name="basis" required><option value="">Wybierz podstawę</option>{% for value,label in basis_labels.items() %}<option value="{{ value }}">{{ label }}</option>{% endfor %}</select></label>
+ <label><span><input type="checkbox" name="confirmed" value="yes" required> Potwierdzam metodę i podstawę dla tego spisu</span></label>
+ <label><span><input type="checkbox" name="confirm_manual_basis" value="yes"> Potwierdzam, że ręczne koszty stanu początkowego i zakupów historycznych wpisano w wybranej podstawie</span></label>
+ <button class="btn primary">Zapisz wybór</button></form><p class="source-note">Potwierdzenie ręcznych kosztów jest potrzebne tylko wtedy, gdy spis korzysta z takich wpisów.</p>
+ {% else %}<p class="source-note">Źródła i metodę wybiera się przed rozpoczęciem spisu. Wynik rozpoczętego spisu korzysta z utrwalonych danych.</p>{% endif %}
+ </section>
+
+ {% if remanent.phase=='DRAFT' %}
+ <section class="source-card"><h2>1. Wczytaj plik z Rocznego Rozliczenia</h2>
+ <form method="post" enctype="multipart/form-data" action="{{ url_for('remanent_sources_preview',session_id=remanent.session_id) }}" class="source-row">
+ <label>Plik uzgodnienia JSON v2, maks. 5 MB <input type="file" name="file" accept=".json,application/json" required></label><button class="btn primary">Pokaż podgląd</button></form>
+ <p class="source-note">Przenosimy koszty i historię źródeł. Ten import nie zwiększa fizycznego stock. Brak kosztu pozostaje brakiem i może blokować zatwierdzenie wyceny.</p>
+ </section>
+ {% endif %}
+
+ {% if plan %}
+ <section class="source-card"><h2>2. Sprawdź {{ plan.rows|length }} pozycji i wybierz działanie dla każdej</h2>
+ <p>{{ plan.message }}</p><p class="source-note">Poprzednie decyzje są pokazane informacyjnie. Żadna pozycja nie zostanie automatycznie zaakceptowana.</p>
+ <form method="post" enctype="multipart/form-data" action="{{ url_for('remanent_sources_commit',session_id=remanent.session_id) }}" id="source-decisions">
+ <input type="hidden" name="fingerprint" value="{{ plan.fingerprint }}">
+ {% for row in plan.rows %}{% set s=row.source %}
+ <article class="source-card" style="margin:14px 0" data-source-line="{{ row.key }}">
+ <h3>{{ loop.index }}. {{ s.sku }} — {{ status_labels.get(row.status,row.status) }}</h3>
+ <dl class="source-meta">
+ <div><dt>Źródło / pozycja</dt><dd>{{ s.source_import_id }} / {{ s.line_id }}</dd></div>
+ {% if s.source_reference %}<div><dt>Opis źródła</dt><dd>{{ s.source_reference }}</dd></div>{% endif %}
+ <div><dt>Wersja / rok</dt><dd>{{ s.source_version }} / {{ s.inventory_year }}</dd></div>
+ <div><dt>Dokument / dostawca</dt><dd>{{ s.document_no or 'brak' }} / {{ s.supplier or 'brak' }}</dd></div>
+ <div><dt>Data dokumentu/importu</dt><dd>{{ s.document_date }}</dd></div>
+ <div><dt>Data przyjęcia ze źródła</dt><dd>{{ s.received_date or 'brak — ustal osobno' }}</dd></div>
+ <div><dt>Ilość źródłowa</dt><dd class="source-amount">{{ s.quantity }} szt.</dd></div>
+ <div><dt>Podstawa kosztów</dt><dd>{{ basis_labels.get(s.valuation_basis,s.valuation_basis) }}</dd></div>
+ <div><dt>Koszt pozycji / 1 szt. PLN</dt><dd class="source-amount">{{ s.get('line_value_pln') if s.get('line_value_pln') is not none else 'BRAK' }} / {{ s.get('unit_value_pln') if s.get('unit_value_pln') is not none else 'BRAK' }}</dd></div>
+ </dl>
+ {% if row.previous_decision %}<p class="source-note">Poprzednia decyzja: {{ action_labels.get(row.previous_decision.action,row.previous_decision.action) }}{% if row.previous_decision.received_date %}, przyjęcie {{ row.previous_decision.received_date }}{% endif %}.{% for allocation in row.previous_decision.allocations %} Przyjęcie {{ allocation.receipt_key }}: {{ allocation.quantity }} szt.{% endfor %}</p>{% endif %}
+ <div class="source-choice">
+ <label for="action-{{ row.key }}"><strong>Twoja decyzja</strong></label>
+ <select id="action-{{ row.key }}" name="action_{{ row.key }}" class="source-action" required>
+ <option value="">Wybierz działanie</option><option value="exclude">Wyłącz tę pozycję</option>
+ {% if row.product_id %}{% if s.kind=='opening' %}<option value="opening">Potwierdź stan początkowy</option>{% else %}
+ {% if row.candidates %}<option value="link">Powiąż koszty z istniejącymi przyjęciami</option>{% endif %}
+ <option value="history">Włącz zakup historyczny bez zmiany magazynu</option>{% endif %}{% endif %}</select>
+ {% if not row.product_id %}<p class="source-error">Nie można przypisać kosztów do nieznanego lub niejednoznacznego SKU. Wyłącz pozycję i wyjaśnij katalog przed kolejnym importem.</p>{% endif %}
+ <fieldset data-action="link" hidden disabled><legend>Przyjęcia tego SKU — wskaż każde powiązanie i ilość</legend>
+ {% for receipt in row.candidates %}{% set field=row.key ~ '_' ~ loop.index0 %}
+ <div class="source-receipt"><label><input type="checkbox" name="receipt_{{ field }}" value="yes" class="receipt-choice" {{ 'disabled' if receipt.quantity is none else '' }}> {{ receipt.document_no or 'bez numeru dokumentu' }} · {{ receipt.supplier or 'bez dostawcy' }} · przyjęto {{ receipt.received_date }} · {{ receipt.quantity if receipt.quantity is not none else 'ilość nieznana' }} szt. ({{ receipt.receipt_key }})</label>
+ <label>Przypisz szt. <input type="number" name="quantity_{{ field }}" min="1" max="{{ receipt.quantity if receipt.quantity is not none else 0 }}" step="1" class="receipt-quantity" disabled></label></div>
+ {% else %}<p>Brak przyjęć dla tego SKU.</p>{% endfor %}
+ <p class="source-note">Możesz powiązać kilka częściowych dostaw. Łączna ilość nie może przekroczyć źródła ani wolnej ilości przyjęć. Koszty nie zwiększą ponownie stanu.</p>
+ </fieldset>
+ <fieldset data-action="history" hidden disabled><legend>Zakup historyczny</legend>
+ <label>Potwierdzona data fizycznego przyjęcia <input type="date" name="received_{{ row.key }}" required></label>
+ <p><label><input type="checkbox" name="history_confirm_{{ row.key }}" value="yes" required> Włączam {{ s.quantity }} szt. do historii spisu bez zwiększania fizycznego stanu magazynu</label></p>
+ </fieldset>
+ <fieldset data-action="opening" hidden disabled><legend>Stan początkowy na 1 stycznia {{ s.inventory_year }}</legend>
+ <p>Źródło: {{ s.source_reference or s.source_import_id }}, pozycja {{ s.line_id }}. Ilość: {{ s.quantity }} szt. Wartość: {{ s.get('line_value_pln') if s.get('line_value_pln') is not none else 'BRAK' }} PLN.</p>
+ <label><input type="checkbox" name="opening_confirm_{{ row.key }}" value="yes" required> Potwierdzam te dane źródłowe stanu początkowego</label>
+ </fieldset>
+ </div></article>
+ {% endfor %}
+ <h3>3. Zapisz sprawdzone uzgodnienie</h3>
+ <div class="source-row"><label>Wybierz ponownie dokładnie ten sam plik <input type="file" name="file" accept=".json,application/json" required></label><button class="btn primary">Zapisz decyzje i źródła</button></div>
+ <p class="source-note">Przy zapisie ponownie sprawdzamy plik i aktualne przyjęcia. Zmiana wersji źródła jest przechowywana w historii.</p>
+ </form></section>
+ <section class="source-card"><h2>Przyjęcia magazynowe bez zapisanego powiązania</h2>
+ <p class="source-note">{{ plan.warehouse_only|length }} pozycji. Zestawienie przedstawia stan przed decyzjami w tym formularzu. Brak źródła kosztu wymaga wyjaśnienia.</p>
+ <div class="source-scroll"><table class="source-table"><thead><tr><th>SKU / przyjęcie</th><th>Dokument / dostawca</th><th>Data fizycznego przyjęcia</th><th>Ilość</th></tr></thead><tbody>
+ {% for receipt in plan.warehouse_only %}<tr><td>{{ receipt.sku or 'SKU nieustalone' }}<br>{{ receipt.receipt_key }}</td><td>{{ receipt.document_no or 'brak' }}<br>{{ receipt.supplier or 'brak' }}</td><td>{{ receipt.received_date }}</td><td>{{ receipt.quantity if receipt.quantity is not none else 'nieustalona' }}</td></tr>{% else %}<tr><td colspan="4">Brak niepowiązanych przyjęć.</td></tr>{% endfor %}
+ </tbody></table></div></section>
+ {% endif %}
+</div>
+<script>
+document.querySelectorAll('[data-source-line]').forEach(line => {
+  const action = line.querySelector('.source-action');
+  const sync = () => {
+    line.querySelectorAll('fieldset[data-action]').forEach(group => {
+      const active = group.dataset.action === action.value;
+      group.hidden = !active;
+      group.disabled = !active;
+    });
+    line.querySelectorAll('.source-receipt').forEach(receipt => {
+      const checked = receipt.querySelector('.receipt-choice').checked;
+      const quantity = receipt.querySelector('.receipt-quantity');
+      quantity.disabled = action.value !== 'link' || !checked;
+      quantity.required = action.value === 'link' && checked;
+    });
+  };
+  action.addEventListener('change', sync);
+  line.querySelectorAll('.receipt-choice').forEach(input => input.addEventListener('change', sync));
+  sync();
+});
+</script>
+{% endblock %}

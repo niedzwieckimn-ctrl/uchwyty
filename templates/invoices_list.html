@@ -22,6 +22,9 @@
         {% else %}<span class="status-pill status-wait">Niewysłana</span>{% endif %}
       </td>
       <td class="actions-cell">
+        {% if not inv.publication_complete %}
+        {% if inv.source_order_id %}<a class="compact-action" href="{{ url_for('order_invoice',order_id=inv.source_order_id) }}">Dokończ dokument</a>{% endif %}
+        {% else %}
         <a class="compact-action" href="{{ url_for('invoice_download_admin', invoice_id=inv.id) }}" target="_blank">PDF</a>
         {% if not inv.sent_to_client %}<form method="post" action="{{ url_for('invoice_send_admin', invoice_id=inv.id) }}"><input type="hidden" name="next" value="{{ request.full_path }}"><button class="compact-action primary" type="submit">Wyślij</button></form>{% endif %}
         <details class="action-menu"><summary title="Więcej akcji">⋮</summary><div class="action-menu-popover">
@@ -29,6 +32,7 @@
           {% if not inv.paid %}<form method="post" action="{{ url_for('invoice_payment_reminder_admin', invoice_id=inv.id) }}"><input type="hidden" name="next" value="{{ request.full_path }}"><button type="submit">Przypomnij o płatności</button></form><form method="post" action="{{ url_for('invoice_paid_admin', invoice_id=inv.id) }}"><input type="hidden" name="next" value="{{ request.full_path }}"><button type="submit">Oznacz jako zapłaconą</button></form>{% else %}<form method="post" action="{{ url_for('invoice_unpaid_admin', invoice_id=inv.id) }}"><input type="hidden" name="next" value="{{ request.full_path }}"><button type="submit">Cofnij opłacenie</button></form>{% endif %}
           {% if inv.ksef_status != 'sent' %}<a href="{{ url_for('invoice_ksef_xml', invoice_id=inv.id) }}">Pobierz XML KSeF</a><form method="post" action="{{ url_for('invoice_ksef_validate', invoice_id=inv.id) }}"><input type="hidden" name="next" value="{{ request.full_path }}"><button type="submit">Sprawdź KSeF</button></form><form method="post" action="{{ url_for('invoice_ksef_send', invoice_id=inv.id) }}" onsubmit="return confirm('UWAGA: to jest realna wysyłka faktury do KSeF. Kontynuować?');"><input type="hidden" name="next" value="{{ request.full_path }}"><button type="submit">Wyślij do KSeF</button></form><a href="{{ url_for('invoice_edit_admin', invoice_id=inv.id) }}">Edytuj</a><form method="post" action="{{ url_for('invoice_delete_admin', invoice_id=inv.id) }}" onsubmit="return confirm('Usunąć fakturę {{ inv.invoice_no }}?');"><input type="hidden" name="next" value="{{ request.full_path }}"><button class="danger-text" type="submit">Usuń</button></form>{% else %}<form method="post" action="{{ url_for('invoice_rollback_admin', invoice_id=inv.id) }}" onsubmit="return confirm('AWARYJNIE cofnąć fakturę {{ inv.invoice_no }} w aplikacji?');"><input type="hidden" name="next" value="{{ request.full_path }}"><button class="danger-text" type="submit">Cofnij fakturę</button></form>{% endif %}
         </div></details>
+        {% endif %}
       </td>
     </tr>
     <tr class="invoice-details" hidden><td colspan="10"><div class="detail-grid"><div><span>Zamówienie</span><b>{{ inv.order_display }}</b></div><div><span>PDF</span><b>{{ 'Dostępny' if inv.pdf_ok else 'Brak PDF' }}</b></div><div><span>Numer KSeF</span><b>{{ inv.ksef_number or '—' }}</b></div><div><span>Wysłanie KSeF</span><b>{{ inv.ksef_sent_at or '—' }}</b></div><div><span>Pobranie PDF</span><b>{{ inv.seen_at or '—' }}</b></div><div><span>Zapłata</span><b>{{ inv.paid_at or '—' }}</b></div></div></td></tr>
