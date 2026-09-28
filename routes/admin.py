@@ -73,6 +73,7 @@ def register_routes(context):
         status_divisor = max(1, status_total)
         overdue_count = dashboard["overdue_count"]
         overdue_total = dashboard["overdue_amount"]
+        overdue_currency_totals = dashboard["overdue_by_currency"]
         replenishment_rows = dashboard["replenishment_items"][:5]
         replenishment_count = dashboard["replenishment_count"]
 
@@ -95,7 +96,7 @@ def register_routes(context):
             <a class="metric metric-link" href="{{ url_for('orders', tab='all', created_today=1) }}" aria-label="Pokaż zamówienia utworzone dzisiaj"><div class="icon">▣</div><div><span>Nowe zamówienia</span><b>{{ n_orders_today }}</b><small>{{ n_orders_current }} aktualnie w toku</small></div></a>
             <a class="metric metric-link" href="{{ url_for('orders', tab='all', issued_today=1) }}" aria-label="Pokaż zamówienia wydane dzisiaj" style="--soft:#eaf9f4;--tone:#1aa176"><div class="icon">◇</div><div><span>Wydane dzisiaj</span><b>{{ n_issued_today }}</b><small>{{ n_stock_qty }} szt. na stanie</small></div></a>
             <a class="metric" href="{{ url_for('orders', tab='new', ready_today=1) }}" style="--soft:#eaf9f4;--tone:#16835f;text-decoration:none;color:inherit"><div class="icon">✓</div><div><span>Możesz wydać dziś</span><b>{{ n_issuable_today }}</b><small title="{{ issuable_order_labels|join(', ') }}">{{ issuable_order_labels|join(', ') if issuable_order_labels else 'Brak kompletnych zamówień' }}</small></div></a>
-            <a class="metric" href="{{ url_for('overdue_payments') }}" style="--soft:#fff0f1;--tone:#d9485b;text-decoration:none;color:inherit"><div class="icon">!</div><div><span>Zaległości</span><b>{{ overdue_count }}</b><small>{% if overdue_count %}Sprawdź płatności · {{ "{:,.0f}".format(overdue_total).replace(',', ' ') }} zł{% else %}Brak zaległych faktur{% endif %}</small></div></a>
+            <a class="metric" href="{{ url_for('overdue_payments') }}" style="--soft:#fff0f1;--tone:#d9485b;text-decoration:none;color:inherit"><div class="icon">!</div><div><span>Zaległości</span><b>{{ overdue_count }}</b><small>{% if overdue_count %}{% for currency,amount in overdue_currency_totals.items() %}{{ ' · ' if not loop.first else '' }}{{ "{:,.2f}".format(amount).replace(',', ' ') }} {{ currency }}{% endfor %}{% else %}Brak zaległych faktur{% endif %}</small></div></a>
             <a class="metric metric-link" href="{{ url_for('cash_flow') }}#replenishment-ranking" aria-label="Pokaż ranking produktów do uzupełnienia" style="--soft:#fff6e6;--tone:#db8a13"><div class="icon">△</div><div><span>Trzeba uzupełnić</span><b>{{ replenishment_count }}</b><small>Według rankingu zakupowego</small></div></a>
             <a class="metric metric-link" href="{{ url_for('stock') }}" aria-label="Pokaż szczegóły stanów magazynu" style="--soft:#edf3ff;--tone:#5577ee"><div class="icon">▤</div><div><span>Wartość magazynu</span><b>{{ "{:,.0f}".format(inventory_value_net).replace(',', ' ') }} zł</b><small>Netto z towarem w drodze</small></div></a>
           </div>
@@ -129,7 +130,7 @@ def register_routes(context):
                                       n_stock_qty=n_stock_qty, n_in_delivery_qty=n_in_delivery_qty,
                                       inventory_value_net=inventory_value_net, n_orders_today=n_orders_today,
                                       n_issued_today=n_issued_today, n_issuable_today=n_issuable_today,
-                                      overdue_count=overdue_count, overdue_total=overdue_total,
+                                      overdue_count=overdue_count, overdue_total=overdue_total, overdue_currency_totals=overdue_currency_totals,
                                       issuable_order_labels=issuable_order_labels, replenishment_rows=replenishment_rows,
                                       replenishment_count=replenishment_count,
                                       recent_orders=recent_orders, status_new=status_new, status_work=status_work,

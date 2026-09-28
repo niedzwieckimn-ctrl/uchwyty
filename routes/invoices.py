@@ -750,21 +750,23 @@ def register_routes(context):
             inv["document_type"] = resolve_invoice_type(inv)
             inv["document_type_label"] = {"domestic": "KRAJOWA", "wdt": "WDT", "export": "EKSPORT"}.get(inv["document_type"], "KRAJOWA")
             due = norm(inv.get("payment_to"))[:10]
-            inv["payment_status"] = "paid" if inv.get("paid") else ("overdue" if due and due < today else "unpaid")
-            inv["payment_status_label"] = {"paid": "Zapłacona", "overdue": "Po terminie", "unpaid": "Nieopłacona"}[inv["payment_status"]]
+            inv['publication_complete'] = norm(inv.get('publication_state') or 'complete') == 'complete'
+            inv["payment_status"] = ('publication_incomplete' if not inv['publication_complete'] else
+                                     "paid" if inv.get("paid") else ("overdue" if due and due < today else "unpaid"))
+            inv["payment_status_label"] = {"publication_incomplete":"Dokument niedokończony", "paid": "Zapłacona", "overdue": "Po terminie", "unpaid": "Nieopłacona"}[inv["payment_status"]]
 
         all_rows = list(rows)
         summary = {
             "all": len(all_rows),
-            "unpaid": sum(1 for inv in all_rows if not inv.get("paid")),
+            "unpaid": sum(1 for inv in all_rows if inv['publication_complete'] and not inv.get("paid")),
             "overdue": sum(1 for inv in all_rows if inv["payment_status"] == "overdue"),
-            "paid": sum(1 for inv in all_rows if inv.get("paid")),
+            "paid": sum(1 for inv in all_rows if inv['publication_complete'] and inv.get("paid")),
             "ksef": sum(1 for inv in all_rows if inv.get("ksef_status") == "sent"),
             "unsent": sum(1 for inv in all_rows if not inv.get("sent_to_client")),
         }
         month_totals = {}
         for inv in all_rows:
-            if norm(inv.get("issue_date"))[:7] != current_month:
+            if not inv['publication_complete'] or norm(inv.get("issue_date"))[:7] != current_month:
                 continue
             total = month_totals.setdefault(inv["currency"], {"currency": inv["currency"], "net": 0.0, "gross": 0.0})
             total["net"] += float(inv.get("total_net") or 0)
@@ -779,7 +781,7 @@ def register_routes(context):
             and (not query or any(query in norm(inv.get(field)).casefold() for field in ("invoice_no", "customer_display", "source_order_no", "source_order_note")))
             and (not selected_customer or inv["customer_display"] == selected_customer)
             and (not selected_month or norm(inv.get("issue_date"))[:7] == selected_month)
-            and (not selected_payment or (selected_payment == "open" and not inv.get("paid")) or inv["payment_status"] == selected_payment)
+            and (not selected_payment or (selected_payment == "open" and inv['publication_complete'] and not inv.get("paid")) or inv["payment_status"] == selected_payment)
             and (not selected_type or inv["document_type"] == selected_type)
             and (not selected_currency or inv["currency"] == selected_currency)
             and (not selected_ksef or (selected_ksef == "none" and inv.get("ksef_status") not in {"sent", "ready", "error"}) or inv.get("ksef_status") == selected_ksef)
@@ -833,8 +835,9 @@ def register_routes(context):
             currency_total = current["currency_totals"].setdefault(
                 invoice_currency, {"currency": invoice_currency, "total_net": 0.0, "total_gross": 0.0}
             )
-            currency_total["total_net"] += float(inv.get("total_net") or 0)
-            currency_total["total_gross"] += float(inv.get("total_gross") or 0)
+            if inv['publication_complete']:
+                currency_total["total_net"] += float(inv.get("total_net") or 0)
+                currency_total["total_gross"] += float(inv.get("total_gross") or 0)
 
         for g in groups:
             month_map = {}
@@ -851,8 +854,9 @@ def register_routes(context):
                 currency_total = month["currency_totals"].setdefault(
                     invoice_currency, {"currency": invoice_currency, "total_net": 0.0, "total_gross": 0.0}
                 )
-                currency_total["total_net"] += float(inv.get("total_net") or 0)
-                currency_total["total_gross"] += float(inv.get("total_gross") or 0)
+                if inv['publication_complete']:
+                    currency_total["total_net"] += float(inv.get("total_net") or 0)
+                    currency_total["total_gross"] += float(inv.get("total_gross") or 0)
 
         return render_template_string(
             INVOICES_LIST_TEMPLATE, title="Faktury", base_url=BASE_URL, db_path=DB_PATH,
@@ -1316,6 +1320,10 @@ def register_routes(context):
     @app.post("/invoices/<int:invoice_id>/payment-reminder")
     def invoice_payment_reminder_admin(invoice_id):
         result = payment_reminders.send(invoice_id, trigger_source="manual_ui")
+        if result.get('reconciliation_required'):
+            return ('Dostawca przyjął przypomnienie. Lokalny status wymaga uzgodnienia; nie wysyłaj ponownie.'
+                    if result.get('provider_confirmed') else
+                    'Nie potwierdzono wyniku wysyłki. Sprawdź status u dostawcy i uzgodnij zapis; nie wysyłaj ponownie.'), 409
         if not result.get("ok"):
             return (
                 "Nie udało się wysłać przypomnienia. Stan faktury nie został zmieniony. "
@@ -1329,6 +1337,7 @@ def register_routes(context):
 
     @app.post("/invoices/<int:invoice_id>/paid")
     def invoice_paid_admin(invoice_id):
+        require_complete_invoice(invoice_id)
         _set_invoice_payment_state(invoice_id, reminder=0, paid=1)
         return _redirect_after_invoice_action()
 
@@ -1337,6 +1346,7 @@ def register_routes(context):
 
     @app.post("/invoices/<int:invoice_id>/unpaid")
     def invoice_unpaid_admin(invoice_id):
+        require_complete_invoice(invoice_id)
         _set_invoice_payment_state(invoice_id, reminder=0, paid=0)
         return _redirect_after_invoice_action()
 

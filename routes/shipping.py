@@ -106,13 +106,45 @@ def register_routes(context):
         cfg = inpost_config_summary()
         bundle = request.form.get("bundle") == "1" or request.args.get("bundle") == "1"
         error = norm(request.args.get("inpost_error"))
+        structured_package_error = None
+        if structured and request.method == "POST" and not norm(order.get("inpost_shipment_id")):
+            # The controlled operation ships the actual current parcel. An old
+            # invoice for another part of an order neither creates this parcel
+            # nor requires a second invoice for it.
+            from fulfillment_operations import state as fulfillment_state
+            from packing_versions import PackingConflict
+            try:
+                current = fulfillment_state({'order_id': order_id})['state']
+            except PackingConflict as exc:
+                return {'ok': False, 'error': str(exc)}
+            actual_ids = sorted(int(item['id']) for item in package_orders)
+            if (not current['packing_list']['current']
+                    or not current['package']['ready_for_shipment']
+                    or actual_ids != sorted(current['package']['order_ids'])):
+                structured_package_error = 'Nie potwierdzono aktualnej zawartości i zakresu paczki.'
+            else:
+                c = conn()
+                try:
+                    linked_invoice = c.execute('''SELECT pb.invoice_id, i.publication_state
+                        FROM packing_batches pb LEFT JOIN invoices i ON i.id=pb.invoice_id
+                        WHERE pb.id=?''', (current['package']['batch_id'],)).fetchone()
+                finally:
+                    c.close()
+                if (linked_invoice and linked_invoice['invoice_id']
+                        and linked_invoice['publication_state'] != 'complete'):
+                    structured_package_error = 'Dokończ istniejącą fakturę przypisaną do tej paczki przed nadaniem.'
         if request.method == "POST":
             if not cfg["configured"]:
                 error = "Brak konfiguracji InPost na Renderze: " + ", ".join(cfg["missing"])
             elif norm(order.get("inpost_shipment_id")):
+                if structured:
+                    return {'ok': True, 'shipment_id': norm(order['inpost_shipment_id']),
+                            'tracking': norm(order.get('tracking_no'))}
                 enqueue_automatic_inpost_pickup(order["inpost_shipment_id"])
                 return redirect(url_for("order_inpost_label", order_id=order_id, bundle="1" if bundle else None))
-            elif awaiting_invoice:
+            elif structured_package_error:
+                error = structured_package_error
+            elif awaiting_invoice and not structured:
                 return redirect(url_for("order_invoice", order_id=order_id, from_packing="1"))
             elif not inpost_label_allowed_for_status(order.get("status")):
                 error = "Najpierw wybierz zawartość paczki w kreatorze Pakuj."
@@ -186,7 +218,8 @@ def register_routes(context):
                                 shipment = current_shipment
                                 break
                     package_ids = [int(item["id"]) for item in package_orders]
-                    persist_inpost_result(package_ids, shipment_id, tracking_number)
+                    persist_inpost_result(package_ids, shipment_id, tracking_number,
+                                          enqueue_pickup=not structured)
                     if structured:
                         return {'ok': True, 'shipment_id': shipment_id, 'tracking': tracking_number}
                     return redirect(url_for(
@@ -473,7 +506,8 @@ def register_routes(context):
 
 
     def order_packing_list_download_admin_service(
-        order_id, *, request, session=None, structured=False, defer_persistence=False
+        order_id, *, request, session=None, structured=False, defer_persistence=False,
+        selected_order_ids=None
     ):
         """Generuje wspolna liste pakowania dla zamowien tego samego klienta."""
         selected_carrier = norm(request.form.get("carrier") or request.args.get("carrier")).lower()
@@ -545,6 +579,12 @@ def register_routes(context):
             candidate_orders.extend(dict(row) for row in cur.fetchall())
 
         candidate_by_id = {int(order["id"]): order for order in candidate_orders}
+        if selected_order_ids is not None:
+            selected_ids = {int(value) for value in selected_order_ids}
+            if not selected_ids or int(order_id) not in selected_ids or not selected_ids.issubset(candidate_by_id):
+                c.close()
+                return 'Zakres pakowania nie należy do wskazanego klienta lub zamówienia.', 409
+            candidate_by_id = {key: value for key, value in candidate_by_id.items() if key in selected_ids}
         candidate_ids = sorted(candidate_by_id)
         placeholders = ",".join(["?"] * len(candidate_ids))
         cur.execute(f"""
