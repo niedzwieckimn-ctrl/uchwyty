@@ -225,12 +225,16 @@ def _order_closed_for_operation(name, order):
     # recovery operation for that exact state.
     if name == 'orders.packing_list.generate' and status == 'packed_partial':
         return False
-    if order.get('shipped_at') and status != 'partially_shipped':
+    if order.get('shipped_at') and status not in {'partially_shipped','packed_partial'}:
         return True
     closed = {'shipped', 'completed', 'cancelled', 'issued', 'in_delivery'}
     if status in closed:
         return True
-    return status == 'partially_shipped' and name != 'orders.packing_list.generate'
+    # A partial order may have a new, explicitly allocated current parcel.
+    # Shipping preflight still validates that parcel's unconsumed LP for every member.
+    return status in {'partially_shipped','packed_partial'} and name not in {
+        'orders.packing_list.generate','orders.invoice.create','shipping.requirements.update',
+        'shipping.shipment.create','shipping.shipment.confirm_parameters'}
 
 
 def _has_open_current_packing(snapshot_data, current):
@@ -286,6 +290,14 @@ def _packing_scope_matches(data, proposal):
     )
 
 
+def _packing_proposal(data):
+    # Legacy callers already present the exact items and fingerprint in approval.
+    # A bare order command must never silently include other customer orders.
+    scope = data.get('packing_scope') or ('customer' if data.get('packing_scope_fingerprint') else 'order')
+    return packing_list_preview(data['order_id'], packing_scope=scope,
+                                packing_order_ids=data.get('packing_order_ids'))
+
+
 def preflight(name, data, actor=None):
     s = snapshot(data['order_id'])
     if version(s) != data['expected_version']:
@@ -325,7 +337,7 @@ def preflight(name, data, actor=None):
             raise error('ADOPTION_CONFLICT', 'Adopcja wymaga zgodnego, kompletnego podglądu.', 'CONFLICT')
     if name == 'orders.packing_list.generate' and (
             not _has_open_current_packing(s, current) or data.get('packing_scope_fingerprint')):
-        proposal = packing_list_preview(o['id'])
+        proposal = _packing_proposal(data)
         scope_supplied = any(
             key in data for key in ('packing_scope_fingerprint', 'packing_items', 'total_quantity')
         )
@@ -349,8 +361,8 @@ def preflight(name, data, actor=None):
         if not current['packing_list']['current']:
             raise error('PACKING_REQUIRED', 'Najpierw przygotuj aktualną listę pakową.')
     if name == 'shipping.shipment.create' and not current['shipment']['exists']:
-        if not current['readiness']['complete']:
-            raise error('ORDER_NOT_READY', 'Zamówienie nie jest gotowe do wysyłki.')
+        if not current['package']['ready_for_shipment']:
+            raise error('ORDER_NOT_READY', 'Brak potwierdzonej, aktualnej zawartości paczki gotowej do nadania.')
         if not current['packing_list']['current']:
             raise error('CURRENT_DOCUMENTS_REQUIRED', 'Przed nadaniem wymagana jest aktualna lista pakowa.')
         if current['requirements']['missing_fields']:
@@ -362,7 +374,9 @@ def preflight(name, data, actor=None):
             other = state({'order_id': member})['state']
             if other['requirements']['recipient'] != current['requirements']['recipient']:
                 raise error('PACKAGE_RECIPIENT_CONFLICT', 'Zamówienia w paczce mają różnych odbiorców lub adresy.', 'CONFLICT')
-            if other['shipment']['exists'] or not other['packing_list']['current'] or not other['readiness']['complete']:
+            if (other['shipment']['exists'] or not other['packing_list']['current']
+                    or not other['package']['ready_for_shipment']
+                    or other['package']['batch_id'] != current['package']['batch_id']):
                 raise error('PACKAGE_STATE_CONFLICT', 'Jedno z zamówień paczki ma przesyłkę, brak gotowości lub nieaktualne dokumenty.', 'CONFLICT')
     if name.startswith('orders.items.') and not current['editable']:
         raise error('INVOICE_BLOCKS_EDIT', 'Najpierw wykonaj istniejącą obsługę faktury, która blokuje edycję.')
@@ -390,6 +404,28 @@ def state(data, actor=None, correlation_id='', transaction_connection=None):
         from fulfillment_readiness import calculate_fulfillment_readiness
         readiness = next((r for r in calculate_fulfillment_readiness(db) if r['order_id'] == o['id']), None)
         fully = b.order_fully_invoiced(db.cursor(), o['id'])
+        import packing_versions
+        package = packing_versions.current_for_order(db, o['id'])
+        package_batch = db.execute('SELECT root_order_id FROM packing_batches WHERE id=?',
+                                  (package['batch_id'],)).fetchone() if package else None
+        quantities = []
+        order_summaries = []
+        if package:
+            for allocation in package['allocations']:
+                item = db.execute('SELECT order_id,qty FROM order_items WHERE id=?',
+                                  (allocation['order_item_id'],)).fetchone()
+                if not item or int(item['order_id']) != int(allocation['order_id']):
+                    package['complete'] = False
+                quantities.append(int(item['qty']) if item else 0)
+            for member in package['order_ids']:
+                rows = db.execute('''SELECT oi.id,oi.qty,COALESCE(s.qty,0) stock_qty,
+                    COALESCE((SELECT SUM(ia.qty) FROM invoice_allocations ia WHERE ia.order_item_id=oi.id),0) issued_qty
+                    FROM order_items oi LEFT JOIN stock s ON s.product_id=oi.product_id WHERE oi.order_id=?''', (member,)).fetchall()
+                packed = {a['order_item_id']: int(a['packed_qty']) for a in package['allocations'] if a['order_id'] == member}
+                remaining = [max(0, int(r['qty']) - int(r['issued_qty']) - (0 if package.get('invoice_id') else packed.get(r['id'],0))) for r in rows]
+                order_summaries.append({'order_id': member, 'ordered_quantity': sum(int(r['qty']) for r in rows),
+                    'packed_quantity': sum(packed.values()), 'remaining_quantity': sum(remaining),
+                    'available_for_further_fulfillment': sum(min(q, max(0, int(r['stock_qty']) - (0 if package.get('invoice_id') else packed.get(r['id'],0)))) for q,r in zip(remaining,rows))})
     finally:
         db.close()
     documents = {}
@@ -439,9 +475,14 @@ def state(data, actor=None, correlation_id='', transaction_connection=None):
         booked = json.loads(attempt['payload'])
         changed = changed or not parameters_match(booked, fields)
     ready = bool(fully or (readiness and readiness['ready']))
+    package_ready = bool(package and package.get('complete') and package.get('total_qty', 0) > 0
+                         and not package.get('shipment_confirmed') and documents['packing_list']['current']
+                         and package['order_ids'] == s['package_ids']
+                         and all(int(a['packed_qty']) > 0 and int(a['packed_qty']) <= qty
+                                 for a, qty in zip(package['allocations'], quantities)))
     pickup = b.inpost_pickup_status(o.get('inpost_shipment_id')) if o.get('inpost_shipment_id') else None
     next_step = ('reconcile_metadata' if s['persistence']['pending'] else
-                 'readiness' if not ready and not s['invoices'] else
+                 'readiness' if not ready and not package_ready and not s['invoices'] else
                  'review_existing_invoice' if s['invoices'] and not documents['invoice']['current'] else
                  'packing_list' if not documents['packing_list']['current'] else
                  'invoice' if not documents['invoice']['current'] else
@@ -454,7 +495,18 @@ def state(data, actor=None, correlation_id='', transaction_connection=None):
                  'pickup_review' if (pickup or {}).get('state') in {'unknown', 'rejected', 'configuration_error'} else 'print')
     return {'ok': True, 'state': {'order_id': o['id'], 'order_number': o.get('order_no'),
         'customer': o.get('customer_name'), 'order_status': o['status'], 'expected_version': version(s),
-        'package': {'order_ids': s['package_ids'], 'package_key': _hash(s['package_ids']), 'member_versions': s['package_versions'], 'fingerprint': _hash(s)},
+        'package': {'order_ids': s['package_ids'],
+                    'package_key': package.get('packing_list_key') if package else _hash(s['package_ids']),
+                    'packing_list_id': package.get('packing_list_key') if package else None,
+                    'batch_id': package.get('batch_id') if package else None,
+                    'root_order_id': package_batch['root_order_id'] if package_batch else o['id'],
+                    'member_versions': s['package_versions'], 'fingerprint': _hash(s),
+                    'packed_quantity': package.get('total_qty', 0) if package else 0,
+                    'ordered_quantity': sum(r['ordered_quantity'] for r in order_summaries),
+                    'remaining_quantity': sum(r['remaining_quantity'] for r in order_summaries) if package else None,
+                    'orders': order_summaries,
+                    'allocations': package.get('allocations', []) if package else [],
+                    'ready_for_shipment': package_ready},
         'persistence': s['persistence'],
         'editable': not bool(o.get('warehouse_issued')), 'content_hash': s['content_hash'],
         'readiness': {'complete': ready, 'details': readiness},
@@ -545,12 +597,18 @@ def request_view(method='POST', form=None, args=None):
     return SimpleNamespace(method=method, form=MultiDict(form or {}), args=MultiDict(args or {}))
 
 
-def packing_list_preview(oid):
+def packing_list_preview(oid, *, packing_scope='customer', packing_order_ids=None):
+    if packing_scope not in {'order', 'selected', 'customer'}:
+        raise error('INVALID_INPUT', 'Nieznany zakres pakowania.')
+    selected = [int(oid)] if packing_scope == 'order' else packing_order_ids if packing_scope == 'selected' else None
+    if packing_scope == 'selected' and (not selected or int(oid) not in selected):
+        raise error('PACKING_SCOPE_REQUIRED', 'Wskaż uzgodnioną listę zamówień obejmującą zamówienie główne.')
     proposal = _check_response(b.order_packing_list_download_admin_service(
         oid,
         request=request_view(method='GET'),
         session={},
         structured=True,
+        selected_order_ids=selected,
     ))
     fingerprint_payload = {
         'root_order_id': proposal['root_order_id'],
@@ -558,6 +616,7 @@ def packing_list_preview(oid):
         'candidate_order_ids': proposal['candidate_order_ids'],
         'order_ids': proposal['order_ids'],
         'items': proposal['items'],
+        'packing_scope': packing_scope,
     }
     approval_items = [
         {
@@ -571,6 +630,8 @@ def packing_list_preview(oid):
     ]
     return {
         **proposal,
+        'packing_scope': packing_scope,
+        'packing_order_ids': proposal['candidate_order_ids'],
         'approval_items': approval_items,
         'fingerprint': _hash(fingerprint_payload),
     }
@@ -578,7 +639,8 @@ def packing_list_preview(oid):
 
 def packing_list_preview_operation(data, actor=None, correlation_id='', transaction_connection=None):
     current = state({'order_id': data['order_id']})
-    return {**current, 'preview': packing_list_preview(data['order_id'])}
+    return {**current, 'preview': packing_list_preview(data['order_id'],
+        packing_scope=data.get('packing_scope', 'order'), packing_order_ids=data.get('packing_order_ids'))}
 
 
 def _check_response(result):
@@ -636,6 +698,8 @@ def save_document(oid, kind, document_id, path, *, connection=None, content_hash
                          created_at=excluded.created_at,
                          file_hash=excluded.file_hash''', persisted)
         if owned:
+            import reconciliation_store
+            reconciliation_store.stage(b, oid, connection=c)
             c.commit()
         return {
             'order_id': persisted[0], 'kind': persisted[1],
@@ -851,8 +915,16 @@ def perform(name, data, actor, *, correlation_id='', approval_id='', before_stat
         if 'weight' in fields:
             merged['weight_source'] = 'manual'
         c = b.conn()
-        c.execute('INSERT OR REPLACE INTO order_shipping_requirements VALUES(?,?,?)', (oid, json.dumps(merged), b.now_iso()))
-        c.commit(); c.close()
+        try:
+            c.execute('INSERT OR REPLACE INTO order_shipping_requirements VALUES(?,?,?)', (oid, json.dumps(merged), b.now_iso()))
+            import reconciliation_store
+            reconciliation_store.stage(b, oid, connection=c)
+            c.commit()
+        except Exception:
+            c.rollback()
+            raise
+        finally:
+            c.close()
     elif name.startswith('orders.items.'):
         if (s['invoices'] or any(d['kind'] == 'packing_list' for d in s['documents'])) and not data.get('documents_change_confirmed'):
             raise error('DOCUMENTS_CONFIRMATION_REQUIRED', 'Zmiana unieważni dokumenty. Najpierw potwierdź ich ponowne przygotowanie.')
@@ -866,7 +938,7 @@ def perform(name, data, actor, *, correlation_id='', approval_id='', before_stat
     elif name == 'orders.packing_list.generate':
         if _has_open_current_packing(s, current) and not data.get('packing_scope_fingerprint'):
             return state(data)
-        proposal = packing_list_preview(oid)
+        proposal = _packing_proposal(data)
         scope_supplied = any(
             key in data for key in ('packing_scope_fingerprint', 'packing_items', 'total_quantity')
         )
@@ -882,6 +954,7 @@ def perform(name, data, actor, *, correlation_id='', approval_id='', before_stat
             session={},
             structured=True,
             defer_persistence=True,
+            selected_order_ids=proposal['candidate_order_ids'],
         ))
         prepared['batch_id'] = finalize_packing_list(
             oid,
@@ -957,8 +1030,8 @@ def perform(name, data, actor, *, correlation_id='', approval_id='', before_stat
     elif name == 'shipping.shipment.create':
         if current['shipment']['exists']:
             return state(data)
-        if not current['readiness']['complete']:
-            raise error('ORDER_NOT_READY', 'Zamówienie nie jest gotowe do wysyłki.')
+        if not current['package']['ready_for_shipment']:
+            raise error('ORDER_NOT_READY', 'Brak potwierdzonej, aktualnej zawartości paczki gotowej do nadania.')
         if not current['packing_list']['current']:
             raise error('CURRENT_DOCUMENTS_REQUIRED', 'Przed nadaniem wymagana jest aktualna lista pakowa.')
         if current['requirements']['missing_fields']:
@@ -966,11 +1039,32 @@ def perform(name, data, actor, *, correlation_id='', approval_id='', before_stat
         c = b.conn()
         package_ids = [int(o['id']) for o in b._packed_package_orders(c.cursor(), s['order'])]
         c.close()
+        if sorted(package_ids) != sorted(current['package']['order_ids']):
+            raise error('PACKAGE_STATE_CONFLICT', 'Zakres paczki zmienił się. Odczytaj bieżącą listę pakową.', 'CONFLICT')
         fields = current['requirements']['known']
         _validate_requirements(fields)
         form = {**fields, 'service': 'inpost_courier_standard', 'sms': '1' if fields['sms'] else '0', 'email': '1' if fields['email'] else '0', 'quantity': 1}
-        _check_response(b.order_inpost_create_service(oid, request=request_view(form=form), session={}, structured=True,
-                       receiver_override=current['requirements']['recipient']))
+        response = b.order_inpost_create_service(oid, request=request_view(form=form), session={}, structured=True,
+                       receiver_override=current['requirements']['recipient'])
+        # A UI redirect (for example to an invoice) is not evidence of a
+        # carrier booking. Require both the structured receipt and its durable
+        # association with every member of the exact approved parcel.
+        if not isinstance(response, dict):
+            raise error('SHIPMENT_NOT_CONFIRMED', 'Nie otrzymano potwierdzenia utworzenia przesyłki. Sprawdź stan paczki przed ponowieniem.')
+        _check_response(response)
+        shipment_id = str(response.get('shipment_id') or '').strip()
+        if response.get('ok') is not True or not shipment_id or isinstance(response.get('shipment_id'), bool):
+            raise error('SHIPMENT_NOT_CONFIRMED', 'Brak potwierdzonego identyfikatora przesyłki. Sprawdź wynik nadania przed ponowieniem.')
+        c = b.conn()
+        try:
+            marks = ','.join('?' for _ in package_ids)
+            saved = c.execute(f'SELECT id,inpost_shipment_id FROM orders WHERE id IN ({marks})', package_ids).fetchall()
+        finally:
+            c.close()
+        if (sorted(package_ids) != sorted(current['package']['order_ids'])
+                or len(saved) != len(package_ids)
+                or any(str(row['inpost_shipment_id'] or '').strip() != shipment_id for row in saved)):
+            raise error('SHIPMENT_PERSISTENCE_UNCONFIRMED', 'Identyfikator przesyłki nie został potwierdzony dla całej paczki. Sprawdź wynik nadania; nie twórz kolejnej przesyłki.')
     elif name == 'shipping.shipment.refresh':
         sid = s['order'].get('inpost_shipment_id')
         if not sid and s['attempts']:
@@ -1160,6 +1254,12 @@ def install(ops):
         if not read:
             props.update(expected_version={'type': 'integer', 'minimum': 0}, idempotency_key={'type': 'string', 'minLength': 1, 'maxLength': 200})
             required += ['expected_version', 'idempotency_key']
+        if name in {'orders.packing_list.preview', 'orders.packing_list.generate'}:
+            props['packing_scope'] = {'type': 'string', 'enum': ['order', 'selected', 'customer'],
+                'description': 'order: tylko wskazane zamówienie (domyślnie); selected: uzgodnione packing_order_ids; customer: jawnie uzgodnione dostępne zamówienia klienta.'}
+            props['packing_order_ids'] = {'type': 'array', 'maxItems': 200,
+                'items': {'type': 'integer', 'minimum': 1},
+                'description': 'Dokładny uzgodniony zakres dla packing_scope=selected; zawiera order_id.'}
         if name.startswith('orders.items.'):
             props['documents_change_confirmed'] = {'type': 'boolean'}
             if name.endswith('.add'): props['product_id'] = {'type': 'integer', 'minimum': 1}; required += ['product_id']
@@ -1211,7 +1311,7 @@ def install(ops):
         risk = 'GREEN' if read or name in GREEN else 'YELLOW'
         description = 'Realizuje jeden krok istniejącego fulfillment. Najpierw orders.fulfillment.state; użyj zwróconej expected_version. Po WRITE odczytaj state z wyniku i kontynuuj next_step. Nie odtwarzaj poprawnych dokumentów. Pytaj tylko o requirements.missing_fields. Nie anuluj przesyłki. shipping.shipment.refresh odzyskuje wynik timeoutu bez ponownego POST. Druk oznacza przygotowanie PDF, nie fizyczny wydruk.'
         if name == 'orders.packing_list.preview':
-            description = 'Pokazuje tę samą propozycję co UI Wybierz zawartość paczki: wszystkie kwalifikujące się zamówienia tego klienta, dostępne pozycje, ilości i łączną liczbę sztuk. Użyj przy intencji jednej paczki lub jednej listy pakowej dla wielu zamówień; po wyszukaniu klienta podaj dowolny jego kwalifikujący się order_id jako root. Po pokazaniu propozycji przekaż fingerprint i approval_items do orders.packing_list.generate.'
+            description = 'Pokazuje dostępne pozycje do pakowania. Domyślnie packing_scope=order obejmuje tylko order_id. Szerszy zakres wymaga uzgodnienia: selected plus packing_order_ids albo customer. Pokaż zakres, zamówienia i sztuki, a do generate przekaż ten sam scope, fingerprint i approval_items. To propozycja nowego pakowania, nie odczyt zawartości istniejącej paczki.'
         elif name == 'orders.packing_list.generate':
             description = 'Tworzy jedną wspólną listę pakową przez ten sam service co UI. Przy intencji spakowania wszystkich dostępnych zamówień klienta najpierw wywołaj orders.packing_list.preview, pokaż order IDs, SKU, ilości i sumę, a następnie przekaż fingerprint, approval_items jako packing_items oraz total_quantity. Operacja sama uruchamia wymagany HUMAN approval; nie twórz shipment.merge.'
         ops.OPERATION_REGISTRY[name] = ops.BusinessOperationDefinition(name, 1,

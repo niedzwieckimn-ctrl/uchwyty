@@ -99,6 +99,10 @@ FULFILLMENT_POLICIES = tuple(
     for name, permission in _fulfillment_permissions.items())
 
 PILOT_POLICIES = FULFILLMENT_POLICIES + (
+    ('policy-invoice-payment-set-status','invoices.payment.set_status',1,'payments.set_status',YELLOW,1,'approvals.decide',1800,0,None,1),
+    *tuple(('policy-count-'+action, 'inventory.count.'+action, 1, 'inventory.read' if action=='history' else 'inventory.discrepancy_report', GREEN, 0, 'approvals.decide', 3600, 1, None, 1)
+           for action in ('history','pause','resume','keep_result')),
+    ('policy-dashboard-read', 'dashboard.read', 1, 'inventory.read', GREEN, 0, 'approvals.decide', 3600, 1, None, 1),
     ('policy-human-chat-decision', 'approval.decide', 1, 'approvals.decide', GREEN, 0, 'approvals.decide', 1800, 0, None, 1),
     ("policy-business-describe-schema", "business.describe_schema", 1, "business.generic_read", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
     ("policy-business-query", "business.query", 1, "business.generic_read", GREEN, 0, "approvals.decide", 3600, 1, None, 1),

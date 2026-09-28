@@ -57,7 +57,7 @@ function browser({chat, approval, streaming = true} = {}) {
   const elements = Object.fromEntries(['aiForm','aiInput','aiSend','aiMessages','aiEmpty',
     'aiNewConversation','aiVoice','aiVoiceStatus','aiReplayVoice','aiVoiceDebug'].map(id => [id, new Element()]));
   const calls = [], logs = [], audios = [], windowListeners = {};
-  let expireTurn;
+  let expireTurn, expireRecovery;
   class Audio extends Element {
     constructor(src) { super(); this.src = src; this.readyState = 4; this.networkState = 1;
       this.duration = 1; this.currentTime = 0; this.volume = 1; this.error = null; audios.push(this); }
@@ -70,6 +70,7 @@ function browser({chat, approval, streaming = true} = {}) {
     }},
     window:{setTimeout:(callback, delay) => {
       if (delay === 120000) expireTurn = callback;
+      if (delay === 60000) expireRecovery = callback;
       return setTimeout(callback, delay);
     }, clearTimeout, addEventListener:(name, callback) => { windowListeners[name] = callback; }},
     navigator:{}, Blob, AbortController, performance, Audio,
@@ -97,6 +98,7 @@ function browser({chat, approval, streaming = true} = {}) {
     newConversation:() => elements.aiNewConversation.dispatch('click'),
     pagehide:() => windowListeners.pagehide(),
     timeout:() => expireTurn(),
+    recoveryTimeout:() => expireRecovery(),
     assistant:() => elements.aiMessages.querySelectorAll('.assistant'),
     text:() => elements.aiMessages.querySelectorAll('.assistant').map(row => row.querySelector('.ai-bubble').textContent),
   };
@@ -308,6 +310,114 @@ test('New conversation aborts approval follow-up stream and prevents late contro
   await flush(); b.newConversation(); await pending;
   assert.equal(b.calls[1].options.signal.aborted, true); assert.equal(stream.cancelled, true);
   assert.equal(b.assistant().length, 0); assert.equal(b.elements.aiSend.disabled, false);
+});
+
+for (const failedTransport of [false, true]) {
+  test(`New conversation cancels pending approval recovery after ${failedTransport ? 'transport loss' : 'model failure'} without restoring old context`, async () => {
+    let resolveRecovery, chatNumber = 0;
+    const success = {execution_status:'SUCCESS', result:{status:'SUCCESS'}};
+    const b = browser({
+      chat:() => ({ok:true, status:200, json:async () => ++chatNumber === 1 ? approvalData()
+        : {...finalData('Nowa odpowiedź.'), conversation_id:'new-conversation'}}),
+      approval:options => {
+        if (options.method === 'GET') return new Promise(resolve => { resolveRecovery = resolve; });
+        if (failedTransport) throw new TypeError('Simulated connection lost');
+        return {ok:true, status:200, json:async () => ({status:'SUCCESS', model_status:'FAILED', execution_outcome:success})};
+      },
+    });
+    await b.submit('Przygotuj zmianę');
+    const pending = b.elements.aiMessages.querySelector('[data-approval-id]').querySelector('button').onclick();
+    await flush();
+    const recovery = b.calls.find(call => call.options.method === 'GET');
+    assert.ok(recovery.url.endsWith('?conversation_id=conversation-1'));
+    assert.equal(recovery.options.signal.aborted, false);
+    b.newConversation();
+    assert.equal(recovery.options.signal.aborted, true);
+    await b.submit('Pierwsza wiadomość nowej rozmowy');
+    // Deliberately ignore abort in this fake to exercise late completion guards too.
+    resolveRecovery({ok:true, status:200, json:async () => ({status:'SUCCESS', conversation_id:'conversation-1',
+      message:'Stary wynik', execution_outcome:success, turn_released:true})});
+    await pending;
+    await b.submit('Kolejna wiadomość nowej rozmowy');
+    const chats = b.calls.filter(call => call.url.endsWith('/chat'));
+    assert.equal(JSON.parse(chats[2].options.body).conversation_id, 'new-conversation');
+    assert.deepEqual(b.text(), ['Nowa odpowiedź.', 'Nowa odpowiedź.']);
+    assert.equal(b.calls.filter(call => call.url.endsWith('/approve')).length, 1);
+    assert.equal(b.audios.length, 0);
+  });
+}
+
+for (const stalledPart of ['fetch', 'body']) {
+  test(`approval recovery deadline aborts stalled ${stalledPart}, unlocks input and never repeats the write`, async () => {
+    const b = browser({chat:() => ({ok:true, status:200, json:async () => approvalData()}),
+      approval:options => {
+        if (options.method !== 'GET') throw new TypeError('Connection lost after submission');
+        const waitForAbort = () => new Promise((_, reject) => options.signal.addEventListener('abort',
+          () => reject(Object.assign(new Error('aborted'), {name:'AbortError'})), {once:true}));
+        return stalledPart === 'fetch' ? waitForAbort() : {ok:true, status:200, json:waitForAbort};
+      },
+    });
+    await b.submit('Przygotuj zmianę');
+    const buttons = b.elements.aiMessages.querySelector('[data-approval-id]').querySelectorAll('button');
+    const pending = buttons[0].onclick(); await flush();
+    assert.equal(b.elements.aiSend.disabled, true);
+    // Exercise the actual registered deadline callback without waiting a minute.
+    b.recoveryTimeout(); await pending;
+    assert.equal(b.calls.find(call => call.options.method === 'GET').options.signal.aborted, true);
+    assert.equal(b.elements.aiSend.disabled, false);
+    assert.ok(buttons.every(button => !button.disabled));
+    assert.match(b.text().at(-1), /Sprawdź stan operacji/);
+    assert.equal(b.calls.filter(call => call.url.endsWith('/approve')).length, 1);
+    assert.equal(b.calls.filter(call => call.options.method === 'GET').length, 1);
+  });
+}
+
+test('approved execution recovery returns trusted success and leaves approval consumed', async () => {
+  const b = browser({chat:() => ({ok:true, status:200, json:async () => approvalData()}),
+    approval:options => {
+      if (options.method !== 'GET') throw new TypeError('Connection lost after submission');
+      return {ok:true, status:200, json:async () => ({status:'SUCCESS', message:'Korekta została wykonana.',
+        conversation_id:'conversation-1', turn_released:true,
+        execution_outcome:{execution_status:'SUCCESS', result:{status:'SUCCESS'}}})};
+    },
+  });
+  await b.submit('Przygotuj zmianę');
+  const buttons = b.elements.aiMessages.querySelector('[data-approval-id]').querySelectorAll('button');
+  await buttons[0].onclick();
+  assert.equal(b.text().at(-1), 'Korekta została wykonana.');
+  assert.ok(buttons.every(button => button.disabled));
+  assert.equal(b.elements.aiSend.disabled, false);
+  assert.equal(b.calls.filter(call => call.url.endsWith('/approve')).length, 1);
+});
+
+for (const [status, data, category] of [
+  [403, {status:'DENIED', error_code:'ENTITY_SCOPE_REQUIRED'}, 'gate'],
+  [503, {status:'FAILED', error_code:'MODEL_FAILED'}, 'model'],
+  [503, {status:'FAILED', error_code:'MODEL_FAILED', failure_category:'provider'}, 'provider'],
+]) {
+  test(`agent failure diagnostics classify ${category} without exposing transcript or tool payload`, async () => {
+    const b = browser({chat:() => ({ok:false, status, json:async () => ({...data,
+      request_id:'request-test-1', agent_run_id:'run-test-1', message:'PRIVATE_RESPONSE',
+      tool_calls:[{arguments:'PRIVATE_ARGUMENTS sk-secret'}], raw_provider_body:'PRIVATE_PROVIDER'})})});
+    await b.submit('PRIVATE_USER_TEXT');
+    const diagnostic = b.logs.find(log => log.name === 'AI_CLIENT_ERROR');
+    assert.equal(diagnostic.category, category);
+    assert.equal(diagnostic.http_status, status);
+    assert.equal(diagnostic.request_id, 'request-test-1');
+    assert.equal(diagnostic.agent_run_id, 'run-test-1');
+    assert.ok(!JSON.stringify(b.logs).includes('PRIVATE'));
+    assert.ok(!JSON.stringify(b.logs).includes('sk-secret'));
+  });
+}
+
+test('SSE transport loss records stream turn id without claiming a provider failure', async () => {
+  const stream = controlledStream(); const b = browser({chat:() => stream.response});
+  const pending = b.submit('Pytanie'); await flush();
+  stream.send(event('turn_started', {turn_id:'transport-turn-1'})); stream.close(); await pending;
+  const diagnostic = b.logs.find(log => log.name === 'AI_CLIENT_ERROR');
+  assert.equal(diagnostic.category, 'transport');
+  assert.equal(diagnostic.turn_id, 'transport-turn-1');
+  assert.equal(diagnostic.timeout, false);
 });
 
 test('approval JSON fallback preserves NOOP button behavior and never automatically retries', async () => {

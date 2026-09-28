@@ -194,7 +194,7 @@ def test_buffered_final_preserves_original_text_speech_mode_model_and_usage_with
         screen + '<speech_text mode="direct">' + speech + '</speech_text>',
         model='original-final-model', input_tokens=321, output_tokens=54,
     )], chunks=['REGENERATED_TEXT_MUST_NOT_BE_USED'])
-    response = post_stream(provider, 'Ile mamy Avery?')
+    response = post_stream(provider, 'Pokaż szczegóły Avery')
     try:
         received = []
         for name, data in frames(response):
@@ -272,10 +272,12 @@ def test_streaming_preserves_same_turn_read_before_write_guard():
         received = list(frames(response))
     finally:
         response.close()
-    # V45 rejects the unrecognized identity before a model can supply a hidden ID.
-    assert received[-1][0] == 'done'
-    assert received[-1][1]['inventory_fast_failure'] == 'product_not_found'
+    # The explicit product cannot borrow the preceding turn's stale read.
+    assert received[-1][0] == 'error'
+    assert received[-1][1]['status'] == 'DENIED'
+    assert received[-1][1]['error_code'] == 'ENTITY_SCOPE_REQUIRED'
     assert received[-1][1]['tool_calls'] == 0
+    assert not any(name == 'display_delta' for name, _data in received)
     assert not read_rows('SELECT 1 FROM internal_inventory_count_items')
     assert not read_rows('SELECT 1 FROM stock_adjustments')
 
@@ -306,12 +308,14 @@ def test_cancel_during_inflight_write_completes_commit_audit_and_releases_lock(m
         release.set()
     assert finished.wait(5)
     worker.join(timeout=1)
-    assert results[0]['error_code'] == 'TURN_CANCELLED'
+    assert results[0]['status'] == 'SUCCESS' and results[0]['error_code'] == ''
+    assert results[0]['confirmation_source'] == 'stored_execution'
+    assert results[0]['synthesis_error_code'] == 'TURN_CANCELLED'
     assert len(read_rows('SELECT 1 FROM internal_inventory_count_sessions')) == 1
     execution = read_rows("SELECT status FROM internal_operation_executions WHERE operation='inventory.count.session.start'")
     assert execution[0]['status'] == 'SUCCESS'
     assert len(read_rows("SELECT 1 FROM internal_audit_log WHERE operation='business_operation.success'")) == 1
-    assert len(read_rows("SELECT 1 FROM internal_audit_log WHERE operation='agent.failed'")) == 1
+    assert_finalized(results[0])
     assert not read_rows('SELECT 1 FROM internal_agent_turn_leases')
     assert not any(name in {'display_delta', 'done', 'speech_ready'} for name, _ in events)
     # This thread did not own the previous transaction; a leak would block it.

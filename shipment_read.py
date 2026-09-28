@@ -31,8 +31,19 @@ class ShipmentReadError(ValueError):
     pass
 
 
+def is_readiness_question(text):
+    """A prospective shipment question must use live readiness, not history."""
+    value = str(text or '').casefold()
+    prospective = re.search(r'\b(?:mogę|moge|możemy|mozemy|można|mozna|możesz|mozesz|da\s+się|da\s+sie)\b', value)
+    action = re.search(r'\b(?:wysłać|wyslac|wysyłać|wysylac|nadać|nadac|wydać|wydac|spakować|spakowac)\b', value)
+    ready = re.search(r'\b(?:gotow\w*\s+do\s+(?:wysył\w*|wysyl\w*|wysł\w*|wysl\w*|nadania)|do\s+(?:wysłania|wyslania|wysyłki|wysylki|nadania))\b', value)
+    return bool(prospective and action or ready)
+
+
 def is_question(text):
     value = str(text or '').casefold()
+    if is_readiness_question(value):
+        return False
     if re.search(r'\b(?:wyślij|wyslij|utw[oó]rz|wygeneruj|nadaj)\b', value):
         return False
     # Explicit LP questions keep the existing LP/current/history workflow.

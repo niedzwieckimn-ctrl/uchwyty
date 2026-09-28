@@ -71,11 +71,14 @@ def test_deleted_draft_number_is_reusable(numbering_db):
     db.execute("DELETE FROM invoices WHERE invoice_no='FVAT 5/09/2026'")
     db.commit()
     db.close()
-    assert invoice_numbering.preview(backend, "2026-09-15") == "FVAT 5/09/2026"
+    # The shared policy is max(existing invoice numbers) + 1, not the old cursor.
+    assert invoice_numbering.preview(backend, "2026-09-15") == "FVAT 3/09/2026"
 
 
 def test_legacy_permanent_claim_history_is_removed_on_upgrade(numbering_db):
     db = backend.conn()
+    db.execute('DROP TABLE invoice_number_claims')
+    db.execute('CREATE TABLE invoice_number_claims(invoice_no TEXT PRIMARY KEY,created_at TEXT NOT NULL)')
     db.execute("CREATE TRIGGER retain_invoice_number AFTER INSERT ON invoices BEGIN SELECT 1; END")
     db.execute("INSERT OR REPLACE INTO invoice_number_claims VALUES('FVAT 99/09/2026',?)", (backend.now_iso(),))
     db.execute("INSERT OR REPLACE INTO invoice_number_counters VALUES('09/2026',99)")

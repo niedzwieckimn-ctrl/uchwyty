@@ -32,7 +32,7 @@ def _fold(value):
 
 def normalize_transcript(value):
     """Expand common spoken integers locally; keep product words and identifiers."""
-    tokens = [part.strip('.,!?;:') for part in str(value or '').replace(',', ' ').split()]
+    tokens = [part.strip('.,!?;:…') for part in str(value or '').replace(',', ' ').replace('…', ' ').split()]
     tokens = [part for part in tokens if part]
     result = []
     index = 0
@@ -58,6 +58,8 @@ class VoiceCommand:
     decision: str = ''
     raw_transcript: str = ''
     interpretations: tuple[tuple[str, int], ...] = ()
+    quantity_options: tuple[int, ...] = ()
+    selection_index: int | None = None
 
 
 def _spoken_number(parts):
@@ -72,7 +74,7 @@ def _trailing_number_interpretations(value):
     The catalog decides which split is valid. This prevents e.g. 128 + 8 from
     being flattened into 136 before the product identity is known.
     """
-    parts = [part.strip('.,!?;:') for part in str(value or '').replace(',', ' ').split()]
+    parts = [part.strip('.,!?;:…') for part in str(value or '').replace(',', ' ').replace('…', ' ').split()]
     parts = [part for part in parts if part]
     if parts and _fold(parts[-1]) in _UNITS:
         parts.pop()
@@ -99,14 +101,49 @@ def _trailing_number_interpretations(value):
 
 def parse(value):
     raw_transcript = str(value or '')
+    text = normalize_transcript(raw_transcript)
+    folded = ' '.join(_fold(text).split())
+    if folded in {'konczymy na dzis', 'na dzis koniec', 'przerwa', 'wstrzymaj liczenie',
+                  'wstrzymaj remanent', 'przerwij liczenie'}:
+        return VoiceCommand('pause', raw_transcript=raw_transcript)
+    if folded in {'wznow liczenie', 'wznow remanent', 'wracamy do liczenia', 'kontynuuj liczenie'}:
+        return VoiceCommand('resume', raw_transcript=raw_transcript)
+    if folded in {'ile czasu liczymy', 'jak dlugo liczymy', 'ile czasu trwal remanent',
+                  'ile czasu liczenia', 'jak dlugo trwa remanent'}:
+        return VoiceCommand('elapsed', raw_transcript=raw_transcript)
+    selections = {
+        'pierwsza':0, 'pierwszy':0, 'te pierwsza':0, 'ten pierwszy':0, 'pierwszy wariant':0,
+        'druga':1, 'drugi':1, 'te druga':1, 'ten drugi':1, 'drugi wariant':1,
+        'trzecia':2, 'trzeci':2, 'te trzecia':2, 'ten trzeci':2, 'trzeci wariant':2,
+        'czwarta':3, 'czwarty':3, 'te czwarta':3, 'ten czwarty':3, 'czwarty wariant':3,
+    }
+    if folded in selections:
+        return VoiceCommand('selection', selection_index=selections[folded], raw_transcript=raw_transcript)
+    unit = r'(?:\s+szt(?:uk|uki|uka|uke)?)?'
+    # Explicit correction/addition applies to the count, never to a product's spacing.
+    # Keep the product prefix so a combined utterance does not inherit an old item.
+    additive = re.fullmatch(r'(.*?)\b(?:mam\s+)?(\d{1,7})' + unit
+        + r'\s+(?:nie\s+)?(?:mam\s+)?jeszcze\s+(\d{1,7})' + unit, folded)
+    correction = re.fullmatch(r'(.*?)\b(?:mam\s+)?(\d{1,7})' + unit
+        + r'\s+(?:poprawka|jednak|nie(?:\s+jednak)?)\s+(?:mam\s+)?(\d{1,7})' + unit, folded)
+    corrected = additive or correction
+    if corrected:
+        product = corrected[1].strip()
+        quantity = int(corrected[3]) + (int(corrected[2]) if additive else 0)
+        return VoiceCommand('product' if product else 'quantity', product=product,
+            product_without_count=product, quantity=quantity, raw_transcript=raw_transcript)
+    ambiguous = re.fullmatch(r'(.*?)\b(\d{1,7})\s+czy\s+(\d{1,7})' + unit, folded)
+    if ambiguous:
+        product = re.sub(r'\bmam\s*$', '', ambiguous[1]).strip()
+        options = tuple(dict.fromkeys((int(ambiguous[2]), int(ambiguous[3]))))
+        return VoiceCommand('product' if product else 'quantity_ambiguous', product=product,
+            product_without_count=product, quantity_options=options, raw_transcript=raw_transcript)
     interpretations = _trailing_number_interpretations(raw_transcript)
     if interpretations:
         product, quantity = interpretations[0]
         return VoiceCommand('product', product=product, product_without_count=product,
                             quantity=quantity, raw_transcript=raw_transcript,
                             interpretations=interpretations)
-    text = normalize_transcript(raw_transcript)
-    folded = ' '.join(_fold(text).split())
     if folded in {'nastepny', 'nastepny produkt', 'dalej'}:
         return VoiceCommand('next', raw_transcript=raw_transcript)
     if folded in {'koniec remanentu', 'zakoncz remanent'}:

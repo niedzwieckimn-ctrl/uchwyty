@@ -1009,8 +1009,9 @@ def test_local_stt_comparator_uses_same_audio_language_and_context(isolated, mon
         calls.append(kwargs)
         return StubTranscriptionResponse({'text': 'porównanie'})
     monkeypatch.setattr(voice_io.requests, 'post', post)
-    assert compare_voice_stt.main([str(audio)]) == 0
-    assert [c['data']['model'] for c in calls] == ['gpt-4o-mini-transcribe', 'gpt-transcribe']
+    selected = ['gpt-4o-mini-transcribe', 'gpt-4o-transcribe']
+    assert compare_voice_stt.main([str(audio), '--models', *selected]) == 0
+    assert [c['data']['model'] for c in calls] == selected
     assert calls[0]['files'] == calls[1]['files']
     for call in calls:
         assert call['data']['language'] == 'pl'
@@ -1042,16 +1043,7 @@ def test_voice_cerne_count_keeps_stock_until_existing_human_approval(isolated, m
 
     stt = transcribe(test_client)
     assert stt.status_code == 200 and stt.get_json()['text'] == transcript
-    count_args = {'product_id': 905, 'counted_quantity': 1, 'expected_version': 0,
-                  'idempotency_key': 'voice-count-cerne'}
-    count_provider = runtime.FakeModelProvider([
-        runtime.ProviderResponse(tool_calls=(
-            runtime.ToolCall('product', 'inventory.product.get', json.dumps({'product_id': 905})),
-            runtime.ToolCall('expected', 'inventory.count.get_expected', json.dumps({'product_id': 905})),
-            runtime.ToolCall('count', 'inventory.count.record', json.dumps(count_args)),
-        ), model='fake-model'),
-        respond('Cerne 128 BB. System: 3. Policzono: 1. Różnica: -2. Skorygować stan do 1?'),
-    ])
+    count_provider = runtime.FakeModelProvider([])
     backend.AGENT_MODEL_PROVIDER = count_provider
     counted_response = test_client.post('/api/internal/ai/chat', json={
         'message': stt.get_json()['text'], 'conversation_id': conversation_id,
@@ -1059,27 +1051,22 @@ def test_voice_cerne_count_keeps_stock_until_existing_human_approval(isolated, m
     counted = counted_response.get_json()
     assert counted_response.status_code == 200
     assert counted['conversation_id'] == conversation_id
-    assert any(item.get('role') == 'user' and item.get('content') == transcript
-               for item in count_provider.calls[0]['input_items'])
-    assert counted['approvals'] == []
+    # A recognized variant uses the deterministic count path. The original STT
+    # text must still be durable even though it is never sent to a model.
+    assert count_provider.calls == []
+    assert len(counted['approvals']) == 1
     count_card = next(item for item in counted['artifacts'] if item['type'] == 'inventory_count_card')
     assert (count_card['expected_quantity'], count_card['counted_quantity'], count_card['difference']) == (3, 1, -2)
 
-    backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([
-        tool('inventory.adjust', {'product_id': 905, 'expected_version': 0,
-                                  'idempotency_key': 'voice-adjust-cerne'}),
-        respond('Korekta czeka na zatwierdzenie przez człowieka.'),
-    ])
-    pending_response = test_client.post('/api/internal/ai/chat', json={
-        'message': 'Tak, przygotuj korektę', 'conversation_id': conversation_id,
-    })
-    assert pending_response.status_code == 200
-    approval = pending_response.get_json()['approvals'][0]
+    approval = counted['approvals'][0]
     assert approval['operation'] == 'inventory.adjust'
     assert (approval['from_quantity'], approval['to_quantity']) == (3, 1)
     db = backend.conn()
     try:
         assert db.execute('SELECT qty FROM stock WHERE product_id=905').fetchone()[0] == 3
+        assert transcript in [row[0] for row in db.execute(
+            'SELECT user_text FROM internal_agent_turns WHERE conversation_id=?',
+            (conversation_id,)).fetchall()]
     finally:
         db.close()
 

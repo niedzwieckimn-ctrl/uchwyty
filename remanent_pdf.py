@@ -2,6 +2,8 @@
 from io import BytesIO
 from html import escape
 from pathlib import Path
+import json
+from decimal import Decimal, ROUND_HALF_UP
 
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER
@@ -45,6 +47,7 @@ def render_pdf(session, items, total, kind, company):
     styles = getSampleStyleSheet()
     styles.add(ParagraphStyle(name='RemTitle', fontName=font, fontSize=16, leading=20, spaceAfter=9))
     styles.add(ParagraphStyle(name='RemText', fontName=font, fontSize=9, leading=13, spaceAfter=5))
+    styles.add(ParagraphStyle(name='RemSection', parent=styles['RemText'], keepWithNext=True))
     styles.add(ParagraphStyle(name='RemSmall', fontName=font, fontSize=7, leading=10))
     styles.add(ParagraphStyle(name='RemCenter', parent=styles['RemSmall'], alignment=TA_CENTER))
     width, height = landscape(A3 if kind=='internal' else A4)
@@ -58,6 +61,12 @@ def render_pdf(session, items, total, kind, company):
                        f"Rozpoczęto: {session['snapshot_at']} · Zamknięto: {session['completed_at']}",styles['RemText']),
              Spacer(1,5*mm)]
     p = lambda value: Paragraph(escape(str(value if value is not None else '—')), styles['RemSmall'])
+    unit = lambda value: str(Decimal(value).quantize(Decimal('0.000001'), rounding=ROUND_HALF_UP)) if value is not None else None
+    metadata = json.loads(items[0].get('source_json') or '{}') if items else {}
+    bases = {'goods_net':'towar netto','goods_transport':'towar + transport','landed_cost':'pełny koszt'}
+    if metadata.get('valuation_method'):
+        story.extend([Paragraph('Metoda: średnia ważona okresowa. Podstawa kosztów: ' + escape(bases.get(metadata.get('valuation_basis'),str(metadata.get('valuation_basis')))) + '.',styles['RemText']),
+            Paragraph('Wybrana techniczna metoda wyceny. Koszty i źródła zamrożono w chwili rozpoczęcia spisu. Cena jednostkowa w PDF: 6 miejsc; wartości pozycji obliczono z pełną precyzją i zaokrąglono do groszy.',styles['RemSmall']),Spacer(1,4*mm)])
     if kind == 'sheet':
         rows = [[p(x) for x in ('Lp.','Towar / SKU / wariant','J.m.','Ilość','Cena jedn. PLN','Wartość PLN')]]
         for n,item in enumerate(items,1):
@@ -65,7 +74,7 @@ def render_pdf(session, items, total, kind, company):
             if item['variant']:
                 description += f" / {item['variant']}"
             rows.append([p(n),p(description),p(item['unit']),p(item['counted_qty']),
-                         p(item['unit_value_pln']),p(item['counted_stock_value'])])
+                         p(unit(item['unit_value_pln'])),p(item['counted_stock_value'])])
         rows.append([p(''),p('ŁĄCZNA WARTOŚĆ SPISU'),p(''),p(total['counted_qty']),p(''),p(total['counted_value'])])
         story.extend([_table(rows,[12*mm,139*mm,15*mm,23*mm,31*mm,48*mm],font),Spacer(1,7*mm),
                       Paragraph(f"Spis zakończono na pozycji {len(items)}.",styles['RemText']),
@@ -86,7 +95,7 @@ def render_pdf(session, items, total, kind, company):
         values = [[p(x) for x in ('Lp.','SKU','Cena jednostkowa PLN','Wartość dokumentowa PLN',
                                  'Wartość fizyczna PLN','Różnica wartości PLN')]]
         for n,i in enumerate(items,1):
-            values.append([p(x) for x in (n,i['sku'],i['unit_value_pln'],i['document_stock_value'],
+            values.append([p(x) for x in (n,i['sku'],unit(i['unit_value_pln']),i['document_stock_value'],
                                             i['counted_stock_value'],i['difference_value'])])
         story.extend([Paragraph('Wycena pozycji',styles['RemText']),
                       _table(values,[13*mm,45*mm,66*mm,75*mm,75*mm,76*mm],font),Spacer(1,8*mm)])
@@ -100,6 +109,25 @@ def render_pdf(session, items, total, kind, company):
                   ('Pozycje policzone',total['counted_count']),('Pozycje niepoliczone',total['uncounted_count'])]
         story.append(KeepTogether([Paragraph('Podsumowanie',styles['RemText'])] +
                                   [Paragraph(f'{key}: {value}',styles['RemText']) for key,value in fields]))
-    document.build(story)
+        evidence = [[p(x) for x in ('SKU','Źródło / wersja / pozycja','Dokument / data','Uzgodnienie i ilość')]]
+        for item in items:
+            for trace in json.loads(item.get('source_json') or '{}').get('valuation_sources',[]):
+                if trace.get('source_type') == 'warehouse_manual_entry':
+                    identity=f"Wpis ręczny {trace['entry_id']}: {trace.get('source','')}"
+                    document_description=f"{trace.get('document_no','')} / {trace.get('period_start','')} - {trace.get('period_end','')}"
+                    decision=f"{trace.get('kind','')}; {trace.get('quantity')} szt.; {trace.get('unit_value_pln')} PLN/szt."
+                else:
+                    identity=f"{trace.get('installation_id','')} / {trace.get('import_id','')} / v{trace.get('version','')} / {trace.get('line_id','')}"
+                    document_description=f"{trace.get('document_no','')} / {trace.get('document_date','')}"
+                    receipt=trace.get('receipt') or {}
+                    decision=f"{(trace.get('decision') or {}).get('action','')}; przyjęcie: {receipt.get('receipt_key','-')} / {receipt.get('received_date','-')}; {trace.get('allocated_quantity','-')} szt.; decyzja {trace.get('decision_revision','-')}"
+                evidence.append([p(item['sku']),p(identity),p(document_description),p(decision)])
+        if len(evidence)>1:
+            story.extend([Spacer(1,8*mm),Paragraph('Zamrożone źródła wyceny',styles['RemSection']),
+                _table(evidence,[40*mm,145*mm,70*mm,95*mm],font)])
+    def page_number(canvas, doc):
+        canvas.setFont(font,8)
+        canvas.drawRightString(width-13*mm,7*mm,f"{session['remanent_no']} | strona {doc.page}")
+    document.build(story,onFirstPage=page_number,onLaterPages=page_number)
     buffer.seek(0)
     return buffer

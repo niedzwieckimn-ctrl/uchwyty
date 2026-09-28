@@ -69,6 +69,9 @@ from fulfillment_operations import PERMISSIONS as _fulfillment_permissions, WRIT
 
 # This backend catalogue is the only source of operation version and risk.
 OPERATION_DEFINITIONS: dict[str, OperationDefinition] = {
+    'invoices.payment.set_status': OperationDefinition('invoices.payment.set_status',1,'payments.set_status',YELLOW,WRITE),
+    **{'inventory.count.'+action: OperationDefinition('inventory.count.'+action,1,'inventory.discrepancy_report',GREEN,WRITE)
+       for action in ('pause','resume','keep_result','conversation.select')},
     'approval.decide': OperationDefinition('approval.decide', 1, 'approvals.decide', GREEN, WRITE),
     **{name: OperationDefinition(name, 1, _fulfillment_permissions[name], GREEN if name in _fulfillment_green else YELLOW, WRITE) for name in _fulfillment_writes},
     'invoices.remove': OperationDefinition('invoices.remove', 1, 'invoices.reverse', RED, WRITE),

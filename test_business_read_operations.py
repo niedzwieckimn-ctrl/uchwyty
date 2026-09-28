@@ -258,6 +258,9 @@ def test_dashboard_and_operation_share_fulfillment_calculator(data, monkeypatch)
     calls = []
     original = fulfillment_readiness.calculate_fulfillment_readiness
     monkeypatch.setattr(fulfillment_readiness, "calculate_fulfillment_readiness", lambda db: calls.append(True) or original(db))
+    # The extracted dashboard imports this dependency once; patch its actual binding too.
+    monkeypatch.setattr(backend.routes_admin, "calculate_fulfillment_readiness", lambda db: calls.append(True) or original(db))
+    monkeypatch.setattr(backend, 'maybe_pull_shared_from_supabase', lambda **kw: None)
     backend.app.secret_key = "readiness-test"
     client = backend.app.test_client()
     with client.session_transaction() as session:

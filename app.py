@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
+import sys
 import io
 import html
 import csv
@@ -136,6 +137,8 @@ import ksef_domestic
 import ksef_foreign
 from cash_flow_module import register_cash_flow, cash_flow_overdue_invoices
 import payment_reminders
+import invoice_payment_operations
+import invoice_payment_sync
 from inventory_analytics import ACTIVE_ORDER_STATUSES, build_replenishment_analysis, recommended_replenishments
 from seventeentrack_module import SeventeenTrackClient, enabled as seventeentrack_is_enabled, map_package_status, monotonic_status, parse_tracking_payload, verify_webhook_signature
 from proforma_module import generate_proforma_pdf
@@ -983,6 +986,7 @@ def init_db():
     import invoice_numbering
     invoice_numbering.initialize(c)
     invoice_stock.initialize(c)
+    invoice_payment_sync.initialize(c)
     _startup_step("invoice_schema_initialized")
     import inpost_history
     c.execute(inpost_history.SCHEMA)
@@ -1121,6 +1125,13 @@ def _artifact_links(operation_name: str, record: dict) -> dict:
         links = {'detail_url': f'/orders/{entity_id}'}
         invoice_id = _packing_invoice_id_for_order(entity_id)
         if invoice_id and _existing_packing_list_source(invoice_id):
+            import packing_history, packing_versions
+            try:
+                verified = packing_history.shipment_read({'invoice_id':invoice_id,'current':True}, connection_factory=conn)
+            except (packing_history.PackingHistoryError,packing_versions.PackingConflict):
+                return links
+            if not verified.get('verified') or not verified.get('complete') or entity_id not in verified.get('order_ids',[]):
+                return links
             links.update({
                 'packing_list_url': f'/api/internal/ai/documents/packing-lists/{invoice_id}',
                 'packing_invoice_id': invoice_id,
@@ -2854,7 +2865,17 @@ def sqlite_upsert_rows(table: str, rows: list, conflict_col: str):
     if not rows:
         return 0
 
-    table_cols = sqlite_table_columns(table)
+    c = conn()
+    try:
+        c.execute('BEGIN IMMEDIATE')
+        rows = invoice_payment_sync.protect_incoming(c, table, rows)
+        return _sqlite_upsert_rows_in_transaction(c, table, rows, conflict_col)
+    finally:
+        c.close()
+
+
+def _sqlite_upsert_rows_in_transaction(c, table, rows, conflict_col):
+    table_cols = [r[1] for r in c.execute(f'PRAGMA table_info({table})')]
     usable_cols = [c for c in table_cols if any(c in row for row in rows)]
     if not usable_cols:
         return 0
@@ -2882,7 +2903,6 @@ def sqlite_upsert_rows(table: str, rows: list, conflict_col: str):
     else:
         sql = f"INSERT INTO {table}({','.join(usable_cols)}) VALUES({placeholders}) ON CONFLICT({conflict_col}) DO NOTHING"
 
-    c = conn()
     try:
         cur = c.cursor()
         cnt = 0
@@ -2901,6 +2921,8 @@ def sqlite_upsert_rows(table: str, rows: list, conflict_col: str):
 def sqlite_delete_missing_rows(table: str, conflict_col: str, remote_keys: list):
     c = conn()
     try:
+        c.execute('BEGIN IMMEDIATE')
+        remote_keys = list({str(key) for key in remote_keys} | invoice_payment_sync.protected_keys(c, table))
         cur = c.cursor()
         if not remote_keys:
             cur.execute(f"DELETE FROM {table}")
@@ -3030,6 +3052,11 @@ def _business_group_has_local_data(group: str) -> bool:
 def reconcile_business_freshness_after_write(operation_name: str, _result: dict) -> None:
     """Keep only snapshots affected by the committed local order state current."""
     from fulfillment_operations import WRITES as _fulfillment_writes
+    if operation_name == 'invoices.payment.set_status':
+        invoice_payment_sync.flush_pending(sys.modules[__name__], invoice_id=int(_result['invoice_id']))
+        for group in ('orders','invoices','sales','dashboard','fulfillment_workflow','customers'):
+            _mark_business_freshness(group, time.time())
+        return
     if operation_name in _fulfillment_writes:
         completed_at = time.time()
         for group in ('orders','inventory','inventory_catalog','fulfillment','invoices','shipment',
@@ -3224,6 +3251,7 @@ def ensure_business_operation_freshness(operation_name: str, input_data=None) ->
 def pull_shared_tables_from_supabase(force: bool = False, delete_missing: bool = True):
     if not supabase_enabled():
         return {"ok": False, "error": "not_configured"}
+    invoice_payment_sync.flush_pending(sys.modules[__name__])
 
     now_ts = time.time()
     with _supabase_sync_lock:
@@ -4974,9 +5002,12 @@ def upsert_invoice_meta(
     seen_at: str | None = None,
     payment_reminder: int | None = None,
     paid: int | None = None,
-    paid_at: str | None = None
+    paid_at: str | None = None,
+    transaction_connection=None,
+    clear_paid_at: bool = False,
 ):
-    current = load_invoice_meta(invoice_id) or {}
+    current = (dict(transaction_connection.execute('SELECT * FROM invoice_meta WHERE invoice_id=?',(invoice_id,)).fetchone() or {})
+               if transaction_connection is not None else load_invoice_meta(invoice_id) or {})
     if sent_to_client is None:
         sent_to_client = int(current.get("sent_to_client") or 0)
     if seen_by_client is None:
@@ -4987,10 +5018,10 @@ def upsert_invoice_meta(
         payment_reminder = int(current.get("payment_reminder") or 0)
     if paid is None:
         paid = int(current.get("paid") or 0)
-    if paid_at is None:
+    if paid_at is None and not clear_paid_at:
         paid_at = current.get("paid_at")
 
-    c = conn()
+    c = transaction_connection or conn()
     cur = c.cursor()
     cur.execute("""
       INSERT INTO invoice_meta(invoice_id, pdf_path, invoice_items_json, sent_to_client, seen_by_client, payment_reminder, paid, paid_at, seen_at, updated_at)
@@ -5006,8 +5037,9 @@ def upsert_invoice_meta(
         seen_at=excluded.seen_at,
         updated_at=excluded.updated_at
     """, (invoice_id, pdf_path, invoice_items_json, int(sent_to_client), int(seen_by_client), int(payment_reminder), int(paid), paid_at, seen_at, now_iso()))
-    c.commit()
-    c.close()
+    if transaction_connection is None:
+        c.commit()
+        c.close()
 
 
 def sync_invoice_meta_to_supabase(invoice_id: int):
@@ -8407,8 +8439,21 @@ def reconcile_legacy_orders_by_age(days: int = 14):
     return []
 
 
-def _set_invoice_payment_state(invoice_id: int, *, reminder: int | None = None, paid: int | None = None):
-    meta = load_invoice_meta(invoice_id) or {}
+def _set_invoice_payment_state(invoice_id: int, *, reminder: int | None = None, paid: int | None = None, transaction_connection=None):
+    if transaction_connection is None:
+        db = conn()
+        try:
+            db.execute('BEGIN IMMEDIATE')
+            result = _set_invoice_payment_state(invoice_id,reminder=reminder,paid=paid,transaction_connection=db)
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+        invoice_payment_sync.flush_pending(sys.modules[__name__], invoice_id=int(invoice_id))
+        return result
+    meta = dict(transaction_connection.execute('SELECT * FROM invoice_meta WHERE invoice_id=?',(invoice_id,)).fetchone() or {})
     pdf_path = meta.get("pdf_path", "")
     items_json = meta.get("invoice_items_json", "")
     sent_to_client = int(meta.get("sent_to_client") or 0)
@@ -8424,7 +8469,7 @@ def _set_invoice_payment_state(invoice_id: int, *, reminder: int | None = None, 
     if next_paid:
         next_reminder = 0
         state_changed_at = now_iso()
-        next_paid_at = state_changed_at
+        next_paid_at = current_paid_at if current_paid and current_paid_at else state_changed_at
         # Opłacona faktura nie powinna nadal oczekiwać na potwierdzenie
         # klienta. Zachowujemy jedną prawdę w invoice_meta/Supabase.
         if not seen_by_client:
@@ -8442,13 +8487,16 @@ def _set_invoice_payment_state(invoice_id: int, *, reminder: int | None = None, 
         seen_at=seen_at,
         payment_reminder=next_reminder,
         paid=next_paid,
-        paid_at=next_paid_at
+        paid_at=next_paid_at,
+        transaction_connection=transaction_connection,
+        clear_paid_at=paid == 0,
     )
 
     changed_order_ids = []
-    c = conn()
+    c = transaction_connection
     cur = c.cursor()
-    for order_id in _invoice_source_order_ids(cur, invoice_id):
+    source_order_ids = _invoice_source_order_ids(cur, invoice_id)
+    for order_id in source_order_ids:
         cur.execute("SELECT status, tracking_no, packed_at FROM orders WHERE id=?", (order_id,))
         order_row = cur.fetchone()
         if not order_row:
@@ -8473,19 +8521,8 @@ def _set_invoice_payment_state(invoice_id: int, *, reminder: int | None = None, 
             cur.execute("UPDATE orders SET status=? WHERE id=?", (next_status, order_id))
             changed_order_ids.append(order_id)
 
-    c.commit()
-    c.close()
-
-    if supabase_enabled():
-        try:
-            sync_invoice_meta_to_supabase(invoice_id)
-        except Exception:
-            pass
-        if changed_order_ids:
-            try:
-                sync_local_rows_to_supabase("orders", "id", changed_order_ids)
-            except Exception:
-                pass
+    invoice_payment_sync.stage(transaction_connection, invoice_id, source_order_ids)
+    return changed_order_ids
 
 def _delete_invoice_everywhere(invoice_id: int):
     assert_invoice_mutable(invoice_id)
@@ -8782,6 +8819,7 @@ invoice_amendment.configure(_amendment_sys.modules[__name__])
 import fulfillment_operations
 fulfillment_operations.configure(_amendment_sys.modules[__name__])
 payment_reminders.configure(_amendment_sys.modules[__name__])
+invoice_payment_operations.configure(_amendment_sys.modules[__name__])
 from business_operations import configure_order_status
 from order_write import transition as local_order_transition
 configure_order_status(lambda db, order_id, status: local_order_transition(
@@ -8803,6 +8841,8 @@ if "client_searches_v2" in globals():
 
 import remanent as _remanent
 _remanent.register_routes(app, {"conn": conn, "BASE_URL": BASE_URL, "DB_PATH": DB_PATH})
+import remanent_source_routes as _remanent_source_routes
+_remanent_source_routes.register_routes(app, {"conn": conn, "BASE_URL": BASE_URL, "DB_PATH": DB_PATH})
 
 import search_analytics as _search_analytics
 import sys as _search_sys

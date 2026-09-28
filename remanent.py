@@ -13,6 +13,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from invoice_sales import sales_by_sku
+import inventory_count_lifecycle as count_lifecycle
+import remanent_sources
 
 WARSAW = ZoneInfo('Europe/Warsaw')
 MONEY = Decimal('0.01')
@@ -49,6 +51,7 @@ def initialize_schema(db):
     db.execute('CREATE UNIQUE INDEX IF NOT EXISTS uq_remanent_no ON internal_inventory_count_sessions(remanent_no) WHERE remanent_no IS NOT NULL')
     db.execute('''CREATE UNIQUE INDEX IF NOT EXISTS uq_remanent_open_owner ON internal_inventory_count_sessions(created_by)
                   WHERE status='OPEN' AND inventory_year IS NOT NULL''')
+    remanent_sources.initialize(db)
     db.commit()
 
 
@@ -63,6 +66,7 @@ def _session(db, session_id, owner=None, *, phase=None):
 
 
 def create_draft(db, owner, year):
+    count_lifecycle.assert_storage(db)
     year = int(year)
     if not 2000 <= year <= 2100:
         raise ValueError('Nieprawidłowy rok')
@@ -95,6 +99,7 @@ def _overlap(db, product_id, start, end):
 def add_entry(db, session_id, owner, *, product_id, kind, period_start, period_end,
               quantity, source, unit_value_pln=None, document_no='', note='',
               import_id=None, import_row=None):
+    count_lifecycle.assert_storage(db)
     session = _session(db, session_id, owner, phase='DRAFT')
     if kind not in KINDS:
         raise ValueError('Nieprawidłowe źródło danych')
@@ -138,6 +143,7 @@ def add_entry(db, session_id, owner, *, product_id, kind, period_start, period_e
 
 
 def void_entry(db, session_id, owner, entry_id, reason):
+    count_lifecycle.assert_storage(db)
     session = _session(db, session_id, owner, phase='DRAFT')
     if not reason.strip():
         raise ValueError('Podaj powód wycofania wpisu')
@@ -150,6 +156,8 @@ def void_entry(db, session_id, owner, entry_id, reason):
 
 def preview_csv(db, session_id, owner, data, kind, start, end):
     session = _session(db, session_id, owner, phase='DRAFT')
+    if kind == 'historical_purchase_import':
+        raise ValueError('CSV zakupów bez trwałych identyfikatorów dostawy nie może być dodany jako kolejne ilości. Użyj Uzgodnij źródła i pliku JSON v2 z Rocznego Rozliczenia; połącz z przyjęciem albo jawnie wybierz historię.')
     if kind not in {'historical_purchase_import', 'historical_sales_import'}:
         raise ValueError('Import dotyczy zakupów albo sprzedaży historycznej')
     start = _validate_date(start, session['inventory_year'])
@@ -266,20 +274,18 @@ def _source_fingerprint(db, start, end):
 def _app_purchases(db, start, end):
     quantities = defaultdict(int)
     incomplete = []
-    for row in db.execute('''SELECT * FROM china_stock_receipts WHERE substr(received_at,1,10) BETWEEN ? AND ?''',
-                          (start, end)):
-        try:
-            payload = json.loads(row['quantities_json'] or '[]')
-        except ValueError:
-            payload = []
-        if not payload:
-            incomplete.append(row['package_id'])
-        for item in payload:
-            quantities[int(item['product_id'])] += int(item['qty'])
+    for row in remanent_sources.receipts(db):
+        if not start <= row['received_date'] <= end:
+            continue
+        if row['quantity'] is None or not row['product_id'] or not row['sku']:
+            incomplete.append(row['receipt_key'])
+        else:
+            quantities[row['product_id']] += row['quantity']
     return quantities, incomplete
 
 
 def start_count(db, session_id, owner, as_of_date):
+    count_lifecycle.assert_storage(db)
     session = _session(db, session_id, owner, phase='DRAFT')
     as_of = _validate_date(as_of_date, session['inventory_year'])
     start = f"{session['inventory_year']}-01-01"
@@ -295,6 +301,13 @@ def start_count(db, session_id, owner, as_of_date):
         entries = db.execute('''SELECT * FROM internal_remanent_entries
             WHERE inventory_year=? AND voided_at IS NULL AND period_start<=? ORDER BY id''',
             (session['inventory_year'], as_of)).fetchall()
+        setting = db.execute('SELECT * FROM remanent_valuation_settings WHERE session_id=?',(session_id,)).fetchone()
+        if not setting:
+            raise ValueError('Przed rozpoczęciem wybierz metodę wyceny i podstawę kosztów w Uzgodnieniu źródeł. Szkic pozostaje do uzupełnienia.')
+        basis = setting['basis'] if setting else 'landed_cost'
+        valuation = remanent_sources.valuation(db,int(session['inventory_year']),as_of,basis)
+        if valuation.get(None,{}).get('problems'):
+            raise ValueError('; '.join(valuation[None]['problems']))
         sources = defaultdict(list)
         for entry in entries:
             if entry['period_end'] > as_of:
@@ -313,23 +326,50 @@ def start_count(db, session_id, owner, as_of_date):
             record = sources[pid]
             def total(kind):
                 return sum(int(r['quantity']) for r in record if r['kind']==kind)
-            opening = total('opening')
+            linked = valuation.get(pid, {'opening_quantity':0,'opening_value':Decimal('0'),'opening_known':False,
+                'history_quantity':0,'purchase_value':Decimal('0'),'receipt_quantity':0,'problems':[],'sources':[]})
+            problems = list(linked['problems'])
+            manual_openings = [r for r in record if r['kind']=='opening']
+            opening_known = bool(manual_openings) or linked['opening_known']
+            if len(manual_openings)>1 or (manual_openings and linked['opening_known']):
+                problems.append('Sprzeczne źródła stanu początkowego')
+            opening = total('opening') + linked['opening_quantity']
             purchase_manual = total('historical_purchase_manual')
             purchase_import = total('historical_purchase_import')
-            historical_purchases = purchase_manual + purchase_import
+            historical_purchases = purchase_manual + purchase_import + linked['history_quantity']
             purchase_app = app_purchases[pid]
             coverage = any(r['kind']=='purchase_coverage' and r['period_start']==start
                            and r['period_end']==as_of for r in record)
             sale_manual = total('historical_sales_manual')
             sale_import = total('historical_sales_import')
             sale_app = app_sales.get(pid,0)
-            document_qty = opening + historical_purchases + purchase_app - sale_manual - sale_import - sale_app if coverage else None
-            explicit = [r['unit_value_pln'] for r in record if r['kind'] in ('unit_value_manual','unit_value_import')]
-            prices = [r['unit_value_pln'] for r in record if r['unit_value_pln'] is not None]
-            if explicit and len({Decimal(v) for v in explicit}) > 1:
-                raise ValueError(f"Sprzeczne zatwierdzone ceny dla {product['sku']}")
-            # Multiple purchase prices need an explicit valuation decision.
-            value = explicit[-1] if explicit else (prices[-1] if len({Decimal(v) for v in prices}) == 1 else None)
+            document_qty = opening + historical_purchases + purchase_app - sale_manual - sale_import - sale_app if coverage and opening_known else None
+            if not opening_known: problems.append('Niepotwierdzony stan początkowy; brak nie oznacza zera')
+            if not coverage: problems.append('Niepotwierdzona kompletność zakupów')
+            if not setting: problems.append('Nie wybrano metody i podstawy wyceny')
+            total_value = linked['opening_value'] + linked['purchase_value']
+            source_trace = list(linked['sources'])
+            for entry in manual_openings + [r for r in record if r['kind'].startswith('historical_purchase')]:
+                if entry['kind']=='historical_purchase_import':
+                    problems.append('Starszy import CSV wymaga uzgodnienia tożsamości dostawy')
+                if entry['unit_value_pln'] is None and entry['quantity']:
+                    problems.append('Brak wartości źródła '+str(entry['id']))
+                elif entry['unit_value_pln'] is not None:
+                    total_value += Decimal(entry['unit_value_pln'])*int(entry['quantity'])
+                source_trace.append({'source_type':'warehouse_manual_entry','entry_id':entry['id'],
+                    'source':entry['source'],'kind':entry['kind'],'document_no':entry['document_no'],
+                    'period_start':entry['period_start'],'period_end':entry['period_end'],
+                    'quantity':entry['quantity'],'unit_value_pln':entry['unit_value_pln'],
+                    'valuation_basis':basis,'basis_confirmed':bool(setting['manual_basis_confirmed'])})
+                if entry['unit_value_pln'] is not None and not setting['manual_basis_confirmed']:
+                    problems.append('Potwierdź podstawę kosztów ręcznych przy wyborze metody')
+            denominator = opening + historical_purchases + purchase_app
+            value = str(total_value/Decimal(denominator)) if denominator and not problems else None
+            valuation_trace = {'valuation_method':setting['method'] if setting else None,'valuation_basis':basis if setting else None,
+                'valuation_sources':source_trace,'valuation_problems':sorted(set(problems)),
+                'opening_known':opening_known,'weighted_quantity':denominator,'weighted_value_pln':str(total_value)}
+            if problems:
+                raise ValueError(str(product['sku']) + ': ' + '; '.join(sorted(set(problems))) + '. Uzupełnij szkic przed rozpoczęciem.')
             previous = db.execute('''SELECT sn.counted_final FROM internal_remanent_snapshots sn
                  JOIN internal_inventory_count_sessions s ON s.session_id=sn.session_id
                  WHERE s.status='COMPLETED' AND sn.product_id=? AND sn.counted_final IS NOT NULL
@@ -346,7 +386,7 @@ def start_count(db, session_id, owner, as_of_date):
                  int(product['stock_qty']),int(previous['counted_final']) if previous else None,
                  opening,historical_purchases,purchase_app,int(bool(coverage)),sale_manual,sale_import,sale_app,
                  document_qty,value,json.dumps({'entry_ids':[r['id'] for r in record],
-                                                'sales_dates':sale_dates.get(pid,[])},ensure_ascii=False)))
+                                                'sales_dates':sale_dates.get(pid,[]),**valuation_trace},ensure_ascii=False)))
         changed = db.execute('''UPDATE internal_inventory_count_sessions SET phase='IN_PROGRESS',
             as_of_date=?,snapshot_at=?,source_fingerprint=?,company_snapshot_json=?
             WHERE session_id=? AND phase='DRAFT' AND status='OPEN' ''',
@@ -355,6 +395,7 @@ def start_count(db, session_id, owner, as_of_date):
              session_id)).rowcount
         if changed != 1:
             raise ValueError('Remanent został rozpoczęty w innym żądaniu')
+        count_lifecycle.event(db,session_id,owner,'start')
         db.commit()
     except Exception:
         db.rollback()
@@ -378,6 +419,8 @@ def detail(db, session_id, owner=None):
             price = Decimal('0')  # zero-stock SKU has no valuation to guess
             row['unit_value_pln'] = '0.00'
         row['counted_qty'] = count
+        row['count_status'] = counts[row['product_id']]['status'] if row['product_id'] in counts else 'UNCOUNTED'
+        row.update({key:value for key,value in json.loads(row['source_json']).items() if key in {'valuation_method','valuation_basis','valuation_problems','opening_known'}})
         row['assumed_zero'] = bool(row['assumed_zero']) if session['status']=='COMPLETED' else False
         row['purchases_total'] = row['historical_purchases'] + row['purchases_from_app'] if row['purchases_known'] else None
         row['sales_total'] = row['historical_sales_manual']+row['historical_sales_import']+row['sales_from_app']
@@ -409,6 +452,7 @@ def detail(db, session_id, owner=None):
 
 
 def close_count(db, session_id, owner, *, confirm_uncounted=False):
+    count_lifecycle.assert_storage(db)
     session = _session(db,session_id,owner,phase='IN_PROGRESS')
     if session['status'] != 'OPEN':
         raise ValueError('Remanent już zamknięto')
@@ -417,9 +461,14 @@ def close_count(db, session_id, owner, *, confirm_uncounted=False):
     # The frozen count must never silently acquire backdated documents.
     db.execute('BEGIN IMMEDIATE')
     try:
+        pending, approvals = count_lifecycle.unresolved(db,session_id)
+        if pending or approvals:
+            raise ValueError('Rozstrzygnij wszystkie korekty i zatwierdzenia: zaakceptuj korektę albo zachowaj wynik bez zmiany magazynu.')
         if _source_fingerprint(db,start,session['as_of_date']) != session['source_fingerprint']:
             raise ValueError('Faktury lub przyjęcia zmieniły się od rozpoczęcia spisu; zweryfikuj dokumenty')
         _s,items,total = detail(db,session_id,owner)
+        if any(item.get('valuation_problems') for item in items):
+            raise ValueError('Niekompletna wycena: ' + '; '.join(sorted({problem for item in items for problem in item.get('valuation_problems',[])})))
         if total['uncounted_count'] and not confirm_uncounted:
             raise ValueError('Niepoliczone SKU wymagają jawnego potwierdzenia przyjęcia 0 szt.')
         if any(not item['purchases_known'] for item in items):
@@ -432,8 +481,9 @@ def close_count(db, session_id, owner, *, confirm_uncounted=False):
                 WHERE session_id=? AND product_id=?''',
                 (item['counted_qty'] if item['counted_qty'] is not None else 0,
                  int(item['counted_qty'] is None),session_id,item['product_id']))
-        db.execute('''UPDATE internal_inventory_count_sessions SET status='COMPLETED',completed_at=?,active_product_id=NULL
+        db.execute('''UPDATE internal_inventory_count_sessions SET status='COMPLETED',completed_at=?,active_product_id=NULL,pending_approval_id=NULL,voice_state='WAIT_PRODUCT'
                       WHERE session_id=? AND status='OPEN' ''',(now(),session_id))
+        count_lifecycle.event(db,session_id,owner,'complete')
         db.commit()
     except Exception:
         db.rollback()
@@ -449,12 +499,14 @@ def register_routes(app, deps):
 
     @app.before_request
     def require_durable_remanent_storage():
-        if (request.path.startswith('/remanent') and request.method == 'POST'
-                and os.environ.get('RENDER')
-                and (not os.environ.get('APP_DATA_DIR')
-                     or os.environ.get('REMANENT_PERSISTENCE_READY') != '1')):
-            return ('Remanent jest zablokowany: najpierw potwierdź trwały dysk '
-                    'APP_DATA_DIR i ustaw REMANENT_PERSISTENCE_READY=1.', 503)
+        if request.path.startswith('/remanent') and request.method == 'POST':
+            db = deps['conn']()
+            try:
+                count_lifecycle.assert_storage(db)
+            except ValueError as exc:
+                return str(exc),503
+            finally:
+                db.close()
 
     def owner():
         actor = current_actor_context()
@@ -473,11 +525,16 @@ def register_routes(app, deps):
               JOIN products p ON p.id=e.product_id WHERE e.inventory_year=? ORDER BY e.id DESC''',
               (session['inventory_year'],))]
             products=[dict(row) for row in db.execute('SELECT id,sku,name FROM products ORDER BY sku')]
+            conversations = [dict(row) for row in db.execute('''SELECT conversation_id,created_at
+                FROM internal_agent_conversations WHERE human_actor_id=? ORDER BY created_at DESC LIMIT 30''', (owner().actor_id,))]
+            session['timing'] = count_lifecycle.timing(db,session_id)
+            valuation_setting = db.execute('SELECT * FROM remanent_valuation_settings WHERE session_id=?',(session_id,)).fetchone()
+            valuation_setting = dict(valuation_setting) if valuation_setting else None
         finally:
             db.close()
         return render_template('remanent.html', title='Remanent',base_url=deps['BASE_URL'],db_path=deps['DB_PATH'],
                                remanent=session,items=items,totals=total,entries=entries,products=products,
-                               error=error,preview=preview,today=date.today().isoformat())
+                               error=error,preview=preview,conversations=conversations,valuation_setting=valuation_setting,today=date.today().isoformat())
 
     @app.get('/remanent')
     @require_permission('inventory.read')
@@ -639,6 +696,49 @@ def register_routes(app, deps):
                 raise ValueError('Zamknięcie wymaga jawnego potwierdzenia')
             close_count(db,session_id,owner().actor_id,
                         confirm_uncounted=request.form.get('uncounted_zero')=='yes')
+            return redirect(url_for('remanent_detail',session_id=session_id))
+        except ValueError as exc:
+            db.rollback()
+            return show(session_id,error=str(exc)),409
+        finally: db.close()
+
+    @app.post('/remanent/<session_id>/count-decision')
+    @require_permission('inventory.discrepancy_report')
+    def remanent_count_decision(session_id):
+        action = request.form.get('action')
+        if action not in {'keep_result','adjust','pause','resume'}: abort(400)
+        payload = {'count_session_id':session_id,'idempotency_key':str(uuid.uuid4())}
+        if action in {'keep_result','adjust'}:
+            try: payload['product_id'] = int(request.form.get('product_id'))
+            except (ValueError,TypeError): abort(400)
+            expected = execute_business_operation(owner(),'inventory.count.get_expected',{'product_id':payload['product_id']})
+            if expected.status != 'SUCCESS': return show(session_id,error=expected.safe_error_message),409
+            payload['expected_version'] = expected.data['version']
+        result = execute_business_operation(owner(),'inventory.adjust' if action=='adjust' else 'inventory.count.'+action,payload)
+        if result.status == 'PENDING_APPROVAL':
+            return show(session_id,error='Korekta czeka na oddzielne zatwierdzenie w panelu operacji. Identyfikator: '+result.approval_id)
+        if result.status != 'SUCCESS': return show(session_id,error=result.safe_error_message or result.error_code),409
+        return redirect(url_for('remanent_detail',session_id=session_id))
+
+    @app.post('/remanent/<session_id>/conversation')
+    @require_permission('inventory.discrepancy_report')
+    def remanent_conversation(session_id):
+        db = db_open()
+        try:
+            db.execute('BEGIN IMMEDIATE')
+            selected = _session(db,session_id,owner().actor_id,phase='IN_PROGRESS')
+            if selected['status'] != 'OPEN': raise ValueError('Spis jest zamknięty.')
+            cid = str(request.form.get('conversation_id') or '')
+            if cid and not db.execute('SELECT 1 FROM internal_agent_conversations WHERE conversation_id=? AND human_actor_id=?',(cid,owner().actor_id)).fetchone():
+                raise ValueError('Rozmowa nie należy do bieżącego użytkownika.')
+            if count_lifecycle.unresolved(db,session_id)[1]:
+                raise ValueError('Najpierw rozstrzygnij oczekujące zatwierdzenie korekty.')
+            db.execute("UPDATE internal_inventory_count_sessions SET conversation_id=?,active_product_id=NULL,pending_approval_id=NULL,voice_state='WAIT_PRODUCT' WHERE session_id=?",(cid,session_id))
+            from internal_audit import record_audit_event
+            record_audit_event('inventory.count.conversation.select',result='SUCCESS',actor_context=owner(),
+                entity_type='inventory_count_session',entity_id=session_id,
+                before_state={'conversation_id':selected['conversation_id']},after_state={'conversation_id':cid},transaction_connection=db)
+            db.commit()
             return redirect(url_for('remanent_detail',session_id=session_id))
         except ValueError as exc:
             db.rollback()

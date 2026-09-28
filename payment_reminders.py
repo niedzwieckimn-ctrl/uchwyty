@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import inspect
 import uuid
 
 from cash_flow_module import cash_flow_overdue_invoices
@@ -18,7 +19,7 @@ def configure(backend):
 
 
 def initialize(db):
-    db.executescript('''
+    schema = '''
     CREATE TABLE IF NOT EXISTS payment_reminder_attempts(
         attempt_id TEXT PRIMARY KEY,
         invoice_id INTEGER NOT NULL,
@@ -27,10 +28,32 @@ def initialize(db):
         channel TEXT NOT NULL,
         trigger_source TEXT NOT NULL,
         recipient TEXT NOT NULL DEFAULT '',
-        status TEXT NOT NULL CHECK(status IN ('RUNNING','SUCCESS','FAILED')),
+        status TEXT NOT NULL CHECK(status IN ('RUNNING','PROVIDER_ACCEPTED','SUCCESS','FAILED','UNKNOWN','RECONCILIATION_REQUIRED')),
         error TEXT NOT NULL DEFAULT '',
+        provider_confirmed INTEGER NOT NULL DEFAULT 0,
+        provider_message_id TEXT NOT NULL DEFAULT '',
+        reconciled_at TEXT,
         FOREIGN KEY(invoice_id) REFERENCES invoices(id)
-    );
+    );'''
+    old = db.execute("SELECT sql FROM sqlite_master WHERE name='payment_reminder_attempts'").fetchone()
+    if old and 'RECONCILIATION_REQUIRED' not in old[0]:
+        db.execute('SAVEPOINT reminder_outcome_migration')
+        try:
+            db.execute(schema.replace('payment_reminder_attempts', 'payment_reminder_attempts_v2', 1))
+            db.execute('''INSERT INTO payment_reminder_attempts_v2(
+                attempt_id,invoice_id,attempted_at,completed_at,channel,trigger_source,recipient,status,error,provider_confirmed)
+                SELECT attempt_id,invoice_id,attempted_at,completed_at,channel,trigger_source,recipient,status,error,
+                       CASE WHEN status='SUCCESS' THEN 1 ELSE 0 END FROM payment_reminder_attempts''')
+            db.execute('DROP TABLE payment_reminder_attempts')
+            db.execute('ALTER TABLE payment_reminder_attempts_v2 RENAME TO payment_reminder_attempts')
+            db.execute('RELEASE reminder_outcome_migration')
+        except Exception:
+            db.execute('ROLLBACK TO reminder_outcome_migration')
+            db.execute('RELEASE reminder_outcome_migration')
+            raise
+    else:
+        db.execute(schema)
+    db.executescript('''
     CREATE INDEX IF NOT EXISTS idx_payment_reminder_attempts_invoice
         ON payment_reminder_attempts(invoice_id,attempted_at DESC);
     ''')
@@ -63,58 +86,130 @@ def _invoice(invoice_id, db=None):
             db.close()
 
 
-def send(invoice_id, *, trigger_source, attempt_id=None):
-    """Send once, record the attempt, and mutate invoice state only on success."""
+_UNRESOLVED = ('RUNNING', 'PROVIDER_ACCEPTED', 'UNKNOWN', 'RECONCILIATION_REQUIRED')
+
+
+def _outcome(row):
+    row = dict(row)
+    accepted = bool(row.get('provider_confirmed')) or row['status'] == 'SUCCESS'
+    unresolved = row['status'] in _UNRESOLVED
+    code = ('REMINDER_STATUS_RECONCILIATION_REQUIRED' if accepted and unresolved else
+            'REMINDER_OUTCOME_UNKNOWN' if unresolved else
+            'REMINDER_SEND_FAILED' if row['status'] == 'FAILED' else '')
+    return {'ok': accepted, 'invoice_id': int(row['invoice_id']),
+            'reminder_sent': accepted, 'attempt_id': row['attempt_id'],
+            'provider_confirmed': accepted, 'delivery_status': row['status'],
+            'reconciliation_required': unresolved, 'error_code': code,
+            'error': row.get('error') or ('Wynik wcześniejszej wysyłki wymaga sprawdzenia. Nie wysyłam ponownie.' if unresolved and not accepted else '')}
+
+
+def _save_outcome(attempt_id, status, *, error='', provider_confirmed=False, provider_message_id=''):
     b = _backend
-    invoice = _invoice(invoice_id)
-    if int(invoice.get('paid') or 0):
-        return {'ok': False, 'invoice_id': int(invoice_id), 'reminder_sent': False,
-                'attempt_id': '', 'error_code': 'INVOICE_ALREADY_PAID',
-                'error': 'Faktura jest oznaczona jako opłacona.'}
+    db = b.conn()
+    try:
+        db.execute('''UPDATE payment_reminder_attempts SET status=?,error=?,completed_at=?,
+            provider_confirmed=MAX(provider_confirmed,?),
+            provider_message_id=CASE WHEN ?<>'' THEN ? ELSE provider_message_id END,
+            reconciled_at=CASE WHEN ?='SUCCESS' THEN ? ELSE reconciled_at END
+            WHERE attempt_id=?''',
+            (status, str(error)[:300], b.now_iso(), int(provider_confirmed), provider_message_id,
+             provider_message_id, status, b.now_iso(), attempt_id))
+        db.commit()
+        return dict(db.execute('SELECT * FROM payment_reminder_attempts WHERE attempt_id=?', (attempt_id,)).fetchone())
+    finally:
+        db.close()
+
+
+def reconcile_confirmed(attempt_id):
+    """Repair only local invoice flags, using durable provider acceptance evidence.
+
+    This function never calls the email provider. UNKNOWN/RUNNING attempts need
+    operator/provider reconciliation and cannot authorize an automatic resend.
+    """
+    b = _backend
+    db = b.conn()
+    try:
+        row = db.execute('SELECT * FROM payment_reminder_attempts WHERE attempt_id=?', (attempt_id,)).fetchone()
+        if row is None:
+            raise _error('REMINDER_ATTEMPT_NOT_FOUND', 'Nie znaleziono próby wysyłki.')
+        row = dict(row)
+    finally:
+        db.close()
+    if row['status'] == 'SUCCESS' or not row['provider_confirmed']:
+        return _outcome(row)
+    try:
+        b._set_invoice_payment_state(int(row['invoice_id']), reminder=1, paid=None)
+        row = _save_outcome(attempt_id, 'SUCCESS', provider_confirmed=True)
+    except Exception as exc:
+        row.update(status='RECONCILIATION_REQUIRED', error=str(exc)[:300])
+        try:
+            _save_outcome(attempt_id, 'RECONCILIATION_REQUIRED', error=str(exc), provider_confirmed=True)
+        except Exception:
+            pass  # Persisted PROVIDER_ACCEPTED still blocks another external send.
+    return _outcome(row)
+
+
+def send(invoice_id, *, trigger_source, attempt_id=None):
+    """Persist an attempt before sending; never retry an uncertain external effect."""
+    b = _backend
     attempt_id = str(attempt_id or uuid.uuid4())
     db = b.conn()
-    existing = db.execute(
-        'SELECT * FROM payment_reminder_attempts WHERE attempt_id=?', (attempt_id,)).fetchone()
-    if existing:
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        existing = db.execute('SELECT * FROM payment_reminder_attempts WHERE attempt_id=?', (attempt_id,)).fetchone()
+        if existing and int(existing['invoice_id']) != int(invoice_id):
+            raise _error('IDEMPOTENCY_CONFLICT', 'Identyfikator próby należy do innej faktury.', 'CONFLICT')
+        if not existing:
+            existing = db.execute('''SELECT * FROM payment_reminder_attempts WHERE invoice_id=?
+                AND status IN ('RUNNING','PROVIDER_ACCEPTED','UNKNOWN','RECONCILIATION_REQUIRED')
+                ORDER BY attempted_at,attempt_id LIMIT 1''', (int(invoice_id),)).fetchone()
+        if existing:
+            return _outcome(existing)
+        invoice = _invoice(invoice_id, db)
+        if int(invoice.get('paid') or 0):
+            return {'ok': False, 'invoice_id': int(invoice_id), 'reminder_sent': False,
+                    'attempt_id': '', 'error_code': 'INVOICE_ALREADY_PAID',
+                    'error': 'Faktura jest oznaczona jako opłacona.'}
+        if (invoice.get('publication_state') or 'complete') != 'complete':
+            return {'ok': False, 'invoice_id': int(invoice_id), 'reminder_sent': False,
+                    'attempt_id': '', 'error_code': 'INVOICE_NOT_COMPLETE',
+                    'error': 'Publikacja faktury nie jest ukończona.'}
+        db.execute('''INSERT INTO payment_reminder_attempts(
+            attempt_id,invoice_id,attempted_at,channel,trigger_source,recipient,status,error)
+            VALUES(?,?,?,?,?,?,?,?)''', (attempt_id, int(invoice_id), b.now_iso(), 'email',
+            str(trigger_source), str(invoice.get('customer_email') or ''), 'RUNNING', ''))
+        db.commit()
+    finally:
         db.close()
-        existing = dict(existing)
-        return {'ok': existing['status'] == 'SUCCESS', 'invoice_id': int(invoice_id),
-                'reminder_sent': existing['status'] == 'SUCCESS', 'attempt_id': attempt_id,
-                'error_code': 'REMINDER_SEND_FAILED' if existing['status'] == 'FAILED' else '',
-                'error': existing.get('error') or ''}
-    attempted_at = b.now_iso()
-    db.execute('''INSERT INTO payment_reminder_attempts(
-                      attempt_id,invoice_id,attempted_at,channel,trigger_source,recipient,status,error)
-                  VALUES(?,?,?,?,?,?,?,?)''',
-               (attempt_id, int(invoice_id), attempted_at, 'email', str(trigger_source),
-                str(invoice.get('customer_email') or ''), 'RUNNING', ''))
-    db.commit()
-    db.close()
-
-    error_message = ''
     try:
         if not b.send_payment_reminder:
             raise RuntimeError('Moduł wysyłki przypomnień nie jest dostępny')
         invoice_context, pdf_url = b._invoice_email_context(int(invoice_id))
-        result = b.send_payment_reminder(invoice_context, pdf_url=pdf_url)
-        if not isinstance(result, dict) or not result.get('ok'):
-            raise RuntimeError(str((result or {}).get('error') or 'Wysyłka nie powiodła się'))
-        # paid=None is deliberate: sending a reminder must never alter payment state.
-        b._set_invoice_payment_state(int(invoice_id), reminder=1, paid=None)
     except Exception as exc:
-        error_message = str(exc or type(exc).__name__)[:300]
-
-    db = b.conn()
-    status = 'FAILED' if error_message else 'SUCCESS'
-    db.execute('''UPDATE payment_reminder_attempts
-                     SET status=?,error=?,completed_at=? WHERE attempt_id=?''',
-               (status, error_message, b.now_iso(), attempt_id))
-    db.commit()
-    db.close()
-    return {'ok': not error_message, 'invoice_id': int(invoice_id),
-            'reminder_sent': not error_message, 'attempt_id': attempt_id,
-            'error_code': 'REMINDER_SEND_FAILED' if error_message else '',
-            'error': error_message}
+        return _outcome(_save_outcome(attempt_id, 'FAILED', error=str(exc)))
+    try:
+        kwargs = {'pdf_url': pdf_url}
+        parameters = inspect.signature(b.send_payment_reminder).parameters.values()
+        if any(p.name == 'idempotency_key' or p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters):
+            kwargs['idempotency_key'] = 'payment-reminder/' + attempt_id
+        result = b.send_payment_reminder(invoice_context, **kwargs)
+    except Exception as exc:
+        result = {'ok': False, 'delivery_outcome': 'unknown', 'error': str(exc)}
+    if not isinstance(result, dict) or not result.get('ok'):
+        result = result if isinstance(result, dict) else {}
+        status = 'UNKNOWN' if result.get('delivery_outcome') == 'unknown' or not result else 'FAILED'
+        return _outcome(_save_outcome(attempt_id, status, error=result.get('error') or 'Nie potwierdzono wyniku wysyłki.'))
+    body = result.get('body')
+    provider_id = str((body.get('id') if isinstance(body, dict) else None) or result.get('id') or '')
+    try:
+        _save_outcome(attempt_id, 'PROVIDER_ACCEPTED', provider_confirmed=True, provider_message_id=provider_id)
+    except Exception as exc:
+        # RUNNING was committed before the POST and blocks retry even when this
+        # confirmation cannot be saved. The caller still receives the known fact.
+        return _outcome({'invoice_id': invoice_id, 'attempt_id': attempt_id,
+                         'status': 'RECONCILIATION_REQUIRED', 'provider_confirmed': True,
+                         'error': 'Dostawca przyjął e-mail; zapis potwierdzenia wymaga uzgodnienia: ' + str(exc)[:180]})
+    return reconcile_confirmed(attempt_id)
 
 
 def read(data, actor=None, correlation_id='', transaction_connection=None):
@@ -149,7 +244,8 @@ def read(data, actor=None, correlation_id='', transaction_connection=None):
             if query and query not in haystack:
                 continue
             attempts = [dict(item) for item in db.execute(
-                '''SELECT attempt_id,attempted_at,completed_at,channel,trigger_source,status,error
+                '''SELECT attempt_id,attempted_at,completed_at,channel,trigger_source,status,error,
+                          provider_confirmed,provider_message_id,reconciled_at
                      FROM payment_reminder_attempts WHERE invoice_id=?
                      ORDER BY attempted_at DESC,attempt_id DESC''', (int(row['id']),)).fetchall()]
             last = attempts[0] if attempts else None
@@ -215,6 +311,10 @@ def execute(execution_id, definition, actor, data, approval_id, entity_type,
         output = operations.validate_output(definition, {
             'ok': True, 'invoice_id': int(data['invoice_id']),
             'reminder_sent': True, 'attempt_id': result['attempt_id'],
+            'provider_confirmed': result.get('provider_confirmed', True),
+            'delivery_status': result.get('delivery_status', 'SUCCESS'),
+            'reconciliation_required': result.get('reconciliation_required', False),
+            'message': result.get('error') or '',
         })
         row = operations._transition(
             execution_id, definition, actor, 'SUCCESS', 'business_operation.success', 'SUCCESS',

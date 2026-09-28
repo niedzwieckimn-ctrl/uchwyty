@@ -1,4 +1,5 @@
 import json
+import re
 import socket
 import urllib.request
 
@@ -50,11 +51,13 @@ def test_internal_page_has_expected_navigation_and_conversation_controls(client)
     assert "event.key === 'Enter' && !event.shiftKey" in html
 
 
-def test_browser_request_contains_only_message_conversation_and_renders_only_safe_message(client):
+def test_browser_request_contains_only_message_conversation_voice_hint_and_renders_only_safe_message(client):
     login(client)
     html = client.get("/ai-assistant").get_data(as_text=True)
     assert "fetch('/api/internal/ai/chat'" in html
-    assert "JSON.stringify({message: message, conversation_id: conversationId})" in html
+    chat_script = html[html.index("fetch('/api/internal/ai/chat'"):]
+    payload = re.search(r'body:\s*JSON\.stringify\(\{([^}]+)\}\)',chat_script).group(1)
+    assert set(re.findall(r'\b([a-z_]+)\s*:',payload)) == {'message','conversation_id','voice_fast_mode'}
     assert "Nowa rozmowa" in html
     forbidden_request_fields = ("actor_id", "actor_type", "roles", "permissions", "risk_level", "AI_OWNER_ACTOR_ID")
     assert all(value not in html for value in forbidden_request_fields)
@@ -65,21 +68,20 @@ def test_browser_request_contains_only_message_conversation_and_renders_only_saf
     assert "localStorage" not in html and "sessionStorage" not in html
 
 
-def test_fake_provider_smoke_returns_grounded_answer(client):
+def test_direct_physical_read_returns_grounded_answer_without_model(client):
     db = backend.conn()
     now = backend.now_iso()
     db.execute("INSERT INTO products(id,sku,model,name,created_at) VALUES(1,'CH101-BLK-160','Avery 160','Avery czarny 160',?)", (now,))
     db.execute("INSERT INTO stock(product_id,qty) VALUES(1,24)")
     db.commit()
     db.close()
-    backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([
-        runtime.ProviderResponse(tool_calls=(runtime.ToolCall("call-1", "inventory.product.search", json.dumps({"query": "Avery 160"})),), model="fake-model"),
-        runtime.ProviderResponse(text="Na magazynie mamy 24 sztuki Avery 160.", model="fake-model"),
-    ])
+    backend.AGENT_MODEL_PROVIDER = runtime.FakeModelProvider([])
     login(client)
     response = client.post("/api/internal/ai/chat", json={"message": "Ile mamy Avery 160?"})
     assert response.status_code == 200
-    assert response.get_json()["message"] == "Na magazynie mamy 24 sztuki Avery 160."
+    assert response.get_json()["message"] == "Avery 160 — stan fizyczny 24 szt."
+    assert backend.AGENT_MODEL_PROVIDER.calls == []
+    assert response.get_json()['tool_calls'] == 1
 
 
 def test_ui_has_controlled_error_mapping(client):
@@ -110,7 +112,8 @@ def test_assistant_ui_has_supervised_approval_and_push_to_talk(client):
     assert "new MediaRecorder" in html
     assert "/api/internal/ai/voice/transcribe" in html
     assert "/api/internal/ai/voice/synthesize" in html
-    assert "playSpeech(data.speech_text, voiceRoundtripStarted)" in html
+    assert "playSpeech(spoken, voiceRoundtripStarted)" in html
+    assert "playSpeech(value.tts_text, voiceRoundtripStarted)" in html
     assert 'id="aiVoiceDebug"' in html
     assert "console.info(event, JSON.stringify(entry))" in html
     assert response.headers['Permissions-Policy'] == 'camera=(self), microphone=(self), geolocation=()'

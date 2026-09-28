@@ -110,7 +110,7 @@ def _decode_resend_error(exc: urllib.error.HTTPError) -> tuple[str, dict]:
         return raw[:1200], {"raw": raw[:1200]}
 
 
-def send_email(to, subject: str, html_body: str, text_body: str = "", attachments=None) -> dict:
+def send_email(to, subject: str, html_body: str, text_body: str = "", attachments=None, *, idempotency_key="") -> dict:
     cfg = email_config_summary()
     recipients = _uniq_emails(to if isinstance(to, (list, tuple, set)) else [to])
     if not recipients:
@@ -157,6 +157,10 @@ def send_email(to, subject: str, html_body: str, text_body: str = "", attachment
             "User-Agent": "NiedzwieccyOrders/1.0 (+https://niedzwieccy.com)",
         },
     )
+    if idempotency_key:
+        if len(idempotency_key) > 256 or any(c in idempotency_key for c in '\r\n'):
+            return {"ok": False, "skipped": True, "error": "Nieprawidłowy identyfikator próby e-mail."}
+        req.add_header("Idempotency-Key", idempotency_key)
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
@@ -164,12 +168,17 @@ def send_email(to, subject: str, html_body: str, text_body: str = "", attachment
                 body = json.loads(raw) if raw else {}
             except Exception:
                 body = {"raw": raw}
-            return {"ok": 200 <= int(resp.status) < 300, "status": int(resp.status), "body": body, "to": recipients}
+            accepted = 200 <= int(resp.status) < 300
+            return {"ok": accepted, "status": int(resp.status), "body": body, "to": recipients,
+                    "delivery_outcome": "accepted" if accepted else "unknown"}
     except urllib.error.HTTPError as exc:
         message, body = _decode_resend_error(exc)
-        return {"ok": False, "status": exc.code, "error": message, "body": body, "to": recipients}
+        # A timeout/server error can follow acceptance. Callers must reconcile
+        # that attempt rather than send again with a fresh key.
+        return {"ok": False, "status": exc.code, "error": message, "body": body, "to": recipients,
+                "delivery_outcome": "unknown" if exc.code >= 500 or exc.code in (408, 409) else "rejected"}
     except Exception as exc:
-        return {"ok": False, "error": str(exc), "to": recipients}
+        return {"ok": False, "error": str(exc), "to": recipients, "delivery_outcome": "unknown"}
 
 
 ORDER_COPY = {
@@ -359,7 +368,7 @@ def send_invoice_available(invoice: dict, pdf_url: str = "", admin_email: str = 
         attachments.append(pdf_attachment)
     return send_email(recipients, subject, html_body, text_body, attachments=attachments)
 
-def send_payment_reminder(invoice: dict, pdf_url: str = "", admin_email: str = "") -> dict:
+def send_payment_reminder(invoice: dict, pdf_url: str = "", admin_email: str = "", *, idempotency_key="") -> dict:
     invoice_no = invoice.get("invoice_no") or "faktura"
     buyer_name = invoice.get("buyer_name") or invoice.get("customer_name") or "Klient"
     buyer_email = invoice.get("buyer_email") or invoice.get("customer_email") or ""
@@ -386,4 +395,4 @@ def send_payment_reminder(invoice: dict, pdf_url: str = "", admin_email: str = "
         "Prosimy o uregulowanie płatności. Jeśli przelew został już wykonany, możesz zignorować tę wiadomość.\n"
         "Pozdrawiamy, Niedźwieccy"
     )
-    return send_email(recipients, subject, html_body, text_body)
+    return send_email(recipients, subject, html_body, text_body, idempotency_key=idempotency_key)

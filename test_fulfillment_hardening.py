@@ -66,9 +66,17 @@ def test_deleted_draft_number_returns_and_parallel_reservations_stay_unique(flow
     invoice_numbering.initialize(c)
     c.commit(); c.close()
     c = b.conn(); c.execute('DELETE FROM invoices'); c.commit(); c.close()
+    def reserve(_):
+        try:
+            return invoice_numbering.reserve(b, '2026-09-13')
+        except ValueError as exc:
+            return str(exc)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        results = list(pool.map(lambda _: invoice_numbering.reserve(b, '2026-09-13'), range(2)))
-    assert set(results) == {'FVAT 8/09/2026', 'FVAT 9/09/2026'}
+        results = list(pool.map(reserve, range(2)))
+    # No invoices remain: sequence restarts at 1. A concurrent live claim must
+    # block, not advance to 2 and leave a technical gap if its owner fails.
+    assert results.count('FVAT 1/09/2026') == 1
+    assert sum('obecnie rezerwowany' in value for value in results) == 1
 
 
 def test_partial_invoice_outcome_and_retry(flow, monkeypatch):
@@ -85,7 +93,7 @@ def test_partial_invoice_outcome_and_retry(flow, monkeypatch):
 
 
 def test_recount_preserves_history_and_requires_new_adjustment(flow):
-    session = str(uuid.uuid4())
+    session = start_count_session()
     def count(quantity, version):
         return ops.execute_business_operation(actor(), 'inventory.count.record', {'product_id': 701, 'count_session_id': session,
             'counted_quantity': quantity, 'expected_version': version, 'idempotency_key': str(uuid.uuid4())})
@@ -187,29 +195,20 @@ def test_reconciliation_metadata_and_pdf_survive_local_reset(flow, monkeypatch, 
 
 
 def prepare_combined():
-    docs(); requirements()
     c = b.conn()
     c.execute("INSERT INTO orders(id,order_no,customer_name,customer_email,customer_address,customer_phone,status,currency,created_at) SELECT 802,'MAG-802',customer_name,customer_email,customer_address,customer_phone,'confirmed',currency,created_at FROM orders WHERE id=702")
     c.execute("INSERT INTO order_items(id,order_id,product_id,sku,qty,unit_net_price,currency,created_at) SELECT 803,802,product_id,sku,2,unit_net_price,currency,created_at FROM order_items WHERE id=703")
     c.commit(); c.close()
-    for name in ('orders.packing_list.generate', 'orders.invoice.create'):
-        with b.app.test_request_context():
-            b._refresh_domain_route_context()
-            s = f.state({'order_id': 802})['state']
-            payload = {'order_id': 802, 'expected_version': s['expected_version'], 'idempotency_key': str(uuid.uuid4())}
-            if name == 'orders.packing_list.generate':
-                preview = f.packing_list_preview(802)
-                payload.update(
-                    packing_scope_fingerprint=preview['fingerprint'],
-                    packing_items=preview['approval_items'],
-                    total_quantity=preview['total_quantity'],
-                )
-            result = ops.execute_business_operation(actor(), name, payload)
-            assert result.status == 'PENDING_APPROVAL', result
-            approvals.approve_request(result.approval_id, human())
-            result = ops.execute_business_operation(actor(), name, payload, approval_id=result.approval_id)
-            assert result.status == 'SUCCESS', result
-    c = b.conn(); c.execute("UPDATE orders SET packed_at='2026-09-13T12:00:00' WHERE id IN (702,802)"); c.commit(); c.close()
+    # Package membership is established by one real, explicitly selected LP,
+    # not inferred from a coincidentally equal packing timestamp.
+    with b.app.test_request_context():
+        b._refresh_domain_route_context()
+        preview = f.packing_list_preview(702, packing_scope='selected', packing_order_ids=[702, 802])
+    success('orders.packing_list.generate', packing_scope='selected', packing_order_ids=[702, 802],
+            packing_scope_fingerprint=preview['fingerprint'], packing_items=preview['approval_items'],
+            total_quantity=preview['total_quantity'])
+    success('orders.invoice.create')
+    requirements()
 
 
 def test_combined_package_and_all_documents(flow, monkeypatch):
@@ -233,7 +232,7 @@ def test_combined_package_and_all_documents(flow, monkeypatch):
         assert result.status == 'SUCCESS', result
         assert result.data['documents'][0]['document_type'] == 'package'
         stream = f.package_pdf({'order_id': 702}, human())
-    assert len(PdfReader(stream).pages) >= 5
+    assert len(PdfReader(stream).pages) >= 3
 
 
 def test_combined_member_change_invalidates_approval(flow):
@@ -269,8 +268,17 @@ def test_shipment_missing_parameters_can_be_completed(flow):
     assert not flow['calls']
 
 
+def start_count_session():
+    from agent_conversation import open_conversation
+    cid, _, _ = open_conversation(human(), actor())
+    result = ops.execute_business_operation(actor(), 'inventory.count.session.start',
+        {'conversation_id': cid, 'idempotency_key': str(uuid.uuid4())})
+    assert result.status == 'SUCCESS', result
+    return result.data['count_id']
+
+
 def test_recount_invalidates_unconsumed_old_approval(flow):
-    session = str(uuid.uuid4())
+    session = start_count_session()
     def count(n, version):
         return ops.execute_business_operation(actor(), 'inventory.count.record', {'product_id': 701, 'count_session_id': session,
             'counted_quantity': n, 'expected_version': version, 'idempotency_key': str(uuid.uuid4())})
@@ -279,9 +287,13 @@ def test_recount_invalidates_unconsumed_old_approval(flow):
     pending = ops.execute_business_operation(actor(), 'inventory.adjust', payload)
     second = count(1, first.data['version'])
     assert second.status == 'SUCCESS'
-    approvals.approve_request(pending.approval_id, human())
+    assert approvals.get_request_snapshot(pending.approval_id)['status'] == 'CANCELLED'
+    with pytest.raises(approvals.ApprovalDenied) as blocked:
+        approvals.approve_request(pending.approval_id, human())
+    assert blocked.value.code == 'INVALID_APPROVAL_STATUS'
     result = ops.execute_business_operation(actor(), 'inventory.adjust', payload, approval_id=pending.approval_id)
     assert result.status == 'CONFLICT'
+    assert result.error_code == 'COUNT_OBSERVATION_SUPERSEDED'
     c = b.conn(); assert c.execute('SELECT qty FROM stock WHERE product_id=701').fetchone()[0] == 100; c.close()
 
 

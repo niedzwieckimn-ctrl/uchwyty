@@ -97,9 +97,11 @@ def test_finance_agent_can_send_only_after_human_approval(monkeypatch):
     assert _meta() == {'payment_reminder': 1, 'paid': 0}
 
     owner_ai = rbac.load_actor_context(rbac.AI_OWNER_ASSISTANT_ACTOR_ID)
-    assert payment_reminders.WRITE not in {
+    # Owner Assistant has the same explicitly approval-gated reminder capability.
+    assert payment_reminders.WRITE in {
         item['name'] for item in operations.list_available_operations(owner_ai)
     }
+    assert operations.OPERATION_REGISTRY[payment_reminders.WRITE].approval_requirement == 'REQUIRED'
 
 
 def test_reminder_operations_publish_machine_readable_capability_contract():

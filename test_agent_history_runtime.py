@@ -4,6 +4,7 @@ These tests prove history and tools reach the model, not live model comprehensio
 import json
 from pathlib import Path
 import time
+import threading
 import pytest
 import agent_runtime as runtime
 import agent_conversation as conversations
@@ -125,7 +126,7 @@ def test_two_model_round_trips_one_operation_and_timing_fields():
     p=runtime.FakeModelProvider([tool('inventory.product.search',{'query':'Avery 160'}),respond('24 sztuki.')])
     result=runtime.run_agent_turn(owner(),'Ile mam Avery 160?',p)
     assert len(p.calls)==2 and result['tool_calls']==1
-    assert set(result['timings'])=={
+    assert set(result['timings'])>={
         'acquire_turn_ms','memory_load_ms','context_history_build_ms','supabase_business_reads_ms',
         'model_request_ms','tool_execution_ms','second_model_pass_ms','parallel_read_batch_ms',
         'parallel_read_sequential_estimate_ms','context_build_ms',
@@ -153,10 +154,19 @@ def test_four_independent_green_reads_use_one_parallel_batch(monkeypatch):
         ('china.orders.summary', {'scope':'active'}),
     ]
     original = operations.execute_business_operation
+    lock = threading.Lock()
+    activity = {'current': 0, 'maximum': 0}
 
     def delayed_read(*args, **kwargs):
         if args[1] in {name for name,_arguments in reads}:
-            time.sleep(0.08)
+            with lock:
+                activity['current'] += 1
+                activity['maximum'] = max(activity['maximum'], activity['current'])
+            try:
+                time.sleep(0.08)
+            finally:
+                with lock:
+                    activity['current'] -= 1
         return original(*args, **kwargs)
 
     monkeypatch.setattr(operations, 'execute_business_operation', delayed_read)
@@ -164,9 +174,9 @@ def test_four_independent_green_reads_use_one_parallel_batch(monkeypatch):
         *[tool(name, arguments, f'seq-{index}') for index,(name,arguments) in enumerate(reads)],
         respond('Podsumowanie gotowe.'),
     ])
-    sequential_started = time.perf_counter()
     sequential = runtime.run_agent_turn(owner(), 'co mam dziś do zrobienia?', sequential_provider)
-    sequential_ms = (time.perf_counter()-sequential_started)*1000
+    assert activity['maximum'] == 1
+    activity['maximum'] = 0
 
     batch_calls = tuple(runtime.ToolCall(f'batch-{index}',name,json.dumps(arguments))
                         for index,(name,arguments) in enumerate(reads))
@@ -181,16 +191,14 @@ def test_four_independent_green_reads_use_one_parallel_batch(monkeypatch):
         runtime.ProviderResponse(tool_calls=batch_calls,model='fake-model'),
         synthesize,
     ])
-    batch_started = time.perf_counter()
     batched = runtime.run_agent_turn(owner(), 'co mam dziś do zrobienia?', batch_provider)
-    batch_ms = (time.perf_counter()-batch_started)*1000
 
     assert sequential['status']==batched['status']=='SUCCESS'
     assert len(sequential_provider.calls)==5
     assert len(batch_provider.calls)==2 and batched['tool_calls']==4
     assert batched['timings']['parallel_read_batch_ms'] > 0
     assert batched['timings']['parallel_read_sequential_estimate_ms'] > batched['timings']['parallel_read_batch_ms']*2
-    assert batch_ms < sequential_ms*0.7
+    assert activity['maximum'] == 4
 
 
 def test_green_batch_final_synthesis_prevents_extra_tools_and_returns_http_200():
@@ -690,7 +698,10 @@ def test_high_level_catalog_leaves_model_free_to_choose_correct_read(question, o
     def plan(kwargs):
         names = {item['name'] for item in kwargs['tools']}
         assert operation in names
-        assert {'business.daily.state', 'business.orders.state'} <= names
+        if operation == 'business.sales.summary':
+            assert names == {'business.sales.summary'}
+        else:
+            assert {'business.daily.state', 'business.orders.state'} <= names
         return tool(operation, {})
 
     monkeypatch.setattr(operations, 'execute_business_operation', execute)

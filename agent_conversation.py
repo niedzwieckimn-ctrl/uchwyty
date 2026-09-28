@@ -94,8 +94,9 @@ def open_conversation(human, ai, conversation_id=''):
             status = 'resumed'
             if datetime.fromisoformat(row['expires_at']) <= now:
                 db.execute('DELETE FROM internal_agent_turns WHERE conversation_id=?', (conversation_id,))
+                db.execute("UPDATE internal_agent_conversations SET state_json='{}' WHERE conversation_id=?", (conversation_id,))
                 status = 'expired'
-            db.execute("UPDATE internal_agent_conversations SET state_json='{}',last_active_at=?,expires_at=? WHERE conversation_id=?",
+            db.execute("UPDATE internal_agent_conversations SET last_active_at=?,expires_at=? WHERE conversation_id=?",
                 (_iso(now), _iso(now+timedelta(minutes=CONVERSATION_TTL_MINUTES)), conversation_id))
         else:
             conversation_id = str(uuid.uuid4())
@@ -144,7 +145,7 @@ def _owner_is_dead(owner):
 def begin_turn(human, ai, cid, run_id, message):
     with connection() as db:
         db.execute('BEGIN IMMEDIATE')
-        _owned(db, human, ai, cid)
+        conversation = _owned(db, human, ai, cid)
         now = _utc_now()
         abandoned = db.execute('''SELECT l.run_id,o.owner_json
             FROM internal_agent_turn_leases l JOIN internal_agent_turn_owners o
@@ -174,6 +175,10 @@ def begin_turn(human, ai, cid, run_id, message):
                    (cid, run_id, json.dumps(owner)))
         db.execute('INSERT INTO internal_agent_turns(run_id,conversation_id,user_text,created_at) VALUES(?,?,?,?)',
             (run_id, cid, message, _iso(now)))
+        # Ownership and the new lease are established in this transaction.
+        # Reuse its row instead of opening another connection for the same state.
+        state = json.loads(conversation['state_json'])
+        return state if isinstance(state, dict) else {}
 
 
 def history_for_model(human, ai, cid, run_id):
@@ -216,6 +221,33 @@ def release_turn(human, ai, cid, run_id):
         _owned(db, human, ai, cid)
         db.execute('DELETE FROM internal_agent_turn_leases WHERE conversation_id=? AND run_id=?', (cid, run_id))
         db.execute('DELETE FROM internal_agent_turn_owners WHERE conversation_id=? AND run_id=?', (cid, run_id))
+
+
+def turn_state(human, ai, cid, run_id):
+    """Read backend-owned working state only while this conversation lease is held."""
+    with connection() as db:
+        row = _owned(db, human, ai, cid)
+        lease = db.execute('SELECT run_id FROM internal_agent_turn_leases WHERE conversation_id=?', (cid,)).fetchone()
+        if not lease or lease['run_id'] != run_id:
+            raise ConversationBusy('Turn lease lost')
+        state = json.loads(row['state_json'])
+        return state if isinstance(state, dict) else {}
+
+
+def save_turn_state(human, ai, cid, run_id, state):
+    """Persist draft parameters separately from executed business operations."""
+    if not isinstance(state, dict):
+        raise ValueError('Conversation state must be an object')
+    encoded = json.dumps(state, ensure_ascii=False, separators=(',', ':'))
+    if len(encoded.encode()) > 16000:
+        raise ValueError('Conversation state exceeds its bounded size')
+    with connection() as db:
+        db.execute('BEGIN IMMEDIATE')
+        _owned(db, human, ai, cid)
+        lease = db.execute('SELECT run_id FROM internal_agent_turn_leases WHERE conversation_id=?', (cid,)).fetchone()
+        if not lease or lease['run_id'] != run_id:
+            raise ConversationBusy('Turn lease lost')
+        db.execute('UPDATE internal_agent_conversations SET state_json=? WHERE conversation_id=?', (encoded, cid))
 
 
 def _tokens(value):

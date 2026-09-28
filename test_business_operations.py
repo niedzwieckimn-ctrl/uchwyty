@@ -122,7 +122,8 @@ def test_registry_is_closed_and_contains_required_contracts(isolated):
         "customers.search", "customers.get", "china.orders.summary", "china.orders.search", "china.orders.get", "business.sales.summary",
         "payments.reminders.read", "payments.reminders.send", "search.analytics.read", "cashflow.read",
         "internal.test.change_setting", "internal.test.external.execute",
-        "orders.internal_note.add", "orders.status.transition"
+        "orders.internal_note.add", "orders.status.transition", "dashboard.read", "invoices.payment.set_status",
+        "inventory.count.pause", "inventory.count.resume", "inventory.count.keep_result", "inventory.count.history"
         , "inventory.count.get_expected", "inventory.count.session.start", "inventory.count.summary", "inventory.count.record",
         "inventory.count.complete", "inventory.adjust", "orders.packing.check",
         "orders.packing.shortage.report", "orders.packing.confirm"

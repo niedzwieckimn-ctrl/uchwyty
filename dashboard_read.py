@@ -7,6 +7,7 @@ Dependencies are injected to keep this module independent from Flask routes.
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from typing import Callable
 from zoneinfo import ZoneInfo
 
@@ -73,11 +74,13 @@ def build_dashboard_read(
         cur.execute("""SELECT COUNT(DISTINCT issued.order_id) AS n
                        FROM (
                          SELECT ia.order_id, ia.created_at AS issued_at
-                         FROM invoice_allocations ia
+                         FROM invoice_allocations ia JOIN invoices published ON published.id=ia.invoice_id
+                         WHERE COALESCE(published.publication_state,'complete')='complete'
                          UNION ALL
                          SELECT i.order_id, i.created_at AS issued_at
                          FROM invoices i
                          WHERE i.order_id IS NOT NULL
+                           AND COALESCE(i.publication_state,'complete')='complete'
                            AND NOT EXISTS (
                              SELECT 1 FROM invoice_allocations ia2
                              WHERE ia2.invoice_id=i.id
@@ -104,7 +107,13 @@ def build_dashboard_read(
             ]
         overdue = overdue_invoice_rows(db)
         overdue_count = len(overdue)
-        overdue_amount = sum(float(row.get("total_gross") or 0) for row in overdue)
+        overdue_by_currency = {}
+        for row in overdue:
+            currency = str(row.get('receivable_currency') or row.get('currency') or 'PLN').strip().upper()
+            overdue_by_currency[currency] = overdue_by_currency.get(currency, Decimal('0')) + Decimal(str(row.get('total_gross') or 0))
+        overdue_by_currency = {key: float(value) for key,value in sorted(overdue_by_currency.items())}
+        # Compatibility field is explicitly the PLN subtotal, never a mixed sum.
+        overdue_amount = overdue_by_currency.get('PLN', 0.0)
         horizon = 60
         try:
             cur.execute("SELECT value FROM cash_flow_settings WHERE key='reorder_horizon_days'")
@@ -115,12 +124,20 @@ def build_dashboard_read(
         if horizon not in (45, 60, 90):
             horizon = 60
         cur.execute("""SELECT o.id,o.order_no,o.customer_name,o.created_at,o.status,o.currency,
-                             COALESCE(SUM(oi.qty * COALESCE(oi.unit_net_price,pr.net_price,0)),0) AS total_net
+                             COALESCE(SUM(oi.qty * COALESCE(oi.unit_net_price,
+                               CASE WHEN UPPER(COALESCE(o.currency,'PLN'))='EUR' THEN
+                                 (SELECT ep.price_eur FROM pricing_eur ep WHERE LOWER(TRIM(ep.sku))=LOWER(TRIM(COALESCE(oi.sku,p.sku)))
+                                  ORDER BY ep.updated_at DESC,ep.sku DESC LIMIT 1)
+                               WHEN UPPER(COALESCE(o.currency,'PLN'))='PLN' THEN COALESCE(
+                               (SELECT pr.net_price FROM pricing pr
+                                WHERE TRIM(LOWER(pr.model))=TRIM(LOWER(p.sku))
+                                ORDER BY pr.created_at DESC, pr.model DESC LIMIT 1),
+                               (SELECT pr.net_price FROM pricing pr
+                                WHERE TRIM(LOWER(pr.model))=TRIM(LOWER(p.model))
+                                ORDER BY pr.created_at DESC, pr.model DESC LIMIT 1),0) ELSE NULL END,0)),0) AS total_net
                       FROM orders o
                       LEFT JOIN order_items oi ON oi.order_id=o.id
                       LEFT JOIN products p ON p.id=oi.product_id
-                      LEFT JOIN pricing pr ON (TRIM(LOWER(pr.model))=TRIM(LOWER(p.model))
-                                               OR TRIM(LOWER(pr.model))=TRIM(LOWER(p.sku)))
                       GROUP BY o.id ORDER BY o.id DESC LIMIT 8""")
         recent_orders = [dict(row) for row in cur.fetchall()]
         cur.execute("SELECT status,COUNT(*) AS n FROM orders GROUP BY status")
@@ -159,6 +176,8 @@ def build_dashboard_read(
         "ready_to_issue_today": ready_to_issue_today,
         "overdue_count": overdue_count,
         "overdue_amount": overdue_amount,
+        "overdue_currency": "PLN",
+        "overdue_by_currency": overdue_by_currency,
         "replenishment_count": len(ranked),
         "replenishment_items": replenishment_items,
         "products_count": products_count,

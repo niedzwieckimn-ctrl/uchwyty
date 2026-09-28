@@ -112,7 +112,7 @@ def _actor():
 def _preview():
     with backend.app.test_request_context():
         result = operations.execute_business_operation(
-            _actor(), "orders.packing_list.preview", {"order_id": ROOT_ORDER_ID}
+            _actor(), "orders.packing_list.preview", {"order_id": ROOT_ORDER_ID, "packing_scope": "customer"}
         )
     assert result.status == "SUCCESS", result
     return result.data
@@ -123,6 +123,8 @@ def _generate_args(preview):
         "order_id": ROOT_ORDER_ID,
         "expected_version": preview["state"]["expected_version"],
         "idempotency_key": str(uuid.uuid4()),
+        "packing_scope": preview["preview"]["packing_scope"],
+        "packing_order_ids": preview["preview"]["packing_order_ids"],
         "packing_scope_fingerprint": preview["preview"]["fingerprint"],
         "packing_items": preview["preview"]["approval_items"],
         "total_quantity": preview["preview"]["total_quantity"],
@@ -195,6 +197,8 @@ def test_agent_multi_order_intent_previews_then_creates_one_approval(multi_order
             "order_id": ROOT_ORDER_ID,
             "expected_version": output["state"]["expected_version"],
             "idempotency_key": "agent-multi-order-packing",
+            "packing_scope": proposal["packing_scope"],
+            "packing_order_ids": proposal["packing_order_ids"],
             "packing_scope_fingerprint": proposal["fingerprint"],
             "packing_items": proposal["approval_items"],
             "total_quantity": proposal["total_quantity"],
@@ -208,7 +212,7 @@ def test_agent_multi_order_intent_previews_then_creates_one_approval(multi_order
             runtime.ToolCall(
                 "preview",
                 "orders.packing_list.preview",
-                json.dumps({"order_id": ROOT_ORDER_ID}),
+                json.dumps({"order_id": ROOT_ORDER_ID, "packing_scope": "customer"}),
             ),
         )),
         request_approved_write,
@@ -323,6 +327,7 @@ def test_multi_order_generate_without_preview_scope_is_blocked_before_approval(m
         "order_id": ROOT_ORDER_ID,
         "expected_version": preview["state"]["expected_version"],
         "idempotency_key": "missing-multi-order-scope",
+        "packing_scope": "customer",
     }
 
     with backend.app.test_request_context():
@@ -338,8 +343,9 @@ def test_tool_descriptions_route_one_package_intent_to_preview_then_existing_gen
     preview_definition = operations.OPERATION_REGISTRY["orders.packing_list.preview"]
     generate_definition = operations.OPERATION_REGISTRY["orders.packing_list.generate"]
 
-    assert "jednej paczki" in preview_definition.description
-    assert "wielu zamówień" in preview_definition.description
+    assert "packing_scope=order" in preview_definition.description
+    assert "selected" in preview_definition.description and "customer" in preview_definition.description
+    assert "packing_order_ids" in preview_definition.input_schema["properties"]
     assert "nie twórz shipment.merge" in generate_definition.description
     assert "packing_scope_fingerprint" in generate_definition.input_schema["properties"]
     assert "packing_items" in generate_definition.input_schema["properties"]

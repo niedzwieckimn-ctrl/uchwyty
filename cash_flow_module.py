@@ -81,7 +81,7 @@ def cash_flow_overdue_invoices(db_conn, *, current_time=None, visible_hour=8):
     now = current_time or datetime.now()
     cur = db_conn.cursor()
     cur.execute("""
-      SELECT i.*, COALESCE(m.paid,0) AS paid,
+      SELECT i.*, COALESCE(i.currency,o.currency,'PLN') AS receivable_currency, COALESCE(m.paid,0) AS paid,
              COALESCE(m.payment_reminder,0) AS payment_reminder,
              o.id AS source_order_id, o.order_no AS source_order_no,
              o.created_at AS source_order_created_at, o.note AS source_order_note,
@@ -90,6 +90,7 @@ def cash_flow_overdue_invoices(db_conn, *, current_time=None, visible_hour=8):
       LEFT JOIN invoice_meta m ON m.invoice_id=i.id
       LEFT JOIN orders o ON o.id=i.order_id
       WHERE COALESCE(m.paid,0)=0 AND TRIM(COALESCE(i.payment_to,''))<>''
+        AND COALESCE(i.publication_state,'complete')='complete'
       ORDER BY i.payment_to, i.id
     """)
     result = []

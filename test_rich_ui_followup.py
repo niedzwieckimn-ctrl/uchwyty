@@ -131,7 +131,7 @@ def test_e_f_no_image_and_llm_text_cannot_create_image(order):
     assert invented['artifacts'] == []
 
 
-def _invoice_and_packing(order_id, tmp_path, create_packing=True):
+def _invoice_and_packing(order_id, tmp_path, create_packing=True, monkeypatch=None):
     invoice_pdf = tmp_path / 'FV-812.pdf'
     invoice_pdf.write_bytes(b'%PDF invoice')
     packing_pdf = Path(backend.packing_list_pdf_path_for_invoice(str(invoice_pdf), 'FV/812'))
@@ -150,19 +150,32 @@ def _invoice_and_packing(order_id, tmp_path, create_packing=True):
         "INSERT INTO invoice_meta(invoice_id,pdf_path,invoice_items_json,updated_at) VALUES(812,?,'[]',?)",
         (str(invoice_pdf), now),
     )
+    if create_packing:
+        import packing_versions
+        assert monkeypatch is not None
+        db.execute("INSERT INTO products(id,sku,model,name,created_at) VALUES(990,'LP-990','Test','Test LP',?)", (now,))
+        item_id = db.execute('''INSERT INTO order_items(order_id,product_id,sku,qty,unit_net_price,created_at)
+            VALUES(?,990,'LP-990',1,10,?)''', (order_id,now)).lastrowid
+        db.execute('''INSERT INTO invoice_allocations(invoice_id,order_id,order_item_id,product_id,sku,qty,created_at)
+            VALUES(812,?,?,990,'LP-990',1,?)''', (order_id,item_id,now))
+        with monkeypatch.context() as setup:
+            setup.setattr(backend, 'DATA_DIR', str(tmp_path))
+            setup.setattr(backend, 'generate_invoice_packing_list_pdf', lambda *_a, **_kw: str(packing_pdf))
+            packing_versions.publish_invoice(backend,812,
+                [{'source_order_id':order_id,'order_item_id':item_id,'qty':1}], str(packing_pdf), connection=db)
     db.commit()
     db.close()
     return packing_pdf
 
 
 def test_g_existing_packing_list_produces_read_only_document_link(order, isolated, tmp_path, monkeypatch):
-    packing_pdf = _invoice_and_packing(order, tmp_path)
+    packing_pdf = _invoice_and_packing(order, tmp_path, monkeypatch=monkeypatch)
     result = operations.execute_business_operation(ai(), 'orders.get', {'id': order})
     artifacts = backend.build_business_artifacts('orders.get', result.data)
     link = _artifact(artifacts, 'document_link')
     assert link == {
         'type': 'document_link', 'document_type': 'packing_list',
-        'label': 'Lista pakowa',
+        'label': 'Bieżąca lista pakowa faktury', 'document_basis':'existing_invoice_document',
         'url': '/api/internal/ai/documents/packing-lists/812',
         'order_id': order, 'invoice_id': 812,
     }
@@ -181,7 +194,7 @@ def test_g_existing_packing_list_produces_read_only_document_link(order, isolate
     db.close()
 
 
-def test_h_missing_packing_list_has_no_link_and_route_is_404(order, isolated, tmp_path):
+def test_h_missing_packing_list_has_no_link_and_route_is_conflict(order, isolated, tmp_path):
     _invoice_and_packing(order, tmp_path, create_packing=False)
     result = operations.execute_business_operation(ai(), 'orders.get', {'id': order})
     artifacts = backend.build_business_artifacts('orders.get', result.data)
@@ -190,4 +203,16 @@ def test_h_missing_packing_list_has_no_link_and_route_is_404(order, isolated, tm
     with isolated.session_transaction() as current:
         current['admin_authenticated'] = True
         rbac.bind_bootstrap_owner_session(current)
-    assert isolated.get('/api/internal/ai/documents/packing-lists/812').status_code == 404
+    assert isolated.get('/api/internal/ai/documents/packing-lists/812').status_code == 409
+
+
+def test_loose_invoice_pdf_does_not_claim_verified_parcel(order, isolated, tmp_path):
+    packing_pdf = _invoice_and_packing(order,tmp_path,create_packing=False)
+    packing_pdf.write_bytes(b'%PDF unverified loose file')
+    result = operations.execute_business_operation(ai(), 'orders.get', {'id':order})
+    artifacts = backend.build_business_artifacts('orders.get', result.data)
+    assert not any(item.get('document_type') == 'packing_list' for item in artifacts)
+    with isolated.session_transaction() as current:
+        current['admin_authenticated'] = True
+        rbac.bind_bootstrap_owner_session(current)
+    assert isolated.get('/api/internal/ai/documents/packing-lists/812').status_code == 409

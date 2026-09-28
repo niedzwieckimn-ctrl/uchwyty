@@ -3,6 +3,7 @@
 import re
 
 from voice_io import normalize_tts_text
+from inventory_voice_products import display_name
 
 
 def product_prompt(data):
@@ -20,6 +21,21 @@ def difference_prompt(difference):
     return normalize_tts_text(f'Różnica {int(difference):+d}. Zatwierdzić?')
 
 
+def timing_summary(timing):
+    if not isinstance(timing, dict) or timing.get('active_seconds') is None:
+        return 'Brak zapisanej historii czasu dla tej sesji. Nie mogę ustalić czasu wcześniejszego liczenia.'
+    def duration(value):
+        value = max(0, int(value or 0))
+        hours, minutes = divmod(value // 60, 60)
+        return f'{hours} godz. {minutes} min {value % 60} s' if hours else f'{minutes} min {value % 60} s'
+    measured = f'Czas aktywnego liczenia: {duration(timing["active_seconds"])}.'
+    if timing.get('calendar_seconds') is not None:
+        measured += f' Czas kalendarzowy od rozpoczęcia pomiaru: {duration(timing["calendar_seconds"])}.'
+    if not timing.get('timing_complete'):
+        measured += ' Pomiar nie obejmuje wcześniejszej pracy; jej czas jest nieznany.'
+    return measured
+
+
 def from_operation(operation, data, *, pending_adjustment=False):
     """Use trusted operation fields, never generated answer text."""
     data = data if isinstance(data, dict) else {}
@@ -30,8 +46,12 @@ def from_operation(operation, data, *, pending_adjustment=False):
     if operation == 'inventory.count.record':
         difference = data.get('difference')
         if isinstance(difference, int):
-            return ('Zgodne. Następny.' if difference == 0
-                    else difference_prompt(difference))
+            if difference == 0:
+                return 'Zgodne. Następny.'
+            if pending_adjustment:
+                return difference_prompt(difference)
+            return normalize_tts_text(
+                f'Różnica {difference:+d}. Wynik liczenia zapisany. Korekta nie jest przygotowana.')
     if operation == 'inventory.adjust' and pending_adjustment:
         difference = data.get('difference')
         if isinstance(difference, int):
@@ -51,6 +71,10 @@ def approval_response(outcome, decision):
         display = ('Korekta została zapisana. Nowy stan: '
                    f'{quantity} szt.' if isinstance(quantity, int) and quantity >= 0
                    else 'Korekta została zapisana.')
+        result_data = outcome.get('result', {}).get('data') or {}
+        label = display_name(result_data) if isinstance(result_data, dict) else ''
+        if label:
+            display = f'{label} — {display}'
         return display, 'Zapisano. Następny.'
     if decision == 'reject':
         return ('Korekta odrzucona. Wynik remanentu pozostaje zapisany, '

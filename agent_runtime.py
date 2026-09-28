@@ -14,6 +14,7 @@ import uuid
 from typing import Any, Protocol
 import requests
 import agent_conversation
+import agent_shipping_draft
 from agent_artifacts import build_artifact_sources
 import business_operations
 import business_query
@@ -368,6 +369,8 @@ def _is_packing_history_document_followup(value: str) -> bool:
 def _detect_read_intent(value: str) -> str:
     """Choose one primary read intent without another model round-trip."""
     normalized = ' '.join(str(value or '').casefold().split()).strip(' ?!.')
+    if shipment_read.is_readiness_question(normalized):
+        return 'order_readiness'
     if shipment_read.is_question(normalized):
         return 'shipment_contents'
     if re.search(r'\bco\s+(?:było|bylo|jest)\s+w\s+zam[oó]wieni\w*\b', normalized):
@@ -380,8 +383,10 @@ def _detect_read_intent(value: str) -> str:
         or re.search(r'\b(?:nowe\s+zam[oó]wienia|wydane\s+(?:dziś|dzis|dzisiaj)|'
                     r'(?:ile|co)\s+(?:dziś|dzis|dzisiaj)\s+wyda\w*|'
                     r'(?:możesz|mozna|można)\s+(?:dziś|dzis|dzisiaj)?\s*wyda\w*|'
-                    r'co\s+trzeba\s+uzupełni\w*|mam\s+(?:jakieś|jakies)\s+zaległ\w*)\b',
+                    r'co\s+trzeba\s+uzupełni\w*)\b',
                     normalized)
+        or (re.search(r'\bmam\s+(?:jakieś|jakies)\s+zaleg[łl]\w*\b', normalized)
+            and not re.search(r'\b(?:płatno\w*|platno\w*|faktur\w*|należno\w*|nalezno\w*)\b', normalized))
     ):
         return 'dashboard_read'
     outgoing = re.search(r'\b(?:wysła\w*|wysla\w*|wysłan\w*|wyslan\w*|wydał\w*|wydal\w*|wydan\w*|poszło|poszlo|wyszło|wyszlo)\b', normalized)
@@ -424,6 +429,12 @@ def _direct_physical_stock_query(value: str) -> str:
     """Return a product phrase only for an unambiguous physical-stock question."""
     normalized = ' '.join(str(value or '').strip().split()).strip(' ?!.')
     folded = normalized.casefold()
+    if re.search(r'\b(?:faktur\w*|zam[oó]wie\w*|klient\w*|kontrahent\w*|przesył\w*|przesyl\w*|'
+                 r'paczk\w*|płatno\w*|platno\w*|należno\w*|nalezno\w*)\b', folded):
+        return ''
+    if re.fullmatch(r'(?:ile\s+(?:mamy|jest)\s+(?:sztuk|towaru|produktów|produktow)(?:\s+na\s+magazynie)?'
+                    r'|(?:jaki\s+jest\s+stan|sprawdź\s+stan|sprawdz\s+stan)\s+magazynu)', folded):
+        return ''
     if re.search(r'\b(?:dostępn\w*|dostepn\w*|rezerw\w*|zam[oó]wion\w*|dostaw\w*|w\s+drodze)\b', folded):
         return ''
     patterns = (
@@ -443,17 +454,22 @@ _GENERIC_QUERY_INTENTS = frozenset({
 })
 
 
+def _is_business_write_request(value: str) -> bool:
+    """Keep execution tools available while the user is requesting a change."""
+    normalized = ' '.join(str(value or '').casefold().split())
+    return bool(re.search(
+        r'\b(?:realizuj|realizujemy|kontynuuj\w*|pakuj|spakuj|zapakuj|wystaw|utw[oó]rz|dodaj|'
+        r'zmień|zmien|ustaw|odnotuj|zaznacz|usuń|usun|anuluj|nadaj|zam[oó]w|zamawiam\w*|zamawiaj\w*|zatwierdź|zatwierdz|'
+        r'zatwierdzam|odrzuć|odrzuc|odrzucam|wydrukuj|zapisz|oznacz|potwierdź|potwierdz|'
+        r'wykonaj|przygotuj|edytuj|zaktualizuj|wyślij|wyslij|wstrzymaj|wznów|wznow|zatrzymaj|zachowaj)\b', normalized))
+
+
 def _prefers_generic_business_read(value: str, intent: str = '') -> bool:
     normalized = ' '.join(str(value or '').casefold().split()).strip(' ?!.')
     intent = intent or _detect_read_intent(normalized)
     if intent not in _GENERIC_QUERY_INTENTS:
         return False
-    operational = re.search(
-        r'\b(?:realizuj|realizujemy|pakuj|spakuj|wystaw|utwórz|dodaj|zmień|usun|usuń|anuluj|'
-        r'nadaj|zamów kuriera|zamow kuriera|zatwierdź|zatwierdzam|odrzuć|odrzucam|wydrukuj|'
-        r'zapisz|oznacz|potwierdź|wykonaj|przygotuj|edytuj|zaktualizuj|wyślij|wyslij)\b',
-        normalized,
-    )
+    operational = _is_business_write_request(normalized)
     preflight = re.search(
         r'\b(?:preflight|readiness|czy (?:mogę|moge|można|mozna) '
         r'(?:realizować|realizowac|pakować|pakowac|wysłać|wyslac|nadać|nadac)|'
@@ -680,7 +696,7 @@ Przed kosztownym lub zatwierdzanym zapisem uzyskaj jasną intencję człowieka p
 Po WRITE sprawdź wynik oraz świeży stan. Przy błędzie czytaj także partial_result: istnienie rekordu i numeru faktury jest inne niż dostępność PDF i zakończenie publikacji. Nie mów, że faktura nie powstała, jeśli rekord istnieje. Naprawiaj brakujący artefakt istniejącej faktury przez dostępną operację wznowienia, nie twórz drugiej. KSeF pozostaje poza uprawnieniami agenta.
 Przy domówieniu sprawdź istniejące dokumenty i dostępność produktów. Zmiana zawartości unieważnia dokumenty i wymaga zgody na ich odtworzenie. Jeśli faktura blokuje edycję, użyj zaakceptowanego invoices.removal.preview → HUMAN approval → invoices.remove, następnie świeży odczyt i istniejące operacje pozycji. Nie resetuj warehouse_issued ani stock. Stare dokumenty lub przesyłki bez metadanych najpierw sprawdź dostępnymi preview adopcji, nie regeneruj ich w ciemno. Po zmianie sprawdź parametry istniejącej przesyłki, zbierz tylko braki i decyzję człowieka. Nigdy automatycznie jej nie anuluj lub nie nadawaj ponownie.
 Po timeout nadania tylko reconciliation/refresh istniejącego wyniku; brak potwierdzenia nie uprawnia do nowego POST. Tracking, etykieta, podjazd i fizyczny odbiór to odrębne stany. Dokumenty mogą być gotowe do druku przy nieukończonym podjeździe; wtedy nie ogłaszaj zakończenia całej realizacji. Druk oznacza aktualne dokumenty przygotowane do otwarcia w przeglądarce, nie potwierdzenie pracy drukarki.
-Remanent: użyj inventory.count.session.start; backend podaje sesję. Każda wyraźna nowa obserwacja, także poprawka tego samego produktu, to inventory.count.record względem świeżego get_expected. Jeżeli użytkownik podaje policzoną ilość bez nazwy produktu, a ostatnia tura wskazuje dokładnie jeden produkt, zachowaj go jako aktywny: ponownie wywołaj get_expected dla tego produktu i dopiero potem count.record. Gdy ostatnia tura wskazuje kilka produktów, poproś o nazwę lub SKU i nie zapisuj liczenia. Produkt jawnie wskazany w nowej wiadomości zastępuje wcześniejszy kontekst. Poprzednia obserwacja pozostaje w historii. Samo liczenie nie zmienia stock. Przy różnicy podaj system, policzono i różnicę, zapytaj o korektę; po zgodzie inventory.adjust przygotowuje nową decyzję HUMAN. Użyj aktualnej wersji z wyniku liczenia. Nie przechodź do kolejnego produktu bez domknięcia, odmowy lub odłożenia rozbieżności. Przy zgodności krótko potwierdź wynik. Nie twierdź, że fizyczne liczenie lub pakowanie miało miejsce bez wypowiedzi człowieka.
+Remanent: użyj inventory.count.session.start; backend podaje sesję. Każda wyraźna nowa obserwacja, także poprawka tego samego produktu, to inventory.count.record względem świeżego get_expected. Jeżeli użytkownik podaje policzoną ilość bez nazwy produktu, a ostatnia tura wskazuje dokładnie jeden produkt, zachowaj go jako aktywny: ponownie wywołaj get_expected dla tego produktu i dopiero potem count.record. Gdy ostatnia tura wskazuje kilka produktów, poproś o nazwę lub SKU i nie zapisuj liczenia. Produkt jawnie wskazany w nowej wiadomości zastępuje wcześniejszy kontekst. Poprzednia obserwacja pozostaje w historii. Samo liczenie nie zmienia stock. Przy różnicy podaj system, policzono i różnicę; inventory.adjust ma najpierw przygotować PENDING approval, a dopiero potem zapytaj o decyzję HUMAN. Nie zapowiadaj oczekującej korekty bez potwierdzonego PENDING. Użyj aktualnej wersji z wyniku liczenia. Jawne wskazanie kolejnego produktu odkłada poprzednią rozbieżność bez zatwierdzania, odrzucania ani usuwania jej obserwacji. Rozstrzygnij nowy produkt świeżym odczytem; późniejsze samotne tak lub nie dotyczy wyłącznie bieżącej decyzji, nigdy odłożonej korekty. Przy zgodności krótko potwierdź wynik. Nie twierdź, że fizyczne liczenie lub pakowanie miało miejsce bez wypowiedzi człowieka.
 Potwierdzona firmowa terminologia służy do interpretacji języka użytkownika w bieżącym kontekście biznesowym. Gdy `confirmed_business_terminology` zawiera jeden dopasowany alias, zastosuj jego znaczenie przed READ i użyj znaczenia aliasu w zapytaniu do właściwej istniejącej operacji. Nie wykonuj najpierw literalnego wyszukania po aliasie. Przykład ogólny: alias X oznacza firmę Y, więc pytanie o „zamówienia do X” oznacza `orders.search` po nazwie Y. Jeśli dalsza operacja wymaga `customer_id`, najpierw użyj `customers.search` dla Y i pobierz ID z wyniku READ; nigdy nie twórz ID samodzielnie. Nie podstawiaj aliasu globalnie: jeśli kontekst dotyczy geografii, adresu albo innego znaczenia, zachowaj literalny sens wypowiedzi. Terminologia nie jest uprawnieniem ani aktualnym faktem biznesowym; wszystkie ID, rekordy i stany nadal potwierdzaj przez Business Operations. Nieznane pojęcie sprawdź przez agent.terminology.search, a jeśli trzeba zapytaj. Jeśli dopasowanie zwraca kilka terminów, pokaż warianty albo dopytaj; nie wybieraj jednego bez podstawy. Zapisuj agent.terminology.remember tylko po jawnym wyjaśnieniu użytkownika, bez sekretów i poleceń. Potwierdzone preferencje pracy i procedury zapisuj przez agent.memory.remember z krótkimi hasłami relewancji. Nie deklaruj sukcesu zapisu pamięci własnym tekstem; backend poda użytkownikowi status z wyniku operacji, więc po wywołaniu możesz dodać wyłącznie zwykłą, pomocniczą odpowiedź bez słów „zapisane”, „zapamiętałem” i podobnych potwierdzeń. Gdy użytkownik jednoznacznie ustanawia regułę obowiązującą niezależnie od tematu pytania, dodaj do relevance_terms stabilny znacznik __always_apply__; nie używaj go dla zasad tematycznych. Pamięć wpływa wyłącznie na sposób pracy, kolejność i priorytety. Nigdy nie może nadpisywać RBAC, approval engine, permissions, Business Operations, świeżych danych biznesowych ani reguł bezpieczeństwa. expected_version=0 oznacza nowy wpis; aktualizacja wymaga świeżej wersji. confirmed_by_user dotyczy treści pamięci, nie zgody na zapis biznesowy.
 Odczyt payment_status jest autorytatywny: unpaid nie oznacza overdue. Nie ustalaj przeterminowania samodzielnie z daty; korzystaj z tego samego statusu i czasu backendu co panel.
 verified_presented_documents opisuje dokumenty rzeczywiście dostępne w karcie. existing_invoice_document oznacza istniejącą bieżącą listę faktury, nie dowód historycznego snapshotu. Brak packing_history może współistnieć z takim dokumentem: wyjaśnij obie rzeczy osobno. Wskazane już order_id/customer_id wykorzystaj w kolejnym READ, nie żądaj ponownie znanego obiektu. Nie rekonstruuj historii z aktualnych pozycji.
@@ -928,6 +944,7 @@ MEMORY_WRITES = frozenset({'agent.terminology.remember','agent.memory.remember'}
 COUNT_SESSION_START = 'inventory.count.session.start'
 COUNT_SESSION_BOUND = frozenset({
     'inventory.count.record','inventory.count.summary','inventory.count.complete','inventory.adjust',
+    'inventory.count.pause','inventory.count.resume','inventory.count.keep_result','inventory.count.history',
 })
 _CONTEXTUAL_INVENTORY_COUNT = re.compile(
     r'^(?:'
@@ -1146,6 +1163,48 @@ def _trusted_post_write_confirmation(execution_outcome: dict[str, Any] | None) -
     return _plain_response_text(confirmation.get('message') or '')
 
 
+def _stored_write_receipt(operation, result):
+    """A committed execution, rather than model wording, authorizes a receipt."""
+    definition = business_operations.OPERATION_REGISTRY.get(operation)
+    if result.status != 'SUCCESS' or not definition or definition.read_only:
+        return None
+    db = business_operations._factory()()
+    try:
+        if operation == 'approval.decide':
+            data = result.data or {}
+            if data.get('decision') != 'approve' or data.get('execution_status') != 'SUCCESS':
+                return None
+            row = db.execute('SELECT * FROM internal_operation_executions WHERE approval_id=? AND status=\'SUCCESS\'',
+                             (data.get('approval_id'),)).fetchone()
+        else:
+            row = db.execute('SELECT * FROM internal_operation_executions WHERE execution_id=? AND status=\'SUCCESS\'',
+                             (result.execution_id,)).fetchone()
+        if row is None:
+            return None
+        labels = {
+            'orders.internal_note.add': 'Notatka do zamówienia została zapisana.',
+            'orders.status.transition': 'Status zamówienia został zmieniony.',
+            'invoices.payment.set_status': 'Status płatności faktury został zapisany.',
+            'shipping.requirements.update': 'Parametry wskazanej paczki zostały zapisane.',
+            'orders.packing_list.generate': 'Lista pakowa została utworzona.',
+            'shipping.shipment.create': 'Przesyłka została utworzona.',
+            'shipping.pickup.request': 'Operacja zamówienia odbioru została wykonana.',
+            'shipping.shipment.refresh': 'Stan wcześniejszego zlecenia przesyłki został sprawdzony.',
+            'inventory.count.record': 'Wynik liczenia został zapisany.',
+            'inventory.count.pause': 'Przerwa w liczeniu została zapisana.',
+            'inventory.count.resume': 'Pomiar czasu liczenia został wznowiony.',
+            'inventory.count.keep_result': 'Wynik liczenia został zachowany bez zmiany stanu magazynu.',
+            'inventory.adjust': 'Zatwierdzona korekta stanu została wykonana.',
+            'agent.memory.remember': 'Informacja została zapisana w pamięci.',
+            'agent.terminology.remember': 'Znaczenie terminu zostało zapisane.',
+        }
+        return {'execution_id': row['execution_id'], 'operation': row['operation'],
+                'approval_id': row['approval_id'] or '', 'idempotency_key': row['idempotency_key'] or '',
+                'status': 'SUCCESS', 'message': labels.get(row['operation'], 'Operacja została wykonana i zapisana.')}
+    finally:
+        db.close()
+
+
 def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModelProvider,
                    conversation_id: str = '', execution_outcome: dict[str, Any] | None = None,
                    *, emit=None, cancelled=None, stream_trace=None,
@@ -1199,12 +1258,17 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
     previous_turn_entities = {}
     previous_turn_sources = {}
     memory_write_receipts = []
+    executed_operations = []
+    conversation_state = {}
+    shipping_draft = None
+    shipping_context_evidence = []
     current_stage = 'runtime_initialization'
     detected_intent = _detect_read_intent(message)
+    write_workflow_requested = execution_outcome is None and _is_business_write_request(message)
     read_planning_mode = _read_planning_mode(message, detected_intent)
     read_question_domains = sorted(_read_question_domains(message))
-    packing_history_read = detected_intent == 'packing_history'
-    shipment_read_requested = detected_intent == 'shipment_contents'
+    packing_history_read = detected_intent == 'packing_history' and not write_workflow_requested
+    shipment_read_requested = detected_intent == 'shipment_contents' and not write_workflow_requested
     fast_count_session = ''
     fast_voice_operation = ''
     fast_voice_data = {}
@@ -1251,6 +1315,205 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         except Exception:
             # Diagnostics must not interrupt cleanup or alter a business result.
             pass
+
+    def retain_write_confirmation(operation, result):
+        nonlocal post_write_confirmation
+        receipt = _stored_write_receipt(operation, result)
+        if receipt and not any(item['execution_id'] == receipt['execution_id'] for item in executed_operations):
+            executed_operations.append(receipt)
+            post_write_confirmation = '\n'.join(dict.fromkeys(item['message'] for item in executed_operations))
+
+    def save_shipping_draft(draft):
+        nonlocal shipping_draft
+        shipping_draft = draft
+        if draft is None:
+            conversation_state.pop('shipping_draft', None)
+        else:
+            conversation_state['shipping_draft'] = draft
+        agent_conversation.save_turn_state(human_actor, ai_actor, conversation_id, run_id, conversation_state)
+
+    def observe_shipping_state(operation, data):
+        if not isinstance(data, dict) or not isinstance(data.get('state'), dict):
+            return
+        if operation not in business_operations.SUPERVISED_WRITES | {
+                'orders.fulfillment.state', 'orders.packing_list.preview', 'shipping.requirements.get'}:
+            return
+        candidate = agent_shipping_draft.observe(shipping_draft, data['state'], turn_message, run_id)
+        if candidate is not None:
+            save_shipping_draft(candidate)
+
+    def draft_operation(operation, arguments):
+        """A narrowly scoped preflight/write through the normal RBAC and approval gate."""
+        check_cancelled()
+        definition = business_operations.OPERATION_REGISTRY[operation]
+        current = load_actor_context(human_actor.actor_id)
+        if (current is None or any(current.permission_decision(permission) == DENY
+                                  for permission in business_operations.required_permissions(definition))):
+            raise business_operations.ControlledOperationError('PERMISSION_DENIED', 'Brak uprawnień do obsługi paczki.', status='DENIED')
+        if (not shipping_draft or arguments.get('order_id') != shipping_draft['identity']['root_order_id']
+                or timings['tool_calls_count'] >= MAX_TOOL_CALLS_PER_TURN):
+            raise business_operations.ControlledOperationError('ENTITY_SCOPE_CONFLICT', 'Nie potwierdzono zakresu wskazanej paczki.', status='DENIED')
+        if not definition.read_only:
+            conflict = business_operations.validate_resolved_entity_scope(operation, arguments, resolved_entities, ambiguous_entities)
+            if conflict:
+                raise business_operations.ControlledOperationError(*conflict, status='DENIED')
+        timings['tool_calls_count'] += 1
+        _audit('agent.tool_selected', ai_actor, run_id, correlation_id, SUCCESS, human_actor.actor_id,
+               tool_name=operation, conversation_id=conversation_id, selection_reason='verified_parcel_draft')
+        selected_at = time.perf_counter()
+        result = business_operations.execute_business_operation(ai_actor, operation, arguments, correlation_id=correlation_id)
+        retain_write_confirmation(operation, result)
+        elapsed = round((time.perf_counter()-selected_at)*1000, 2)
+        timings['business_operation_ms'] += elapsed
+        timings['tool_execution_ms'] += elapsed
+        _audit('agent.tool_result', ai_actor, run_id, correlation_id,
+               SUCCESS if result.status == 'SUCCESS' else FAILED, human_actor.actor_id,
+               tool_name=operation, execution_id=result.execution_id, result_status=result.status,
+               conversation_id=conversation_id)
+        call_id = 'parcel-draft-' + str(timings['tool_calls_count']) + '-' + run_id
+        items = [
+            {'type':'function_call', 'call_id':call_id, 'name':operation, 'arguments':json.dumps(arguments)},
+            {'type':'function_call_output', 'call_id':call_id, 'output':json.dumps(
+                result.data if result.status == 'SUCCESS' else {'status':result.status, 'error_code':result.error_code,
+                                                              'error':result.safe_error_message}, ensure_ascii=False)},
+        ]
+        evidence.extend(items)
+        shipping_context_evidence.extend(items)
+        if result.status == 'SUCCESS':
+            chat_503_diagnostics['tool_calls_ok'] += 1
+            data = result.data or {}
+            state = data.get('state') or {}
+            if state.get('order_id'):
+                resolved_entities['order'] = state['order_id']
+                ambiguous_entities.discard('order')
+            observe_shipping_state(operation, data)
+            artifact_sources.extend(build_artifact_sources(operation, data, conversation_id, run_id))
+            if _artifact_builder:
+                try:
+                    artifacts[:] = [item for item in (_artifact_builder(operation, data) or []) if isinstance(item, dict)][:6]
+                except Exception as exc:
+                    logger.error('AI_ARTIFACT_BUILD_FAILED %s', json.dumps({
+                        'operation':operation, 'exception_type':type(exc).__name__,
+                    }, sort_keys=True))
+        if result.status == 'PENDING_APPROVAL':
+            import human_approval
+            human_approval.bind(business_operations, result.approval_id, conversation_id, human_actor, run_id)
+            pending = {'approval_id':result.approval_id, 'operation':operation,
+                       'order_id':arguments['order_id'], 'expected_version':arguments['expected_version']}
+            pending_approvals.append(pending)
+            save_shipping_draft({**shipping_draft, 'pending_approval':pending})
+        elif result.status == 'SUCCESS' and not definition.read_only:
+            save_shipping_draft({**shipping_draft, 'execution_refs':
+                [*shipping_draft.get('execution_refs', []), result.execution_id][-8:]})
+        return result
+
+    def continue_shipping_draft():
+        """Fill a missing weight without asking the user to perform technical reads."""
+        nonlocal write_workflow_requested
+        if not agent_shipping_draft.is_followup(turn_message, shipping_draft):
+            return None
+        previous_pending = shipping_draft.get('pending_approval')
+        if previous_pending and not agent_shipping_draft.requests_shipping(turn_message):
+            import internal_approval
+            snapshot = internal_approval.get_request_snapshot(previous_pending['approval_id']) or {}
+            if snapshot.get('status') in {'REJECTED','CANCELLED'}:
+                save_shipping_draft({**shipping_draft, 'shipping_requested':False})
+        prior_identity = dict(shipping_draft['identity'])
+        supplied = agent_shipping_draft.parse_parameters(turn_message, active=True)
+        save_shipping_draft(agent_shipping_draft.merge_parameters(shipping_draft, turn_message))
+        if agent_shipping_draft.cancels_shipping(turn_message):
+            return finish('SUCCESS', 'Wstrzymano przygotowanie wysyłki w tej rozmowie. '
+                          'Wcześniejsze oczekujące propozycje wymagają osobnej decyzji; istniejąca przesyłka nie została anulowana.',
+                          voice_response_mode='direct')
+        refreshed = draft_operation('orders.fulfillment.state', {'order_id':prior_identity['root_order_id']})
+        if refreshed.status != 'SUCCESS':
+            return finish(refreshed.status, refreshed.safe_error_message, refreshed.error_code)
+        state = refreshed.data['state']
+        if agent_shipping_draft.identity(state) != prior_identity:
+            return finish('DENIED', 'Zakres lub wersja listy pakowej tej paczki zmieniły się. Potwierdź jej aktualną zawartość przed dalszą realizacją.', 'PARCEL_SCOPE_CHANGED')
+        if _is_packing_history_read(turn_message):
+            return direct_business_read(PACKING_HISTORY_OPERATION,
+                {'packing_list_key':prior_identity['packing_list_id'], 'mode':'current'})
+        write_workflow_requested = bool(supplied or shipping_draft.get('shipping_requested') or write_workflow_requested)
+        if not supplied and not agent_shipping_draft.requests_shipping(turn_message) and not re.search(r'\b(?:kontynuuj\w*|dalej)\b', turn_message.casefold()):
+            return None
+        if not shipping_draft.get('shipping_requested'):
+            return None
+        missing = agent_shipping_draft.missing_fields(shipping_draft, state)
+        if missing:
+            labels = {'carrier':'przewoźnika', 'length':'długość paczki', 'width':'szerokość paczki',
+                      'height':'wysokość paczki', 'weight':'masę paczki w kilogramach',
+                      'dimension_unit':'jednostkę wymiarów', 'weight_unit':'jednostkę masy',
+                      'sms':'wybór powiadomienia SMS', 'email':'wybór powiadomienia e-mail',
+                      'recipient.name':'nazwę odbiorcy', 'recipient.street':'ulicę odbiorcy',
+                      'recipient.post_code':'kod pocztowy odbiorcy', 'recipient.city':'miasto odbiorcy',
+                      'recipient.phone':'telefon odbiorcy', 'recipient.email':'e-mail odbiorcy'}
+            return finish('SUCCESS', 'Dane paczki są zachowane w szkicu rozmowy. Podaj jeszcze: ' +
+                          ', '.join(labels.get(key, key) for key in missing) + '.', voice_response_mode='direct')
+        known = (state.get('requirements') or {}).get('known') or {}
+        fields = {key:value for key,value in shipping_draft.get('parameters', {}).items() if known.get(key) != value}
+        pending = shipping_draft.get('pending_approval')
+        if pending:
+            import human_approval
+            if any(item['approval_id'] == pending['approval_id'] for item in human_approval.pending(business_operations, conversation_id, human_actor)):
+                pending_approvals.append(pending)
+                if fields or pending.get('expected_version') != state.get('expected_version'):
+                    return finish('CONFLICT',
+                        'Poprzednia propozycja dla tej paczki nadal oczekuje na decyzję i ma inne parametry lub wersję. '
+                        'Odrzuć tę propozycję przed przygotowaniem nowej. Nowe dane są zachowane w szkicu.',
+                        'PENDING_SHIPMENT_CHANGED')
+                return finish('SUCCESS', 'Ta sama operacja dla wskazanej paczki już oczekuje na zatwierdzenie. Parametry są zachowane.', voice_response_mode='direct')
+        if fields:
+            arguments = {'order_id':prior_identity['root_order_id'], 'expected_version':state['expected_version'],
+                         'idempotency_key':agent_shipping_draft.idempotency_key(shipping_draft, 'shipping.requirements.update',
+                             {'fields':fields, 'expected_version':state['expected_version']}), **fields}
+            updated = draft_operation('shipping.requirements.update', arguments)
+            if updated.status != 'SUCCESS':
+                return finish(updated.status, updated.safe_error_message, updated.error_code)
+            state = updated.data['state']
+        shipment = state.get('shipment') or {}
+        if shipment.get('pickup_confirmed'):
+            return finish('SUCCESS', 'Odbiór tej paczki jest już potwierdzony. Nie utworzono ponownego zlecenia.', voice_response_mode='direct')
+        pickup_state = (shipment.get('pickup') or {}).get('state')
+        if pickup_state in {'queued', 'sending'}:
+            return finish('SUCCESS', 'Zlecenie odbioru tej przesyłki jest już zapisane w kolejce lub w trakcie wysyłania. '
+                          'Potwierdzenie przewoźnika jeszcze nie jest dostępne. Nie utworzono ponownego zlecenia.',
+                          voice_response_mode='direct')
+        if pickup_state == 'unknown':
+            return finish('SUCCESS', 'Wynik wcześniejszego zlecenia odbioru wymaga sprawdzenia. '
+                          'Nie utworzono nowego zlecenia ani kolejnej propozycji odbioru.', voice_response_mode='direct')
+        if shipment.get('attempt_state') in {'SENDING', 'UNKNOWN'}:
+            recovered = draft_operation('shipping.shipment.refresh', {
+                'order_id':prior_identity['root_order_id'], 'expected_version':state['expected_version'],
+                'idempotency_key':agent_shipping_draft.idempotency_key(shipping_draft, 'shipping.shipment.refresh', {'attempt':shipment.get('attempt_state'), 'run_id':run_id})})
+            if recovered.status != 'SUCCESS':
+                return finish(recovered.status, recovered.safe_error_message, recovered.error_code)
+            state = recovered.data['state']
+            shipment = state.get('shipment') or {}
+            if not shipment.get('exists') or shipment.get('attempt_state') in {'SENDING', 'UNKNOWN'}:
+                return finish('SUCCESS', 'Wynik wcześniejszego zlecenia tej paczki wymaga uzgodnienia. Nie tworzę ponownego nadania.', voice_response_mode='direct')
+        operation = 'shipping.pickup.request' if shipment.get('exists') else 'shipping.shipment.create'
+        package = state.get('package') or {}
+        if not shipment.get('exists') and (not package.get('ready_for_shipment') or not (state.get('packing_list') or {}).get('current')):
+            return finish('SUCCESS', 'Parametry są zapisane. Aktualna lista pakowa nie potwierdza jeszcze gotowej zawartości tej paczki; wymagane jest sprawdzenie jej alokacji.', voice_response_mode='direct')
+        arguments = {'order_id':prior_identity['root_order_id'], 'expected_version':state['expected_version'],
+                     'idempotency_key':agent_shipping_draft.idempotency_key(shipping_draft, operation,
+                         {'identity':prior_identity, 'fingerprint':package.get('fingerprint'),
+                          'requirements':(state.get('requirements') or {}).get('known', {}),
+                          'previous_approval_id':(pending or {}).get('approval_id')})}
+        if operation == 'shipping.shipment.create':
+            arguments['package_fingerprint'] = package['fingerprint']
+        prepared = draft_operation(operation, arguments)
+        if prepared.status != 'PENDING_APPROVAL':
+            return finish(prepared.status, prepared.safe_error_message or 'Stan operacji tej paczki został sprawdzony.', prepared.error_code)
+        params = {**(state.get('requirements') or {}).get('known', {}), **shipping_draft['parameters']}
+        label = 'utworzenie jednej przesyłki InPost' if operation == 'shipping.shipment.create' else 'zamówienie odbioru istniejącej przesyłki'
+        return finish('SUCCESS',
+            f"Paczka obejmuje {len(prior_identity['order_ids'])} zamówienia; potwierdzona zawartość: {package.get('packed_quantity')} szt. "
+            f"Wymiary {params['length']:g} × {params['width']:g} × {params['height']:g} cm, masa {params['weight']:g} kg. "
+            f"SMS: {'tak' if params['sms'] else 'nie'}, e-mail: {'tak' if params['email'] else 'nie'}. "
+            f"Prośba o {label} oczekuje na zatwierdzenie. Zlecenie zewnętrzne nie zostało teraz wykonane.",
+            voice_response_mode='direct')
 
     def _finish(status, answer, code='', speech_text='', voice_response_mode='adaptive', inventory_tts=''):
         nonlocal active, current_stage
@@ -1373,20 +1636,42 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 'correlation_id':correlation_id,'conversation_id':conversation_id,'tool_calls':timings['tool_calls_count'],
                 'model':model_name,'usage':usage,'error_code':code,'timings':dict(timings),
                 'artifacts':artifacts, 'approvals':pending_approvals,
-                'pending_approvals':pending_approvals, 'decisions': decisions}
+                'pending_approvals':pending_approvals, 'decisions': decisions,
+                'executed_operations': executed_operations}
+        result['request_id'] = getattr(human_actor, 'request_id', '')
         if status == 'SUCCESS' and (fast_voice_active or shipment_read_requested):
             result['display_text'] = answer
             result['tts_text'] = speech_text
         if fast_voice_trace:
             result['inventory_fast_trace_ms'] = dict(fast_voice_trace)
         if status != 'SUCCESS':
+            result['failure_category'] = (
+                'gate' if status in {'DENIED', 'CONFLICT'} else
+                'transport' if code == 'TURN_CANCELLED' else
+                'provider' if code == 'PROVIDER_CONTRACT_VIOLATION' else
+                chat_503_diagnostics.get('failure_category', 'runtime'))
             result['_chat_503_diagnostics'] = {'stage':current_stage, **chat_503_diagnostics}
         return result
 
     def finish(status, answer, code='', speech_text='', voice_response_mode='adaptive', inventory_tts=''):
-        nonlocal active
+        nonlocal active, post_write_confirmation
+        if pending_approvals:
+            import internal_approval
+            try:
+                pending_confirmed = any(
+                    (internal_approval.get_request_snapshot(item['approval_id']) or {}).get('status') == 'PENDING'
+                    for item in pending_approvals)
+            except Exception:
+                pending_confirmed = False
+            if pending_confirmed:
+                pending_text = 'Przygotowana operacja oczekuje na zatwierdzenie. Nie została jeszcze wykonana.'
+                post_write_confirmation = '\n'.join(filter(None, (post_write_confirmation, pending_text)))
         synthesis_status, synthesis_error_code = status, code
-        used_stored_confirmation = bool(post_write_confirmation and status != 'SUCCESS')
+        synthesis_errors = {'MODEL_FAILED', 'PROVIDER_CONTRACT_VIOLATION', 'RESPONSE_TOO_LARGE',
+                            'CONTEXT_LIMIT_EXCEEDED', 'HISTORY_SAVE_FAILED', 'AUDIT_FAILED',
+                            'TURN_FINALIZATION_FAILED', 'TURN_CANCELLED'}
+        used_stored_confirmation = bool(post_write_confirmation and status != 'SUCCESS'
+                                       and (execution_outcome is not None or code in synthesis_errors))
         if used_stored_confirmation:
             logger.warning('AI_POST_WRITE_CONFIRMATION_FALLBACK %s', json.dumps({
                 'agent_run_id': run_id,
@@ -1398,7 +1683,8 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
             speech_text, voice_response_mode = '', 'direct'
         try:
             result = _finish(status, answer, code, speech_text, voice_response_mode, inventory_tts)
-            if post_write_confirmation and result['status'] != 'SUCCESS':
+            if (post_write_confirmation and result['status'] != 'SUCCESS'
+                    and (execution_outcome is not None or result.get('error_code') in synthesis_errors)):
                 used_stored_confirmation = True
                 synthesis_status = result['status']
                 synthesis_error_code = result.get('error_code') or synthesis_error_code
@@ -1407,9 +1693,11 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                     speech_text=post_write_confirmation, voice_response_mode='direct', error_code='',
                 )
                 result.pop('_chat_503_diagnostics', None)
+                result.pop('failure_category', None)
             if used_stored_confirmation:
                 result.update(
-                    confirmation_source='stored_execution',
+                    confirmation_source=('stored_execution' if executed_operations or execution_outcome is not None
+                                         else 'stored_pending_approval'),
                     synthesis_status=synthesis_status,
                     synthesis_error_code=synthesis_error_code,
                 )
@@ -1432,7 +1720,11 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                         'tool_calls': timings['tool_calls_count'], 'model': model_name, 'usage': usage,
                         'error_code': '', 'timings': dict(timings), 'artifacts': artifacts,
                         'approvals': pending_approvals, 'pending_approvals': pending_approvals,
-                        'decisions': decisions, 'confirmation_source':'stored_execution',
+                        'decisions': decisions,
+                        'confirmation_source':('stored_execution' if executed_operations or execution_outcome is not None
+                                               else 'stored_pending_approval'),
+                        'executed_operations': executed_operations,
+                        'request_id':getattr(human_actor, 'request_id', ''),
                         'synthesis_status':'FAILED',
                         'synthesis_error_code':'TURN_FINALIZATION_FAILED'}
             return {'ok': False, 'status': 'FAILED', 'message': 'Nie udało się teraz pobrać odpowiedzi.',
@@ -1443,6 +1735,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                     'error_code': 'TURN_FINALIZATION_FAILED', 'timings': dict(timings),
                     'artifacts': [], 'approvals': pending_approvals,
                     'pending_approvals': pending_approvals, 'decisions': decisions,
+                    'failure_category':'runtime', 'request_id':getattr(human_actor, 'request_id', ''),
                     '_chat_503_diagnostics': {'stage':'turn_finalization', **chat_503_diagnostics}}
         finally:
             if active:
@@ -1568,14 +1861,28 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         stage_started = time.perf_counter()
         conversation_id, _, _ = agent_conversation.open_conversation(human_actor,ai_actor,conversation_id)
         turn_message = message or 'Przekaż krótki, naturalny wynik decyzji.'
-        agent_conversation.begin_turn(human_actor,ai_actor,conversation_id,run_id,turn_message)
+        conversation_state = agent_conversation.begin_turn(human_actor,ai_actor,conversation_id,run_id,turn_message)
         active = True
         trace_phase('turn_acquired', actor_id=ai_actor.actor_id, roles=list(ai_actor.roles),
                     streaming=stream_enabled, lease_acquired=True,
                     normalized_text_sha256=hashlib.sha256(' '.join(turn_message.casefold().split()).encode()).hexdigest(),
                     text_length=len(turn_message))
         timings['acquire_turn_ms'] = round((time.perf_counter()-stage_started)*1000,2)
-        if execution_outcome is None and shipment_read.is_question(turn_message):
+        shipping_draft = conversation_state.get('shipping_draft')
+        if execution_outcome is None and shipping_draft:
+            if (agent_shipping_draft.needs_parameter_review(turn_message)
+                    and not agent_shipping_draft.is_parameter_question(turn_message)
+                    and (agent_shipping_draft.shipping_context(turn_message)
+                         or re.search(r'\b(?:kg|kilogram\w*)\b', turn_message.casefold()))):
+                save_shipping_draft({**shipping_draft, 'shipping_requested':False})
+            if (agent_shipping_draft.selects_other_scope(turn_message, shipping_draft)
+                    and (agent_shipping_draft.requests_shipping(turn_message)
+                         or agent_shipping_draft.parse_parameters(turn_message, active=True))):
+                save_shipping_draft(None)
+            draft_response = continue_shipping_draft()
+            if draft_response is not None:
+                return draft_response
+        if execution_outcome is None and not write_workflow_requested and shipment_read.is_question(turn_message):
             selector = shipment_read.direct_selector(turn_message, today=business_operations._business_now().date())
             if selector:
                 return direct_business_read(shipment_read.OPERATION, selector)
@@ -1588,14 +1895,17 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         if execution_outcome is None and not shipment_read.is_question(turn_message):
             import human_approval
             import internal_approval
+            import inventory_voice_context
+            import inventory_voice_products
 
             def voice_mark(stage):
                 fast_voice_trace[stage] = round((time.perf_counter()-started)*1000, 2)
                 trace_phase(stage, model_calls=0)
 
             lookup_started = time.perf_counter()
-            fast_count_session = business_operations.active_inventory_count_session(
+            voice_state = business_operations._inventory_count_runtime_snapshot(
                 ai_actor, human_actor, conversation_id)
+            fast_count_session = str(voice_state['session_id']) if voice_state else ''
             timings['session_lookup_ms'] = round((time.perf_counter()-lookup_started)*1000,2)
             command = inventory_voice_fast.parse(turn_message) if fast_count_session else None
             command_matches_inventory = command is not None
@@ -1608,12 +1918,28 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                         ai_actor, human_actor, conversation_id, identity, allow_typo=True)
                     for identity in identities if identity
                 )
+                spoken_tokens = inventory_voice_products.tokens(command.product, spoken=True)
+                command_matches_inventory = command_matches_inventory or bool(voice_fast_mode
+                    and any(token in inventory_voice_products.COLORS or token == 'plk' for token in spoken_tokens)
+                    and any(token.isdigit() or '-' in token for token in spoken_tokens))
             if fast_count_session and command_matches_inventory:
+                if voice_state.get('_context_read_denied'):
+                    return finish('DENIED', 'Brak dostępu do liczenia', 'PERMISSION_DENIED')
                 current_stage = 'inventory_voice_fast'
                 voice_mark('fast_path_detected')
                 voice_mark('parse_done')
-                voice_state = business_operations.inventory_count_voice_state(
-                    ai_actor, human_actor, conversation_id)
+                clarification = (voice_state or {}).get('clarification', {})
+                activity_state = (voice_state or {}).get('timing', {})
+
+                def save_clarification(value):
+                    nonlocal clarification
+                    # A fresh empty snapshot needs no second authenticated DELETE.
+                    # Never retain this snapshot beyond this leased turn.
+                    if not value and not clarification:
+                        return
+                    inventory_voice_context.save(
+                        business_operations, ai_actor, human_actor, conversation_id, value)
+                    clarification = dict(value)
 
                 def voice_finish(answer, speech, *, state, failure=''):
                     saved_state = business_operations.inventory_count_voice_state(
@@ -1665,6 +1991,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                     result = business_operations.execute_business_operation(
                         ai_actor if operation != 'approval.decide' else human_actor,
                         operation, arguments, correlation_id=correlation_id)
+                    retain_write_confirmation(operation, result)
                     elapsed = round((time.perf_counter()-call_started)*1000, 2)
                     timings[phase] += elapsed
                     timings['tool_execution_ms'] += elapsed
@@ -1695,6 +2022,32 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 if not voice_state:
                     return finish('CONFLICT', 'Sesja remanentu została zamknięta. Rozpocznij ponownie.',
                                   'COUNT_SESSION_CLOSED')
+                if command.kind in {'pause','resume','elapsed'} or (
+                        command.kind == 'complete' and voice_state.get('inventory_year') is not None):
+                    action = 'pause' if command.kind == 'complete' else command.kind
+                    operation = 'inventory.count.summary' if action == 'elapsed' else 'inventory.count.' + action
+                    arguments = {'count_session_id':fast_count_session, 'conversation_id':conversation_id}
+                    if action == 'elapsed':
+                        arguments['limit'] = 1
+                    else:
+                        arguments['idempotency_key'] = run_id + ':count-' + action
+                    activity = voice_call(operation, arguments, phase='count_record_ms')
+                    if activity.status != 'SUCCESS':
+                        return finish(activity.status, activity.safe_error_message or 'Nie udało się zapisać kroku liczenia.',
+                                      activity.error_code, inventory_tts='Sprawdź ekran.')
+                    timing_text = inventory_fast_voice.timing_summary((activity.data or {}).get('timing'))
+                    if action == 'pause':
+                        answer = 'Liczenie wstrzymane. Aby kontynuować, powiedz „wznów liczenie”.'
+                        if voice_state.get('inventory_year') is not None:
+                            answer += ' Roczny spis pozostaje otwarty; ostateczne zamknięcie wykonaj na ekranie po uzgodnieniu wyników.'
+                        return finish('SUCCESS', answer + ' ' + timing_text, inventory_tts='Liczenie wstrzymane.')
+                    if action == 'resume':
+                        return finish('SUCCESS', 'Liczenie wznowione. ' + timing_text,
+                                      inventory_tts='Wznowiono. Podaj produkt lub kontynuuj bieżący krok.')
+                    return finish('SUCCESS', timing_text, inventory_tts=timing_text)
+                if activity_state.get('paused'):
+                    return finish('SUCCESS', 'Liczenie jest wstrzymane. Powiedz „wznów liczenie”, aby kontynuować.',
+                                  inventory_tts='Liczenie wstrzymane. Powiedz: wznów liczenie.')
                 eligible = human_approval.pending(business_operations, conversation_id, human_actor)
                 inventory_pending = []
                 for candidate in eligible:
@@ -1707,19 +2060,22 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                             inventory_pending.append(candidate)
                 selected_pending = next((item for item in inventory_pending
                     if item['approval_id'] == voice_state['pending_approval_id']), None)
-                if not selected_pending and len(inventory_pending) == 1:
-                    selected_pending = inventory_pending[0]
-                if not selected_pending and len(inventory_pending) > 1:
-                    if command is not None and command.kind == 'product':
-                        matches = business_operations.resolve_inventory_voice_product(
-                            ai_actor, human_actor, conversation_id, command.product)
-                        if len(matches) == 1:
-                            selected_pending = next((item for item in inventory_pending
-                                if str(item['entity_id']) == str(matches[0]['id'])), None)
-                    if not selected_pending:
-                        return voice_finish('Czeka kilka korekt. Podaj nazwę produktu do decyzji.',
-                                            'Którego produktu?', state=voice_state['voice_state'])
-                if selected_pending:
+                # Only the durable current decision can receive a bare "yes".
+                # Deferred approvals remain in the session, without becoming
+                # current merely because there is just one left.
+                explicit_product_command = command is not None and command.kind == 'product'
+                recount_product = None
+                if selected_pending and command is not None and command.kind in {'quantity', 'quantity_ambiguous', 'product'}:
+                    pending_snapshot = internal_approval.get_request_snapshot(selected_pending['approval_id'])
+                    pending_product = int(json.loads(pending_snapshot['safe_payload'])['product_id'])
+                    if command.kind in {'quantity', 'quantity_ambiguous'}:
+                        recount_product = pending_product
+                    elif command.quantity is not None:
+                        recount_matches = business_operations.resolve_inventory_voice_product(
+                            ai_actor, human_actor, conversation_id, command.product_without_count or command.product)
+                        if len(recount_matches) == 1 and int(recount_matches[0]['id']) == pending_product:
+                            recount_product = pending_product
+                if selected_pending and recount_product is None and not explicit_product_command:
                     approval_id = selected_pending['approval_id']
                     if (voice_state['voice_state'] != 'WAIT_APPROVAL'
                             or voice_state['pending_approval_id'] != approval_id):
@@ -1765,12 +2121,16 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                                       'ADJUST_FAILED')
                     new_qty = int((decision_data.get('outcome') or {}).get(
                         'counted_quantity', payload.get('counted_quantity', 0)))
+                    confirmed_variant = inventory_voice_products.display_name(decision_data.get('outcome') or {})
                     business_operations.set_inventory_count_voice_state(
                         ai_actor, human_actor, conversation_id, 'WAIT_PRODUCT')
-                    return voice_finish(f'Korekta zapisana. Nowy stan: {new_qty} szt.',
+                    save_clarification({})
+                    return voice_finish((f'{confirmed_variant} — ' if confirmed_variant else '')
+                                        + f'Korekta zapisana. Nowy stan: {new_qty} szt.',
                                         'Zapisano. Następny.', state='WAIT_PRODUCT')
 
-                if voice_state['voice_state'] == 'WAIT_APPROVAL':
+                if (voice_state['voice_state'] == 'WAIT_APPROVAL' and recount_product is None
+                        and not explicit_product_command):
                     old_approval = internal_approval.get_request_snapshot(
                         voice_state['pending_approval_id']) if voice_state['pending_approval_id'] else None
                     if old_approval and (old_approval['status'] not in {'PENDING', 'APPROVED'}
@@ -1800,22 +2160,49 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                         business_operations.set_inventory_count_voice_state(
                             ai_actor, human_actor, conversation_id, 'WAIT_PRODUCT')
                         voice_state['voice_state'] = 'WAIT_PRODUCT'
+                        save_clarification({})
                     return voice_finish('Remanent jest otwarty. Podaj produkt.', 'Podaj produkt.',
                                         state=voice_state['voice_state'])
 
-                active_product = (voice_state['active_product_id']
+                active_product = recount_product or (voice_state['active_product_id']
                                   if voice_state['voice_state'] == 'WAIT_COUNT' else None)
+                if command.kind == 'selection':
+                    choices = clarification.get('candidates') or []
+                    index = command.selection_index
+                    if index is None or not 0 <= index < len(choices):
+                        return voice_finish('Nie ma takiego wariantu do wyboru. Podaj pełny produkt.',
+                                            'Podaj produkt.', state=voice_state['voice_state'])
+                    selected = choices[index]
+                    command = inventory_voice_fast.VoiceCommand('product',
+                        product=selected['sku'], product_without_count=selected['sku'],
+                        quantity=clarification.get('quantity'),
+                        quantity_options=tuple(clarification.get('quantity_options', ())),
+                        raw_transcript=turn_message)
                 if command.kind == 'decision':
                     return voice_finish('Nie ma korekty oczekującej na decyzję.',
                                         'Nie ma korekty.', state=voice_state['voice_state'])
-                if command.kind == 'quantity' and active_product is None:
+                if command.kind in {'quantity', 'quantity_ambiguous'} and active_product is None:
                     return voice_finish('Podaj produkt do kolejnego liczenia.',
                                         'Jaki produkt?', state=voice_state['voice_state'])
 
-                product_id = active_product if command.kind == 'quantity' else None
+                product_id = active_product if command.kind in {'quantity', 'quantity_ambiguous'} else None
                 quantity = command.quantity
                 resolved_identity = ''
                 if command.kind == 'product':
+                    context_candidates = list(clarification.get('candidates') or [])
+                    if active_product and not context_candidates:
+                        active_read = business_operations.read_inventory_voice_product(
+                            ai_actor, human_actor, conversation_id, active_product)
+                        context_candidates = [dict(active_read, id=active_product)]
+                    if recount_product is None:
+                        if (voice_state['voice_state'] != 'WAIT_PRODUCT'
+                                or voice_state.get('active_product_id')
+                                or voice_state.get('pending_approval_id')):
+                            business_operations.set_inventory_count_voice_state(
+                                ai_actor, human_actor, conversation_id, 'WAIT_PRODUCT',
+                                defer_pending=True)
+                        voice_state['voice_state'] = 'WAIT_PRODUCT'
+                        save_clarification({})
                     resolve_started = time.perf_counter()
                     interpreted_exact = []
                     interpreted_fallback = []
@@ -1843,7 +2230,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                         # A complete exact product name wins over the trailing-count interpretation.
                         resolved_identity = command.product
                         candidates = business_operations.resolve_inventory_voice_product(
-                            ai_actor, human_actor, conversation_id, resolved_identity, exact_only=True)
+                            ai_actor, human_actor, conversation_id, resolved_identity)
                         if candidates and command.product_without_count != command.product:
                             quantity = None
                         elif not candidates:
@@ -1852,9 +2239,33 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                                 ai_actor, human_actor, conversation_id, resolved_identity, allow_typo=True)
                     timings['product_resolve_ms'] = round(
                         (time.perf_counter()-resolve_started)*1000, 2)
-                    if len(candidates) > 1 or len(unique_interpreted) > 1:
-                        return voice_finish('Nie znaleziono jednoznacznego produktu. Powtórz rozstaw lub wariant.',
-                                            'Nie jestem pewien. Powtórz rozstaw.',
+                    if not candidates:
+                        candidates = inventory_voice_products.contextual_suggestions(
+                            context_candidates, command.product,
+                            context_product_ids=[item['id'] for item in context_candidates])
+                        if candidates:
+                            resolved_identity = command.product
+                            if command.product_without_count != command.product:
+                                quantity = None
+                        elif resolved_identity != command.product:
+                            candidates = inventory_voice_products.contextual_suggestions(
+                                context_candidates, resolved_identity,
+                                context_product_ids=[item['id'] for item in context_candidates])
+                    if (len(candidates) > 1 or len(unique_interpreted) > 1
+                            or any(item.get('_voice_requires_confirmation') for item in candidates)):
+                        choices = list({int(item['id']):item for item in candidates}.values())
+                        pending_quantity_options = command.quantity_options
+                        interpreted_quantities = {item[2] for item in unique_interpreted.values()}
+                        if len(interpreted_quantities) > 1:
+                            quantity = None
+                            pending_quantity_options = tuple(sorted(interpreted_quantities))
+                        save_clarification({'candidates':choices, 'quantity':quantity,
+                                            'quantity_options':pending_quantity_options})
+                        variants = '\n'.join(f'{index + 1}. {inventory_voice_products.display_name(item)}'
+                                             for index, item in enumerate(choices))
+                        count_note = f' Podana ilość: {quantity} szt.' if quantity is not None else ''
+                        return voice_finish('Wybierz pełny wariant produktu:' + count_note + '\n' + variants,
+                                            'Wybierz wariant z ekranu.',
                                             state=voice_state['voice_state'],
                                             failure='ambiguous_product')
                     if not candidates:
@@ -1877,18 +2288,20 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                         return finish(expected.status, expected.safe_error_message or 'Nie udało się odczytać stanu.',
                                       expected.error_code or 'INVENTORY_READ_FAILED')
                     product = expected.data
-                    if resolved_identity and business_operations._product_match_rank(
-                            dict(product, id=product_id), resolved_identity) is None and business_operations._product_typo_rank(
+                    if resolved_identity and inventory_voice_products.match(
                             dict(product, id=product_id), resolved_identity) is None:
                         return finish('CONFLICT', 'Dane produktu zmieniły się. Podaj produkt ponownie.', 'PRODUCT_CHANGED')
                     voice_mark('inventory_read_done')
                     timings['supabase_business_reads_ms'] += timings['inventory_read_ms']
-                    display_name = str(product['model'] or product['name'] or product['sku'])
+                    display_name = inventory_voice_products.display_name(product)
                     if quantity is None:
                         business_operations.set_inventory_count_active_product(
                             ai_actor, human_actor, conversation_id, product_id)
+                        save_clarification({'candidates':[], 'quantity_options':command.quantity_options})
+                        options = ' czy '.join(str(value) for value in command.quantity_options)
+                        question = f' Potwierdź ilość: {options} szt.?' if options else ' Podaj policzoną ilość.'
                         return voice_finish(
-                            f'{display_name} — stan systemowy {product["expected_quantity"]} szt. Podaj policzoną ilość.',
+                            f'{display_name} — stan systemowy {product["expected_quantity"]} szt.' + question,
                             inventory_fast_voice.product_prompt(dict(product, model=(resolved_identity
                                 if resolved_identity and not resolved_identity.isdigit() else product['model']))), state='WAIT_COUNT')
                     counted = voice_call('inventory.count.record', {
@@ -1901,9 +2314,14 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                         return finish(counted.status, counted.safe_error_message or
                                       'Nie udało się zapisać liczenia.',
                                       counted.error_code or 'COUNT_RECORD_FAILED')
+                    save_clarification({})
                     observed = counted.data or {}
                     if _artifact_builder:
-                        artifacts.extend(_artifact_builder('inventory.count.record', observed) or [])
+                        count_artifacts = _artifact_builder('inventory.count.record', observed) or []
+                        for artifact in count_artifacts:
+                            if artifact.get('type') == 'inventory_count_card':
+                                artifact['display_name'] = display_name
+                        artifacts.extend(count_artifacts)
                     difference = int(observed['difference'])
                     document_note = (f' Stan dokumentowy: {observed["document_stock"]}.'
                                      if observed.get('document_stock') is not None else '')
@@ -1968,7 +2386,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         packing_history_document_followup = False
         packing_history_direct_arguments = None
         packing_history_selection_reason = ''
-        if (not shipment_read_requested and packing_history_context_batch_id and _is_packing_history_followup(turn_message)
+        if (not write_workflow_requested and not shipment_read_requested and packing_history_context_batch_id and _is_packing_history_followup(turn_message)
                 and not _packing_history_order_number(turn_message)):
             detected_intent = 'packing_history'
             packing_history_read = True
@@ -2024,7 +2442,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         elif packing_history_read:
             tools = _packing_history_tool_catalog(tools)
             high_level_read_enabled = False
-        elif read_planning_mode == 'investigative_lookup':
+        elif read_planning_mode == 'investigative_lookup' and not write_workflow_requested:
             tools = _investigative_read_tool_catalog(tools)
             high_level_read_enabled = (
                 high_level_read_enabled
@@ -2041,7 +2459,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 tools = _prefer_generic_tool_catalog(tools)
         else:
             tools = _v1_high_level_tool_catalog(tools)
-        if detected_intent in _SPECIALIST_READ_TOOLS:
+        if detected_intent in _SPECIALIST_READ_TOOLS and not write_workflow_requested:
             names = _SPECIALIST_READ_TOOLS[detected_intent]
             tools = [item for item in tools if item['name'] in names]
             high_level_read_enabled = False
@@ -2074,6 +2492,14 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 'ambiguous':len(memory['confirmed_terminology']) > 1,
             }, sort_keys=True))
         input_items.extend(history)
+        input_items.extend(shipping_context_evidence)
+        if shipping_draft:
+            input_items.extend([
+                {'type':'function_call', 'call_id':'parcel-context-' + run_id,
+                 'name':'trusted_parcel_draft', 'arguments':'{}'},
+                {'type':'function_call_output', 'call_id':'parcel-context-' + run_id,
+                 'output':json.dumps(agent_shipping_draft.model_context(shipping_draft), ensure_ascii=False)},
+            ])
         input_items.append({'role':'user','content':turn_message})
         if eligible_approvals:
             input_items.extend([
@@ -2124,12 +2550,13 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
             exhausted_green_synthesis = (
                 model_calls > 0 and remaining_tool_budget <= 0 and only_green_reads_so_far)
             read_planning_exhausted = (
-                (high_level_read_enabled or read_planning_mode == 'investigative_lookup')
+                not write_workflow_requested
+                and (high_level_read_enabled or read_planning_mode == 'investigative_lookup')
                 and read_planning_rounds >= max_read_planning_rounds
             )
             synthesis_only = (
                 green_batch_synthesis_only or exhausted_green_synthesis
-                or detected_intent == 'sales_analytics' and read_planning_rounds >= 1
+                or not write_workflow_requested and detected_intent == 'sales_analytics' and read_planning_rounds >= 1
                 or read_planning_exhausted
                 or generic_analytical_read and generic_read_diagnostics['query_count'] >= 2
                 or generic_analytical_read and detected_intent in {'sales_analytics', 'overdue_payments'}
@@ -2138,7 +2565,14 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                     and len(generic_tools_used) >= len(_INTENT_TOOL_NAMES[detected_intent])
             )
             model_instructions = instructions
-            if detected_intent in _SPECIALIST_READ_TOOLS:
+            if write_workflow_requested:
+                model_instructions += '''
+Użytkownik zleca zmianę. Odczyty preflight służą jej bezpiecznemu przygotowaniu i nie kończą zadania.
+Po świeżym odczycie wykonaj właściwe narzędzie tworzące żądaną operację; wymagane zatwierdzenie
+zapewnia istniejąca bramka. Sam opis planu nie tworzy operacji. Nie deklaruj utworzenia ani zapisu
+bez potwierdzonego wyniku narzędzia. Zachowaj wspólny limit operacji i pytaj tylko o faktyczne braki.
+'''
+            elif detected_intent in _SPECIALIST_READ_TOOLS:
                 model_instructions += _SPECIALIST_READ_INSTRUCTIONS
                 if detected_intent == 'sales_analytics':
                     model_instructions += _intent_read_instructions(detected_intent)
@@ -2146,7 +2580,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
                 model_instructions += SHIPMENT_READ_INSTRUCTIONS
             elif packing_history_read:
                 model_instructions += PACKING_HISTORY_READ_INSTRUCTIONS
-            elif high_level_read_enabled:
+            elif high_level_read_enabled and not write_workflow_requested:
                 model_instructions += HIGH_LEVEL_READ_MODEL_INSTRUCTIONS
             elif generic_analytical_read:
                 model_instructions += _intent_read_instructions(detected_intent)
@@ -2157,7 +2591,7 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
 '''
             elif china_shortage_coverage_question:
                 model_instructions += CHINA_SHORTAGE_COVERAGE_INSTRUCTIONS
-            if read_planning_mode == 'investigative_lookup':
+            if read_planning_mode == 'investigative_lookup' and not write_workflow_requested:
                 model_instructions += INVESTIGATIVE_READ_INSTRUCTIONS
             if read_planning_rounds and not synthesis_only:
                 model_instructions += READ_EVIDENCE_CHECK_INSTRUCTIONS
@@ -2279,7 +2713,7 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                 and len(reply.tool_calls) <= 2
                 and all(call.name in business_read_models.PLANNER_READ_OPERATIONS for call in reply.tool_calls)
             )
-            if (high_level_read_enabled and len(reply.tool_calls) > 2
+            if (high_level_read_enabled and not write_workflow_requested and len(reply.tool_calls) > 2
                     and all(call.name in business_read_models.PLANNER_READ_OPERATIONS
                             for call in reply.tool_calls)):
                 return finish('FAILED','Plan odczytu przekroczył dwa modele biznesowe.','TOOL_LIMIT_EXCEEDED')
@@ -2562,6 +2996,10 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                             timings['supabase_business_reads_ms']+operation_elapsed,2)
                 if call.name == 'approval.decide' and result.status == 'SUCCESS':
                     decisions.append({'approval_id': result.data['approval_id'], 'decision': result.data['decision']})
+                    if (shipping_draft and result.data.get('decision') == 'reject'
+                            and (shipping_draft.get('pending_approval') or {}).get('approval_id') == result.data.get('approval_id')):
+                        save_shipping_draft({**shipping_draft, 'shipping_requested':False})
+                retain_write_confirmation(call.name, result)
                 if call.name in MEMORY_WRITES:
                     memory_write_receipts.append(_memory_write_receipt(call.name, arguments, result))
                 logger.info('AI_TOOL_EXECUTION_END %s',json.dumps({'agent_run_id':run_id,'tool_name':call.name,'status':result.status}))
@@ -2570,6 +3008,7 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                             arguments=business_operations._safe_diagnostic_args(arguments))
                 if result.status == 'SUCCESS':
                     chat_503_diagnostics['tool_calls_ok'] += 1
+                    observe_shipping_state(call.name, result.data)
                     if call.name in {'inventory.count.session.start', 'inventory.count.get_expected',
                                      'inventory.count.record', 'inventory.count.complete',
                                      'inventory.product.get'}:
@@ -2604,12 +3043,18 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                         approval['invoice_number'] = removal['invoice_number']
                         approval['order_numbers'] = [o['order_number'] for o in removal['affected_orders']]
                     if call.name == 'inventory.adjust':
+                        business_operations.set_inventory_count_voice_state(
+                            ai_actor, human_actor, conversation_id, 'WAIT_APPROVAL',
+                            result.approval_id)
                         try:
                             approval.update(business_operations.inventory_adjustment_preview(
                                 ai_actor,human_actor,conversation_id,arguments['product_id']))
                         except business_operations.ControlledOperationError:
                             pass
                     pending_approvals.append(approval)
+                    if (shipping_draft and call.name in {'shipping.shipment.create', 'shipping.pickup.request'}
+                            and arguments.get('order_id') in shipping_draft['identity']['order_ids']):
+                        save_shipping_draft({**shipping_draft, 'pending_approval':approval})
                 current_artifacts = []
                 if result.status == 'SUCCESS' and _artifact_builder and len(artifacts) < 6:
                     try:
@@ -2699,7 +3144,7 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                        'nie będę rekonstruować jej z bieżących zamówień.',
                     voice_response_mode='direct',
                 )
-            if ((read_planning_mode != 'investigative_lookup'
+            if not write_workflow_requested and ((read_planning_mode != 'investigative_lookup'
                     and (parallel_read_batch or v1_read_batch))
                     or generic_analytical_read and generic_read_diagnostics['query_count'] >= 2
                     or generic_analytical_read and detected_intent in {'sales_analytics', 'overdue_payments'}
@@ -2714,8 +3159,12 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
         return finish('DENIED','Nie masz dostępu do tej rozmowy.','CONVERSATION_ACCESS_DENIED')
     except agent_conversation.ConversationBusy:
         return finish('DENIED','Ta rozmowa ma już aktywny turn. Spróbuj po jego zakończeniu.','CONVERSATION_BUSY')
+    except business_operations.ControlledOperationError as exc:
+        return finish(exc.status, exc.safe_message, exc.error_code)
     except Exception as exc:
         chat_503_diagnostics['exception_type'] = type(exc).__name__
+        chat_503_diagnostics['failure_category'] = ('provider' if getattr(exc, '_agent_provider_diagnostic', None)
+                                                   else 'model' if 'model_call' in current_stage else 'runtime')
         logger.error('AI_RUNTIME_FAILURE %s', json.dumps({
             'agent_run_id': run_id,
             'request_id': getattr(human_actor, 'request_id', ''),

@@ -231,7 +231,7 @@ def test_invoice_language_variants_use_semantic_operations(query, operation, arg
 
 
 @pytest.mark.parametrize(("query", "operation", "arguments", "answer"), [
-    ("Ile mamy Avery 160?", "inventory.product.search", {"query": "Avery 160"},
+    ("Pokaż szczegóły Avery 160", "inventory.product.search", {"query": "Avery 160"},
      "Na magazynie mamy 24 sztuki Avery 160."),
     ("Mam niezapłacone faktury?", "invoices.overdue", {},
      "Znaleziono 1 niezapłaconą fakturę."),
@@ -269,8 +269,11 @@ def test_unknown_product_does_not_invent_stock():
 
 
 def test_ambiguous_product_asks_for_variant():
-    result = runtime.run_agent_turn(owner(), "Ile mamy Avery?", fake_search_answer("Avery", "Mamy kilka wariantów Avery. Który rozstaw mam sprawdzić?"))
-    assert result["status"] == "SUCCESS" and "który" in result["message"].lower()
+    provider = fake_search_answer("Avery", "Mamy kilka wariantów Avery. Który rozstaw mam sprawdzić?")
+    result = runtime.run_agent_turn(owner(), "Ile mamy Avery?", provider)
+    assert result["status"] == "SUCCESS" and "podaj pełny model lub rozstaw" in result["message"].lower()
+    assert provider.calls == [] and result['tool_calls'] == 1
+    assert '24 szt.' not in result['message'] and '8 szt.' not in result['message']
 
 
 def test_write_request_is_blocked_before_model_and_database_unchanged():
@@ -342,7 +345,7 @@ def test_production_chat_endpoint_uses_runtime_and_real_business_operation_gate(
         session["admin_authenticated"] = True
         session["csrf_token"] = "csrf"
 
-    response = client.post("/api/internal/ai/chat", json={"message": "Ile mamy Avery 160?"})
+    response = client.post("/api/internal/ai/chat", json={"message": "Pokaż szczegóły Avery 160"})
 
     assert response.status_code == 200
     payload = response.get_json()
@@ -374,7 +377,7 @@ def test_mark_invoice_paid_is_blocked_before_model():
 
 def test_tool_loop_limit_stops_provider():
     responses = [tool("inventory.product.search", {"query": f"Avery {i}"}, f"c-{i}") for i in range(7)]
-    result = runtime.run_agent_turn(owner(), "Ile mamy Avery?", runtime.FakeModelProvider(responses))
+    result = runtime.run_agent_turn(owner(), "Pokaż Avery", runtime.FakeModelProvider(responses))
     assert result["status"] == "FAILED" and result["error_code"] == "TOOL_LIMIT_EXCEEDED"
 
 
@@ -450,7 +453,8 @@ def test_model_failures_are_controlled(response):
 def test_tool_failure_is_not_reported_as_success(monkeypatch):
     monkeypatch.setitem(operations._HANDLERS, "inventory.product.search", lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("db secret")))
     result = runtime.run_agent_turn(owner(), "Ile mamy Avery?", runtime.FakeModelProvider([tool("inventory.product.search", {"query": "Avery"})]))
-    assert result["status"] == "FAILED" and result["error_code"] == "MODEL_FAILED"
+    assert result["status"] == "FAILED" and result["error_code"] == "HANDLER_FAILED"
+    assert 'db secret' not in json.dumps(result)
 
 
 def test_audit_correlates_human_ai_and_execution():
@@ -489,7 +493,7 @@ def test_real_adapter_uses_env_config_and_safe_responses_contract(monkeypatch):
 
 def test_provider_failure_is_diagnostic_in_log_but_endpoint_response_stays_safe(monkeypatch, caplog):
     secret = "sk-this-secret-must-never-reach-logs"
-    user_message = "Ile mamy Avery 160? prywatny-marker"
+    user_message = "Pokaż szczegóły Avery 160. prywatny-marker"
 
     class ErrorResponse:
         status_code = 400

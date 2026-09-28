@@ -117,7 +117,7 @@ test('click start/stop -> STT -> same chat and conversation, transcript visible'
   assert.equal(b.calls[1].options.headers['X-CSRF-Token'], 'rendered-csrf');
   assert.match(b.calls[1].options.body.get('capture_duration_ms'), /^\d+$/);
   assert.deepEqual(JSON.parse(b.calls[2].options.body), {message:'jakie mam zaległe faktury?',
-    conversation_id:'existing-conversation'});
+    conversation_id:'existing-conversation', voice_fast_mode:true});
   const bubbles = b.elements.aiMessages.children.flatMap(row => row.children).map(child => child.textContent);
   assert.ok(bubbles.includes('jakie mam zaległe faktury?'));
   assert.equal(b.elements.aiVoiceStatus.textContent, 'Voice: gotowy');
@@ -127,6 +127,74 @@ test('click start/stop -> STT -> same chat and conversation, transcript visible'
     assert.ok(b.logs.some(entry => entry.event === event));
   }
   assert.ok(!JSON.stringify(b.logs).includes('zaległe faktury'));
+});
+
+for (const typedFinishesFirst of [false, true]) {
+  test(`text during STT preserves speech as draft and releases Voice when ${typedFinishesFirst ? 'chat' : 'STT'} finishes first`, async () => {
+    let releaseSTT, releaseChat;
+    const b = browser({
+      sttResponse:() => new Promise(resolve => { releaseSTT = resolve; }),
+      chatResponse:() => new Promise(resolve => { releaseChat = resolve; }),
+    });
+    b.click(); await flush(); b.click(); await flush();
+    assert.equal(b.elements.aiSend.disabled, false);
+    b.type('Pytanie tekstowe'); await flush();
+    const finishChat = async () => {
+      releaseChat({ok:true,status:200,json:async () => ({status:'SUCCESS',conversation_id:'chat-1',message:'Odpowiedź',artifacts:[]})});
+      await flush();
+    };
+    if (typedFinishesFirst) await finishChat();
+    releaseSTT({ok:true,status:200,json:async () => ({ok:true,text:'Rozpoznane polecenie'})});
+    await flush();
+    if (!typedFinishesFirst) await finishChat();
+    assert.equal(b.elements.aiInput.value, 'Rozpoznane polecenie');
+    assert.equal(b.elements.aiVoiceStatus.textContent, 'Voice: rozpoznany tekst czeka w polu wiadomości');
+    assert.equal(b.calls.filter(call => call.url.endsWith('/chat')).length, 1);
+    assert.equal(b.elements.aiSend.disabled, false);
+    assert.equal(b.audios.length, 0);
+    b.click(); await flush();
+    assert.equal(b.recorders.length, 2);
+    assert.equal(b.elements.aiVoiceStatus.textContent, 'Voice: słucham...');
+  });
+}
+
+test('typed draft during STT survives beside transcript and is not automatically submitted', async () => {
+  let releaseSTT;
+  const b = browser({sttResponse:() => new Promise(resolve => { releaseSTT = resolve; })});
+  b.click(); await flush(); b.click(); await flush();
+  b.elements.aiInput.value = 'Niedokończony szkic';
+  releaseSTT({ok:true,status:200,json:async () => ({ok:true,text:'Rozpoznane polecenie'})});
+  await flush();
+  assert.equal(b.elements.aiInput.value, 'Niedokończony szkic\nRozpoznane polecenie');
+  assert.equal(b.calls.filter(call => call.url.endsWith('/chat')).length, 0);
+  b.type(b.elements.aiInput.value); await flush();
+  assert.equal(b.calls.filter(call => call.url.endsWith('/chat')).length, 1);
+  assert.equal(b.elements.aiVoiceStatus.textContent, 'Voice: gotowy');
+  assert.equal(b.audios.length, 0);
+});
+
+test('text during recording also defers speech after successful typed chat without double send', async () => {
+  const b = browser(); b.click(); await flush();
+  b.type('Pytanie tekstowe'); await flush();
+  b.click(); await flush();
+  assert.equal(b.calls.filter(call => call.url.endsWith('/chat')).length, 1);
+  assert.equal(b.elements.aiInput.value, 'jakie mam zaległe faktury?');
+  assert.equal(b.elements.aiVoiceStatus.textContent, 'Voice: rozpoznany tekst czeka w polu wiadomości');
+  b.type(b.elements.aiInput.value); await flush();
+  assert.equal(b.calls.filter(call => call.url.endsWith('/chat')).length, 2);
+  assert.equal(b.elements.aiVoiceStatus.textContent, 'Voice: gotowy');
+});
+
+test('STT failure during typed chat keeps input busy until the chat finishes', async () => {
+  let releaseSTT, releaseChat;
+  const b = browser({sttResponse:() => new Promise(resolve => { releaseSTT = resolve; }),
+    chatResponse:() => new Promise(resolve => { releaseChat = resolve; })});
+  b.click(); await flush(); b.click(); await flush(); b.type('Tekst'); await flush();
+  releaseSTT({ok:false,status:503,json:async () => ({ok:false,error_code:'STT_BACKEND_ERROR'})}); await flush();
+  assert.equal(b.elements.aiInput.disabled, true);
+  releaseChat({ok:true,status:200,json:async () => ({status:'SUCCESS',message:'Gotowe',artifacts:[]})}); await flush();
+  assert.equal(b.elements.aiInput.disabled, false);
+  b.click(); await flush(); assert.equal(b.recorders.length, 2);
 });
 
 for (const [type, filename] of [['audio/webm','recording.webm'], ['audio/mp4','recording.mp4']]) {

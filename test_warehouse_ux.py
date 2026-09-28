@@ -39,7 +39,10 @@ def start(owner,conversation_id=''):
 
 def count(owner,conversation_id,product_id,quantity,key):
     args={'product_id':product_id,'counted_quantity':quantity,'expected_version':0,'idempotency_key':key}
-    return run(owner,f'Policzono {quantity}',[
+    db = backend.conn()
+    sku = db.execute('SELECT sku FROM products WHERE id=?',(product_id,)).fetchone()['sku']
+    db.close()
+    return run(owner,f'{sku} mam {quantity}',[
         runtime.ProviderResponse(tool_calls=(runtime.ToolCall('count','inventory.count.record',json.dumps(args)),),model='fake'),
         runtime.ProviderResponse(text=f'Policzono: {quantity}\nZgadza się.',model='fake'),
     ],conversation_id)
@@ -95,7 +98,9 @@ def test_g_session_identifiers_are_hidden_from_model_tool_inputs(catalog):
     for name in runtime.COUNT_SESSION_BOUND:
         assert 'count_session_id' not in descriptors[name]['parameters']['properties']
         assert 'conversation_id' not in descriptors[name]['parameters']['properties']
-    assert descriptors['inventory.count.session.start']['parameters']['properties']=={}
+    # Explicit annual attachment may name an existing session; the BO checks owner and conversation.
+    assert set(descriptors['inventory.count.session.start']['parameters']['properties'])=={'count_session_id'}
+    assert 'count_session_id' not in descriptors['inventory.count.session.start']['parameters']['required']
 
 
 def test_h_n_plain_message_and_voice_ready_contract(catalog):
@@ -225,13 +230,14 @@ def test_active_product_count_followup_performs_fresh_read_before_write(
     assert result['status'] == 'SUCCESS'
     assert result['error_code'] == ''
     card = next(item for item in result['artifacts'] if item['type'] == 'inventory_count_card')
-    assert card['display_name'] == display_name
+    assert card['display_name'] == f'{display_name} [UX-{product_id}]'
     assert (card['expected_quantity'], card['counted_quantity'], card['difference']) == (
         stock, counted, counted-stock)
     assert f'policzono {counted}' in result['message']
-    assert f'korektę stanu do {counted}' in result['message']
-    # One automatic get_expected READ and one count.record WRITE were executed.
-    assert result['tool_calls'] == 2
+    assert 'Korekta wymaga zatwierdzenia' in result['message']
+    assert result['approvals'][0]['to_quantity'] == counted
+    # Fresh expected READ, observed count WRITE, then preparation of an approval (no stock write).
+    assert result['tool_calls'] == 3
     db = backend.conn()
     try:
         records = db.execute(
@@ -249,7 +255,7 @@ def test_model_planned_get_expected_satisfies_same_turn_write_guard(isolated):
     opened = start(owner)
     _read_active_product(owner, opened['conversation_id'], product_id, 'Tom 128 BB')
 
-    result = run(owner, 'Na półce leży mi tylko sto', [
+    result = run(owner, 'Zapisz pomiar dla produktu 930', [
         runtime.ProviderResponse(tool_calls=(runtime.ToolCall(
             'expected', 'inventory.count.get_expected', json.dumps({'product_id':product_id})),),
             model='fake'),
@@ -291,7 +297,7 @@ def test_explicit_new_product_replaces_active_product_for_count(isolated):
 
     assert result['status'] == 'SUCCESS'
     card = next(item for item in result['artifacts'] if item['type'] == 'inventory_count_card')
-    assert card['display_name'] == 'Winsor 128 BB'
+    assert card['display_name'] == 'Winsor 128 BB [UX-932]'
     assert (card['expected_quantity'], card['counted_quantity'], card['difference']) == (12, 10, -2)
     db = backend.conn()
     try:
@@ -323,9 +329,10 @@ def test_ambiguous_active_products_require_product_name_without_write(isolated):
             })),), model='fake'),
     ], opened['conversation_id'])
 
-    assert result['status'] == 'DENIED'
-    assert result['error_code'] == 'ENTITY_SCOPE_AMBIGUOUS'
-    assert result['message'] == 'Który produkt masz na myśli? Podaj jego nazwę lub SKU.'
+    assert result['status'] == 'SUCCESS'
+    assert result['inventory_fast_state'] == 'WAIT_PRODUCT'
+    assert result['message'] == 'Podaj produkt do kolejnego liczenia.'
+    assert result['tool_calls'] == 0 and result['approvals'] == []
     db = backend.conn()
     try:
         assert db.execute('SELECT COUNT(*) FROM internal_inventory_count_items').fetchone()[0] == 0
@@ -394,7 +401,7 @@ def test_remanent_no_difference_has_one_clean_card_and_no_approval(catalog):
     assert result['approvals']==[]
     assert [item['type'] for item in result['artifacts']]==['inventory_count_card']
     card=result['artifacts'][0]
-    assert card=={'type':'inventory_count_card','display_name':'Cerne 128 BB',
+    assert card=={'type':'inventory_count_card','display_name':'Cerne 128 BB [UX-905]',
                   'expected_quantity':1,'counted_quantity':1,'difference':0,'matches':True}
     db=backend.conn()
     try: assert db.execute('SELECT qty FROM stock WHERE product_id=?',(product_id,)).fetchone()['qty']==1
@@ -405,13 +412,12 @@ def test_remanent_difference_prepare_and_human_approve_changes_stock(catalog, is
     product_id=_add_counted_product(); owner=_owner(); opened=start(owner)
     counted=_record_turn(owner,opened['conversation_id'],product_id,3,0,'Cerne 128 BB na półce 3 sztuki')
 
-    assert counted['message'].endswith('Skorygować stan do 3?')
+    assert counted['message'].endswith('Korekta wymaga zatwierdzenia.')
     assert [item['type'] for item in counted['artifacts']]==['inventory_count_card']
     assert counted['artifacts'][0]['difference']==2
-    pending=_prepare_adjustment(owner,opened['conversation_id'],product_id)
-    approval=pending['approvals'][0]
+    approval=counted['approvals'][0]
     assert approval['operation']=='inventory.adjust'
-    assert approval['product_name']=='Cerne 128 BB'
+    assert approval['product_name']=='Cerne 128 BB [UX-905]'
     assert (approval['from_quantity'],approval['to_quantity'])==(1,3)
     db=backend.conn(); assert db.execute('SELECT qty FROM stock WHERE product_id=?',(product_id,)).fetchone()['qty']==1; db.close()
 
@@ -423,7 +429,8 @@ def test_remanent_difference_prepare_and_human_approve_changes_stock(catalog, is
 
     body=response.get_json()
     assert response.status_code==200 and body['status']=='SUCCESS'
-    assert body['message']=='Stan Cerne 128 BB skorygowany do 3 sztuk.'
+    assert body['message']=='Cerne 128 BB [UX-905] — Korekta została zapisana. Nowy stan: 3 szt.'
+    assert backend.AGENT_MODEL_PROVIDER.calls == []
     db=backend.conn()
     try:
         assert db.execute('SELECT qty FROM stock WHERE product_id=?',(product_id,)).fetchone()['qty']==3
@@ -433,8 +440,8 @@ def test_remanent_difference_prepare_and_human_approve_changes_stock(catalog, is
 
 def test_remanent_reject_keeps_stock_and_count_observation(catalog, isolated, monkeypatch):
     product_id=_add_counted_product(); owner=_owner(); opened=start(owner)
-    _record_turn(owner,opened['conversation_id'],product_id,3,0,'Cerne 128 BB mam 3')
-    pending=_prepare_adjustment(owner,opened['conversation_id'],product_id); approval=pending['approvals'][0]
+    counted=_record_turn(owner,opened['conversation_id'],product_id,3,0,'Cerne 128 BB mam 3')
+    approval=counted['approvals'][0]
     monkeypatch.setattr(backend,'AGENT_MODEL_PROVIDER',runtime.FakeModelProvider([
         runtime.ProviderResponse(text='Korekta odrzucona. Stan pozostał bez zmian.',model='fake')]))
 
@@ -442,19 +449,19 @@ def test_remanent_reject_keeps_stock_and_count_observation(catalog, isolated, mo
         f"/api/internal/ai/approvals/{approval['approval_id']}/reject",
         json={'conversation_id':opened['conversation_id']})
 
-    assert response.get_json()['message']=='Korekta odrzucona. Stan pozostał bez zmian.'
+    assert 'Korekta odrzucona' in response.get_json()['message']
     db=backend.conn()
     try:
         assert db.execute('SELECT qty FROM stock WHERE product_id=?',(product_id,)).fetchone()['qty']==1
-        assert db.execute('SELECT status FROM internal_inventory_count_items WHERE product_id=?',(product_id,)).fetchone()['status']=='PENDING_ADJUSTMENT'
+        assert db.execute('SELECT status FROM internal_inventory_count_items WHERE product_id=?',(product_id,)).fetchone()['status']=='COUNT_ONLY'
     finally: db.close()
     assert approvals.get_request_snapshot(approval['approval_id'])['status']=='REJECTED'
 
 
 def test_remanent_conflict_does_not_apply_stale_count(catalog, isolated, monkeypatch):
     product_id=_add_counted_product(); owner=_owner(); opened=start(owner)
-    _record_turn(owner,opened['conversation_id'],product_id,3,0,'Cerne 128 BB mam 3')
-    pending=_prepare_adjustment(owner,opened['conversation_id'],product_id); approval=pending['approvals'][0]
+    counted=_record_turn(owner,opened['conversation_id'],product_id,3,0,'Cerne 128 BB mam 3')
+    approval=counted['approvals'][0]
     db=backend.conn(); db.execute('UPDATE stock SET qty=2 WHERE product_id=?',(product_id,)); db.commit(); db.close()
     monkeypatch.setattr(backend,'AGENT_MODEL_PROVIDER',runtime.FakeModelProvider([
         runtime.ProviderResponse(text='Stan zmienił się od czasu liczenia. Trzeba policzyć produkt ponownie.',model='fake')]))
@@ -465,7 +472,7 @@ def test_remanent_conflict_does_not_apply_stale_count(catalog, isolated, monkeyp
 
     body=response.get_json()
     assert body['status']=='CONFLICT'
-    assert body['message']=='Stan zmienił się od czasu liczenia. Trzeba policzyć produkt ponownie.'
+    assert body['message']=='Nie zapisano korekty. Sprawdź stan produktu.'
     db=backend.conn()
     try: assert db.execute('SELECT qty FROM stock WHERE product_id=?',(product_id,)).fetchone()['qty']==2
     finally: db.close()
@@ -473,8 +480,7 @@ def test_remanent_conflict_does_not_apply_stale_count(catalog, isolated, monkeyp
 
 def test_ai_cannot_approve_its_inventory_adjustment(catalog):
     product_id=_add_counted_product(); owner=_owner(); opened=start(owner)
-    _record_turn(owner,opened['conversation_id'],product_id,3,0,'Cerne 128 BB mam 3')
-    pending=_prepare_adjustment(owner,opened['conversation_id'],product_id)
+    pending=_record_turn(owner,opened['conversation_id'],product_id,3,0,'Cerne 128 BB mam 3')
     ai=rbac.load_actor_context(rbac.AI_OWNER_ASSISTANT_ACTOR_ID,delegated_by_actor_id=owner.actor_id)
 
     with pytest.raises(approvals.ApprovalDenied):

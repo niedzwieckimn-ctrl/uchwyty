@@ -33,8 +33,14 @@ def _save(b, oid, revision, payload):
         raise ValueError('Nie zapisano trwałych metadanych realizacji. Wymagane jest uzgodnienie konfliktu wersji.')
     c = b.conn()
     try:
-        c.execute('INSERT OR REPLACE INTO fulfillment_reconciliation_versions VALUES(?,?)', (oid, result['revision']))
-        c.execute('DELETE FROM fulfillment_reconciliation_pending WHERE order_id=?', (oid,))
+        c.execute('''INSERT INTO fulfillment_reconciliation_versions VALUES(?,?)
+                     ON CONFLICT(order_id) DO UPDATE SET revision=MAX(revision,excluded.revision)''',
+                  (oid, result['revision']))
+        # An acknowledgement of an earlier payload must not discard a newer
+        # local write staged while the remote request was in flight.
+        c.execute('''DELETE FROM fulfillment_reconciliation_pending
+                     WHERE order_id=? AND expected_revision=? AND payload=?''',
+                  (oid, revision, json.dumps(payload)))
         c.commit()
     finally:
         c.close()
@@ -56,6 +62,8 @@ def stage(b, oid, connection=None, allow_replace=False):
         return
     c = connection or b.conn()
     try:
+        if connection is None:
+            c.execute('BEGIN IMMEDIATE')
         payload = {table: [dict(r) for r in c.execute(f'SELECT * FROM {table} WHERE {key}=?', (oid,))] for table, key in TABLES.items()}
         payload['fulfillment_shipping_attempts'] = [dict(r) for r in c.execute('''SELECT * FROM fulfillment_shipping_attempts WHERE order_id=?
             OR order_id IN (SELECT attempt_order_id FROM fulfillment_shipping_members WHERE order_id=?)''', (oid, oid))]
@@ -76,28 +84,60 @@ def stage(b, oid, connection=None, allow_replace=False):
             payload['fulfillment_document_history'] = [dict(r) for r in c.execute(f"SELECT * FROM fulfillment_document_history WHERE kind='packing_list' AND document_id IN ({bid_marks})", ids)]
         row = c.execute('SELECT revision FROM fulfillment_reconciliation_versions WHERE order_id=?', (oid,)).fetchone()
         revision = row[0] if row else 0
-    finally:
-        if connection is None:
-            c.close()
-    for document in payload['fulfillment_documents'] + payload.get('fulfillment_document_history', []):
-        path = Path(document['path'])
-        if path.is_file():
+        for document in payload['fulfillment_documents'] + payload.get('fulfillment_document_history', []):
+            path = Path(document['path'])
+            if not path.is_file():
+                raise ValueError('Brak pliku dokumentu do trwałego zapisu; najpierw odzyskaj dokument.')
             content = path.read_bytes()
             if len(content) > 10_000_000:
                 raise ValueError('Dokument przekracza limit trwałego zapisu 10 MB.')
+            if hashlib.sha256(content).hexdigest() != document['file_hash']:
+                raise ValueError('Suma kontrolna dokumentu do trwałego zapisu nie zgadza się.')
             document['pdf_base64'] = base64.b64encode(content).decode('ascii')
-        document.pop('path', None)
-    c = connection or b.conn()
-    try:
+            document.pop('path', None)
         if not allow_replace and c.execute('SELECT 1 FROM fulfillment_reconciliation_pending WHERE order_id=?', (oid,)).fetchone():
             raise ValueError('Najpierw uzgodnij wcześniejszy zapis metadanych.')
         c.execute('INSERT OR REPLACE INTO fulfillment_reconciliation_pending VALUES(?,?,?)', (oid, revision, json.dumps(payload)))
         if connection is None:
             c.commit()
+    except Exception:
+        if connection is None:
+            c.rollback()
+        raise
     finally:
         if connection is None:
             c.close()
     return revision, payload
+
+
+def _repair_same_revision_files(b, c, payload):
+    """Repair missing cached bytes without replaying already-applied metadata.
+
+    A same-revision read can race a local write that has not yet been published.
+    Only a document whose identity and hashes still match may be repaired.
+    """
+    for table in ('fulfillment_documents', 'fulfillment_document_history'):
+        for source in payload.get(table, []):
+            local = c.execute(f'''SELECT * FROM {table}
+                WHERE order_id=? AND kind=? AND document_id=?''',
+                (source['order_id'], source['kind'], source['document_id'])).fetchone()
+            if not local or any(local[key] != source[key] for key in ('content_hash', 'file_hash')):
+                continue
+            path = Path(local['path'])
+            if path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == local['file_hash']:
+                continue
+            encoded = source.get('pdf_base64')
+            if not encoded:
+                raise ValueError('Brak trwałej kopii pliku dokumentu.')
+            content = base64.b64decode(encoded, validate=True)
+            if hashlib.sha256(content).hexdigest() != local['file_hash']:
+                raise ValueError('Suma kontrolna trwałego dokumentu nie zgadza się.')
+            # Restore only a previously stored cache path owned by this app.
+            root = Path(b.DATA_DIR).resolve()
+            if not path.resolve().is_relative_to(root):
+                raise ValueError('Nieprawidłowa lokalizacja odtwarzanego dokumentu.')
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
 
 
 
@@ -127,22 +167,27 @@ def restore(b, oid):
     record = rows[0]
     c = b.conn()
     try:
+        c.execute('BEGIN IMMEDIATE')
+        local = c.execute('SELECT revision FROM fulfillment_reconciliation_versions WHERE order_id=?', (oid,)).fetchone()
+        if local and int(record['revision']) < int(local[0]):
+            return  # A delayed response can never move this cache backwards.
         pending = c.execute('SELECT * FROM fulfillment_reconciliation_pending WHERE order_id=?', (oid,)).fetchone()
         if pending:
-            if record['payload'] == json.loads(pending['payload']):
+            if (int(record['revision']) > int(pending['expected_revision'])
+                    and record['payload'] == json.loads(pending['payload'])):
                 c.execute('DELETE FROM fulfillment_reconciliation_pending WHERE order_id=?', (oid,))
+                c.execute('''INSERT INTO fulfillment_reconciliation_versions VALUES(?,?)
+                    ON CONFLICT(order_id) DO UPDATE SET revision=MAX(revision,excluded.revision)''',
+                    (oid, record['revision']))
+                _repair_same_revision_files(b, c, record['payload'])
                 c.commit()
+                return
             else:
                 return  # Keep the explicit unresolved result; never overwrite a competing revision.
-        local = c.execute('SELECT revision FROM fulfillment_reconciliation_versions WHERE order_id=?', (oid,)).fetchone()
-        if local and local[0] == record['revision'] and not record['payload'].get('packing_lists'):
-            documents = list(c.execute('SELECT path,file_hash FROM fulfillment_documents WHERE order_id=?', (oid,)))
-            expected = record['payload'].get('fulfillment_documents', [])
-            if len(documents) == len(expected) and all(
-                Path(d['path']).is_file() and hashlib.sha256(Path(d['path']).read_bytes()).hexdigest() == d['file_hash']
-                for d in documents
-            ):
-                return
+        if local and int(local[0]) == int(record['revision']):
+            _repair_same_revision_files(b, c, record['payload'])
+            c.commit()
+            return
         payload = record['payload']
         for table in TABLES:
             entries = payload.get(table, [])
@@ -216,9 +261,15 @@ def restore_packing_evidence(c, payload):
                 raise ValueError('Nieobsługiwana wersja zawartości paczki.')
             existing = c.execute(f'SELECT * FROM {table} WHERE id=?', (source['id'],)).fetchone()
             if existing:
-                immutable = tuple(source) if table == 'packing_allocations' else ('root_order_id', 'created_at', 'invoice_id')
+                immutable = tuple(source) if table == 'packing_allocations' else ('root_order_id', 'created_at')
                 if any(existing[k] != source[k] for k in immutable):
                     raise ValueError('Konflikt trwałego identyfikatora zawartości listy pakowej.')
+                if table == 'packing_batches' and source.get('invoice_id'):
+                    if existing['invoice_id'] and existing['invoice_id'] != source['invoice_id']:
+                        raise ValueError('Batch należy już do innej faktury.')
+                    if not existing['invoice_id']:
+                        c.execute('UPDATE packing_batches SET invoice_id=? WHERE id=?',
+                                  (source['invoice_id'], source['id']))
                 if table == 'packing_batches' and source.get('packing_list_id'):
                     if existing['packing_list_id'] and existing['packing_list_id'] != source['packing_list_id']:
                         raise ValueError('Batch należy już do innej logicznej listy pakowej.')
@@ -232,6 +283,11 @@ def restore_packing_evidence(c, payload):
         existing = c.execute('SELECT * FROM packing_lists WHERE packing_list_id=?', (source['packing_list_id'],)).fetchone()
         if existing and existing['revision'] == source['revision'] and existing['current_batch_id'] != source['current_batch_id']:
             raise ValueError('Konflikt bieżącej wersji listy pakowej.')
+        if existing and existing['invoice_id'] and source.get('invoice_id') and existing['invoice_id'] != source['invoice_id']:
+            raise ValueError('Logiczna lista pakowa należy już do innej faktury.')
+        if existing and not existing['invoice_id'] and source.get('invoice_id'):
+            c.execute('UPDATE packing_lists SET invoice_id=? WHERE packing_list_id=?',
+                      (source['invoice_id'], source['packing_list_id']))
         if not existing or existing['revision'] < source['revision']:
             c.execute('''INSERT INTO packing_lists VALUES(?,?,?,?,?,?) ON CONFLICT(packing_list_id) DO UPDATE SET
                          current_batch_id=excluded.current_batch_id,revision=excluded.revision,invoice_id=excluded.invoice_id''',

@@ -604,19 +604,19 @@ def test_missing_saved_document_keeps_structural_history_readable(historical_bat
     assert result.data["history_source"] == "allocation_snapshot"
 
 
-@pytest.mark.parametrize("phrase", (
-    "Odczytaj listę pakową.",
-    "Co było w paczce?",
-    "Co było na liście pakowej?",
-    "Co było spakowane?",
-    "Jaka była zawartość paczki?",
-    "Co zawierała paczka?",
-    "Co ostatnio spakowałem?",
-    "Co wysłałem?",
-    "Ostatnia paczka dla klienta Artystyczna Manufaktura.",
+@pytest.mark.parametrize("phrase,intent", (
+    ("Odczytaj listę pakową.", "packing_history"),
+    ("Co było w paczce?", "shipment_contents"),
+    ("Co było na liście pakowej?", "packing_history"),
+    ("Co było spakowane?", "packing_history"),
+    ("Jaka była zawartość paczki?", "packing_history"),
+    ("Co zawierała paczka?", "packing_history"),
+    ("Co ostatnio spakowałem?", "packing_history"),
+    ("Co wysłałem?", "shipment_contents"),
+    ("Ostatnia paczka dla klienta Artystyczna Manufaktura.", "packing_history"),
 ))
-def test_packing_history_phrases_have_dedicated_read_intent(phrase):
-    assert runtime._detect_read_intent(phrase) == "packing_history"
+def test_packing_history_phrases_have_dedicated_read_intent(phrase, intent):
+    assert runtime._detect_read_intent(phrase) == intent
 
 
 def test_agent_routes_only_to_history_and_returns_deterministic_14(historical_batch):

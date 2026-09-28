@@ -257,7 +257,7 @@ ROLE_PERMISSION_DECISIONS = {
         },
         approval={"purchases.manage", "purchases.costs"},
     ),
-    "AI_OWNER_ASSISTANT": _decisions(approval={"orders.change_status", "inventory.adjust", "packing.confirm", "invoices.reverse", "invoices.publish", "shipping.create", "shipping.request_pickup", "orders.update", "payments.remind"}, allow={
+    "AI_OWNER_ASSISTANT": _decisions(approval={"orders.change_status", "inventory.adjust", "packing.confirm", "invoices.reverse", "invoices.publish", "shipping.create", "shipping.request_pickup", "orders.update", "payments.remind", "payments.set_status"}, allow={
         "business.generic_read",
         "shipping.prepare", "shipping.label_read",
         "orders.internal_note.add",

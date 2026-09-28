@@ -9,17 +9,20 @@ _CLAIM_TTL_MINUTES = 10
 
 
 def initialize(c):
-    """Keep only short-lived race claims; issued invoices are the sequence truth."""
+    """Use existing invoices for numbering; retain protected document numbers."""
     # The counter table remains for backwards-compatible database startup, but
     # numbering no longer reads or writes it.
     c.execute('CREATE TABLE IF NOT EXISTS invoice_number_counters(period TEXT PRIMARY KEY, last_number INTEGER NOT NULL)')
-    c.execute('CREATE TABLE IF NOT EXISTS invoice_number_claims(invoice_no TEXT PRIMARY KEY, created_at TEXT NOT NULL)')
+    c.execute('CREATE TABLE IF NOT EXISTS invoice_number_claims(invoice_no TEXT PRIMARY KEY, created_at TEXT NOT NULL, permanent INTEGER NOT NULL DEFAULT 0)')
+    had_permanent_column = 'permanent' in {r[1] for r in c.execute('PRAGMA table_info(invoice_number_claims)')}
+    if not had_permanent_column:
+        c.execute('ALTER TABLE invoice_number_claims ADD COLUMN permanent INTEGER NOT NULL DEFAULT 0')
 
     legacy_permanent_claims = c.execute(
         "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name IN "
         "('retain_invoice_number','retain_updated_invoice_number',"
         "'retain_final_invoice_number_insert','retain_final_invoice_number_update') LIMIT 1"
-    ).fetchone() is not None
+    ).fetchone() is not None and not had_permanent_column
 
     for trigger in (
         'retain_invoice_number', 'retain_updated_invoice_number',
@@ -33,24 +36,40 @@ def initialize(c):
     # invoice row then protects the number through invoices.invoice_no UNIQUE.
     c.execute('''CREATE TRIGGER consume_reserved_invoice_number AFTER INSERT ON invoices BEGIN
         DELETE FROM invoice_number_claims
-         WHERE lower(trim(invoice_no))=lower(trim(NEW.invoice_no));
+         WHERE lower(trim(invoice_no))=lower(trim(NEW.invoice_no)) AND permanent=0;
     END''')
     c.execute('''CREATE TRIGGER consume_changed_invoice_number AFTER UPDATE OF invoice_no ON invoices
     WHEN lower(trim(OLD.invoice_no))<>lower(trim(NEW.invoice_no)) BEGIN
         DELETE FROM invoice_number_claims
-         WHERE lower(trim(invoice_no))=lower(trim(NEW.invoice_no));
+         WHERE lower(trim(invoice_no))=lower(trim(NEW.invoice_no)) AND permanent=0;
     END''')
 
     # Remove records that cannot be active reservations. Fresh orphan claims are
     # retained briefly because another worker may be between reserve and insert.
     c.execute('DELETE FROM invoice_number_counters')
     if legacy_permanent_claims:
-        c.execute('DELETE FROM invoice_number_claims')
+        c.execute('DELETE FROM invoice_number_claims WHERE permanent=0')
+    protected = """coalesce(k.ksef_number,'')<>'' OR coalesce(k.sent_at,'')<>''
+        OR lower(coalesce(k.status,'')) IN ('sending','processing','unknown','sent','accepted')"""
+    c.execute(f'''INSERT INTO invoice_number_claims(invoice_no,created_at,permanent)
+        SELECT i.invoice_no,coalesce(nullif(i.created_at,''),datetime('now','localtime')),1
+        FROM invoices i JOIN ksef_documents k ON k.invoice_id=i.id WHERE {protected}
+        ON CONFLICT(invoice_no) DO UPDATE SET permanent=1''')
+    for suffix, event in (('insert', 'INSERT'), ('update', 'UPDATE')):
+        c.execute(f'''CREATE TRIGGER retain_final_invoice_number_{suffix}
+            AFTER {event} ON ksef_documents
+            WHEN coalesce(NEW.ksef_number,'')<>'' OR coalesce(NEW.sent_at,'')<>''
+                 OR lower(coalesce(NEW.status,'')) IN ('sending','processing','unknown','sent','accepted')
+            BEGIN
+                INSERT INTO invoice_number_claims(invoice_no,created_at,permanent)
+                SELECT invoice_no,datetime('now','localtime'),1 FROM invoices WHERE id=NEW.invoice_id
+                ON CONFLICT(invoice_no) DO UPDATE SET permanent=1;
+            END''')
     c.execute('''DELETE FROM invoice_number_claims
-                  WHERE EXISTS(SELECT 1 FROM invoices
+                  WHERE permanent=0 AND (EXISTS(SELECT 1 FROM invoices
                                 WHERE lower(trim(invoices.invoice_no))=lower(trim(invoice_number_claims.invoice_no)))
                      OR datetime(created_at) IS NULL
-                     OR datetime(created_at) < datetime('now','localtime',?)''',
+                     OR datetime(created_at) < datetime('now','localtime',?))''',
               (f'-{_CLAIM_TTL_MINUTES} minutes',))
 
 
@@ -61,6 +80,9 @@ def _period(issue_date):
 def _real_invoice_exists(c, number):
     return c.execute(
         'SELECT 1 FROM invoices WHERE lower(trim(invoice_no))=lower(trim(?)) LIMIT 1',
+        (number,),
+    ).fetchone() is not None or c.execute(
+        'SELECT 1 FROM invoice_number_claims WHERE lower(trim(invoice_no))=lower(trim(?)) AND permanent=1',
         (number,),
     ).fetchone() is not None
 
@@ -90,7 +112,7 @@ def _claim_is_live(c, number):
     return c.execute(
         '''SELECT 1 FROM invoice_number_claims
             WHERE lower(trim(invoice_no))=lower(trim(?))
-              AND datetime(created_at) >= datetime('now','localtime',?) LIMIT 1''',
+              AND (permanent=1 OR datetime(created_at) >= datetime('now','localtime',?)) LIMIT 1''',
         (number, f'-{_CLAIM_TTL_MINUTES} minutes'),
     ).fetchone() is not None
 
@@ -99,7 +121,7 @@ def _drop_stale_claim(c, number):
     c.execute(
         '''DELETE FROM invoice_number_claims
             WHERE lower(trim(invoice_no))=lower(trim(?))
-              AND (datetime(created_at) IS NULL
+              AND permanent=0 AND (datetime(created_at) IS NULL
                    OR datetime(created_at) < datetime('now','localtime',?))''',
         (number, f'-{_CLAIM_TTL_MINUTES} minutes'),
     )
@@ -180,7 +202,7 @@ def reserve(b, issue_date, requested='', *, manual=False):
             # the insert trigger can consume it; local history cannot override it.
             if _real_invoice_exists(c, number):
                 raise ValueError('Numer faktury został już wykorzystany.')
-            c.execute('INSERT OR REPLACE INTO invoice_number_claims(invoice_no,created_at) VALUES(?,?)',
+            c.execute('INSERT OR REPLACE INTO invoice_number_claims(invoice_no,created_at,permanent) VALUES(?,?,0)',
                       (number, b.now_iso()))
         c.commit()
         return number

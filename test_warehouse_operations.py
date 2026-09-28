@@ -9,6 +9,7 @@ import business_operations as operations
 import internal_approval as approvals
 import internal_rbac as rbac
 import agent_runtime as runtime
+import agent_conversation
 from test_business_operations import isolated, _actor, _owner
 
 
@@ -32,13 +33,20 @@ def op(name,payload,actor=None):
     return operations.execute_business_operation(actor or ai(),name,payload)
 
 
+def count_session():
+    cid,_,_ = agent_conversation.open_conversation(_owner(),ai())
+    opened = op('inventory.count.session.start',{'conversation_id':cid,'idempotency_key':str(uuid.uuid4())})
+    assert opened.status == 'SUCCESS', opened
+    return opened.data['count_id']
+
+
 def record(product,counted,key='count-1',session=None,version=0,actor=None):
-    return op('inventory.count.record',{'product_id':product,'count_session_id':session or str(uuid.uuid4()),
+    return op('inventory.count.record',{'product_id':product,'count_session_id':session or count_session(),
         'counted_quantity':counted,'expected_version':version,'idempotency_key':key},actor)
 
 
 def test_expected_and_count_record_do_not_change_stock(warehouse):
-    product,_=warehouse; session=str(uuid.uuid4())
+    product,_=warehouse; session=count_session()
     expected=op('inventory.count.get_expected',{'product_id':product})
     assert expected.status=='SUCCESS' and expected.data['expected_quantity']==10 and expected.data['version']==0
     result=record(product,8,session=session)
@@ -52,7 +60,7 @@ def test_expected_and_count_record_do_not_change_stock(warehouse):
 
 
 def test_count_summary_and_unresolved_session_guard(warehouse):
-    product,_=warehouse; session=str(uuid.uuid4()); record(product,8,session=session)
+    product,_=warehouse; session=count_session(); record(product,8,session=session)
     summary=op('inventory.count.summary',{'count_session_id':session})
     assert summary.data['variance_count']==1 and summary.data['unresolved_count']==1
     complete=op('inventory.count.complete',{'count_session_id':session,'idempotency_key':'complete-blocked'})
@@ -60,7 +68,7 @@ def test_count_summary_and_unresolved_session_guard(warehouse):
 
 
 def test_adjust_requires_approval_is_atomic_and_idempotent(warehouse):
-    product,_=warehouse; session=str(uuid.uuid4()); record(product,8,session=session)
+    product,_=warehouse; session=count_session(); record(product,8,session=session)
     payload={'product_id':product,'count_session_id':session,'expected_version':0,'idempotency_key':'adjust-1'}
     pending=op('inventory.adjust',payload)
     assert pending.status=='PENDING_APPROVAL'
@@ -80,7 +88,7 @@ def test_adjust_requires_approval_is_atomic_and_idempotent(warehouse):
 
 
 def test_adjust_revalidates_stock_after_approval(warehouse):
-    product,_=warehouse; session=str(uuid.uuid4()); record(product,8,session=session)
+    product,_=warehouse; session=count_session(); record(product,8,session=session)
     payload={'product_id':product,'count_session_id':session,'expected_version':0,'idempotency_key':'adjust-stale'}
     pending=op('inventory.adjust',payload); approvals.approve_request(pending.approval_id,_owner())
     db=backend.conn(); db.execute('UPDATE stock SET qty=9 WHERE product_id=?',(product,)); db.commit(); db.close()
@@ -94,7 +102,7 @@ def test_adjust_revalidates_stock_after_approval(warehouse):
 
 
 def test_adjust_handler_failure_rolls_back_write_and_approval(warehouse,monkeypatch):
-    product,_=warehouse; session=str(uuid.uuid4()); record(product,8,session=session)
+    product,_=warehouse; session=count_session(); record(product,8,session=session)
     payload={'product_id':product,'count_session_id':session,'expected_version':0,'idempotency_key':'adjust-fail'}
     pending=op('inventory.adjust',payload); approvals.approve_request(pending.approval_id,_owner())
     def failing(data,actor,correlation,db):

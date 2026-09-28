@@ -13,6 +13,7 @@ import app as backend
 import business_operations as operations
 import internal_rbac as rbac
 import remanent
+import remanent_sources
 from cash_flow_module import calculate_cash_flow_snapshot
 from invoice_sales import sales_by_sku
 from test_business_operations import isolated, _owner
@@ -40,8 +41,11 @@ def inventory(isolated):
     return _owner()
 
 
-def draft(db,actor):
-    sid=remanent.create_draft(db,actor.actor_id,2026)
+def draft(db,actor,sid=None):
+    sid=sid or remanent.create_draft(db,actor.actor_id,2026)
+    remanent.add_entry(db,sid,actor.actor_id,product_id=1,kind='opening',
+                       period_start='2026-01-01',period_end='2026-01-01',quantity=0,
+                       unit_value_pln='0',source='Potwierdzony stan początkowy')
     remanent.add_entry(db,sid,actor.actor_id,product_id=1,kind='historical_purchase_manual',
                        period_start='2026-01-12',period_end='2026-01-12',quantity=250,
                        unit_value_pln='5.00',source='Fakturownia')
@@ -49,6 +53,16 @@ def draft(db,actor):
                        period_start='2026-01-01',period_end='2026-01-31',quantity=180,
                        source='Fakturownia')
     remanent.confirm_purchase_coverage(db,sid,actor.actor_id,'2026-09-21')
+    db.commit()
+    data=remanent_sources.canonical({'schema':'annual_inventory_bridge','version':2,
+        'export_scope':'complete_source_versions','source_installation_id':'f5271c04-f67a-46d4-b7c3-b98669b70cdd',
+        'lines':[{'source_import_id':'PO-1','source_version':1,'line_id':'line-1','kind':'purchase',
+        'sku':'SKU-1','quantity':90,'document_no':'PO-1','supplier':'Synthetic','document_date':'2026-04-01',
+        'received_date':None,'inventory_year':2026,'valuation_basis':'goods_net','line_value_pln':'450.00','unit_value_pln':'5'}]}).encode()
+    plan=remanent_sources.preview(db,sid,actor.actor_id,data)
+    remanent_sources.commit(db,sid,actor.actor_id,data,[{'line_key':plan['rows'][0]['key'],'action':'link',
+        'allocations':[{'receipt_key':'1:product:1','quantity':90}]}],plan['fingerprint'])
+    remanent_sources.select_method(db,sid,actor.actor_id,remanent_sources.METHOD,'goods_net',confirm_manual_basis=True)
     db.commit()
     return sid
 
@@ -103,6 +117,10 @@ def test_count_close_restart_immutability_and_both_pdfs(inventory):
               'expected_version':expected.data['version'],'idempotency_key':str(uuid.uuid4())})
         assert result.status=='SUCCESS' and result.data['difference_document_vs_count']==-3, (result.error_code, result.safe_error_message)
         assert db.execute('SELECT qty FROM stock WHERE product_id=1').fetchone()[0]==72
+        expected=operations.execute_business_operation(inventory,'inventory.count.get_expected',{'product_id':1})
+        kept=operations.execute_business_operation(inventory,'inventory.count.keep_result',
+            {'product_id':1,'count_session_id':sid,'expected_version':expected.data['version'],'idempotency_key':str(uuid.uuid4())})
+        assert kept.status=='SUCCESS',(kept.error_code,kept.safe_error_message)
         session,rows,total=remanent.close_count(db,sid,inventory.actor_id)
         assert rows[0]['counted_qty']==70 and rows[0]['difference_value']=='-15.00'
         assert total['counted_value']=='350.00' and total['shortage_qty']==3
@@ -135,16 +153,14 @@ def test_count_close_restart_immutability_and_both_pdfs(inventory):
 def test_missing_purchases_are_unknown_and_close_blocked(inventory):
     db=backend.conn()
     try:
-        sid=remanent.create_draft(db,inventory.actor_id,2026)
-        remanent.add_entry(db,sid,inventory.actor_id,product_id=1,kind='unit_value_manual',
-                           period_start='2026-01-01',period_end='2026-01-01',quantity=0,
-                           unit_value_pln='5',source='Księgowa')
+        sid=draft(db,inventory)
+        coverage=db.execute("SELECT id FROM internal_remanent_entries WHERE kind='purchase_coverage'").fetchone()[0]
+        remanent.void_entry(db,sid,inventory.actor_id,coverage,'Kompletność wymaga sprawdzenia')
         db.commit()
-        remanent.start_count(db,sid,inventory.actor_id,'2026-09-21')
-        _,rows,_=remanent.detail(db,sid,inventory.actor_id)
-        assert rows[0]['purchases_total'] is None and rows[0]['document_stock'] is None
         with pytest.raises(ValueError,match='Niepotwierdzona kompletność zakupów'):
-            remanent.close_count(db,sid,inventory.actor_id,confirm_uncounted=True)
+            remanent.start_count(db,sid,inventory.actor_id,'2026-09-21')
+        assert remanent.detail(db,sid,inventory.actor_id)[0]['phase']=='DRAFT'
+        assert db.execute('SELECT COUNT(*) FROM internal_remanent_snapshots WHERE session_id=?',(sid,)).fetchone()[0]==0
     finally: db.close()
 
 
@@ -170,15 +186,17 @@ def test_csv_preview_duplicate_unknown_and_overlap(inventory):
     try:
         sid=remanent.create_draft(db,inventory.actor_id,2026)
         data=b'sku,quantity,date,unit_value_pln,document_no,line_value_pln\nSKU-1,3,2026-01-15,5.12,PO-1,15.36\n'
-        preview=remanent.preview_csv(db,sid,inventory.actor_id,data,'historical_purchase_import','2026-01-01','2026-01-31')
+        with pytest.raises(ValueError,match='trwałych identyfikatorów'):
+            remanent.preview_csv(db,sid,inventory.actor_id,data,'historical_purchase_import','2026-01-01','2026-01-31')
+        preview=remanent.preview_csv(db,sid,inventory.actor_id,data,'historical_sales_import','2026-01-01','2026-01-31')
         assert preview['matched']==1 and preview['quantity']==3 and preview['value_pln']=='15.36'
-        remanent.import_csv(db,sid,inventory.actor_id,data,'historical_purchase_import',
+        remanent.import_csv(db,sid,inventory.actor_id,data,'historical_sales_import',
                             '2026-01-01','2026-01-31',preview['sha256'])
         with pytest.raises(ValueError,match='już istnieje'):
-            remanent.import_csv(db,sid,inventory.actor_id,data,'historical_purchase_import',
+            remanent.import_csv(db,sid,inventory.actor_id,data,'historical_sales_import',
                                 '2026-01-01','2026-01-31',preview['sha256'])
         unknown=remanent.preview_csv(db,sid,inventory.actor_id,data.replace(b'SKU-1',b'MISSING'),
-            'historical_purchase_import','2026-01-01','2026-01-31')
+            'historical_sales_import','2026-01-01','2026-01-31')
         assert unknown['unmatched']==1 and unknown['problems']
         sale=b'sku,quantity,date\nSKU-1,3,2026-02-01\n'
         conflict=remanent.preview_csv(db,sid,inventory.actor_id,sale,'historical_sales_import','2026-01-01','2026-03-01')
@@ -201,13 +219,10 @@ def test_remanent_ui_requires_session_and_renders_snapshot(inventory,monkeypatch
     assert response.status_code==302
     sid=response.headers['Location'].split('/')[-1]
     draft_page=client.get(response.headers['Location'])
-    assert draft_page.status_code==200 and 'Import CSV' in draft_page.get_data(as_text=True)
+    assert draft_page.status_code==200 and 'Import historycznej sprzedaży CSV' in draft_page.get_data(as_text=True)
     db=backend.conn()
     try:
-        remanent.add_entry(db,sid,inventory.actor_id,product_id=1,kind='unit_value_manual',
-            period_start='2026-01-01',period_end='2026-01-01',quantity=0,unit_value_pln='5',source='Test')
-        remanent.confirm_purchase_coverage(db,sid,inventory.actor_id,'2026-09-21')
-        db.commit()
+        draft(db,inventory,sid)
     finally: db.close()
     response=client.post(f'/remanent/{sid}/start',data={'as_of_date':'2026-09-21','csrf_token':'test'})
     assert response.status_code==302, response.get_data(as_text=True)[:300]
@@ -224,9 +239,14 @@ def test_agent_fast_mode_reuses_the_one_active_remanent(inventory):
         sid=draft(db,inventory)
         remanent.start_count(db,sid,inventory.actor_id,'2026-09-21')
     finally: db.close()
-    opened=start(inventory)
-    assert opened['status']=='SUCCESS'
+    opened=runtime.run_agent_turn(inventory,'Wybieram przygotowany spis.',
+        runtime.FakeModelProvider([runtime.ProviderResponse(text='Wybierz przygotowany spis.',model='fake')]))
     ai=rbac.load_actor_context(rbac.AI_OWNER_ASSISTANT_ACTOR_ID,delegated_by_actor_id=inventory.actor_id)
+    bound=operations.execute_business_operation(ai,'inventory.count.session.start',{
+        'count_session_id':sid,'conversation_id':opened['conversation_id'],'idempotency_key':str(uuid.uuid4())})
+    assert bound.status=='SUCCESS',(bound.error_code,bound.safe_error_message)
+    opened=start(inventory,opened['conversation_id'])
+    assert opened['status']=='SUCCESS'
     assert operations.active_inventory_count_session(ai,inventory,opened['conversation_id'])==sid
     result=runtime.run_agent_turn(inventory,'SKU-1 70',runtime.FakeModelProvider([]),opened['conversation_id'])
     assert result['status']=='SUCCESS', result
@@ -248,3 +268,23 @@ def test_two_workers_cannot_create_two_open_counts(inventory):
     with ThreadPoolExecutor(max_workers=2) as pool:
         results=list(pool.map(lambda _i:create(),range(2)))
     assert sum(bool(result) for result in results)==1
+
+
+@pytest.mark.parametrize('document',['invoice','receipt'])
+def test_changed_documents_during_count_block_closing_frozen_snapshot(inventory,document):
+    db=backend.conn()
+    try:
+        sid=draft(db,inventory)
+        remanent.start_count(db,sid,inventory.actor_id,'2026-09-21')
+        if document=='invoice':
+            db.execute('UPDATE invoice_meta SET invoice_items_json=? WHERE invoice_id=2',
+                (json.dumps([{'sku':'SKU-1','qty':99}]),))
+        else:
+            db.execute('UPDATE china_stock_receipts SET quantities_json=? WHERE package_id=1',
+                (json.dumps([{'product_id':1,'qty':91}]),))
+        db.commit()
+        with pytest.raises(ValueError,match='zmieniły się'):
+            remanent.close_count(db,sid,inventory.actor_id,confirm_uncounted=True)
+        session,rows,_=remanent.detail(db,sid,inventory.actor_id)
+        assert session['status']=='OPEN' and rows[0]['document_stock']==73
+    finally: db.close()
