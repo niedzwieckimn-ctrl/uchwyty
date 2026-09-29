@@ -8920,6 +8920,9 @@ _remanent.register_routes(app, {"conn": conn, "BASE_URL": BASE_URL, "DB_PATH": D
 import remanent_source_routes as _remanent_source_routes
 _remanent_source_routes.register_routes(app, {"conn": conn, "BASE_URL": BASE_URL, "DB_PATH": DB_PATH})
 
+import orderchamp_http as _orderchamp_http
+_orderchamp_http.register_routes(app, lambda: DB_PATH)
+
 import search_analytics as _search_analytics
 import sys as _search_sys
 _search_analytics.register(_search_sys.modules[__name__])
