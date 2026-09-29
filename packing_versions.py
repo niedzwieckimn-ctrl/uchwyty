@@ -243,6 +243,9 @@ def sync_evidence(b, order_ids):
 def batch_result(db, batch_id, *, mode='historical', shipment=None):
     """The shared structural READ used by the UI, the agent and PDF adapters."""
     batch = db.execute('SELECT * FROM packing_batches WHERE id=?', (batch_id,)).fetchone()
+    if shipment is None and mode == 'current':
+        shipment = db.execute('SELECT * FROM packing_shipments WHERE final_batch_id=? '
+                              'ORDER BY confirmed_at DESC LIMIT 1', (batch_id,)).fetchone()
     rows = [dict(r) for r in db.execute('SELECT * FROM packing_allocations WHERE batch_id=? ORDER BY id', (batch_id,))]
     if not batch or not rows or any(not r.get('order_number_snapshot') or not r.get('sku_snapshot') for r in rows):
         raise PackingConflict('Brak kompletnej zapisanej zawartości listy pakowej.')

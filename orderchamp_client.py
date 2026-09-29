@@ -14,6 +14,12 @@ API_URL = "https://api.orderchamp.com/v1/graphql"
 CONNECTION_QUERY = """query StockConnectionTest {
   productVariants(first: 1) { nodes { id sku } }
 }"""
+ORDERS_PROBE_QUERY = """query StockSalesProbe {
+  orders(first: 1, sort: CREATED_AT_DESC, includeUnconfirmed: true, includeCancelled: true) {
+    totalCount
+    nodes { id createdAt updatedAt status isConfirmed isCancelled }
+  }
+}"""
 VARIANT_QUERY = """query StockDryRunVariant($sku: String!) {
   productVariantBySku(sku: $sku) {
     id sku inventoryQuantity inventoryPolicy
@@ -104,7 +110,7 @@ class OrderchampClient:
 
     def _read(self, query, variables):
         # Exact allowlist: dry run cannot submit arbitrary GraphQL or mutations.
-        if query not in (CONNECTION_QUERY, VARIANT_QUERY):
+        if query not in (CONNECTION_QUERY, VARIANT_QUERY, ORDERS_PROBE_QUERY):
             raise OrderchampError("READ_QUERY_NOT_ALLOWED")
         if self._fatal_error:
             raise OrderchampError(self._fatal_error)
@@ -158,7 +164,8 @@ class OrderchampClient:
                             }.items() if any(term in message for message in messages for term in terms)]
                             logging.getLogger(__name__).warning(
                                 "ORDERCHAMP_GRAPHQL_READ_ERROR query=%s hints=%s count=%s",
-                                "variant" if query == VARIANT_QUERY else "connection",
+                                "variant" if query == VARIANT_QUERY else
+                                "orders" if query == ORDERS_PROBE_QUERY else "connection",
                                 ",".join(hints) or "unknown", len(errors))
                             # Partial data must not turn an error into NOT FOUND.
                             raise OrderchampError("GRAPHQL_ERROR")
@@ -192,6 +199,27 @@ class OrderchampClient:
             if not isinstance(node.get("sku"), str):
                 raise OrderchampError("INVALID_API_RESPONSE")
         return {"connected": True, "products_read": True, "write_checked": False}
+
+    def probe_orders(self):
+        """Read only a count and one recent order, without customer information."""
+        connection = self._read(ORDERS_PROBE_QUERY, {}).get("orders")
+        if (not isinstance(connection, dict) or type(connection.get("totalCount")) is not int
+                or connection["totalCount"] < 0 or not isinstance(connection.get("nodes"), list)
+                or len(connection["nodes"]) > 1):
+            raise OrderchampError("INVALID_API_RESPONSE")
+        recent = []
+        for node in connection["nodes"]:
+            if (not isinstance(node, dict) or type(node.get("isConfirmed")) is not bool
+                    or type(node.get("isCancelled")) is not bool):
+                raise OrderchampError("INVALID_API_RESPONSE")
+            recent.append({"id": _string(node.get("id")),
+                           "created_at": _string(node.get("createdAt")),
+                           "updated_at": _string(node.get("updatedAt")),
+                           "status": _string(node.get("status")),
+                           "is_confirmed": node["isConfirmed"],
+                           "is_cancelled": node["isCancelled"]})
+        return {"orders_read": True, "all_order_count": connection["totalCount"],
+                "recent": recent, "writes_enabled": False}
 
     def resolve_variant_by_sku(self, sku):
         data = self._read(VARIANT_QUERY, {"sku": sku})
