@@ -17,14 +17,16 @@
 </head>
 <body><main>
   <a href="/">← Powrót do aplikacji</a>
-  <h1>Orderchamp — diagnostyka</h1>
-  <p>Odczyt połączenia i stanów. Raport pokazuje proponowane ilości; niczego nie zapisuje do Orderchamp.</p>
+  <h1>Orderchamp — stany magazynowe</h1>
+  <p>Źródłem jest lokalny stan „DOSTĘPNE”. Wysyłka dotyczy wyłącznie stanu istniejącego wariantu o zgodnym SKU. Wzrost ponad stan Orderchamp jest blokowany do uzgodnienia sprzedaży tego kanału.</p>
   <button id="connection" type="button">Test połączenia</button>
   <label for="sku">SKU do sprawdzenia</label>
   <input id="sku" value="CH010-AB-N28" maxlength="256">
   <button id="single" type="button">Sprawdź SKU</button>
+  <button id="push" type="button" disabled>Wyślij sprawdzony stan SKU</button>
   <p>Cały katalog jest sprawdzany kolejno, po jednym SKU. Możesz przerwać po bieżącej pozycji.</p>
   <button id="all" type="button">Sprawdź cały katalog</button>
+  <button id="push-all" type="button">Wyślij stany całego katalogu</button>
   <button id="stop" type="button" disabled>Zatrzymaj po tej pozycji</button>
   <button id="download" type="button" disabled>Pobierz JSON</button>
   <p id="status" role="status" aria-live="polite"></p>
