@@ -3,6 +3,7 @@ import sqlite3
 
 import reconciliation_store
 import packing_versions
+import agent_runtime
 
 
 def _database():
@@ -125,4 +126,18 @@ def test_member_snapshot_without_batch_or_allocations_can_be_remapped():
     assert translated['packing_batches'] == []
     assert translated['packing_allocations'] == []
     assert translated['fulfillment_documents'][0]['document_id'] == 1
+    db.close()
+
+
+def test_current_list_reports_existing_final_shipment():
+    db = _database()
+    db.execute('CREATE TABLE fulfillment_document_history '
+               '(order_id INTEGER, kind TEXT, document_id INTEGER, path TEXT)')
+    payload = _snapshot(113, '2026-09-28T08:00:00', final=True)
+    payload['packing_allocations'][0].update(
+        order_number_snapshot='ZAM-2609241', sku_snapshot='CH010-AB-N28')
+    reconciliation_store.restore_packing_evidence(db, payload)
+    result = packing_versions.select(db, {'latest': True}, mode='current')
+    assert result['shipment_confirmed'] is True
+    assert 'potwierdzona zawartość wysyłki' in agent_runtime._packing_history_answer(result)
     db.close()

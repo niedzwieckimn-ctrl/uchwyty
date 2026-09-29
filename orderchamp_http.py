@@ -163,7 +163,7 @@ def register_routes(app, db_path, *, refresh_stock=None):
         body = request.get_json(silent=True)
         if not isinstance(body, dict):
             return _error("INVALID_JSON_BODY", 400)
-        allowed = set() if action == "connection" else {"sku", "offset", "limit", "catalog_version"}
+        allowed = set() if action in ("connection", "orders") else {"sku", "offset", "limit", "catalog_version"}
         if set(body) - allowed:
             return _error("UNKNOWN_PARAMETER", 400)
         if "sku" in body:
@@ -212,6 +212,8 @@ def register_routes(app, db_path, *, refresh_stock=None):
             client = http_client(budget)
             if action == "connection":
                 return _json(client.test_connection())
+            if action == "orders":
+                return _json(client.probe_orders())
             # Exact same service as CLI. Always one explicit SKU, never full HTTP scan.
             report = dry_run_stock_sync(client, db_path(), sku=sku)
             report.pop("local_database", None)
@@ -243,6 +245,11 @@ def register_routes(app, db_path, *, refresh_stock=None):
     @_admin_only
     def test_connection():
         return execute("connection")
+
+    @blueprint.post("/api/admin/orderchamp/probe-orders")
+    @_admin_only
+    def probe_orders():
+        return execute("orders")
 
     @blueprint.post("/api/admin/orderchamp/dry-run")
     @_admin_only

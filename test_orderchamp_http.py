@@ -13,6 +13,7 @@ from test_orderchamp_stock import client_for, connected, found, missing, Respons
 
 CONNECTION = '/api/admin/orderchamp/test-connection'
 DRY_RUN = '/api/admin/orderchamp/dry-run'
+PROBE_ORDERS = '/api/admin/orderchamp/probe-orders'
 PUSH = '/api/admin/orderchamp/push-one'
 HEADERS = {'X-CSRF-Token': 'test'}
 
@@ -40,7 +41,7 @@ def use_client(monkeypatch, *responses):
     return client, session, waits
 
 
-@pytest.mark.parametrize('path', [CONNECTION, DRY_RUN])
+@pytest.mark.parametrize('path', [CONNECTION, DRY_RUN, PROBE_ORDERS])
 def test_anonymous_and_customer_credentials_cannot_call_endpoint(isolated, monkeypatch, path):
     monkeypatch.setattr(http, 'http_client', lambda budget: pytest.fail('Auth must run first'))
     response = isolated.post(path, json={'sku':'CH010-AB-N28'},
@@ -85,6 +86,20 @@ def test_connection_calls_existing_client(owner, monkeypatch):
     assert response.get_json() == {'connected':True, 'products_read':True, 'write_checked':False}
     assert called == [True] and session.closed
     assert response.headers['Cache-Control'] == 'no-store'
+
+
+def test_orders_probe_reads_count_without_customer_data_or_write(owner, monkeypatch):
+    _, session, _ = use_client(monkeypatch, Response({'data': {'orders': {
+        'totalCount': 1, 'nodes': [{'id': 'order-1', 'createdAt': '2026-09-29T08:00:00Z',
+                                    'updatedAt': '2026-09-29T08:01:00Z', 'status': 'AWAITING_FULFILMENT',
+                                    'isConfirmed': True, 'isCancelled': False}]}}}))
+    response = owner.post(PROBE_ORDERS, json={}, headers=HEADERS)
+    assert response.status_code == 200
+    assert response.get_json()['all_order_count'] == 1
+    assert response.get_json()['writes_enabled'] is False
+    assert len(session.calls) == 1 and session.calls[0][1]['json']['query'].startswith('query ')
+    assert 'customer' not in str(response.get_json()).lower()
+    assert session.closed
 
 
 def test_stock_push_requires_owner_csrf_and_backend_preconditions(owner, monkeypatch):

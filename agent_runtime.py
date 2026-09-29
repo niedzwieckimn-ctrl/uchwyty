@@ -899,7 +899,9 @@ def _packing_history_answer(data: dict[str, Any]) -> str:
     elif data.get('document_type') == 'final' and data.get('shipment_confirmed'):
         heading = 'Potwierdzona zawartość wysyłki'
     elif data.get('document_type') == 'current':
-        heading = 'Bieżąca lista pakowa — przygotowana zawartość, bez potwierdzenia wysyłki'
+        heading = ('Bieżąca lista pakowa — potwierdzona zawartość wysyłki'
+                   if data.get('shipment_confirmed') else
+                   'Bieżąca lista pakowa — przygotowana zawartość, bez potwierdzenia wysyłki')
     else:
         heading = 'Historyczna, zweryfikowana lista pakowa'
     if data.get('batch_id'):
