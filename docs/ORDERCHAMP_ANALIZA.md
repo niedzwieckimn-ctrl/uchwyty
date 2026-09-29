@@ -1,5 +1,9 @@
 # Orderchamp — analiza przed implementacją, 2026-09-29
 
+> Analiza historyczna pierwszego etapu CLI. Dla Render Free dodano później adapter
+> HTTP bez zmian klienta i serwisu. Aktualne uruchamianie bez Shell opisują
+> `ORDERCHAMP_RENDER_DRY_RUN.md` i `ORDERCHAMP_HTTP_RENDER_FREE.md`.
+
 ## Baza
 
 Źródła: `uchwyty_ZIP47_InPost_dokonczone_2026-09-29_pelne_zrodla.zip`,

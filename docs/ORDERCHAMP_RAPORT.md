@@ -1,5 +1,9 @@
 # Raport Orderchamp — etap dry run na Render, 2026-09-29
 
+> Raport historyczny pierwszego etapu CLI. Aktualne endpointy HTTP, wyniki testów
+> i korektę dla Render Free opisuje `ORDERCHAMP_HTTP_RENDER_FREE.md`.
+> Obecne uruchamianie na Free nie wymaga Shell.
+
 ## Status
 
 **Gotowe lokalnie: izolowany odczyt API, porównanie SKU i przygotowanie dry run

@@ -1,144 +1,64 @@
-# Orderchamp — uruchomienie dry run na Render
+# Orderchamp — dry run na Render Free, bez Shell
 
-**Ta paczka uruchamia test połączenia i raport porównawczy. Nie uruchamia jeszcze
-automatycznej synchronizacji stanów. Nie zawiera mutacji Orderchamp.**
+Instrukcja poprawiona 2026-09-29. Poprzednia wersja wymagała Render Shell,
+którego plan Free nie udostępnia. Aktualna wersja działa przez zalogowany panel.
 
-## 1. Dodaj pliki do aktualnej aplikacji
+## Wdrożenie
 
-Baza paczki to ZIP47 po dokończeniu InPost z 2026-09-29, opisany w
-`ORDERCHAMP_ANALIZA.md`. Paczka „tylko nowe pliki” nie podmienia dotychczasowych
-modułów. Dodaj jej zawartość z zachowaniem katalogów do repozytorium wdrażanego
-na Render. Trzy pliki wykonywalne muszą leżeć obok `app.py`:
+1. Dodaj pliki z paczki do repozytorium aplikacji, zachowując katalogi.
+2. W Render Environment dodaj `ORDERCHAMP_API_TOKEN` z prawem `products_read`.
+   Jeżeli token już jest ustawiony, pozostaw go. Nie wklejaj go do przeglądarki,
+   komendy fetch ani rozmowy. Opcjonalne `ORDERCHAMP_API_URL` pozostaje
+   `https://api.orderchamp.com/v1/graphql`.
+3. Wdróż aktualizację zwykłą drogą dla swojej aplikacji. Nie zmieniaj Start
+   Command, `APP_DATA_DIR`, bazy, ustawień InPost ani konfiguracji Supabase.
+4. Nie potrzeba SQL, migracji, dodatkowego workera ani Cron Job.
 
-- `orderchamp_client.py`
-- `orderchamp_stock_sync.py`
-- `run_orderchamp_stock.py`
+Paczka skumulowana zawiera również niezmienione pliki Orderchamp z poprzedniego
+etapu, jeżeli nie zostały jeszcze dodane do repozytorium.
 
-Pozostałe pliki są dokumentacją i testami. Istniejące `requirements.txt` już
-zawiera `requests`. Nie zmieniaj Start Command, nie instaluj osobnego serwera.
-Nie potrzeba SQL ani migracji Supabase/SQLite.
+## Uruchomienie z przeglądarki
 
-## 2. ENV w istniejącej usłudze webowej Render
+1. Zaloguj się do aplikacji swoim dotychczasowym kontem administratora.
+2. Otwórz ekran Stan magazynu, aby sprawdzić aktualność lokalnych danych.
+   Adapter korzysta z tej samej bazy i nie uruchamia własnego odświeżania Supabase.
+3. Otwórz **https://uchwyty.onrender.com/admin/orderchamp**.
+4. Kliknij **Test połączenia**.
+5. Pozostaw w polu SKU `CH010-AB-N28` i kliknij **Sprawdź SKU**.
+6. Wynik JSON otrzymasz na stronie. **Pobierz JSON** generuje plik po stronie
+   przeglądarki; backend HTTP nie zapisuje raportu w `/tmp` ani w bazie.
 
-| Zmienna | Ustawienie |
-|---|---|
-| `ORDERCHAMP_API_TOKEN` | Prywatny token z Orderchamp, wprowadzony wyłącznie w backendowym Environment. Na ten etap wystarczy uprawnienie odczytu produktów `products_read`. |
-| `ORDERCHAMP_API_URL` | Opcjonalna; domyślnie `https://api.orderchamp.com/v1/graphql`. Inny adres jest odrzucany. |
-| `APP_DATA_DIR` | Pozostaw istniejącą wartość aplikacji. Adapter czyta z niej `app.db`. Nie wpisuj zgadywanej ścieżki i nie kopiuj bazy. |
+**Sprawdź cały katalog** rozpoczyna serię odczytów po jednym SKU. Przycisk
+**Zatrzymaj po tej pozycji** zachowuje częściowy raport (`complete: false`).
+Zamknięcie strony zatrzymuje dalsze żądania. Nie jest to synchronizacja stanów
+ani harmonogram. Nie dodano nowych pozycji do dotychczasowego menu.
 
-Token nie trafia do komendy, pliku JSON, repozytorium ani frontendu. Nie jest
-potrzebny `products_write`, `orders_write`, token Supabase ani klucz OpenAI.
+## Wyniki
 
-Po wdrożeniu nowych plików i ustawień otwórz **Render → obecna usługa aplikacji →
-Shell**. Bieżący katalog powinien zawierać `app.py` i `run_orderchamp_stock.py`.
-Jeśli nie, przejdź do katalogu źródeł tej aplikacji.
+- Połączenie: `connected: true`, `products_read: true`, `write_checked: false`.
+- Dry run: `rows` zawiera `local_available`, `would_send`, `status`, `remote`
+  oraz `warnings`; `writes_enabled` zawsze wynosi `false`.
+- `would_send` to kandydat ilości z dotychczasowego serwisu, nie wykonany zapis.
+- `MISSING` / HTTP 404: brak SKU w Orderchamp; pełny odczyt przechodzi dalej.
+- `LOCAL_SKU_NOT_FOUND` / HTTP 404: brak SKU lokalnie.
+- HTTP 401/403: zaloguj się ponownie kontem administratora i odśwież stronę.
+- `TOKEN_MISSING_OR_INVALID` / `AUTH_OR_SCOPE_ERROR`: sprawdź ENV i uprawnienia.
+- `HTTP_TIME_BUDGET_EXCEEDED` / HTTP 504: ponów odczyt. Niczego nie zapisano.
+- `CATALOG_CHANGED_RESTART` / HTTP 409: lista SKU zmieniła się; zacznij raport od nowa.
+- `DIAGNOSTIC_BUSY` / HTTP 409: w tym procesie trwa już diagnostyka.
 
-To musi być Shell działającej usługi, która ma bazę. Nie uruchamiaj tego jako
-nowy Cron Job, build command, pre-deploy ani one-off job: nie mają dostępu do
-dysku tej instancji. [Dokumentacja Render](https://render.com/docs/disks#disk-limitations-and-considerations).
+Pełny raport zawiera kolejne momenty odczytu, nie wspólny snapshot dwóch systemów.
+Render Free ma nietrwały system plików: adapter korzysta z dotychczasowego sposobu
+odtwarzania danych aplikacji, bez przebudowy magazynu.
 
-## 3. Test połączenia
+## CLI pozostaje dostępne opcjonalnie
+
+Na środowisku z terminalem nadal działają niezmienione komendy:
 
 ```bash
 python run_orderchamp_stock.py test-connection
+python run_orderchamp_stock.py dry-run --sku CH010-AB-N28
 ```
 
-Oczekiwany wynik:
-
-```json
-{"connected": true, "products_read": true, "write_checked": false}
-```
-
-Sprawdza rzeczywisty odczyt produktów, także jeśli katalog Orderchamp jest pusty.
-Nie sprawdza uprawnień do zapisu i nie pobiera danych klientów.
-
-## 4. Najpierw jedno SKU
-
-```bash
-python run_orderchamp_stock.py dry-run --sku CH010-AB-N28 --report /tmp/orderchamp-one-sku.json
-cat /tmp/orderchamp-one-sku.json
-```
-
-SKU jest dopasowywane dokładnie, bez zgadywania, zmiany wielkości liter i
-automatycznego tworzenia produktu. Jeżeli tego SKU nie ma lokalnie, wybierz
-istniejące SKU z ekranu magazynu.
-
-## 5. Pełny dry run
-
-```bash
-python run_orderchamp_stock.py dry-run --report /tmp/orderchamp-dry-run.json
-cat /tmp/orderchamp-dry-run.json
-```
-
-Istniejący raport nie jest nadpisywany. Przy kolejnym uruchomieniu podaj nową
-nazwę, np. `/tmp/orderchamp-dry-run-2.json`. Bez `--report` cały JSON pojawi się
-bezpośrednio w Shell. `/tmp` jest tymczasowy — skopiuj raport przed restartem
-lub wdrożeniem. Nie wystawiamy go jako publicznego pliku strony.
-
-Jeżeli aplikacja korzysta z niestandardowej lokalizacji bez `APP_DATA_DIR`,
-możesz jawnie podać `--db /rzeczywista/sciezka/app.db`. Błędna ścieżka powoduje
-przerwanie, a nie utworzenie pustej bazy. Nie kieruj adaptera na kopię SQLite,
-jeśli celem jest sprawdzenie aktualnej instancji.
-
-## 6. Co zobaczysz
-
-Dla każdego lokalnego produktu:
-
-- `local_available`: wynik centralnej funkcji ekranu magazynu;
-- `would_send`: ten wynik ograniczony do minimum 0 — **kandydat ilości, jeszcze
-  nie zatwierdzona wartość mutacji Inventory SET**;
-- `status`: `MATCHED`, `MISSING` lub `ERROR`;
-- `remote.id`, `inventory_quantity`, `inventory_policy`;
-- `remote.levels`: stan i dostępność każdej zwróconej lokalizacji,
-  jej identyfikator, oznaczenie głównego magazynu i czas aktualizacji;
-- ostrzeżenia o rezerwacjach/różnicy stanów, backorderach, braku jednoznacznej
-  lokalizacji albo niepełnej liście lokalizacji.
-
-Podsumowanie: `local_sku`, `matched`, `missing`, `errors`, `synchronized`,
-`skipped`, `warning_rows`, `http_requests`. W tym etapie `synchronized` zawsze
-wynosi 0, `skipped` oznacza wszystkie pozycje bez zapisu. `local_sku` liczy
-wybrane rekordy aktywnych produktów; duplikaty SKU są osobnymi błędami.
-
-Raport nie sumuje zapasu z kilku magazynów Orderchamp i nie dolicza towaru
-w drodze do eksportowanej ilości. `null` z API pozostaje brakiem informacji,
-a nie zerem. Brak wariantu nie tworzy produktu i nie zatrzymuje reszty odczytu.
-
-Odczyt lokalny jest spójny na moment `local_snapshot_at`; odczyty Orderchamp są
-sekwencyjne i mogą odzwierciedlać późniejsze momenty. To raport diagnostyczny,
-nie atomowy obraz dwóch systemów. Adapter nie wymusza odświeżenia z Supabase.
-Przed porównaniem otwórz ekran Stan magazynu w tej samej instancji; ruch
-magazynowy w czasie raportu może spowodować różnice względem późniejszego ekranu.
-
-## 7. Wynik procesu i błędy
-
-| Kod procesu | Znaczenie |
-|---|---|
-| 0 | Test/raport ukończony bez błędów i ostrzeżeń danych; nie jest to zgoda na WRITE |
-| 1 | Raport ukończony; są brakujące SKU lub ostrzeżenia |
-| 2 | Błąd konfiguracji/API/bazy, błędy pozycji lub pusty lokalny katalog |
-
-- `AUTH_OR_SCOPE_ERROR`: sprawdź token i uprawnienia odczytu w Environment.
-- `TOKEN_MISSING_OR_INVALID`: token nie jest dostępny w tej usłudze.
-- `LOCAL_DATABASE_NOT_FOUND`: nieprawidłowy katalog albo inna instancja.
-- `LOCAL_AVAILABILITY_READ_FAILED`: niezgodny schemat/błąd bazy; nie wykonuj
-  przypadkowych migracji. Potrzebna weryfikacja wersji aplikacji.
-- `GRAPHQL_ERROR`: API odrzuciło zapytanie; brakujące SKU nie jest tym samym.
-- `TIMEOUT`, `NETWORK_ERROR`, `UPSTREAM_UNAVAILABLE`, `RATE_LIMITED`: odczyt
-  nieudany po najwyżej 3 próbach. Ponów cały dry run z nową nazwą raportu.
-- `RATE_LIMIT_WAIT_TOO_LONG`: serwer wymaga odczekania ponad 60 s; kolejne
-  odczyty w tym przebiegu są wstrzymane. Uruchom ponownie później.
-
-Odczyty odbywają się kolejno, maksymalnie 2 próby HTTP/s; jest timeout 5 s
-połączenia i 20 s odczytu. Retry dotyczy wyłącznie bezpiecznych zapytań READ.
-Treści odpowiedzi błędów i token nie są drukowane.
-
-## 8. Warunek kolejnego etapu
-
-Przekaż wygenerowany JSON. Rzeczywiste liczniki i różnice `quantity` /
-`availableQuantity` pozwolą ustalić mapowanie stanu na tym koncie.
-
-Przed automatycznym PUSH nadal trzeba ustalić docelowe pole, odzwierciedlenie
-sprzedaży Orderchamp w istniejących rezerwacjach lokalnych i zachowanie zapisu
-przy równoczesnej sprzedaży. Dokumentacja nie potwierdza atomowego warunku
-`SET`. Ta paczka nie udaje rozwiązania tego problemu: nie udostępnia WRITE,
-przełącznika aktywującego WRITE ani automatycznego harmonogramu.
+Endpointy, przykłady requestów, testy i lista plików: `ORDERCHAMP_HTTP_RENDER_FREE.md`.
+Ograniczenie Shell potwierdza [dokumentacja Render Free](https://render.com/docs/free#other-limitations).
