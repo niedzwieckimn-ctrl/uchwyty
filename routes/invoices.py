@@ -705,98 +705,25 @@ def register_routes(context):
         selected_sent = norm(request.args.get("sent"))
         recent_only = norm(request.args.get("period")) == "30d"
         cutoff_date = (app_now().date() - timedelta(days=30)).isoformat()
+        from invoice_list_read import read_invoice_list
         c = conn()
-        cur = c.cursor()
-
-        cur.execute("""
-          SELECT
-            i.*,
-            COALESCE(m.pdf_path,'') AS pdf_path,
-            COALESCE(m.sent_to_client,0) AS sent_to_client,
-            COALESCE(m.seen_by_client,0) AS seen_by_client,
-            COALESCE(m.payment_reminder,0) AS payment_reminder,
-            COALESCE(m.paid,0) AS paid,
-            COALESCE(m.paid_at,'') AS paid_at,
-            COALESCE(m.seen_at,'') AS seen_at,
-            COALESCE(k.status,'draft') AS ksef_status,
-            COALESCE(k.ksef_number,'') AS ksef_number,
-            COALESCE(k.last_error,'') AS ksef_error,
-            COALESCE(k.sent_at,'') AS ksef_sent_at,
-            o.id AS source_order_id,
-            o.order_no AS source_order_no,
-            o.created_at AS source_order_created_at,
-            o.note AS source_order_note,
-            o.customer_name AS order_customer_name
-          FROM invoices i
-          LEFT JOIN invoice_meta m ON m.invoice_id = i.id
-          LEFT JOIN ksef_documents k ON k.invoice_id = i.id
-          LEFT JOIN orders o ON o.id = i.order_id
-          ORDER BY LOWER(COALESCE(i.buyer_name, o.customer_name, '')), i.issue_date DESC, i.id DESC
-        """)
-        rows = [dict(r) for r in cur.fetchall()]
-        c.close()
-
-        # Filtry i statystyki tego ekranu są wyliczane wyłącznie w pamięci.
-        # Nie zapisujemy danych ani nie zmieniamy istniejących akcji faktury.
+        try:
+            listing = read_invoice_list(c, request.args, app_now().date(), norm=norm,
+                normalize_currency=normalize_order_currency, resolve_type=resolve_invoice_type, to_int=to_int)
+        finally:
+            c.close()
+        rows = listing["rows"]
+        summary = listing["summary"]
+        month_totals = listing["month_totals"]
+        customers, months, currencies = listing["customers"], listing["months"], listing["currencies"]
+        total_filtered, page, page_count = listing["total_filtered"], listing["page"], listing["page_count"]
         view = norm(request.args.get("view")) or "all"
         if view not in {"all", "customers"}:
             view = "all"
-        today = app_now().date().isoformat()
-        current_month = today[:7]
-
-        for inv in rows:
-            inv["customer_display"] = inv.get("buyer_name") or inv.get("order_customer_name") or "Bez klienta"
-            inv["currency"] = normalize_order_currency(inv.get("currency"))
-            inv["document_type"] = resolve_invoice_type(inv)
-            inv["document_type_label"] = {"domestic": "KRAJOWA", "wdt": "WDT", "export": "EKSPORT"}.get(inv["document_type"], "KRAJOWA")
-            due = norm(inv.get("payment_to"))[:10]
-            inv['publication_complete'] = norm(inv.get('publication_state') or 'complete') == 'complete'
-            inv["payment_status"] = ('publication_incomplete' if not inv['publication_complete'] else
-                                     "paid" if inv.get("paid") else ("overdue" if due and due < today else "unpaid"))
-            inv["payment_status_label"] = {"publication_incomplete":"Dokument niedokończony", "paid": "Zapłacona", "overdue": "Po terminie", "unpaid": "Nieopłacona"}[inv["payment_status"]]
-
-        all_rows = list(rows)
-        summary = {
-            "all": len(all_rows),
-            "unpaid": sum(1 for inv in all_rows if inv['publication_complete'] and not inv.get("paid")),
-            "overdue": sum(1 for inv in all_rows if inv["payment_status"] == "overdue"),
-            "paid": sum(1 for inv in all_rows if inv['publication_complete'] and inv.get("paid")),
-            "ksef": sum(1 for inv in all_rows if inv.get("ksef_status") == "sent"),
-            "unsent": sum(1 for inv in all_rows if not inv.get("sent_to_client")),
-        }
-        month_totals = {}
-        for inv in all_rows:
-            if not inv['publication_complete'] or norm(inv.get("issue_date"))[:7] != current_month:
-                continue
-            total = month_totals.setdefault(inv["currency"], {"currency": inv["currency"], "net": 0.0, "gross": 0.0})
-            total["net"] += float(inv.get("total_net") or 0)
-            total["gross"] += float(inv.get("total_gross") or 0)
-
-        customers = sorted({inv["customer_display"] for inv in all_rows}, key=str.casefold)
-        months = sorted({norm(inv.get("issue_date"))[:7] for inv in all_rows if norm(inv.get("issue_date"))[:7]}, reverse=True)
-        currencies = sorted({inv["currency"] for inv in all_rows})
-        query = q.casefold()
-        rows = [inv for inv in all_rows if (
-            (not recent_only or norm(inv.get("issue_date"))[:10] >= cutoff_date)
-            and (not query or any(query in norm(inv.get(field)).casefold() for field in ("invoice_no", "customer_display", "source_order_no", "source_order_note")))
-            and (not selected_customer or inv["customer_display"] == selected_customer)
-            and (not selected_month or norm(inv.get("issue_date"))[:7] == selected_month)
-            and (not selected_payment or (selected_payment == "open" and inv['publication_complete'] and not inv.get("paid")) or inv["payment_status"] == selected_payment)
-            and (not selected_type or inv["document_type"] == selected_type)
-            and (not selected_currency or inv["currency"] == selected_currency)
-            and (not selected_ksef or (selected_ksef == "none" and inv.get("ksef_status") not in {"sent", "ready", "error"}) or inv.get("ksef_status") == selected_ksef)
-            and (not selected_sent or (selected_sent == "sent" and inv.get("sent_to_client")) or (selected_sent == "unsent" and not inv.get("sent_to_client")))
-        )]
-        rows.sort(key=lambda inv: (norm(inv.get("issue_date")), int(inv.get("id") or 0)), reverse=True)
-        total_filtered = len(rows)
-        page_size = 50
-        page_count = max(1, (total_filtered + page_size - 1) // page_size) if view == "all" else 1
-        page = min(max(1, to_int(request.args.get("page"), 1)), page_count)
+        current_month = app_now().date().isoformat()[:7]
         page_params = request.args.to_dict(flat=True)
         page_params.pop("page", None)
         page_params["view"] = view
-        if view == "all":
-            rows = rows[(page - 1) * page_size:page * page_size]
 
         notice = ""
         notice_error = False
@@ -819,7 +746,7 @@ def register_routes(context):
             key = ("nip", buyer_tax_no) if buyer_tax_no else ("name", normalized_name)
             current = groups_by_key.get(key)
             if current is None:
-                current = {"customer_name": display_name, "invoices": [], "months": [], "currency_totals": {}}
+                current = {"customer_name": display_name, "invoices": [], "months": [], "currency_totals": {}, "group_key": inv["group_key"]}
                 groups.append(current)
                 groups_by_key[key] = current
             inv["order_display"] = order_display_no(
@@ -828,7 +755,6 @@ def register_routes(context):
                 inv.get("source_order_no"),
                 inv.get("source_order_note")
             ) if inv.get("source_order_id") else "-"
-            inv["pdf_ok"] = 1 if (invoice_pdf_exists(inv.get("pdf_path", ""), inv.get("invoice_no", ""))[0] or inv.get("invoice_items_json")) else 0
             current["invoices"].append(inv)
             invoice_currency = normalize_order_currency(inv.get("currency"))
             inv["currency"] = invoice_currency
@@ -840,6 +766,10 @@ def register_routes(context):
                 currency_total["total_gross"] += float(inv.get("total_gross") or 0)
 
         for g in groups:
+            totals = listing["group_totals"].get(g["group_key"], [])
+            g["total_count"] = sum(t["count"] for t in totals) if totals else len(g["invoices"])
+            if totals:
+                g["currency_totals"] = {t["currency"]: t for t in totals}
             month_map = {}
             for inv in g["invoices"]:
                 issue_date = norm(inv.get("issue_date"))
@@ -861,7 +791,7 @@ def register_routes(context):
         return render_template_string(
             INVOICES_LIST_TEMPLATE, title="Faktury", base_url=BASE_URL, db_path=DB_PATH,
             rows=rows, groups=groups, q=q, view=view, summary=summary,
-            month_totals=list(month_totals.values()), current_month=current_month,
+            month_totals=month_totals, current_month=current_month,
             customers=customers, months=months, currencies=currencies,
             selected_customer=selected_customer, selected_month=selected_month,
             selected_payment=selected_payment, selected_type=selected_type,

@@ -680,32 +680,24 @@ def register_routes(context):
             rows = [row for row in rows if predicates[active_filter](row)]
         rows = sorted(rows, key=lambda row: norm(row.get("sku")).casefold())
 
-        c = conn()
-        image_by_product = {int(r["product_id"]): int(r["image_id"]) for r in c.execute(
-            "SELECT product_id, image_id FROM product_image_assignments"
-        ).fetchall()}
-        c.close()
-        for row in rows:
-            row["image_id"] = image_by_product.get(int(row["id"]))
-
         total = len(rows)
         pages = max(1, (total + per_page - 1) // per_page)
         page = min(page, pages)
         start = (page - 1) * per_page
         rows = rows[start:start + per_page]
-        page_image_ids = sorted({int(row["image_id"]) for row in rows if row.get("image_id")})
-        thumbnail_urls = {}
-        if page_image_ids:
+        image_by_product = {}
+        if rows:
             c = conn()
-            placeholders = ",".join("?" for _ in page_image_ids)
-            image_rows = [dict(r) for r in c.execute(
-                f"SELECT id, stored_path FROM product_images WHERE id IN ({placeholders})",
-                page_image_ids,
-            ).fetchall()]
-            c.close()
-            thumbnail_urls = _signed_product_thumbnail_urls(image_rows)
+            try:
+                ids = [int(row["id"]) for row in rows]
+                placeholders = ",".join("?" for _ in ids)
+                image_by_product = {int(r["product_id"]): int(r["image_id"]) for r in c.execute(
+                    f"SELECT product_id,image_id FROM product_image_assignments WHERE product_id IN ({placeholders})", ids)}
+            finally:
+                c.close()
         for row in rows:
-            row["thumbnail_url"] = thumbnail_urls.get(to_int(row.get("image_id"), 0), "")
+            row["image_id"] = image_by_product.get(int(row["id"]))
+        # URLs are signed in a separate, authenticated request after the table paints.
         def page_url(number):
             return url_for("stock", q=q, filter=active_filter, per_page=per_page, page=number)
         page_numbers = sorted(set(n for n in (1, page-1, page, page+1, pages) if 1 <= n <= pages))
@@ -939,6 +931,28 @@ def register_routes(context):
         bucket, _ = storage_ref
         thumb_name = hashlib.sha256(norm(stored_path).encode("utf-8")).hexdigest() + ".webp"
         return supabase_storage_ref("product-images/thumbs/" + thumb_name, bucket)
+
+
+    @app.get("/api/stock/thumbnail-urls")
+    def stock_thumbnail_urls():
+        raw_ids = request.args.get("ids", "").split(",")
+        if len(raw_ids) > 100:
+            return jsonify(ok=False, error="Zbyt wiele miniatur"), 400
+        ids = sorted({to_int(value, 0) for value in raw_ids if to_int(value, 0) > 0})
+        if not ids:
+            return jsonify(ok=True, urls={})
+        c = conn()
+        try:
+            placeholders = ",".join("?" for _ in ids)
+            image_rows = [dict(row) for row in c.execute(
+                f"SELECT id,stored_path FROM product_images WHERE id IN ({placeholders})", ids)]
+        finally:
+            c.close()
+        urls = _signed_product_thumbnail_urls(image_rows)
+        response = jsonify(ok=True, urls={row["id"]: urls.get(row["id"]) or
+            url_for("inventory_image", image_id=row["id"], thumb=1) for row in image_rows})
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
 
 
     def _signed_product_thumbnail_urls(image_rows, expires_in=3600):
