@@ -595,22 +595,37 @@ def register_routes(context):
             c.close()
             abort(404)
 
-        shipment_status = ""
+        import inpost_tracking
         shipment_status_error = ""
+        refresh_result = None
         if request.args.get("refresh_shipment") == "1" and norm(o["inpost_shipment_id"]):
-            try:
-                shipment = inpost_get_shipment(o["inpost_shipment_id"])
-                shipment_status = norm((shipment or {}).get("status"))
-                if not shipment_status:
-                    shipment_status_error = "InPost nie zwrócił statusu tej przesyłki."
+            refresh_result = inpost_tracking.process(sys.modules[app.import_name], dict(o), source='manual')
+            if not refresh_result.get('ok'):
+                if refresh_result.get('stage') == 'sync' and refresh_result.get('orders_applied'):
+                    shipment_status_error = 'Zamówienia zapisano lokalnie; synchronizacja Supabase czeka na ponowienie.'
+                elif refresh_result.get('stage') == 'notification' and refresh_result.get('orders_applied'):
+                    shipment_status_error = ('Zamówienia zapisano; powiadomienie klienta: ' +
+                                             inpost_tracking.notification_label(refresh_result.get('notification_state')) + '.')
+                elif refresh_result.get('stage') == 'api':
+                    shipment_status_error = 'Nie udało się pobrać statusu z InPost: ' + norm(refresh_result.get('error'))[:180]
                 else:
-                    transition = apply_verified_inpost_status(dict(o), shipment)
-                    if not transition.get("ok"):
-                        shipment_status_error = "Status zamówienia zapisano, ale działanie dodatkowe wymaga ponowienia: " + norm(transition.get("error"))[:160]
-                    cur.execute("SELECT * FROM orders WHERE id=?", (order_id,))
-                    o = cur.fetchone()
-            except Exception as exc:
-                shipment_status_error = f"Nie udało się pobrać statusu z InPost: {norm(exc)[:180]}"
+                    shipment_status_error = norm(refresh_result.get('error')) or 'Nie udało się zastosować statusu przesyłki.'
+            cur.execute("SELECT * FROM orders WHERE id=?", (order_id,))
+            o = cur.fetchone()
+        shipment_state = inpost_tracking.read(c, norm(o['inpost_shipment_id'])) if o['inpost_shipment_id'] else None
+        import inpost_reconciliation
+        shipment_work = inpost_reconciliation.read(c, norm(o['inpost_shipment_id'])) if o['inpost_shipment_id'] else None
+        shipment_status = shipment_state['status_code'] if shipment_state else ''
+        if shipment_state and shipment_state['last_result'] in {'api_error','apply_error','applied_with_error','stale_shipment','scope_conflict'}:
+            shipment_status_error = shipment_status_error or shipment_state['last_error']
+        notice = inpost_tracking.notification_view(c, norm(o['inpost_shipment_id'])) if o['inpost_shipment_id'] else None
+        notice_state = notice['state'] if notice else ('pending' if o['inpost_shipment_id'] else 'not_prepared')
+        if shipment_state and shipment_state['last_result'] == 'applied_with_error' and not refresh_result:
+            shipment_status_error = ('Zamówienia zapisano; synchronizacja Supabase czeka na ponowienie.'
+                                     if shipment_state['sync_state'] == 'pending' else
+                                     'Zamówienia zapisano; powiadomienie klienta: ' +
+                                     inpost_tracking.notification_label(notice_state) + '.')
+        shipment_scope = inpost_tracking.scope_diagnostic(c, dict(o)) if o['inpost_shipment_id'] else None
 
         cur.execute("""
           SELECT oi.*, p.model, p.ean, p.name,
@@ -776,8 +791,11 @@ def register_routes(context):
                 <span class="muted">Kurier</span><b>{{ o['carrier'] or 'Jeszcze niewybrany' }}</b>
                 <span class="muted">Numer przesyłki</span><span>{{ o['tracking_no'] or 'Jeszcze nie nadano' }}</span>
                 <span class="muted">Status zamówienia</span><span class="status-line">{{ order_status_label(o['status']) }}</span>
-                {% if o['inpost_shipment_id'] %}<span class="muted">Status przesyłki InPost</span><span>{% if shipment_status %}<b>{{ shipment_status|replace('_', ' ')|capitalize }}</b>{% elif shipment_status_error %}<span style="color:#b92d43;">{{ shipment_status_error }}</span>{% else %}<span class="muted">Jeszcze nieodświeżony</span>{% endif %} <a class="btn" style="padding:5px 9px;font-size:11px;margin-left:7px;" href="{{ url_for('order_view', order_id=o['id'], refresh_shipment='1') }}">Odśwież status</a></span>{% endif %}
-                <span class="muted">Powiadomienie klienta</span><span>{% if shipping or finished %}Wysłane po nadaniu{% else %}Oczekuje na nadanie{% endif %}</span>
+                {% if o['inpost_shipment_id'] %}<span class="muted">Status przesyłki InPost</span><span>{% if shipment_status %}<b>{{ inpost_status_label(shipment_status) }}</b> <small class="muted">({{ shipment_status }})</small>{% else %}<span class="muted">Jeszcze nieodświeżony</span>{% endif %}{% if shipment_state and shipment_state['verified_at'] %}<br><small>Zweryfikowano: {{ shipment_state['verified_at'] }}{% if shipment_state['status_event_at'] %}; zdarzenie: {{ shipment_state['status_event_at'] }}{% endif %}</small>{% endif %}{% if shipment_state and shipment_state['last_attempt_at'] %}<br><small>Ostatnia próba: {{ shipment_state['last_attempt_at'] }}; wynik: {{ inpost_result_label(shipment_state['last_result']) }}</small>{% endif %}{% if refresh_result and refresh_result.get('result') == 'unchanged' %}<br><small>Odczyt udany, bez zmiany statusu.</small>{% elif refresh_result and refresh_result.get('result') == 'recent' %}<br><small>Sprawdzono niedawno; kolejne ręczne pobranie możliwe po 30 sekundach.</small>{% elif refresh_result and refresh_result.get('result') == 'busy' %}<br><small>Sprawdzanie tej przesyłki już trwa.</small>{% endif %}{% if shipment_state and shipment_state['sync_state'] in ('pending','conflict') %}<br><span style="color:#b92d43;">Synchronizacja Supabase: {{ shipment_state['sync_state'] }}. {{ shipment_state['sync_error'] }}</span>{% endif %}{% if shipment_status_error %}<br><span style="color:#b92d43;">{{ shipment_status_error }}</span>{% endif %} <a class="btn" style="padding:5px 9px;font-size:11px;margin-left:7px;" href="{{ url_for('order_view', order_id=o['id'], refresh_shipment='1') }}">Odśwież status</a></span>{% endif %}
+                {% if shipment_work %}<span class="muted">Zastosowanie statusu</span><span>{% if shipment_work['apply_state'] == 'applied' %}Zamówienia zapisano lokalnie ({{ shipment_work['applied_at'] }}).{% else %}Oczekuje na lokalne uzgodnienie; automat ponowi próbę.{% endif %}{% if shipment_work['receipt_error'] %}<br><span style="color:#b92d43;">{{ shipment_work['receipt_error'] }}</span>{% endif %}</span>{% endif %}
+                {% if shipment_state and shipment_state['verified_at'] and not shipment_state['status_event_at'] %}<span class="muted">Czas zdarzenia</span><span>Brak potwierdzonego czasu zdarzenia w dostępnej historii InPost.</span>{% endif %}
+                <span class="muted">Powiadomienie klienta</span><span>{{ inpost_notification_label(notice_state) }}{% if notice and notice['result_text'] %}<br><small>{{ notice['result_text'] }}</small>{% endif %}</span>
+                {% if shipment_scope and (shipment_scope['error'] or shipment_scope['missing_shipment_id'] or shipment_scope['outside_packing_list'] or shipment_scope['tracking_conflict_ids']) %}<span class="muted">Zakres paczki</span><span style="color:#b92d43;">Wymaga sprawdzenia. Lista pakowa: {{ shipment_scope['packing_order_ids'] }}; bieżąca przesyłka: {{ shipment_scope['order_ids'] }}; brak ID: {{ shipment_scope['missing_shipment_id'] }}; poza listą: {{ shipment_scope['outside_packing_list'] }}; sprzeczny tracking: {{ shipment_scope['tracking_conflict_ids'] }}. {{ shipment_scope['error'] }}</span>{% endif %}
               </div>
             </div>
             <div class="card">
@@ -959,7 +977,7 @@ def register_routes(context):
           </div>
         {% endblock %}
         """
-        return render_template_string(tpl, title=canonical_order_no(o["id"], o["created_at"], o["order_no"]), base_url=BASE_URL, db_path=DB_PATH, o=o, items=items, invoice=dict(invoice_row) if invoice_row else None, shipment_status=shipment_status, shipment_status_error=shipment_status_error, order_url=order_url, products=products_rows, locked=(int(o["warehouse_issued"] or 0)==1), order_status_label=order_status_label, order_status_css=order_status_css, canonical_order_no=canonical_order_no)
+        return render_template_string(tpl, title=canonical_order_no(o["id"], o["created_at"], o["order_no"]), base_url=BASE_URL, db_path=DB_PATH, o=o, items=items, invoice=dict(invoice_row) if invoice_row else None, shipment_status=shipment_status, shipment_status_error=shipment_status_error, shipment_state=shipment_state, shipment_work=shipment_work, refresh_result=refresh_result, notice=notice, notice_state=notice_state, shipment_scope=shipment_scope, inpost_status_label=inpost_tracking.status_label, inpost_result_label=inpost_tracking.result_label, inpost_notification_label=inpost_tracking.notification_label, order_url=order_url, products=products_rows, locked=(int(o["warehouse_issued"] or 0)==1), order_status_label=order_status_label, order_status_css=order_status_css, canonical_order_no=canonical_order_no)
 
 
 
