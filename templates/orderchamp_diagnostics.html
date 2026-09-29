@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ session.get('csrf_token', '') }}">
+  <title>Orderchamp — diagnostyka</title>
+  <style>
+    body{font:16px system-ui,sans-serif;color:#17233c;background:#f5f6fa;margin:0}
+    main{max-width:1000px;margin:30px auto;padding:24px;background:white;border-radius:18px}
+    button,input{font:inherit;padding:10px;margin:5px 8px 5px 0;border:1px solid #bfc9df;border-radius:8px}
+    button{cursor:pointer;background:#edf3ff}button:disabled{opacity:.5;cursor:default}
+    label{display:block;margin-top:20px}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f5f6fa;padding:16px}
+    #status{min-height:1.5em}h1{font-size:26px}
+  </style>
+  <script src="{{ url_for('static', filename='orderchamp_diagnostics.js') }}" defer></script>
+</head>
+<body><main>
+  <a href="/">← Powrót do aplikacji</a>
+  <h1>Orderchamp — diagnostyka</h1>
+  <p>Odczyt połączenia i stanów. Raport pokazuje proponowane ilości; niczego nie zapisuje do Orderchamp.</p>
+  <button id="connection" type="button">Test połączenia</button>
+  <label for="sku">SKU do sprawdzenia</label>
+  <input id="sku" value="CH010-AB-N28" maxlength="256">
+  <button id="single" type="button">Sprawdź SKU</button>
+  <p>Cały katalog jest sprawdzany kolejno, po jednym SKU. Możesz przerwać po bieżącej pozycji.</p>
+  <button id="all" type="button">Sprawdź cały katalog</button>
+  <button id="stop" type="button" disabled>Zatrzymaj po tej pozycji</button>
+  <button id="download" type="button" disabled>Pobierz JSON</button>
+  <p id="status" role="status" aria-live="polite"></p>
+  <pre id="result">Wybierz test.</pre>
+</main></body></html>
