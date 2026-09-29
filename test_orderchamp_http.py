@@ -14,6 +14,7 @@ from test_orderchamp_stock import client_for, connected, found, missing, Respons
 CONNECTION = '/api/admin/orderchamp/test-connection'
 DRY_RUN = '/api/admin/orderchamp/dry-run'
 PROBE_ORDERS = '/api/admin/orderchamp/probe-orders'
+LOCAL_CATALOG = '/api/admin/orderchamp/local-catalog'
 PUSH = '/api/admin/orderchamp/push-one'
 SEED = '/api/admin/orderchamp/seed-one'
 HEADERS = {'X-CSRF-Token': 'test'}
@@ -42,7 +43,7 @@ def use_client(monkeypatch, *responses):
     return client, session, waits
 
 
-@pytest.mark.parametrize('path', [CONNECTION, DRY_RUN, PROBE_ORDERS])
+@pytest.mark.parametrize('path', [CONNECTION, DRY_RUN, PROBE_ORDERS, LOCAL_CATALOG])
 def test_anonymous_and_customer_credentials_cannot_call_endpoint(isolated, monkeypatch, path):
     monkeypatch.setattr(http, 'http_client', lambda budget: pytest.fail('Auth must run first'))
     response = isolated.post(path, json={'sku':'CH010-AB-N28'},
@@ -101,6 +102,15 @@ def test_orders_probe_reads_count_without_customer_data_or_write(owner, monkeypa
     assert len(session.calls) == 1 and session.calls[0][1]['json']['query'].startswith('query ')
     assert 'customer' not in str(response.get_json()).lower()
     assert session.closed
+
+
+def test_local_catalog_lists_only_positive_sku_without_orderchamp_call(owner, monkeypatch):
+    monkeypatch.setattr(http, 'http_client', lambda budget: pytest.fail('No external call'))
+    response = owner.post(LOCAL_CATALOG, json={}, headers=HEADERS)
+    assert response.status_code == 200
+    assert response.get_json() == {'mode': 'local_positive_catalog',
+                                   'total_local_sku': 2, 'positive_sku': 1,
+                                   'skus': ['CH010-AB-N28']}
 
 
 def test_stock_push_requires_owner_csrf_and_backend_preconditions(owner, monkeypatch):
