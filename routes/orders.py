@@ -597,6 +597,15 @@ def register_routes(context):
 
         import inpost_tracking
         shipment_status_error = ""
+        # Rebuild only the cache before diagnostics. This does not poll InPost,
+        # finalize a shipment or send mail on an ordinary page view.
+        c.close()
+        try:
+            inpost_tracking.restore_packing_scope(sys.modules[app.import_name], dict(o))
+        except Exception as exc:
+            shipment_status_error = str(exc)
+        c = conn()
+        cur = c.cursor()
         refresh_result = None
         if request.args.get("refresh_shipment") == "1" and norm(o["inpost_shipment_id"]):
             refresh_result = inpost_tracking.process(sys.modules[app.import_name], dict(o), source='manual')
