@@ -1,0 +1,130 @@
+{
+  "baseline_file": "uchwyty_ZIP47_statusy_InPost_pelne_zrodla.zip",
+  "baseline_sha256": "05721b957e2cead4ec08d0b9676cafc5028122eafb2303e77df099a4437b734b",
+  "no_deleted_source_files": true,
+  "entries": [
+    {
+      "path": "uchwyty-main/SHA256_INPOST_STATUS.txt",
+      "change": "modified",
+      "before_sha256": "47ee46b1baaf7118e1032ad653c5bfa36f86b065d2774199365639cdd656554a",
+      "after_sha256": "c500201cb46d3efb9248cddb5cb42f90b7d372137c2397ae25b0b79226ca86ae",
+      "bytes": 26035
+    },
+    {
+      "path": "uchwyty-main/app.py",
+      "change": "modified",
+      "before_sha256": "13949815b4ce9d86a6bf337fe3a49bf1e68a420ff0e0ac45457a36b7c0881f89",
+      "after_sha256": "715a862c6710f6aa8075981310684e0ad104ca2b13ce55821f2b70d25506b9d4",
+      "bytes": 411612
+    },
+    {
+      "path": "uchwyty-main/docs/INPOST_COMPLETION_2026-09-29.md",
+      "change": "added",
+      "before_sha256": null,
+      "after_sha256": "f6f3e7c8f4e2c960910c48e7e67657d28104c7007469da467afb4d3412b84d25",
+      "bytes": 10942
+    },
+    {
+      "path": "uchwyty-main/docs/INPOST_STATUS_REPORT_ZIP47.md",
+      "change": "modified",
+      "before_sha256": "b49521921ccdfe245d2c090cfadbae495dc7dd5ca44790f7c5cc53103daf9651",
+      "after_sha256": "c3f59bf8f10777a28defd1b7d0b15dd618f7b9caeb2e0c51e5d54f376b9b4d9a",
+      "bytes": 5445
+    },
+    {
+      "path": "uchwyty-main/docs/INPOST_STATUS_ZIP47.md",
+      "change": "modified",
+      "before_sha256": "04cc2860499d292659e67c151f477982fdf20066b634a4ad7e1086a7c2ac7973",
+      "after_sha256": "70e9ccfbeb9eb60f805a17be8d223bdd35f0476c004634dea7f616e02b2fc18d",
+      "bytes": 1757
+    },
+    {
+      "path": "uchwyty-main/docs/INPOST_TEST_RESULTS_2026-09-29.md",
+      "change": "added",
+      "before_sha256": null,
+      "after_sha256": "a7255b3f2fd34359075d44e0420944a2d456b163baa3a7cfb520992df4da0497",
+      "bytes": 1950
+    },
+    {
+      "path": "uchwyty-main/inpost_module.py",
+      "change": "modified",
+      "before_sha256": "d6c76fb45e10b893c209d161a906144b43bea4fc656551f6f6165628dd745aa6",
+      "after_sha256": "a91baf223ac1ce444cb4d114c75c80aaa0e246537cfc758555a214aadcc580fd",
+      "bytes": 12134
+    },
+    {
+      "path": "uchwyty-main/inpost_reconciliation.py",
+      "change": "added",
+      "before_sha256": null,
+      "after_sha256": "546bdb7070c3e62eb273d3cd37e50ad1f1d8ba9304a88e940a92a8c367c3fe5f",
+      "bytes": 14119
+    },
+    {
+      "path": "uchwyty-main/inpost_tracking.py",
+      "change": "modified",
+      "before_sha256": "949036704126ad0d81c8d1556aefe4021bdae81b29beff4e06ec727da7e7d202",
+      "after_sha256": "efd1cb474ce7a85623d0d5552d299dc84a74543debd439f09dcb7ef9beb4bfd6",
+      "bytes": 30706
+    },
+    {
+      "path": "uchwyty-main/invoice_payment_sync.py",
+      "change": "modified",
+      "before_sha256": "00fa990b2aff69c28b384e88948b4c7566cc19eebdba702896530a309ec17b7a",
+      "after_sha256": "f04973cdc47779902419d3fcabf305628d3915e9ecdfe42f9bde8c6f948e0dcd",
+      "bytes": 14856
+    },
+    {
+      "path": "uchwyty-main/migrations/inpost_reconciliation_sqlite.sql",
+      "change": "added",
+      "before_sha256": null,
+      "after_sha256": "7adeca3b96f77ddcb4c0b6ba0d731501333f66a355cdf307073e5b571234c766",
+      "bytes": 787
+    },
+    {
+      "path": "uchwyty-main/requirements-inpost-offline-tests.txt",
+      "change": "added",
+      "before_sha256": null,
+      "after_sha256": "ec2f747e441198f6eed6e15360633a734eafacaf5cccc47ba7be80b744b5df3d",
+      "bytes": 583
+    },
+    {
+      "path": "uchwyty-main/routes/orders.py",
+      "change": "modified",
+      "before_sha256": "a1e92fce3d071c7ff6d29d350d03fe4a7abdb011ed353e0fd626f9b55848423c",
+      "after_sha256": "9e7a74cd273be5ddb9c3395de904a8f6b088a932a9bfa179829486dba2fc8eed",
+      "bytes": 103596
+    },
+    {
+      "path": "uchwyty-main/scripts/run_inpost_offline_tests.py",
+      "change": "added",
+      "before_sha256": null,
+      "after_sha256": "3af50b10f2fd9b3854df2cb5a317d96d90e68e97f777508318d61430e5194a33",
+      "bytes": 2165
+    },
+    {
+      "path": "uchwyty-main/test_inpost_additional_review.py",
+      "change": "added",
+      "before_sha256": null,
+      "after_sha256": "dd9aef9767b0eb7caa9902ef74e2c5ebef405dd366dd8fed13105c671fef5e01",
+      "bytes": 6047
+    },
+    {
+      "path": "uchwyty-main/test_inpost_completion.py",
+      "change": "added",
+      "before_sha256": null,
+      "after_sha256": "440042b98a5fc5c0f3e535f1dc31efdf46e0996d2935debc238c791e23f74c0e",
+      "bytes": 19044
+    }
+  ],
+  "manifest_itself": {
+    "path": "uchwyty-main/MANIFEST_INPOST_COMPLETION_2026-09-29.json",
+    "change": "added",
+    "sha256": "excluded to avoid self-reference"
+  },
+  "tests": {
+    "python_passed": 124,
+    "js_passed": 59,
+    "baseline_review_failed": 6,
+    "baseline_review_passed": 1
+  }
+}

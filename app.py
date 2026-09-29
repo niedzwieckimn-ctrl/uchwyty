@@ -151,6 +151,7 @@ from inpost_module import (
     find_dispatch_order_for_shipment as inpost_find_dispatch_order,
     get_label as inpost_get_label,
     get_shipment as inpost_get_shipment,
+    get_tracking as inpost_get_tracking,
 )
 _startup_step("application_modules_imported")
 try:
@@ -993,6 +994,8 @@ def init_db():
     c.commit()
     from inpost_pickups import initialize as initialize_pickups
     initialize_pickups(c)
+    import inpost_tracking
+    inpost_tracking.initialize(c)
     _startup_step("inpost_schema_initialized")
     from ksef_scheduler import initialize as initialize_ksef_scheduler
     initialize_ksef_scheduler(c)
@@ -2647,14 +2650,25 @@ def supabase_insert_row(table: str, row: dict):
 
 
 def supabase_update_rows(table: str, values: dict, filters: dict):
-    params = {k: f"eq.{v}" for k, v in filters.items()}
-    return supabase_request(
+    guarded_inpost = table == 'orders' and isinstance(filters.get('inpost_shipment_id'), list)
+    params = {k: ('in.(' + ','.join(json.dumps(str(item)) for item in v) + ')'
+                  if guarded_inpost and isinstance(v, list) else f"eq.{v}") for k, v in filters.items()}
+    result = supabase_request(
         f"/rest/v1/{table}",
         method="PATCH",
         params=params,
         payload=values,
-        prefer="return=minimal",
+        prefer="return=representation" if guarded_inpost else "return=minimal",
+        timeout=20 if guarded_inpost else 60,
     )
+    if guarded_inpost:
+        from invoice_payment_sync import _field_matches
+        from inpost_reconciliation import SyncConflict
+        if (not isinstance(result, list) or len(result) != 1 or
+                str(result[0].get('id')) != str(filters['id']) or
+                any(not _field_matches(k, result[0].get(k), v) for k, v in values.items())):
+            raise SyncConflict('Supabase nie potwierdził zapisu tej wersji przesyłki; sprawdź bieżący zakres/status')
+    return result
 
 
 def supabase_delete_rows(table: str, filters: dict):
@@ -2869,6 +2883,9 @@ def sqlite_upsert_rows(table: str, rows: list, conflict_col: str):
     try:
         c.execute('BEGIN IMMEDIATE')
         rows = invoice_payment_sync.protect_incoming(c, table, rows)
+        if table == 'orders':
+            import inpost_tracking
+            rows = inpost_tracking.protect_incoming(c, rows)
         return _sqlite_upsert_rows_in_transaction(c, table, rows, conflict_col)
     finally:
         c.close()
@@ -2922,7 +2939,11 @@ def sqlite_delete_missing_rows(table: str, conflict_col: str, remote_keys: list)
     c = conn()
     try:
         c.execute('BEGIN IMMEDIATE')
-        remote_keys = list({str(key) for key in remote_keys} | invoice_payment_sync.protected_keys(c, table))
+        protected_keys = invoice_payment_sync.protected_keys(c, table)
+        if table == 'orders':
+            import inpost_tracking
+            protected_keys = protected_keys | {str(i) for i in inpost_tracking.protected_order_ids(c)}
+        remote_keys = list({str(key) for key in remote_keys} | protected_keys)
         cur = c.cursor()
         if not remote_keys:
             cur.execute(f"DELETE FROM {table}")
@@ -3252,6 +3273,8 @@ def pull_shared_tables_from_supabase(force: bool = False, delete_missing: bool =
     if not supabase_enabled():
         return {"ok": False, "error": "not_configured"}
     invoice_payment_sync.flush_pending(sys.modules[__name__])
+    import inpost_tracking
+    inpost_tracking.flush_pending(sys.modules[__name__])
 
     now_ts = time.time()
     with _supabase_sync_lock:
@@ -6605,7 +6628,7 @@ def invoice_packing_list_email_attachment_for_orders(orders: list[dict]) -> dict
 
 def apply_verified_inpost_status(order: dict, shipment: dict) -> dict:
     """Apply an authenticated InPost status to all and only shipment members."""
-    import packing_versions, sys
+    import packing_versions, inpost_tracking, inpost_reconciliation as work, sys
     remote_status = norm((shipment or {}).get("status"))
     if not inpost_status_is_collected(remote_status):
         return {"ok": True, "ignored": "not_collected", "status": remote_status, "orders": []}
@@ -6616,32 +6639,87 @@ def apply_verified_inpost_status(order: dict, shipment: dict) -> dict:
     c = conn()
     try:
         c.execute('BEGIN IMMEDIATE')
+        work.require_claim(c, shipment)
         cur = c.cursor()
         package_rows = cur.execute(
             "SELECT * FROM orders WHERE inpost_shipment_id=? ORDER BY id", (shipment_id,)
         ).fetchall() if shipment_id else []
-        package_orders = [dict(item) for item in package_rows] or [dict(order)]
-        package_ids = [to_int(item.get("id"), 0) for item in package_orders]
+        package_orders = [dict(item) for item in package_rows]
+        before = {item['id']: dict(item) for item in package_orders}
+        claimed_ids = {to_int(item.get("id"), 0) for item in package_orders}
         shipment_key = 'inpost:' + (shipment_id or remote_tracking)
         if not shipment_id and not remote_tracking:
             raise packing_versions.PackingConflict('Brak identyfikatora potwierdzonej przesyłki.')
-        prior = c.execute("SELECT * FROM packing_shipments WHERE shipment_key=? OR (carrier='inpost' AND tracking<>'' AND tracking=?)",
-                          (shipment_key, remote_tracking)).fetchone()
+        prior = c.execute("SELECT * FROM packing_shipments WHERE shipment_key=?",
+                          (shipment_key,)).fetchone()
         if prior:
             shipment_key = prior['shipment_key']
+            if remote_tracking and prior['tracking'] and re.sub(r'\s+', '', prior['tracking']) != remote_tracking:
+                raise packing_versions.PackingConflict('Numer śledzenia nie zgadza się z finalną listą tej przesyłki.')
         version_before = packing_versions.current_for_order(c, int(order['id']))
         packing = (packing_versions.batch_result(c, prior['final_batch_id'], mode='final') if prior else
-                   packing_versions.ensure_current_for_shipment(sys.modules[__name__], c, int(order['id'])))
-        if prior:
-            package_ids = packing['order_ids']
+                   packing_versions.current_for_order(c, int(order['id'])))
+        if not packing:
+            raise packing_versions.PackingConflict(
+                'Brak zweryfikowanej listy pakowej dla tej przesyłki. Odczytaj historię paczki i jej alokacje.')
+        package_ids = [int(i) for i in packing['order_ids']]
         if int(order['id']) not in packing['order_ids']:
             raise packing_versions.PackingConflict('Przesyłka nie należy do tego zamówienia.')
-        placeholders = ",".join("?" for _ in package_ids)
+        repaired_order_ids = []
+        historical = {}
+        if prior:
+            for oid in set(package_ids) - claimed_ids:
+                saved = work.historical_member(c, oid, shipment_id, remote_tracking)
+                if saved:
+                    historical[oid] = saved
+        missing_ids = sorted(set(package_ids) - claimed_ids - set(historical))
+        extra_ids = sorted(claimed_ids - set(package_ids))
+        if prior and missing_ids and not extra_ids and remote_tracking and prior['tracking'] and \
+                re.sub(r'\s+', '', prior['tracking']) == remote_tracking:
+            # The final batch is immutable evidence. Repair only members whose
+            # own current tracking confirms this exact parcel and who have no
+            # subsequent/historical use of the same shipment ID.
+            candidates = [dict(item) for item in cur.execute(
+                f"SELECT * FROM orders WHERE id IN ({','.join('?' for _ in missing_ids)}) ORDER BY id",
+                tuple(missing_ids)).fetchall()]
+            if len(candidates) == len(missing_ids) and all(
+                    not norm(item.get('inpost_shipment_id')) and
+                    norm(item.get('carrier')).lower() == 'inpost' and
+                    re.sub(r'\s+', '', norm(item.get('tracking_no'))) == remote_tracking and
+                    not cur.execute('SELECT 1 FROM inpost_shipment_history WHERE order_id=? AND shipment_id=?',
+                                    (item['id'], shipment_id)).fetchone()
+                    for item in candidates):
+                cur.execute(
+                    f"UPDATE orders SET inpost_shipment_id=? WHERE id IN ({','.join('?' for _ in missing_ids)}) "
+                    "AND TRIM(COALESCE(inpost_shipment_id,''))=''",
+                    (shipment_id, *missing_ids))
+                if cur.rowcount == len(missing_ids):
+                    repaired_order_ids = missing_ids
+                    before.update({item['id']: item for item in candidates})
+                    claimed_ids.update(missing_ids)
+                    package_orders = [dict(item) for item in cur.execute(
+                        'SELECT * FROM orders WHERE inpost_shipment_id=? ORDER BY id',
+                        (shipment_id,)).fetchall()]
+        if claimed_ids | set(historical) != set(package_ids):
+            missing = sorted(set(package_ids) - claimed_ids - set(historical))
+            extra = sorted(claimed_ids - set(package_ids))
+            raise packing_versions.PackingConflict(
+                f'Zakres przesyłki nie zgadza się z listą pakową: bez ID przesyłki {missing}; '
+                f'poza listą {extra}. Sprawdź powiązania i rozstrzygnij przed zapisem.')
+        conflicting = [item['id'] for item in package_orders if
+                       remote_tracking and norm(item.get('tracking_no')) and
+                       re.sub(r'\s+', '', norm(item['tracking_no'])) != remote_tracking]
+        if conflicting:
+            raise packing_versions.PackingConflict(
+                f'Zamówienia {conflicting} mają inny numer śledzenia niż potwierdzona paczka.')
+        current_ids = sorted(claimed_ids)
+        placeholders = ",".join("?" for _ in current_ids)
         shipped_at = now_iso()
         packing_versions.confirm_shipment(c, batch_id=packing['batch_id'], shipment_key=shipment_key,
             confirmed_at=shipped_at, carrier='inpost', tracking=remote_tracking, order_ids=package_ids)
-        packing_versions.stage_evidence(sys.modules[__name__], c, package_ids,
-            allow_replace=not version_before and not prior)
+        if not prior:
+            packing_versions.stage_evidence(sys.modules[__name__], c, package_ids,
+                allow_replace=not version_before)
         cur.execute(
             f"""UPDATE orders SET
                 status=CASE
@@ -6653,45 +6731,42 @@ def apply_verified_inpost_status(order: dict, shipment: dict) -> dict:
                 carrier='inpost',
                 shipped_at=CASE WHEN TRIM(COALESCE(shipped_at,''))='' THEN ? ELSE shipped_at END
                 WHERE id IN ({placeholders})""",
-            (remote_tracking, remote_tracking, shipped_at, *package_ids),
+            (remote_tracking, remote_tracking, shipped_at, *current_ids),
         )
-        c.commit()
         package_orders = [dict(item) for item in cur.execute(
-            f"SELECT * FROM orders WHERE id IN ({placeholders}) ORDER BY id", tuple(package_ids)
+            f"SELECT * FROM orders WHERE id IN ({placeholders}) ORDER BY id", tuple(current_ids)
         ).fetchall()]
+        mail_orders = sorted([*package_orders, *historical.values()], key=lambda row: row['id'])
+        work.stage(sys.modules[__name__], c, shipment_id, int(order['id']), packing['batch_id'],
+                   package_ids, package_orders, before, mail_orders,
+                   {**shipment, 'tracking_number': remote_tracking})
+        c.commit()
     finally:
         c.close()
 
-    if supabase_enabled():
-        try:
-            packing_versions.sync_evidence(sys.modules[__name__], package_ids)
-            for package_order in package_orders:
-                supabase_update_rows("orders", {
-                    "status": package_order.get("status"), "tracking_no": remote_tracking,
-                    "carrier": "inpost", "shipped_at": package_order.get("shipped_at"),
-                    "warehouse_issued": int(package_order.get("warehouse_issued") or 0),
-                }, {"id": int(package_order["id"])})
-        except Exception as exc:
-            app.logger.exception("InPost: błąd synchronizacji statusu zamówień: %s", exc)
-            return {"ok": False, "error": "supabase_sync_failed", "status": remote_status, "orders": package_ids}
-
-    tracking_hash = hashlib.sha256(remote_tracking.encode("utf-8")).hexdigest()[:16]
-    event_keys = [f"order_shipped:{order_id}:inpost:{tracking_hash}" for order_id in package_ids]
-    if event_keys and all(_email_event_already_ok(key) for key in event_keys):
-        return {"ok": True, "duplicate": True, "status": remote_status, "orders": package_ids}
+    backend = sys.modules[__name__]
+    completed_stage = 'sync' if supabase_enabled() else 'notification'
     try:
-        packing_path, _ = packing_versions.document(sys.modules[__name__], {'batch_id': packing['batch_id'], 'mode': 'historical'})
-        with open(packing_path, 'rb') as packing_file:
-            packing_attachment = {'filename': 'lista_pakowa.pdf', 'content': packing_file.read()}
-        email_result = _send_orders_shipped_email(package_orders, remote_tracking, "inpost", packing_attachment)
+        # Retained post-commit checkpoint. The sync intent is already durable now.
+        if supabase_enabled():
+            inpost_tracking.mark_result(backend, shipment_id, 'applied', sync_state='pending')
+        work.flush(backend, shipment_id)
+        completed_stage = 'notification'
+        work.finish_notification(backend, shipment_id)
     except Exception as exc:
-        app.logger.exception("InPost: nie udało się wysłać powiadomienia z listą pakowania")
-        email_result = {"ok": False, "error": str(exc)}
-    for package_order, event_key in zip(package_orders, event_keys):
-        _record_email_event(event_key, "order_shipped", package_order.get("id"), package_order.get("customer_email"), email_result)
-    if not email_result.get("ok"):
-        return {"ok": False, "error": (norm(email_result.get("error")) or "email_failed")[:300], "status": remote_status, "orders": package_ids}
-    return {"ok": True, "shipped": True, "status": remote_status, "orders": package_ids}
+        app.logger.exception('InPost: zapisano zamówienia, dalszy etap wymaga uzgodnienia')
+        try:
+            result = work.receipt(backend, shipment_id)
+        except Exception:
+            result = {'stage': completed_stage, 'notification_state': 'unknown',
+                      'sync_state': 'pending' if supabase_enabled() else 'none'}
+        return {**result, 'ok': False, 'orders_applied': True,
+                'error': 'Błąd etapu po zapisie zamówień: ' + type(exc).__name__,
+                'orders': current_ids, 'repaired_order_ids': repaired_order_ids}
+    return {**work.receipt(backend, shipment_id), 'status': remote_status,
+            'orders': current_ids, 'historical_order_ids': sorted(historical),
+            'repaired_order_ids': repaired_order_ids}
+
 
 
 def enqueue_automatic_inpost_pickup(shipment_id):
@@ -6982,8 +7057,9 @@ def _record_email_event(event_key, event_type, ref_id, recipient, result):
                 VALUES(?,?,?,?,?,?,?)
             """, (event_key, event_type, str(ref_id or ""), recipient or "", ok, payload, now_iso()))
         c.commit()
+        return True
     except Exception:
-        pass
+        return False
     finally:
         c.close()
 
@@ -8868,6 +8944,10 @@ import inpost_pickups as _inpost_pickups
 import sys as _pickup_sys
 _inpost_pickups.start_worker(_pickup_sys.modules[__name__])
 _startup_step("inpost_worker_init")
+
+import inpost_tracking as _inpost_tracking
+_inpost_tracking.start_worker(_pickup_sys.modules[__name__])
+_startup_step("inpost_tracking_worker_init")
 
 # The scheduler runs in a daemon thread, while the durable claim coordinates
 # all application processes. It starts only after KSeF routes are registered.

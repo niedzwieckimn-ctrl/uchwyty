@@ -73,6 +73,22 @@ def _pending(db, table):
         "SELECT record_id,payload FROM invoice_payment_sync_outbox WHERE table_name=? AND state<>'SYNCED'",(table,))}
 
 
+def refresh_order_snapshot(db, order_id):
+    """Advance an existing payment intent when shipping changes the same status.
+
+    No artificial invoice/link is created. Other payment fields and links remain
+    owned by the payment outbox; old worker acknowledgements cannot clear this.
+    """
+    old = db.execute("SELECT payload FROM invoice_payment_sync_outbox WHERE table_name='orders' AND record_id=?",
+                     (order_id,)).fetchone()
+    if old:
+        row = db.execute('SELECT * FROM orders WHERE id=?', (order_id,)).fetchone()
+        data = json.dumps(dict(row), ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+        if data != old['payload']:
+            db.execute("""UPDATE invoice_payment_sync_outbox SET revision=revision+1,payload=?,state='PENDING',
+                updated_at=?,synced_at=NULL WHERE table_name='orders' AND record_id=?""", (data, _now(), order_id))
+
+
 def protect_incoming(db, table, rows):
     """Overlay only locally pending domain fields; keep unrelated remote updates."""
     if table not in TABLE_KEYS or not rows:
@@ -192,22 +208,35 @@ def _publish(backend, claim):
     before = _read_remote(backend,table,key)  # Explicit columns: schema mismatch cannot silently pass.
     db = backend.conn()
     try:
+        # Order status is also written by shipment reconciliation. Serialize its
+        # PATCH with local shipping commits; invoice-only writes retain their
+        # existing independent revision protocol.
+        if table == 'orders':
+            db.execute('BEGIN IMMEDIATE')
         current = db.execute('''SELECT 1 FROM invoice_payment_sync_outbox WHERE table_name=? AND record_id=?
             AND revision=? AND payload=? AND lease_token=? AND lease_until>?''',
             (table,key,claim['revision'],claim['payload'],claim['lease_token'],_now())).fetchone()
+        if current is None:
+            raise SyncVerificationError('REVISION_SUPERSEDED')
+        if table == 'orders':
+            local = db.execute('SELECT status FROM orders WHERE id=?', (key,)).fetchone()
+            if not local or local['status'] != fields['status']:
+                raise SyncVerificationError('LOCAL_STATUS_SUPERSEDED')
+        if before is None:
+            compatible = backend.supabase_compatible_rows(table,[stored])
+            if len(compatible) != 1 or any(field not in compatible[0] or compatible[0][field] != value for field,value in fields.items()):
+                raise SyncVerificationError('REMOTE_SCHEMA_INCOMPATIBLE')
+            backend.supabase_upsert_rows(table,[stored],TABLE_KEYS[table])
+        else:
+            # Existing remote rows retain unrelated fields, including fresher PDFs.
+            params = {TABLE_KEYS[table]:'eq.'+str(key)}
+            if table == 'orders':
+                params['status'] = 'eq.' + str(before['status'])
+            backend.supabase_request('/rest/v1/'+table,method='PATCH',params=params,payload=fields)
+        if table == 'orders':
+            db.commit()
     finally:
         db.close()
-    if current is None:
-        raise SyncVerificationError('REVISION_SUPERSEDED')
-    if before is None:
-        compatible = backend.supabase_compatible_rows(table,[stored])
-        if len(compatible) != 1 or any(field not in compatible[0] or compatible[0][field] != value for field,value in fields.items()):
-            raise SyncVerificationError('REMOTE_SCHEMA_INCOMPATIBLE')
-        backend.supabase_upsert_rows(table,[stored],TABLE_KEYS[table])
-    else:
-        # Existing remote rows retain unrelated fields, including fresher PDFs.
-        backend.supabase_request('/rest/v1/'+table,method='PATCH',
-            params={TABLE_KEYS[table]:'eq.'+str(key)},payload=fields)
     after = _read_remote(backend,table,key)
     if after is None or any(not _field_matches(field,after.get(field),value) for field,value in fields.items()):
         raise SyncVerificationError('REMOTE_WRITE_UNVERIFIED')

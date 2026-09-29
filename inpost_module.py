@@ -96,7 +96,13 @@ def _request(path, method="GET", payload=None, accept="application/json"):
         }:
             if secret and _looks_like_api_token(secret):
                 safe_message = safe_message.replace(secret, "[ukryto]")
-        raise InPostError(f"InPost HTTP {exc.code}: {safe_message}") from exc
+        error = InPostError(f"InPost HTTP {exc.code}: {safe_message}")
+        error.status_code = exc.code
+        try:
+            error.retry_after = min(21600, max(0, int(exc.headers.get('Retry-After', '0'))))
+        except (TypeError, ValueError, AttributeError):
+            error.retry_after = 0
+        raise error from exc
     except urllib.error.URLError as exc:
         raise InPostError(f"Brak połączenia z InPost: {exc.reason}") from exc
     except TimeoutError as exc:
@@ -197,6 +203,14 @@ def get_label(shipment_id, label_format="pdf", label_type="A6"):
 
 def get_shipment(shipment_id):
     return _request(f"/shipments/{int(shipment_id)}")
+
+
+def get_tracking(tracking_number):
+    """Optional history; call only after authenticating the shipment identity."""
+    number = str(tracking_number or '').strip()
+    if not number:
+        raise InPostError('Brak numeru śledzenia do odczytu historii')
+    return _request('/tracking/' + urllib.parse.quote(number, safe=''))
 
 
 def find_shipment_by_reference(reference, created_at=""):
