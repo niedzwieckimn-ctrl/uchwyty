@@ -164,7 +164,7 @@ def register_routes(app, db_path, *, refresh_stock=None):
         body = request.get_json(silent=True)
         if not isinstance(body, dict):
             return _error("INVALID_JSON_BODY", 400)
-        allowed = set() if action in ("connection", "orders") else {"sku", "offset", "limit", "catalog_version"}
+        allowed = set() if action in ("connection", "orders", "catalog") else {"sku", "offset", "limit", "catalog_version"}
         if set(body) - allowed:
             return _error("UNKNOWN_PARAMETER", 400)
         if "sku" in body:
@@ -191,6 +191,15 @@ def register_routes(app, db_path, *, refresh_stock=None):
         try:
             budget = HttpBudget()
             pagination = None
+            if action == "catalog":
+                local = read_local_availability(db_path())
+                positive = sorted({row["sku"] for row in local
+                                   if isinstance(row["sku"], str) and row["sku"]
+                                   and row["sku"] == row["sku"].strip()
+                                   and type(row["available_qty"]) is int
+                                   and row["available_qty"] > 0})
+                return _json({"mode": "local_positive_catalog", "total_local_sku": len(local),
+                              "positive_sku": len(positive), "skus": positive})
             if action == "dry_run" and sku is None:
                 local = read_local_availability(db_path())
                 identity = sorted((row["id"], row["sku"]) for row in local)
@@ -251,6 +260,11 @@ def register_routes(app, db_path, *, refresh_stock=None):
     @_admin_only
     def probe_orders():
         return execute("orders")
+
+    @blueprint.post("/api/admin/orderchamp/local-catalog")
+    @_admin_only
+    def local_catalog():
+        return execute("catalog")
 
     @blueprint.post("/api/admin/orderchamp/dry-run")
     @_admin_only
