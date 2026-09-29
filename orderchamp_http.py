@@ -74,6 +74,7 @@ ERROR_STATUS = {
     "STOCK_SET_PRECONDITION_FAILED": 409, "LOCAL_STOCK_CHANGED": 409,
     "REMOTE_STOCK_SCOPE_UNSAFE": 409, "REMOTE_STOCK_CHANGED_OR_RESERVED": 409,
     "REMOTE_BELOW_LOCAL_ORDER_RECONCILIATION_REQUIRED": 409,
+    "INITIAL_SEED_ORDERS_PRESENT": 409,
     "INVALID_STOCK_SET_INPUT": 400, "MUTATION_REJECTED": 502,
     "MUTATION_OUTCOME_UNKNOWN": 502, "STOCK_SET_NOT_VERIFIED": 502,
 }
@@ -257,6 +258,7 @@ def register_routes(app, db_path, *, refresh_stock=None):
         return execute("dry_run")
 
     @blueprint.post("/api/admin/orderchamp/push-one")
+    @blueprint.post("/api/admin/orderchamp/seed-one")
     @_admin_only
     def push_one():
         if not request.is_json or request.content_length is None or request.content_length > 2048:
@@ -279,7 +281,8 @@ def register_routes(app, db_path, *, refresh_stock=None):
             refresh_stock()
             client = http_client(HttpBudget(seconds=25))
             result = push_one_stock(client, db_path(), sku=sku, expected_local=expected,
-                                    expected_remote_updated_at=updated)
+                                    expected_remote_updated_at=updated,
+                                    **({'initial_seed': True} if request.path.endswith('/seed-one') else {}))
             return _json(result)
         except OrderchampError as exc:
             code = exc.code if exc.code in ERROR_STATUS else 'MUTATION_OUTCOME_UNKNOWN'

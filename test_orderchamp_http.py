@@ -15,6 +15,7 @@ CONNECTION = '/api/admin/orderchamp/test-connection'
 DRY_RUN = '/api/admin/orderchamp/dry-run'
 PROBE_ORDERS = '/api/admin/orderchamp/probe-orders'
 PUSH = '/api/admin/orderchamp/push-one'
+SEED = '/api/admin/orderchamp/seed-one'
 HEADERS = {'X-CSRF-Token': 'test'}
 
 
@@ -116,6 +117,22 @@ def test_stock_push_requires_owner_csrf_and_backend_preconditions(owner, monkeyp
     assert response.get_json()['status'] == 'VERIFIED'
     assert calls == [{'sku': body['sku'], 'expected_local': 24,
                       'expected_remote_updated_at': body['expected_remote_updated_at']}]
+    assert session.closed
+
+
+def test_seed_one_requires_owner_csrf_and_explicit_single_sku(owner, monkeypatch):
+    calls = []
+    _, session, _ = use_client(monkeypatch)
+    monkeypatch.setattr(http, 'push_one_stock', lambda supplied_client, path, **kwargs:
+                        calls.append(kwargs) or {'ok': True, 'status': 'VERIFIED', 'wrote': True})
+    body = {'sku': 'CH010-AB-N28', 'expected_local': 24,
+            'expected_remote_updated_at': '2026-09-29T08:00:00Z'}
+    assert owner.post(SEED, json=body).status_code == 403
+    assert owner.post(SEED, json={**body, 'all': True}, headers=HEADERS).status_code == 409
+    assert not calls
+    response = owner.post(SEED, json=body, headers=HEADERS)
+    assert response.status_code == 200
+    assert calls == [{**body, 'initial_seed': True}]
     assert session.closed
 
 

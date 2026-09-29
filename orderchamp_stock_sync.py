@@ -118,7 +118,8 @@ def dry_run_stock_sync(client, db_path, *, sku=None):
     return report
 
 
-def push_one_stock(client, db_path, *, sku, expected_local, expected_remote_updated_at):
+def push_one_stock(client, db_path, *, sku, expected_local, expected_remote_updated_at,
+                   initial_seed=False):
     """Set exactly one proven, unreserved primary level from a fresh local read.
 
     A changed local quantity or Orderchamp level makes the prior dry-run stale.
@@ -144,7 +145,18 @@ def push_one_stock(client, db_path, *, sku, expected_local, expected_remote_upda
     # A lower remote count may reflect a sale not yet reserved locally. A SET
     # that increases it would silently put the sold units back on sale.
     if quantity > level['quantity']:
-        raise OrderchampError('REMOTE_BELOW_LOCAL_ORDER_RECONCILIATION_REQUIRED')
+        if not initial_seed or level['quantity'] != 0:
+            raise OrderchampError('REMOTE_BELOW_LOCAL_ORDER_RECONCILIATION_REQUIRED')
+        # This one-time exception is safe only before the first channel order.
+        # Re-read the level after the order check so a stale zero cannot be used.
+        if client.probe_orders()['all_order_count'] != 0:
+            raise OrderchampError('INITIAL_SEED_ORDERS_PRESENT')
+        latest = client.resolve_variant_by_sku(sku)
+        if (not latest or latest['id'] != variant['id'] or
+                latest['inventory_policy'] != 'DENY' or
+                not latest['levels_complete'] or len(latest['levels']) != 1 or
+                latest['levels'][0] != level or latest['inventory_quantity'] != 0):
+            raise OrderchampError('REMOTE_STOCK_CHANGED_OR_RESERVED')
     if level['quantity'] == quantity:
         return {'ok': True, 'sku': sku, 'quantity': quantity, 'status': 'ALREADY_CURRENT',
                 'wrote': False}
