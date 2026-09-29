@@ -3446,6 +3446,8 @@ def trigger_background_supabase_pull(reason: str = "read"):
                 result = pull_shared_tables_from_supabase(force=True, delete_missing=False)
                 if result.get("ok"):
                     _run_post_pull_reconciliation()
+                    if _local_supabase_data_present():
+                        _mark_local_supabase_bootstrap_complete()
             result["reason"] = reason
         except Exception as exc:
             result = {"ok": False, "error": str(exc), "reason": reason}
@@ -3506,6 +3508,16 @@ def maybe_pull_shared_from_supabase(force: bool = False, required: bool = False)
                                     "SUPABASE_BOOTSTRAP status=unavailable reason=SYNC_FAILED failed_tables=%s",
                                     ",".join(failed_tables) or "unknown",
                                 )
+                            # A failed table must not repeat the entire blocking
+                            # pull on every panel when local data is already usable
+                            # under the existing fallback below. Record the attempt
+                            # only in this process; full success alone gets the
+                            # durable marker. Failed tables are retried in the
+                            # existing throttled background refresh.
+                            if _local_supabase_data_present():
+                                with _supabase_sync_lock:
+                                    _supabase_sync_state["initial_pull_attempted"] = True
+                                    _supabase_sync_state["last_pull_finished_ts"] = time.time()
                     _perf_add("supabase_initial_bootstrap", time.perf_counter() - started)
                     if not already_attempted:
                         if required and not result.get("ok") and not _local_supabase_data_present():
