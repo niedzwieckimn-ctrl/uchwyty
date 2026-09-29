@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import logging
 import time
 import uuid
 from datetime import datetime, timezone
@@ -16,7 +17,7 @@ CONNECTION_QUERY = """query StockConnectionTest {
 VARIANT_QUERY = """query StockDryRunVariant($sku: String!) {
   productVariantBySku(sku: $sku) {
     id sku inventoryQuantity inventoryPolicy
-    inventoryLevels {
+    inventoryLevels(first: 100) {
       nodes {
         id quantity availableQuantity updatedAt
         location { id isPrimary }
@@ -145,6 +146,20 @@ class OrderchampClient:
                         )):
                             last_error = "RATE_LIMITED"
                         else:
+                            # Log only fixed categories, never the upstream message,
+                            # queried SKU, response body, or Bearer token.
+                            messages = [str(err.get("message") or "").lower()
+                                        for err in errors if isinstance(err, dict)]
+                            hints = [name for name, terms in {
+                                "inventory_levels": ("inventorylevels", "inventory level"),
+                                "pagination": ("first", "pagination", "page size"),
+                                "field_validation": ("cannot query field", "unknown field"),
+                                "authorization": ("permission", "forbidden", "access denied"),
+                            }.items() if any(term in message for message in messages for term in terms)]
+                            logging.getLogger(__name__).warning(
+                                "ORDERCHAMP_GRAPHQL_READ_ERROR query=%s hints=%s count=%s",
+                                "variant" if query == VARIANT_QUERY else "connection",
+                                ",".join(hints) or "unknown", len(errors))
                             # Partial data must not turn an error into NOT FOUND.
                             raise OrderchampError("GRAPHQL_ERROR")
                     else:
