@@ -26,7 +26,7 @@
   async function run(action) {
     if (busy) return;
     busy = true; stop = false;
-    ["connection", "single", "all", "push", "push-all"].forEach(id => { byId(id).disabled = true; });
+    ["connection", "orders", "single", "all", "push", "push-all"].forEach(id => { byId(id).disabled = true; });
     byId("stop").disabled = !["all", "push-all"].includes(action);
     byId("status").textContent = "Sprawdzam…";
     try {
@@ -37,9 +37,9 @@
         show(result.data);
         byId("status").textContent = result.status === 200 ? "Stan zapisany i zweryfikowany." : "Wysyłka nie została potwierdzona; sprawdź raport i ponów odczyt.";
         lastSingle = null;
-      } else if (action === "connection" || action === "single") {
-        const request = action === "connection" ? {} : {sku: byId("sku").value};
-        const path = action === "connection" ? "test-connection" : "dry-run";
+      } else if (action === "connection" || action === "orders" || action === "single") {
+        const request = action === "single" ? {sku: byId("sku").value} : {};
+        const path = action === "connection" ? "test-connection" : action === "orders" ? "probe-orders" : "dry-run";
         const result = await post("/api/admin/orderchamp/" + path, request);
         show(result.data);
         lastSingle = action === "single" && result.status === 200 ? result.data : null;
@@ -87,7 +87,7 @@
         "Przekroczono czas oczekiwania. Spróbuj ponownie; zachowano dotychczasowy raport." : error.message;
     } finally {
       busy = false;
-      ["connection", "single", "all", "push-all"].forEach(id => { byId(id).disabled = false; });
+      ["connection", "orders", "single", "all", "push-all"].forEach(id => { byId(id).disabled = false; });
       byId("push").disabled = !safeToPush(lastSingle?.rows?.[0]);
       byId("stop").disabled = true;
     }
@@ -106,7 +106,7 @@
       expected_local: row.would_send,
       expected_remote_updated_at: row.remote.levels[0].updated_at});
   }
-  for (const action of ["connection", "single", "all", "push", "push-all"])
+  for (const action of ["connection", "orders", "single", "all", "push", "push-all"])
     byId(action).addEventListener("click", () => run(action));
   byId("stop").addEventListener("click", () => { stop = true; byId("stop").disabled = true; });
   byId("download").addEventListener("click", () => {
