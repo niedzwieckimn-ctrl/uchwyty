@@ -110,3 +110,19 @@ def test_allocation_order_stays_stable_when_only_some_remote_ids_collide():
     reconciliation_store.restore_packing_evidence(db, newer)
     assert db.execute('SELECT COUNT(*) FROM packing_allocations').fetchone()[0] == 13
     db.close()
+
+
+def test_member_snapshot_without_batch_or_allocations_can_be_remapped():
+    db = _database()
+    payload = {
+        'packing_batches': [],
+        'packing_allocations': [],
+        'fulfillment_documents': [{
+            'order_id': 122, 'kind': 'packing_list', 'document_id': 1,
+        }],
+    }
+    translated = reconciliation_store._remap_packing_ids(db, payload)
+    assert translated['packing_batches'] == []
+    assert translated['packing_allocations'] == []
+    assert translated['fulfillment_documents'][0]['document_id'] == 1
+    db.close()

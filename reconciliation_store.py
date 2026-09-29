@@ -39,10 +39,10 @@ def _remap_packing_ids(db, payload):
 
     batch_map = {}
     batches = result.get('packing_batches') or []
-    next_batch = max(
+    next_batch = max([
         int(db.execute('SELECT COALESCE(MAX(id),0) FROM packing_batches').fetchone()[0]),
         *(int(row['id']) for row in batches),
-    ) + 1
+    ]) + 1
     rekey_batches = any(
         (existing := db.execute('SELECT root_order_id,created_at FROM packing_batches WHERE id=?',
                                 (row['id'],)).fetchone()) and
@@ -89,10 +89,10 @@ def _remap_packing_ids(db, payload):
             row['previous_batch_id'] = batch_map.get(int(row['previous_batch_id']), row['previous_batch_id'])
 
     allocations = result.get('packing_allocations') or []
-    next_allocation = max(
+    next_allocation = max([
         int(db.execute('SELECT COALESCE(MAX(id),0) FROM packing_allocations').fetchone()[0]),
         *(int(row['id']) for row in allocations),
-    ) + 1
+    ]) + 1
     rekey_allocations = any(
         (existing := db.execute('SELECT * FROM packing_allocations WHERE id=?',
                                 (row['id'],)).fetchone()) and
