@@ -835,6 +835,7 @@ def register_routes(context):
           <div class="card">
             <div class="flex">
               <h1 style="margin:0;">KSeF</h1>
+              <a class="btn" href="/admin/ksef/automation">Automat — stan i kontrola</a>
               <span class="badge">FA(3)</span>
             </div>
             <div class="hint" style="margin-top:10px;">
@@ -1016,6 +1017,13 @@ def register_routes(context):
 
         if current_ksef.get("status") in {"sending","processing","unknown"} and not ksef_attempt(invoice_id):
             return "Brak referencji wcześniejszej wysyłki. Sprawdź wynik w KSeF przed ponowieniem.", 409
+        # A known configuration error before submission must not create an
+        # ambiguous attempt which permanently blocks the corrected configuration.
+        configuration = ksef_config_summary()
+        if not configuration.get('configured'):
+            upsert_ksef_doc(invoice_id, current_ksef.get('status') or 'error', xml_path=path,
+                            last_error='Brak konfiguracji KSeF: ' + ', '.join(configuration.get('missing') or []))
+            return redirect(next_url)
         previous = ksef_attempt(invoice_id, claim=True)
         if previous:
             if not previous.get("session_ref") or not previous.get("invoice_ref"):

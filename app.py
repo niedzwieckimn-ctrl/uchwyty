@@ -5767,6 +5767,8 @@ def _log_request_performance(response):
 @app.before_request
 def security_gate():
     path = request.path
+    if path == '/health/ksef-worker' and request.method in {'GET', 'HEAD'}:
+        return None  # Liveness only; no invoice data, no scheduler trigger.
     if path in {"/webhooks/17track", "/webhooks/inpost"}:
         # Endpointy webhooków nie korzystają z sesji. 17TRACK sprawdza podpis,
         # a InPost dodatkowo potwierdza stan przesyłki swoim API przed zapisem.
@@ -9049,6 +9051,8 @@ _startup_step("inpost_tracking_worker_init")
 # The scheduler runs in a daemon thread, while the durable claim coordinates
 # all application processes. It starts only after KSeF routes are registered.
 import ksef_scheduler as _ksef_scheduler
+import ksef_automation as _ksef_automation
+_ksef_automation.register_routes(_pickup_sys.modules[__name__])
 _ksef_scheduler.start_worker(_pickup_sys.modules[__name__])
 _startup_step("ksef_scheduler_worker_init")
 

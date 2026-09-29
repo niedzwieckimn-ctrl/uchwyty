@@ -2,7 +2,7 @@
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 
@@ -19,10 +19,13 @@ def candidates(now, backend=None):
     if not start:
         raise ValueError("Ustaw KSEF_AUTOMATION_START_DATE na dzień rozpoczęcia automatu (YYYY-MM-DD).")
     datetime.strptime(start, "%Y-%m-%d")
+    if now.tzinfo is not None:
+        now = now.astimezone(ZoneInfo("Europe/Warsaw"))
+    due_date = (now.date() if now.hour >= 17 else now.date() - timedelta(days=1)).isoformat()
     connection = backend.conn()
     try:
         rows = [dict(row) for row in connection.execute(
-            """SELECT i.id,k.ksef_number,k.status,COALESCE(m.sent_to_client,0) mailed
+            """SELECT i.id,i.created_at,k.ksef_number,k.status,COALESCE(m.sent_to_client,0) mailed
                FROM invoices i
                LEFT JOIN ksef_documents k ON k.invoice_id=i.id
                LEFT JOIN invoice_meta m ON m.invoice_id=i.id
@@ -32,12 +35,11 @@ def candidates(now, backend=None):
         )]
     finally:
         connection.close()
-    after_daily_cutoff = now.hour >= 17
     return [
         row["id"] for row in rows
         if not (row["ksef_number"] and row["mailed"])
         and (
-            after_daily_cutoff
+            str(row["created_at"] or "")[:10] <= due_date
             or row["ksef_number"]
             or row["status"] in ("sending", "processing", "unknown")
         )
@@ -56,7 +58,12 @@ def _result_complete(result):
 def run_batch(backend, now=None, send=True, progress=None):
     now = now or datetime.now(ZoneInfo("Europe/Warsaw"))
     if backend.supabase_enabled():
-        backend.pull_shared_tables_from_supabase(force=True)
+        pulled = backend.pull_shared_tables_from_supabase(force=True)
+        if not isinstance(pulled, dict) or not pulled.get("ok"):
+            failed = [name for name, value in (pulled or {}).get("tables", {}).items()
+                      if value.get("status") == "error"] if isinstance(pulled, dict) else []
+            raise RuntimeError("KSEF_SYNC_FAILED: nie potwierdzono pobrania aktualnych danych z Supabase"
+                               + ("; tabele: " + ", ".join(failed) if failed else ""))
     invoice_ids = candidates(now, backend)
     if not send:
         return {
@@ -77,8 +84,10 @@ def run_batch(backend, now=None, send=True, progress=None):
             ):
                 backend._refresh_domain_route_context()
                 response = backend.app.view_functions["invoice_ksef_send"](invoice_id)
-                if isinstance(response, tuple) and int(response[1]) >= 400:
-                    raise RuntimeError(str(response[0]))
+                http_status = int(response[1]) if isinstance(response, tuple) else getattr(response, "status_code", 200)
+                if http_status >= 400:
+                    raise RuntimeError("KSeF HTTP " + str(http_status) + ": " +
+                                       (str(response[0]) if isinstance(response, tuple) else response.get_data(as_text=True))[:250])
                 document = backend.load_ksef_doc(invoice_id)
                 metadata = backend.load_invoice_meta(invoice_id) or {}
                 results.append({
@@ -86,6 +95,7 @@ def run_batch(backend, now=None, send=True, progress=None):
                     "status": document.get("status"),
                     "number_received": bool(document.get("ksef_number")),
                     "mailed": bool(metadata.get("sent_to_client")),
+                    "error": document.get("last_error") or "",
                 })
         except Exception as exc:
             backend.app.logger.exception("KSeF: faktura %s", invoice_id)

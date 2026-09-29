@@ -5,6 +5,7 @@ import os
 import threading
 import time
 import uuid
+import json
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -14,6 +15,7 @@ WARSAW = ZoneInfo("Europe/Warsaw")
 CUTOFF_HOUR = 17
 CHECK_INTERVAL_SECONDS = 60
 LEASE_SECONDS = 30 * 60
+RETRY_SECONDS = 5 * 60
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS ksef_scheduler_runs(
@@ -28,6 +30,7 @@ CREATE TABLE IF NOT EXISTS ksef_scheduler_runs(
     completed_at TEXT,
     failed_at TEXT,
     last_error TEXT NOT NULL DEFAULT '',
+    summary_json TEXT NOT NULL DEFAULT '{}',
     updated_at TEXT NOT NULL,
     PRIMARY KEY(job_name, run_date)
 )
@@ -36,6 +39,8 @@ CREATE TABLE IF NOT EXISTS ksef_scheduler_runs(
 
 def initialize(connection) -> None:
     connection.execute(SCHEMA)
+    if 'summary_json' not in {row[1] for row in connection.execute('PRAGMA table_info(ksef_scheduler_runs)')}:
+        connection.execute("ALTER TABLE ksef_scheduler_runs ADD COLUMN summary_json TEXT NOT NULL DEFAULT '{}'")
     connection.commit()
 
 
@@ -79,6 +84,12 @@ class Store:
         connection = self.backend.conn()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            if connection.execute(
+                "SELECT 1 FROM ksef_scheduler_runs WHERE job_name=? AND status='running' AND lease_until>?",
+                (JOB_NAME, now_epoch),
+            ).fetchone():
+                connection.commit()
+                return None
             row = connection.execute(
                 "SELECT * FROM ksef_scheduler_runs WHERE job_name=? AND run_date=?",
                 (JOB_NAME, run_date),
@@ -92,9 +103,9 @@ class Store:
                     (JOB_NAME, run_date, "running", 1, token,
                      now_epoch + LEASE_SECONDS, now_iso, now_iso, now_iso),
                 )
-            elif row["status"] == "completed" or (
-                row["status"] == "running" and float(row["lease_until"] or 0) > now_epoch
-            ):
+            elif row['status'] in {'completed', 'failed'} and (
+                now - datetime.fromisoformat(row['updated_at'])
+            ).total_seconds() < RETRY_SECONDS:
                 connection.commit()
                 return None
             else:
@@ -103,8 +114,8 @@ class Store:
                        SET status='running',attempt_count=attempt_count+1,lease_token=?,
                            lease_until=?,started_at=?,completed_at=NULL,failed_at=NULL,
                            last_error='',updated_at=?
-                       WHERE job_name=? AND run_date=? AND status<>'completed'
-                         AND (status='failed' OR lease_until<=?)""",
+                       WHERE job_name=? AND run_date=?
+                         AND (status IN ('completed','failed') OR lease_until<=?)""",
                     (token, now_epoch + LEASE_SECONDS, now_iso, now_iso,
                      JOB_NAME, run_date, now_epoch),
                 )
@@ -174,7 +185,7 @@ class Store:
         finally:
             connection.close()
 
-    def complete(self, run, now: datetime | None = None) -> bool:
+    def complete(self, run, now: datetime | None = None, summary=None) -> bool:
         now = now or _utc_now()
         return self._finish(run, {
             "status": "completed",
@@ -184,9 +195,10 @@ class Store:
             "lease_token": None,
             "lease_until": None,
             "updated_at": _iso(now),
+            "summary_json": summary or {},
         }, sqlite_lease_until=0)
 
-    def fail(self, run, error: str, now: datetime | None = None) -> bool:
+    def fail(self, run, error: str, now: datetime | None = None, summary=None) -> bool:
         now = now or _utc_now()
         return self._finish(run, {
             "status": "failed",
@@ -195,6 +207,7 @@ class Store:
             "lease_token": None,
             "lease_until": None,
             "updated_at": _iso(now),
+            "summary_json": summary or {},
         }, sqlite_lease_until=0)
 
     def _filters(self, run):
@@ -217,6 +230,7 @@ class Store:
             ) or []
             return bool(rows)
         sqlite_values = dict(values)
+        sqlite_values['summary_json'] = json.dumps(sqlite_values.get('summary_json', {}), ensure_ascii=False)
         sqlite_values["lease_until"] = sqlite_lease_until
         keys = list(sqlite_values)
         connection = self.backend.conn()
@@ -250,21 +264,25 @@ def check_once(backend, now: datetime | None = None, run_batch_fn=None):
     if now.tzinfo is None:
         now = now.replace(tzinfo=WARSAW)
     local_now = now.astimezone(WARSAW)
-    run_date = local_now.date().isoformat()
+    run_date = (local_now.date() if local_now.hour >= CUTOFF_HOUR
+                else local_now.date() - timedelta(days=1)).isoformat()
     backend.app.logger.info(
         "KSEF_SCHEDULER_CHECK run_date=%s local_hour=%s cutoff_reached=%s",
         run_date, local_now.hour, local_now.hour >= CUTOFF_HOUR,
     )
-    if local_now.hour < CUTOFF_HOUR:
-        return {"status": "before_cutoff", "run_date": run_date}
+    start = os.environ.get('KSEF_AUTOMATION_START_DATE', '').strip()
+    if not start:
+        raise ValueError('Brak KSEF_AUTOMATION_START_DATE (YYYY-MM-DD); automat nie moze wybrac faktur.')
+    datetime.strptime(start, '%Y-%m-%d')
+    if run_date < start:
+        return {"status": "before_start", "run_date": run_date}
 
     store = Store(backend)
     run = store.claim(run_date, now=local_now.astimezone(timezone.utc))
     if not run:
         current = store.state(run_date)
         if current and current.get("status") == "completed":
-            backend.app.logger.info("KSEF_BATCH_SKIPPED_ALREADY_DONE run_date=%s", run_date)
-            return {"status": "completed", "run_date": run_date}
+            return {"status": "cooldown", "run_date": run_date}
         return {"status": "leased", "run_date": run_date}
 
     backend.app.logger.info(
@@ -297,6 +315,7 @@ def check_once(backend, now: datetime | None = None, run_batch_fn=None):
             lease_lost.set()
             raise RuntimeError("Utracono dzienną blokadę batcha KSeF")
 
+    summary = {}
     try:
         if run_batch_fn is None:
             from run_ksef_batch import run_batch
@@ -304,7 +323,7 @@ def check_once(backend, now: datetime | None = None, run_batch_fn=None):
         summary = run_batch_fn(backend, now=local_now, send=True, progress=progress)
         if not summary.get("ok"):
             raise RuntimeError(_batch_error(summary))
-        if lease_lost.is_set() or not store.complete(run):
+        if lease_lost.is_set() or not store.complete(run, summary=summary):
             raise RuntimeError("Utracono dzienną blokadę przed zapisem wyniku KSeF")
         backend.app.logger.info(
             "KSEF_BATCH_COMPLETED run_date=%s invoices=%s",
@@ -312,7 +331,7 @@ def check_once(backend, now: datetime | None = None, run_batch_fn=None):
         )
         return {"status": "completed", "run_date": run_date, "summary": summary}
     except Exception as exc:
-        store.fail(run, str(exc))
+        store.fail(run, str(exc), summary=summary)
         backend.app.logger.exception(
             "KSEF_BATCH_FAILED run_date=%s error=%s", run_date, str(exc)[:500],
         )
