@@ -2,7 +2,7 @@
 (() => {
   const byId = id => document.getElementById(id);
   const csrf = document.querySelector('meta[name="csrf-token"]').content;
-  let stop = false, busy = false, saved = null;
+  let stop = false, busy = false, saved = null, lastSingle = null;
   function show(value) {
     saved = value;
     byId("result").textContent = JSON.stringify(value, null, 2);
@@ -10,7 +10,7 @@
   }
   async function post(path, body) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 25000);
+    const timer = setTimeout(() => controller.abort(), path.endsWith("push-one") ? 90000 : 25000);
     try {
       const response = await fetch(path, {
         method: "POST", credentials: "same-origin", signal: controller.signal,
@@ -26,19 +26,28 @@
   async function run(action) {
     if (busy) return;
     busy = true; stop = false;
-    ["connection", "single", "all"].forEach(id => { byId(id).disabled = true; });
-    byId("stop").disabled = action !== "all";
+    ["connection", "single", "all", "push", "push-all"].forEach(id => { byId(id).disabled = true; });
+    byId("stop").disabled = !["all", "push-all"].includes(action);
     byId("status").textContent = "Sprawdzam…";
     try {
-      if (action !== "all") {
+      if (action === "push") {
+        const row = lastSingle?.rows?.[0];
+        if (!safeToPush(row)) throw new Error("Najpierw sprawdź SKU; wariant musi mieć jednoznaczny, niezarezerwowany stan w głównej lokalizacji.");
+        const result = await pushRow(row);
+        show(result.data);
+        byId("status").textContent = result.status === 200 ? "Stan zapisany i zweryfikowany." : "Wysyłka nie została potwierdzona; sprawdź raport i ponów odczyt.";
+        lastSingle = null;
+      } else if (action === "connection" || action === "single") {
         const request = action === "connection" ? {} : {sku: byId("sku").value};
         const path = action === "connection" ? "test-connection" : "dry-run";
         const result = await post("/api/admin/orderchamp/" + path, request);
         show(result.data);
+        lastSingle = action === "single" && result.status === 200 ? result.data : null;
         byId("status").textContent = result.status === 200 ? "Odczyt zakończony." : "Odczyt zgłosił problem — szczegóły poniżej.";
       } else {
-        const report = {mode: "paged_dry_run", writes_enabled: false, complete: false,
-          pages: [], summary: {local_sku: 0, matched: 0, missing: 0, errors: 0, synchronized: 0}};
+        const pushing = action === "push-all";
+        const report = {mode: pushing ? "paged_stock_push" : "paged_dry_run", complete: false,
+          pages: [], summary: {local_sku: 0, matched: 0, missing: 0, errors: 0, synchronized: 0, skipped: 0}};
         let offset = 0, version;
         do {
           const body = {offset, limit: 1};
@@ -52,11 +61,24 @@
           report.pages.push(data);
           for (const key of ["local_sku", "matched", "missing", "errors"])
             report.summary[key] += data.summary?.[key] ?? (key === "errors" && status >= 400 ? 1 : 0);
+          if (pushing) {
+            const row = data.rows?.[0];
+            if (safeToPush(row)) {
+              const result = await pushRow(row);
+              data.push_result = result.data;
+              if (result.status === 200) report.summary.synchronized += Number(result.data.wrote);
+              else {
+                report.summary.errors += 1;
+                if (["MUTATION_OUTCOME_UNKNOWN", "STOCK_SET_NOT_VERIFIED", "AUTH_OR_SCOPE_ERROR"]
+                    .includes(result.data.error_code)) stop = true;
+              }
+            } else report.summary.skipped += 1;
+          }
           version = data.pagination.catalog_version;
           offset = data.pagination.next_offset;
           report.complete = !data.pagination.has_more;
           show(report);
-          byId("status").textContent = `Sprawdzono ${report.pages.length} z ${data.pagination.total_sku} SKU.`;
+          byId("status").textContent = `${pushing ? "Przetworzono" : "Sprawdzono"} ${report.pages.length} z ${data.pagination.total_sku} SKU.`;
         } while (!report.complete && !stop);
         byId("status").textContent += report.complete ? " Raport ukończony." : " Zatrzymano; raport jest częściowy.";
       }
@@ -65,11 +87,26 @@
         "Przekroczono czas oczekiwania. Spróbuj ponownie; zachowano dotychczasowy raport." : error.message;
     } finally {
       busy = false;
-      ["connection", "single", "all"].forEach(id => { byId(id).disabled = false; });
+      ["connection", "single", "all", "push-all"].forEach(id => { byId(id).disabled = false; });
+      byId("push").disabled = !safeToPush(lastSingle?.rows?.[0]);
       byId("stop").disabled = true;
     }
   }
-  for (const action of ["connection", "single", "all"])
+  function safeToPush(row) {
+    const remote = row?.remote, levels = remote?.levels;
+    return row?.status === "MATCHED" && remote?.levels_complete === true &&
+      remote?.inventory_policy === "DENY" && levels?.length === 1 &&
+      levels[0].is_primary === true && levels[0].quantity === levels[0].available_quantity &&
+      remote.inventory_quantity === levels[0].quantity &&
+      Number.isInteger(row.would_send) && row.would_send <= levels[0].quantity &&
+      typeof levels[0].updated_at === "string";
+  }
+  function pushRow(row) {
+    return post("/api/admin/orderchamp/push-one", {sku: row.sku,
+      expected_local: row.would_send,
+      expected_remote_updated_at: row.remote.levels[0].updated_at});
+  }
+  for (const action of ["connection", "single", "all", "push", "push-all"])
     byId(action).addEventListener("click", () => run(action));
   byId("stop").addEventListener("click", () => { stop = true; byId("stop").disabled = true; });
   byId("download").addEventListener("click", () => {
