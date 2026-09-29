@@ -13,6 +13,9 @@ import re
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from difflib import SequenceMatcher
+from panel_performance import SQLiteReadCache
+
+_analysis_cache = SQLiteReadCache()
 
 
 ACTIVE_ORDER_STATUSES = {
@@ -136,6 +139,15 @@ def _match_unresolved_query(query: str, products: list[dict], exact_aliases: dic
 
 
 def build_replenishment_analysis(conn_factory, today: date | None = None, horizon_days: int = 60) -> list[dict]:
+    today = today or date.today()
+    horizon_days = int(horizon_days or 60)
+    if horizon_days not in (45, 60, 90):
+        horizon_days = 60
+    return _analysis_cache.get(conn_factory, (today.isoformat(), horizon_days),
+        lambda connection: _calculate_replenishment_analysis(lambda: connection, today, horizon_days))
+
+
+def _calculate_replenishment_analysis(conn_factory, today: date | None = None, horizon_days: int = 60) -> list[dict]:
     """Zwraca analizę dla każdego SKU, posortowaną wg reorder_score."""
     today = today or date.today()
     horizon_days = int(horizon_days or 60)
@@ -243,6 +255,7 @@ def build_replenishment_analysis(conn_factory, today: date | None = None, horizo
                 product_ids_by_sku[alias].add(product_id)
 
     search_events = defaultdict(lambda: {"current": set(), "previous": set(), "clients": set(), "unresolved": 0})
+    matched_queries = {}
     for row in search_rows:
         searched_day = _iso_day(row.get("created_at"))
         if not searched_day:
@@ -252,7 +265,10 @@ def build_replenishment_analysis(conn_factory, today: date | None = None, horizo
             product_ids.update(product_ids_by_sku.get(_key(value), set()))
         is_unresolved = int(row.get("results_count") or 0) == 0 or not product_ids
         if not product_ids and is_unresolved:
-            product_ids = _match_unresolved_query(row.get("query"), products, exact_aliases)
+            query = row.get("query")
+            if query not in matched_queries:
+                matched_queries[query] = _match_unresolved_query(query, products, exact_aliases)
+            product_ids = matched_queries[query]
         if not product_ids:
             continue
         client = _text(row.get("customer_email")).lower() or "unknown"

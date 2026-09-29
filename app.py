@@ -48,6 +48,8 @@ from flask import (
     send_file, abort
 )
 from flask import render_template, render_template_string
+from panel_performance import render_cached_template_string, SignedURLCache
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from agent_streaming import StreamTrace, sse_response
 from werkzeug.exceptions import HTTPException
 from jinja2 import ChoiceLoader, DictLoader, FileSystemLoader
@@ -213,7 +215,8 @@ app.config["JSON_AS_ASCII"] = False
 PERF_LOG_ENABLED = (os.environ.get("PERF_LOG_ENABLED") or "1").strip().lower() in ("1", "true", "yes", "on")
 if PERF_LOG_ENABLED:
     app.logger.setLevel(logging.INFO)
-_raw_render_template_string = render_template_string
+_raw_render_template_string = render_cached_template_string
+_raw_render_template = render_template
 
 
 def _perf_add(stage: str, elapsed_seconds: float):
@@ -228,6 +231,14 @@ def render_template_string(*args, **kwargs):
     started = time.perf_counter()
     try:
         return _raw_render_template_string(*args, **kwargs)
+    finally:
+        _perf_add("render_html", time.perf_counter() - started)
+
+
+def render_template(*args, **kwargs):
+    started = time.perf_counter()
+    try:
+        return _raw_render_template(*args, **kwargs)
     finally:
         _perf_add("render_html", time.perf_counter() - started)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "")
@@ -335,20 +346,24 @@ def _sqlite_statement_writes(sql) -> bool:
 class _SerializedWriteCursor(sqlite3.Cursor):
     def execute(self, sql, parameters=()):
         connection = self.connection
+        started = time.perf_counter()
         connection._before_sql(sql)
         try:
             result = super().execute(sql, parameters)
         finally:
             connection._release_write_lock_if_idle()
+            _perf_add("sqlite_execute", time.perf_counter() - started)
         return result
 
     def executemany(self, sql, seq_of_parameters):
         connection = self.connection
+        started = time.perf_counter()
         connection._before_sql(sql)
         try:
             result = super().executemany(sql, seq_of_parameters)
         finally:
             connection._release_write_lock_if_idle()
+            _perf_add("sqlite_execute", time.perf_counter() - started)
         return result
 
     def executescript(self, sql_script):
@@ -368,8 +383,10 @@ class _SerializedWriteConnection(sqlite3.Connection):
 
     def _before_sql(self, sql):
         if _sqlite_statement_writes(sql) and not self._write_lock_held:
+            started = time.perf_counter()
             _sqlite_write_lock.acquire()
             self._write_lock_held = True
+            _perf_add("sqlite_write_lock_wait", time.perf_counter() - started)
 
     def _release_write_lock_if_idle(self):
         if self._write_lock_held and not self.in_transaction:
@@ -385,19 +402,23 @@ class _SerializedWriteConnection(sqlite3.Connection):
         return super().cursor(factory or _SerializedWriteCursor)
 
     def execute(self, sql, parameters=()):
+        started = time.perf_counter()
         self._before_sql(sql)
         try:
             result = super().execute(sql, parameters)
         finally:
             self._release_write_lock_if_idle()
+            _perf_add("sqlite_execute", time.perf_counter() - started)
         return result
 
     def executemany(self, sql, seq_of_parameters):
+        started = time.perf_counter()
         self._before_sql(sql)
         try:
             result = super().executemany(sql, seq_of_parameters)
         finally:
             self._release_write_lock_if_idle()
+            _perf_add("sqlite_execute", time.perf_counter() - started)
         return result
 
     def executescript(self, sql_script):
@@ -966,6 +987,9 @@ def init_db():
     # UĹ‚atwia agregowanie "w dostawie" po statusach paczek
     cur.execute("CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_items(order_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_order_items_product_id ON order_items(product_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_invoice_allocations_item_qty ON invoice_allocations(order_item_id, qty)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_invoice_allocations_invoice ON invoice_allocations(invoice_id, id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_invoice_allocations_order_created ON invoice_allocations(order_id, created_at)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_status_issued_created ON orders(status, warehouse_issued, created_at)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_china_packages_status ON china_packages(status)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_china_items_package_id ON china_items(package_id)")
@@ -2593,8 +2617,12 @@ def supabase_storage_download_bytes(storage_ref: str) -> tuple[bytes, str]:
     req = urllib.request.Request(supabase_storage_object_url(bucket, object_path), method="GET")
     req.add_header("apikey", SUPABASE_SERVICE_ROLE_KEY)
     req.add_header("Authorization", f"Bearer {SUPABASE_SERVICE_ROLE_KEY}")
-    with urllib.request.urlopen(req, timeout=90) as resp:
-        return resp.read(), os.path.basename(object_path)
+    started = time.perf_counter()
+    try:
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            return resp.read(), os.path.basename(object_path)
+    finally:
+        _perf_add("storage_download", time.perf_counter() - started)
 
 
 def supabase_storage_delete(storage_ref: str):
@@ -2613,7 +2641,21 @@ def supabase_storage_delete(storage_ref: str):
             raise
 
 
+_signed_url_cache = SignedURLCache()
+
+
 def supabase_storage_create_signed_urls(bucket: str, object_paths: list[str], expires_in: int = 3600) -> dict:
+    paths = [norm(path).lstrip("/") for path in object_paths if norm(path)]
+    namespace = (SUPABASE_URL, hashlib.sha256(SUPABASE_SERVICE_ROLE_KEY.encode()).hexdigest(), bucket)
+    started = time.perf_counter()
+    try:
+        return _signed_url_cache.get_many(namespace, paths, int(expires_in),
+            lambda missing: _fetch_supabase_signed_urls(bucket, missing, expires_in))
+    finally:
+        _perf_add("storage_sign", time.perf_counter() - started)
+
+
+def _fetch_supabase_signed_urls(bucket: str, object_paths: list[str], expires_in: int = 3600) -> dict:
     paths = [norm(path).lstrip("/") for path in object_paths if norm(path)]
     if not paths:
         return {}
@@ -2915,8 +2957,13 @@ def _sqlite_upsert_rows_in_transaction(c, table, rows, conflict_col):
                     assignments.append(f"{col}=excluded.{col}")
             update_sql = ", ".join(assignments)
         else:
-            update_sql = ", ".join([f"{c}=excluded.{c}" for c in update_cols])
-        sql = f"INSERT INTO {table}({','.join(usable_cols)}) VALUES({placeholders}) ON CONFLICT({conflict_col}) DO UPDATE SET {update_sql}"
+            assignments = [f"{col}=excluded.{col}" for col in update_cols]
+            update_sql = ", ".join(assignments)
+        # Skip unchanged rows (NULL-safe). Keep the effective guarded values for
+        # received China packages; do not reintroduce updates of immutable rows.
+        changed = " OR ".join(f"{table}.{assignment.partition('=')[0]} IS NOT ({assignment.partition('=')[2]})"
+                              for assignment in assignments)
+        sql = f"INSERT INTO {table}({','.join(usable_cols)}) VALUES({placeholders}) ON CONFLICT({conflict_col}) DO UPDATE SET {update_sql} WHERE {changed}"
     else:
         sql = f"INSERT INTO {table}({','.join(usable_cols)}) VALUES({placeholders}) ON CONFLICT({conflict_col}) DO NOTHING"
 
@@ -3286,16 +3333,28 @@ def pull_shared_tables_from_supabase(force: bool = False, delete_missing: bool =
     result = {"ok": True, "tables": {}, "pulled_at": now_iso()}
     fetched = {}
 
-    for table, conflict_col in SUPABASE_PULL_TABLES:
+    def fetch_table(table, conflict_col):
         table_started = time.perf_counter()
         try:
-            fetched[(table, conflict_col)] = supabase_select_rows(table, order_by=conflict_col)
-        except Exception as e:
-            result["ok"] = False
-            result["tables"][table] = {"status": "error", "stage": "fetch", "error": str(e)}
-        finally:
-            elapsed = time.perf_counter() - table_started
-            result["tables"].setdefault(table, {})["fetch_ms"] = round(elapsed * 1000, 2)
+            rows = supabase_select_rows(table, order_by=conflict_col)
+            return rows, {"fetch_ms": round((time.perf_counter() - table_started) * 1000, 2)}
+        except Exception as exc:
+            return None, {"status": "error", "stage": "fetch", "error": str(exc),
+                          "fetch_ms": round((time.perf_counter() - table_started) * 1000, 2)}
+
+    # Reads of independent tables may overlap; SQLite writes, reconciliation and
+    # the existing publication/outbox guards retain their original ordering.
+    with ThreadPoolExecutor(max_workers=4, thread_name_prefix="supabase-read") as pool:
+        futures = {pool.submit(fetch_table, table, col): (table, col)
+                   for table, col in SUPABASE_PULL_TABLES}
+        for future in as_completed(futures):
+            table, conflict_col = futures[future]
+            rows, state = future.result()
+            result["tables"][table] = state
+            if rows is None:
+                result["ok"] = False
+            else:
+                fetched[(table, conflict_col)] = rows
 
     for table, conflict_col in SUPABASE_PULL_TABLES:
         if (table, conflict_col) not in fetched:
@@ -5679,6 +5738,7 @@ def _start_request_performance_trace():
     if PERF_LOG_ENABLED:
         g.perf_started = time.perf_counter()
         g.perf_stages = {}
+        g.perf_request_id = uuid.uuid4().hex[:16]
 
 
 @app.after_request
@@ -5689,11 +5749,18 @@ def _log_request_performance(response):
         stages = dict(getattr(g, "perf_stages", {}))
         # supabase_http i reconciliation są podetapami pulla, więc nie mogą
         # zostać drugi raz odjęte od czasu całego requestu.
-        top_level = stages.get("render_html", 0.0) + stages.get("supabase_pull_blocking", 0.0)
-        stages["view_logic_sql"] = max(0.0, total - top_level)
+        top_level = (stages.get("render_html", 0.0) + stages.get("supabase_pull_blocking", 0.0)
+                     + stages.get("supabase_initial_bootstrap", 0.0) + stages.get("storage_sign", 0.0))
+        stages["view_other"] = max(0.0, total - top_level)
         payload = {name: round(value * 1000, 2) for name, value in stages.items()}
         payload["total"] = round(total * 1000, 2)
-        app.logger.info("PERF %s %s %s", request.method, request.path, json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        # Visible in browser Network / Performance entries; no SQL or credentials.
+        if session.get("admin_authenticated"):
+            response.headers['Server-Timing'] = ', '.join(
+                f'{name};dur={value:.2f}' for name, value in payload.items())
+            response.headers['X-Request-ID'] = g.perf_request_id
+        app.logger.info("PERF %s %s %s", request.method, request.path,
+                        json.dumps({"request_id": g.perf_request_id, **payload}, ensure_ascii=False, sort_keys=True))
     return response
 
 
@@ -5765,7 +5832,10 @@ def security_headers_and_csrf(response):
         response.headers.setdefault("Permissions-Policy", "camera=(self), microphone=(self), geolocation=()")
     else:
         response.headers.setdefault("Permissions-Policy", "camera=(self), microphone=(), geolocation=()")
-    response.headers.setdefault("Content-Security-Policy", "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://unpkg.com https://cdn.jsdelivr.net; connect-src 'self' https://*.supabase.co https://api.resend.com")
+    storage = urllib.parse.urlsplit(SUPABASE_URL)
+    image_origin = (f" {storage.scheme}://{storage.netloc}" if storage.scheme == 'https'
+                    and re.fullmatch(r'[A-Za-z0-9.:-]+', storage.netloc or '') else '')
+    response.headers.setdefault("Content-Security-Policy", f"default-src 'self'; img-src 'self' data: blob:{image_origin}; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://unpkg.com https://cdn.jsdelivr.net; connect-src 'self' https://*.supabase.co https://api.resend.com")
     if session.get("admin_authenticated") and response.content_type and response.content_type.startswith("text/html"):
         body = response.get_data(as_text=True)
         token = session.get("csrf_token", "")
@@ -5876,6 +5946,29 @@ function removeRow(btn){
 }
 </script>
 
+<div id="panel-navigation-status" role="status" hidden style="position:fixed;top:12px;right:18px;z-index:1300;background:#12213d;color:white;padding:10px 18px;border-radius:12px;box-shadow:0 8px 24px #12213d33"></div>
+<script>
+(function(){
+  const status=document.getElementById('panel-navigation-status');
+  document.addEventListener('click',function(event){
+    const link=event.target.closest('a');
+    if(!link || event.defaultPrevented || event.button!==0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || link.target || link.hasAttribute('download'))return;
+    const url=new URL(link.href,location.href);
+    if(url.origin!==location.origin || (url.pathname===location.pathname && url.search===location.search))return;
+    status.textContent='Otwieranie: '+link.textContent.trim();status.hidden=false;
+  });
+  window.addEventListener('pageshow',function(){status.hidden=true;});
+  window.addEventListener('load',function(){setTimeout(function(){
+    const nav=performance.getEntriesByType('navigation')[0];if(!nav)return;
+    const round=value=>Math.round(value*100)/100;
+    const metrics={path:location.pathname,ttfb_ms:round(nav.responseStart-nav.requestStart),
+      document_ms:round(nav.responseEnd-nav.startTime),dom_ready_ms:round(nav.domContentLoadedEventEnd-nav.startTime),
+      load_ms:round(nav.loadEventEnd-nav.startTime),server:nav.serverTiming.map(s=>({name:s.name,ms:round(s.duration)}))};
+    const record=document.createElement('meta');record.name='uchwyty-navigation-timing';record.content=JSON.stringify(metrics);document.head.appendChild(record);
+    console.info('UCHWYTY_NAV',metrics);
+  },0);});
+})();
+</script>
 </body>
 </html>
 """
@@ -6324,6 +6417,7 @@ app.view_functions["client_searches"] = client_searches_v2
 
 
 register_cash_flow(app, {
+    "render_template_string": render_template_string,
     "conn": conn,
     "now_iso": now_iso,
     "app_now": app_now,

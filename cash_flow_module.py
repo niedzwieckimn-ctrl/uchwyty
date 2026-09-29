@@ -3,7 +3,7 @@ import json
 from datetime import datetime, timedelta
 
 from flask import request, redirect, url_for
-from flask import render_template_string
+from panel_performance import render_cached_template_string as render_template_string
 
 from inventory_analytics import build_replenishment_analysis, recommended_replenishments
 from invoice_sales import invoice_rows, invoice_lines
@@ -262,12 +262,14 @@ def calculate_cash_flow_snapshot(deps, *, current_time=None):
             },
         })
 
+        units_for_invoice = None
         if issue_d:
             chart_row = sales_chart_by_month.get(issue_d.strftime("%Y-%m"))
             if chart_row is not None:
                 chart_row["invoices"] += 1
                 chart_row["revenue"] += net
                 invoice_units = invoice_sales_units(c, inv['id'], inv['invoice_items_json'])
+                units_for_invoice = invoice_units
                 chart_row["units"] += invoice_units
 
         if issue_d and issue_d.year == today.year and issue_d.month == today.month:
@@ -278,7 +280,8 @@ def calculate_cash_flow_snapshot(deps, *, current_time=None):
         if issue_d and issue_d >= today - timedelta(days=30):
             last_30_net += net
             last_30_profit += net * 0.60
-            sold_30_qty += invoice_sales_units(c, inv['id'], inv['invoice_items_json'])
+            sold_30_qty += (units_for_invoice if units_for_invoice is not None else
+                           invoice_sales_units(c, inv['id'], inv['invoice_items_json']))
 
         if paid:
             paid_d = parse_date_safe(inv["paid_at"]) or issue_d
@@ -558,6 +561,7 @@ def register_cash_flow(app, deps):
     supabase_delete_rows = deps.get("supabase_delete_rows")
     base_url = deps["BASE_URL"]
     db_path = deps["DB_PATH"]
+    render_panel = deps.get("render_template_string", render_template_string)
 
     ensure_cash_flow_tables(conn, now_iso)
 
@@ -862,7 +866,7 @@ def register_cash_flow(app, deps):
           </div>
         {% endblock %}
         """
-        return render_template_string(tpl, title="Cash flow", base_url=base_url, db_path=db_path,
+        return render_panel(tpl, title="Cash flow", base_url=base_url, db_path=db_path,
                                       settings=settings, k=kpis, inflow_rows=inflow_rows,
                                       overdue_clients=overdue_clients, paid_clients=paid_clients,
                                       reorder_rows=reorder_rows, reorder_horizon_days=reorder_horizon_days,

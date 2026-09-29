@@ -126,7 +126,7 @@ def build_dashboard_read(
         cur.execute("""SELECT o.id,o.order_no,o.customer_name,o.created_at,o.status,o.currency,
                              COALESCE(SUM(oi.qty * COALESCE(oi.unit_net_price,
                                CASE WHEN UPPER(COALESCE(o.currency,'PLN'))='EUR' THEN
-                                 (SELECT ep.price_eur FROM pricing_eur ep WHERE LOWER(TRIM(ep.sku))=LOWER(TRIM(COALESCE(oi.sku,p.sku)))
+                                 (SELECT ep.price_eur FROM pricing_eur ep WHERE TRIM(LOWER(ep.sku))=TRIM(LOWER(COALESCE(oi.sku,p.sku)))
                                   ORDER BY ep.updated_at DESC,ep.sku DESC LIMIT 1)
                                WHEN UPPER(COALESCE(o.currency,'PLN'))='PLN' THEN COALESCE(
                                (SELECT pr.net_price FROM pricing pr
@@ -135,7 +135,7 @@ def build_dashboard_read(
                                (SELECT pr.net_price FROM pricing pr
                                 WHERE TRIM(LOWER(pr.model))=TRIM(LOWER(p.model))
                                 ORDER BY pr.created_at DESC, pr.model DESC LIMIT 1),0) ELSE NULL END,0)),0) AS total_net
-                      FROM orders o
+                      FROM (SELECT * FROM orders ORDER BY id DESC LIMIT 8) o
                       LEFT JOIN order_items oi ON oi.order_id=o.id
                       LEFT JOIN products p ON p.id=oi.product_id
                       GROUP BY o.id ORDER BY o.id DESC LIMIT 8""")
