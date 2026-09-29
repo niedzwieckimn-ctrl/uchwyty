@@ -10,7 +10,7 @@
   }
   async function post(path, body) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), path.endsWith("push-one") ? 90000 : 25000);
+    const timer = setTimeout(() => controller.abort(), /(?:push|seed)-one$/.test(path) ? 90000 : 25000);
     try {
       const response = await fetch(path, {
         method: "POST", credentials: "same-origin", signal: controller.signal,
@@ -26,14 +26,15 @@
   async function run(action) {
     if (busy) return;
     busy = true; stop = false;
-    ["connection", "orders", "single", "all", "push", "push-all"].forEach(id => { byId(id).disabled = true; });
+    ["connection", "orders", "single", "all", "push", "seed", "push-all"].forEach(id => { byId(id).disabled = true; });
     byId("stop").disabled = !["all", "push-all"].includes(action);
     byId("status").textContent = "Sprawdzam…";
     try {
-      if (action === "push") {
+      if (action === "push" || action === "seed") {
         const row = lastSingle?.rows?.[0];
-        if (!safeToPush(row)) throw new Error("Najpierw sprawdź SKU; wariant musi mieć jednoznaczny, niezarezerwowany stan w głównej lokalizacji.");
-        const result = await pushRow(row);
+        if (action === "seed" ? !safeToSeed(row) : !safeToPush(row))
+          throw new Error("Najpierw sprawdź SKU i jednoznaczny stan wariantu w głównej lokalizacji.");
+        const result = await pushRow(row, action === "seed");
         show(result.data);
         byId("status").textContent = result.status === 200 ? "Stan zapisany i zweryfikowany." : "Wysyłka nie została potwierdzona; sprawdź raport i ponów odczyt.";
         lastSingle = null;
@@ -89,6 +90,7 @@
       busy = false;
       ["connection", "orders", "single", "all", "push-all"].forEach(id => { byId(id).disabled = false; });
       byId("push").disabled = !safeToPush(lastSingle?.rows?.[0]);
+      byId("seed").disabled = !safeToSeed(lastSingle?.rows?.[0]);
       byId("stop").disabled = true;
     }
   }
@@ -101,12 +103,21 @@
       Number.isInteger(row.would_send) && row.would_send <= levels[0].quantity &&
       typeof levels[0].updated_at === "string";
   }
-  function pushRow(row) {
-    return post("/api/admin/orderchamp/push-one", {sku: row.sku,
+  function safeToSeed(row) {
+    const remote = row?.remote, levels = remote?.levels;
+    return row?.status === "MATCHED" && remote?.levels_complete === true &&
+      remote?.inventory_policy === "DENY" && levels?.length === 1 &&
+      levels[0].is_primary === true && levels[0].quantity === 0 &&
+      levels[0].available_quantity === 0 && remote.inventory_quantity === 0 &&
+      Number.isInteger(row.would_send) && row.would_send > 0 &&
+      typeof levels[0].updated_at === "string";
+  }
+  function pushRow(row, initialSeed = false) {
+    return post("/api/admin/orderchamp/" + (initialSeed ? "seed-one" : "push-one"), {sku: row.sku,
       expected_local: row.would_send,
       expected_remote_updated_at: row.remote.levels[0].updated_at});
   }
-  for (const action of ["connection", "orders", "single", "all", "push", "push-all"])
+  for (const action of ["connection", "orders", "single", "all", "push", "seed", "push-all"])
     byId(action).addEventListener("click", () => run(action));
   byId("stop").addEventListener("click", () => { stop = true; byId("stop").disabled = true; });
   byId("download").addEventListener("click", () => {
