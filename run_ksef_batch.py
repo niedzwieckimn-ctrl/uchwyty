@@ -5,6 +5,12 @@ import sys
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+# A failure in an unrelated module must not block verified invoice data.
+KSEF_REQUIRED_TABLES = frozenset({
+    'company_profile', 'customers', 'products', 'orders', 'order_items',
+    'invoices', 'invoice_meta', 'invoice_allocations', 'ksef_documents',
+})
+
 
 def _backend(backend=None):
     if backend is None:
@@ -59,11 +65,16 @@ def run_batch(backend, now=None, send=True, progress=None):
     now = now or datetime.now(ZoneInfo("Europe/Warsaw"))
     if backend.supabase_enabled():
         pulled = backend.pull_shared_tables_from_supabase(force=True)
-        if not isinstance(pulled, dict) or not pulled.get("ok"):
-            failed = [name for name, value in (pulled or {}).get("tables", {}).items()
-                      if value.get("status") == "error"] if isinstance(pulled, dict) else []
+        tables = pulled.get('tables', {}) if isinstance(pulled, dict) else {}
+        failed = sorted(name for name in KSEF_REQUIRED_TABLES
+                        if not isinstance(tables.get(name), dict) or tables[name].get('status') != 'ok')
+        if failed:
             raise RuntimeError("KSEF_SYNC_FAILED: nie potwierdzono pobrania aktualnych danych z Supabase"
                                + ("; tabele: " + ", ".join(failed) if failed else ""))
+        unrelated = sorted(name for name, value in tables.items()
+                           if name not in KSEF_REQUIRED_TABLES and value.get('status') == 'error')
+        if unrelated:
+            backend.app.logger.warning('KSEF_SYNC_UNRELATED_ERRORS tables=%s', ','.join(unrelated))
     invoice_ids = candidates(now, backend)
     if not send:
         return {

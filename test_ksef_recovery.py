@@ -103,6 +103,29 @@ def test_failed_pull_never_reports_success_or_sends(backend,pulled):
     assert calls==[]
 
 
+def test_unrelated_china_documents_error_does_not_block_verified_invoices(backend):
+    invoice(backend)
+    calls=successful_sender(backend)
+    backend.supabase_enabled=lambda:True
+    tables={name:{'status':'ok'} for name in batch.KSEF_REQUIRED_TABLES}
+    tables['china_documents']={'status':'error'}
+    backend.pull_shared_tables_from_supabase=lambda **kw:{'ok':False,'tables':tables}
+    assert batch.run_batch(backend,now=at())['ok'] is True
+    assert calls==[100]
+
+
+@pytest.mark.parametrize('table',sorted(batch.KSEF_REQUIRED_TABLES))
+def test_each_required_table_failure_blocks_submission(backend,table):
+    invoice(backend)
+    calls=successful_sender(backend)
+    backend.supabase_enabled=lambda:True
+    tables={name:{'status':'ok'} for name in batch.KSEF_REQUIRED_TABLES}
+    tables[table]={'status':'error'}
+    backend.pull_shared_tables_from_supabase=lambda **kw:{'ok':False,'tables':tables}
+    with pytest.raises(RuntimeError,match=table):batch.run_batch(backend,now=at())
+    assert calls==[]
+
+
 def test_failed_batch_persists_reason_and_retries_after_backoff(backend,monkeypatch):
     invoice(backend)
     calls=successful_sender(backend)
