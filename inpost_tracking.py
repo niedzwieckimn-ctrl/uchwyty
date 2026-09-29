@@ -425,6 +425,17 @@ def process(b, order, *, source='manual'):
             return {'ok': False, 'result': outcome, 'state': None}
         if outcome == 'older_ignored' or normalized(shipment.get('status')) not in COLLECTED:
             return {'ok': True, 'result': outcome, 'state': _public_state(state), 'orders_applied': False}
+        try:
+            restore_packing_scope(b, order)
+        except Exception as exc:
+            db = b.conn()
+            try:
+                job = work.read(db, shipment_id)
+            finally:
+                db.close()
+            result = work.receipt(b, shipment_id)
+            result.update(ok=False, error=str(exc)[:240])
+            return _complete_process(b, shipment_id, token, job, outcome, result)
         db = b.conn()
         try:
             job = work.read(db, shipment_id)
@@ -559,6 +570,108 @@ def protected_order_ids(db):
         WHERE s.sync_state IN ('pending','conflict')''')}
 
 
+def restore_packing_scope(b, order):
+    """Hydrate missing shipment evidence before READ/apply; never infer allocations.
+
+    Ordinary bootstrap restores orders/invoices, not reconciliation payloads.
+    Restore every member's revision as well as shared batches/PDFs, so publishing
+    the final shipment later cannot accidentally use expected_revision=0.
+    """
+    if not b.supabase_enabled():
+        return
+    import packing_versions
+    import reconciliation_store
+    import inpost_reconciliation as work
+    from pathlib import Path
+    sid = str(order.get('inpost_shipment_id') or '').strip()
+    if not sid:
+        return
+    def inspect():
+        db = b.conn()
+        try:
+            current_ids = {int(r[0]) for r in db.execute(
+                'SELECT id FROM orders WHERE inpost_shipment_id=?', (sid,))}
+            ids = {int(order['id'])} | current_ids
+            final = db.execute('SELECT final_batch_id,tracking FROM packing_shipments WHERE shipment_key=?',
+                               ('inpost:' + sid,)).fetchone()
+            try:
+                packing = (packing_versions.batch_result(db, final[0], mode='final') if final else
+                           packing_versions.current_for_order(db, int(order['id'])))
+            except packing_versions.PackingConflict:
+                # A pointer/final marker may survive a partial cache reset.
+                # Restore missing rows; immutable conflicts are still rejected
+                # by restore_packing_evidence and by the final business guard.
+                packing = None
+            missing = not bool(packing)
+            history_ids = set()
+            if packing:
+                ids.update(packing['order_ids'])
+                if final:
+                    history_ids = {oid for oid in set(packing['order_ids']) - current_ids
+                        if not work.historical_member(db, oid, sid, re.sub(r'\s+', '', final['tracking']))}
+                root = db.execute('SELECT root_order_id FROM packing_batches WHERE id=?',
+                                  (packing['batch_id'],)).fetchone()
+                ids.add(int(root[0]))
+                # The final write republishes all versions/PDFs of this list.
+                docs = list(db.execute('''SELECT h.path,h.file_hash FROM fulfillment_document_history h
+                    JOIN packing_batches pb ON pb.id=h.document_id
+                    WHERE h.kind='packing_list' AND pb.packing_list_id=?''',
+                    (packing['packing_list_key'],)))
+                missing = not docs or any(not Path(r[0]).is_file() or
+                    hashlib.sha256(Path(r[0]).read_bytes()).hexdigest()!=r[1] for r in docs)
+            versions = {int(r[0]) for r in db.execute(
+                'SELECT order_id FROM fulfillment_reconciliation_versions WHERE order_id IN (' +
+                ','.join('?' for _ in ids) + ')', tuple(ids))}
+            # A partial failed hydration must remain eligible on the next try,
+            # even if the first member already restored all shared PDF pointers.
+            missing = missing or bool(ids - versions)
+            return ids, missing, history_ids
+        finally:
+            db.close()
+    restoring_order_id = int(order['id'])
+    try:
+        ids, missing, history_ids = inspect()
+        if not missing and not history_ids:
+            return
+        restored = set()
+        while ids - restored:
+            for oid in sorted(ids - restored):
+                restoring_order_id = oid
+                reconciliation_store.restore(b, oid)
+                restored.add(oid)
+            ids, _, history_ids = inspect()
+        if history_ids:
+            rows = b.supabase_request('/rest/v1/inpost_shipment_history', params={
+                'shipment_id': 'eq.' + sid, 'order_id': 'in.(' + ','.join(map(str, sorted(history_ids))) + ')',
+                'select': 'order_id,shipment_id,snapshot_json,created_at'})
+            if not isinstance(rows, list):
+                raise ValueError('Nie można odczytać historii wcześniejszej przesyłki.')
+            db = b.conn()
+            try:
+                db.execute('BEGIN IMMEDIATE')
+                for row in rows:
+                    if int(row['order_id']) not in history_ids or str(row['shipment_id']) != sid:
+                        raise ValueError('Historia wskazuje inną przesyłkę lub zamówienie.')
+                    existing = db.execute('SELECT snapshot_json FROM inpost_shipment_history WHERE order_id=? AND shipment_id=?',
+                        (row['order_id'],sid)).fetchone()
+                    if existing and json.loads(existing[0]) != json.loads(row['snapshot_json']):
+                        raise ValueError('Konflikt zapisanej historii przesyłki.')
+                    db.execute('INSERT OR IGNORE INTO inpost_shipment_history VALUES(?,?,?,?)',
+                        (row['order_id'],sid,row['snapshot_json'],row['created_at']))
+                    final = db.execute('SELECT tracking FROM packing_shipments WHERE shipment_key=?',('inpost:'+sid,)).fetchone()
+                    if not work.historical_member(db, int(row['order_id']), sid, re.sub(r'\s+', '', final[0])):
+                        raise ValueError('Niepotwierdzona tożsamość historycznego członka przesyłki.')
+                db.commit()
+            finally:
+                db.close()
+    except Exception as exc:
+        b.app.logger.warning('INPOST_PACKING_RESTORE_FAILED shipment_id=%s order_id=%s type=%s',
+                             sid, restoring_order_id, type(exc).__name__)
+        raise packing_versions.PackingConflict(
+            'Nie można odtworzyć zapisanej listy pakowej z Supabase. '
+            'Sprawdź dostęp do metadanych realizacji i konflikt wersji; automat ponowi odczyt.') from exc
+
+
 def scope_diagnostic(db, order):
     """Read the three independent identities without attaching any order."""
     import packing_versions
@@ -579,6 +692,7 @@ def scope_diagnostic(db, order):
         error = '' if packing else 'Brak potwierdzonej listy pakowej'
     except Exception as exc:
         expected, batch_id, error = [], None, str(exc)[:240]
+    evidence_available = bool(batch_id and not error)
     tracking_no = re.sub(r'\s+', '', str(order.get('tracking_no') or ''))
     tracking_conflicts = [row['id'] for row in linked if tracking_no and
                           re.sub(r'\s+', '', row['tracking_no'] or '') not in {'', tracking_no}]
@@ -592,7 +706,8 @@ def scope_diagnostic(db, order):
             'order_ids': ids, 'packing_batch_id': batch_id,
             'packing_order_ids': expected, 'historical_order_ids': historical,
             'missing_shipment_id': sorted(set(expected) - set(ids) - valid_history),
-            'outside_packing_list': sorted(set(ids) - set(expected)),
+            'outside_packing_list': sorted(set(ids) - set(expected)) if evidence_available else [],
+            'evidence_available': evidence_available,
             'tracking_conflict_ids': tracking_conflicts,
             'final_tracking': final['tracking'] if final else '', 'error': error}
 
@@ -648,7 +763,7 @@ def process_due(b):
         pending = [dict(row) for row in db.execute("""SELECT j.*,s.tracking_no FROM inpost_reconciliation j
             JOIN inpost_tracking_state s ON s.shipment_id=j.shipment_id
             LEFT JOIN inpost_tracking_notifications n ON n.shipment_id=j.shipment_id
-            WHERE (j.apply_state='pending' OR (j.apply_state='applied' AND (n.shipment_id IS NULL OR n.state='pending')))
+            WHERE (j.apply_state='pending' OR (j.apply_state='applied' AND (n.shipment_id IS NULL OR n.state='pending' OR j.receipt_error<>'')))
             AND (j.retry_at<=? OR s.next_check_at=0) AND s.lease_until<=?
             ORDER BY j.retry_at LIMIT 20""", (time.time(), time.time()))]
         db.execute("""UPDATE inpost_tracking_notifications SET state='unknown',

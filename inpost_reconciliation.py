@@ -221,6 +221,23 @@ def notification_outcome(result):
         result.get('delivery_outcome'), 'accepted' if result.get('ok') else 'failed')
 
 
+def persist_notification(b, order_ids):
+    import reconciliation_store
+    import packing_versions
+    # Retry the exact pending payload / lost acknowledgement before staging a
+    # new receipt. This preserves the revision protocol on a network timeout.
+    for oid in order_ids:
+        reconciliation_store.retry_pending(b, oid)
+    db = b.conn()
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        packing_versions.stage_evidence(b, db, order_ids)
+        db.commit()
+    finally:
+        db.close()
+    packing_versions.sync_evidence(b, order_ids)
+
+
 def finish_notification(b, sid):
     import hashlib
     import inpost_tracking as tracking
@@ -232,6 +249,10 @@ def finish_notification(b, sid):
         db.close()
     if not job or job['apply_state'] != 'applied':
         return
+    # A durable final proof must exist before a potentially irreversible mail.
+    # After loss of SQLite it also prevents treating an unknown old send as new.
+    if b.supabase_enabled() and receipt(b, sid)['sync_state'] != 'synced':
+        return
     payload = json.loads(job['notification_payload'])
     orders = payload.get('orders', [])
     if not orders:
@@ -241,6 +262,14 @@ def finish_notification(b, sid):
     keys = [f"order_shipped:{row['id']}:inpost:{digest}" for row in orders]
     token = tracking.notification_claim(b, sid, orders[0].get('customer_email'), keys)
     if not token:
+        if b.supabase_enabled() and job['receipt_error']:
+            persist_notification(b, [row['id'] for row in orders])
+            db = b.conn()
+            try:
+                db.execute("UPDATE inpost_reconciliation SET receipt_error='' WHERE shipment_id=?", (sid,))
+                db.commit()
+            finally:
+                db.close()
         return
     attempted = False
     try:
@@ -280,6 +309,13 @@ def finish_notification(b, sid):
             db.commit()
         finally:
             db.close()
+    if b.supabase_enabled():
+        try:
+            persist_notification(b, [row['id'] for row in orders])
+        except Exception as exc:
+            # Final shipment proof was already published. If this receipt cannot
+            # be saved, a cold restart restores unknown and never sends again.
+            errors.append('notification_durability_' + type(exc).__name__)
     if errors:
         db = b.conn()
         try:

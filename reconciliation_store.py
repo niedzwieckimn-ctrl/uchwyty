@@ -81,6 +81,10 @@ def stage(b, oid, connection=None, allow_replace=False):
             bid_marks = ','.join('?' for _ in ids)
             payload['packing_allocations'] = [dict(r) for r in c.execute(f'SELECT * FROM packing_allocations WHERE batch_id IN ({bid_marks})', ids)]
             payload['packing_shipments'] = [dict(r) for r in c.execute(f'SELECT * FROM packing_shipments WHERE packing_list_id IN ({marks})', keys)]
+            shipment_ids = [r['shipment_key'].split(':', 1)[1] for r in payload['packing_shipments']
+                            if r['carrier'] == 'inpost' and r['shipment_key'].startswith('inpost:')]
+            payload['inpost_notifications'] = [dict(r) for sid in shipment_ids for r in c.execute(
+                'SELECT * FROM inpost_tracking_notifications WHERE shipment_id=?', (sid,))]
             payload['fulfillment_document_history'] = [dict(r) for r in c.execute(f"SELECT * FROM fulfillment_document_history WHERE kind='packing_list' AND document_id IN ({bid_marks})", ids)]
         row = c.execute('SELECT revision FROM fulfillment_reconciliation_versions WHERE order_id=?', (oid,)).fetchone()
         revision = row[0] if row else 0
@@ -156,6 +160,39 @@ def publish(b, oid):
     _save(b, oid, revision, payload)
 
 
+def _repair_missing_packing_documents(b, db, payload):
+    """Same durable revision can have an incomplete local cache. Insert missing
+    immutable evidence/pointers only; never replay other fulfillment state.
+    Caller has already excluded a pending local write.
+    """
+    restore_packing_evidence(db, payload)
+    fields = ('order_id','kind','document_id','content_hash','path','created_at','file_hash')
+    for table in ('fulfillment_document_history','fulfillment_documents'):
+        for saved in payload.get(table, []):
+            if saved['kind'] != 'packing_list':
+                continue
+            existing = db.execute(f'SELECT 1 FROM {table} WHERE order_id=? AND kind=?' +
+                (' AND document_id=?' if table.endswith('_history') else ''),
+                (saved['order_id'],saved['kind'],saved['document_id']) if table.endswith('_history')
+                else (saved['order_id'],saved['kind'])).fetchone()
+            if existing:
+                continue
+            batch = db.execute('''SELECT pb.id,pl.current_batch_id FROM packing_batches pb
+                JOIN packing_lists pl ON pl.packing_list_id=pb.packing_list_id WHERE pb.id=?''',
+                (saved['document_id'],)).fetchone()
+            if not batch or (table=='fulfillment_documents' and batch['id']!=batch['current_batch_id']):
+                continue
+            content = base64.b64decode(saved.get('pdf_base64') or '', validate=True)
+            if not content or hashlib.sha256(content).hexdigest()!=saved['file_hash']:
+                raise ValueError('Suma kontrolna trwałego dokumentu nie zgadza się.')
+            directory = Path(b.DATA_DIR)/'fulfillment-cache'
+            directory.mkdir(parents=True,exist_ok=True)
+            path = directory/(saved['file_hash']+'.pdf')
+            path.write_bytes(content)
+            source = dict(saved,path=str(path))
+            db.execute(f'INSERT OR IGNORE INTO {table} VALUES(?,?,?,?,?,?,?)',tuple(source[k] for k in fields))
+
+
 def restore(b, oid):
     if not b.supabase_enabled():
         return
@@ -185,7 +222,9 @@ def restore(b, oid):
             else:
                 return  # Keep the explicit unresolved result; never overwrite a competing revision.
         if local and int(local[0]) == int(record['revision']):
+            _repair_missing_packing_documents(b, c, record['payload'])
             _repair_same_revision_files(b, c, record['payload'])
+            restore_inpost_notifications(c, record['payload'])
             c.commit()
             return
         payload = record['payload']
@@ -213,6 +252,7 @@ def restore(b, oid):
                 names = list(source)
                 c.execute(f'INSERT OR REPLACE INTO {table} ({",".join(names)}) VALUES ({",".join("?" for _ in names)})', tuple(source.values()))
         restore_packing_evidence(c, payload)
+        restore_inpost_notifications(c, payload)
         for source in payload.get('fulfillment_document_history', []):
             source = dict(source)
             encoded = source.pop('pdf_base64', None)
@@ -224,7 +264,7 @@ def restore(b, oid):
             directory = Path(b.DATA_DIR) / 'packing-history'
             directory.mkdir(parents=True, exist_ok=True)
             path = directory / (source['file_hash'] + '.pdf')
-            if not path.exists():
+            if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != source['file_hash']:
                 path.write_bytes(content)
             source['path'] = str(path)
             columns = ('order_id','kind','document_id','content_hash','path','created_at','file_hash')
@@ -302,3 +342,37 @@ def restore_packing_evidence(c, payload):
             raise ValueError('Konflikt finalnej zawartości wysyłki.')
         c.execute('INSERT OR IGNORE INTO packing_shipments VALUES(?,?,?,?,?,?)',
                   tuple(source[k] for k in ('shipment_key','packing_list_id','final_batch_id','confirmed_at','carrier','tracking')))
+
+
+RESTORED_NOTICE_UNKNOWN = 'Odtworzono finalną przesyłkę bez trwałego wyniku e-maila. Sprawdź wcześniejszą wysyłkę wiadomości.'
+
+
+def restore_inpost_notifications(db, payload):
+    """Only proven final shipments can restore a receipt; never authorize resend.
+
+    Older payloads have no mail receipt. The final proof is persisted BEFORE any
+    send, so absence of a receipt after cache loss means unknown, not unsent.
+    """
+    saved = {r['shipment_id']: r for r in payload.get('inpost_notifications', [])}
+    fields = ('shipment_id','state','recipient','result_text','updated_at','claim_token','lease_until')
+    terminal = {'accepted','unknown','failed','skipped'}
+    for final in payload.get('packing_shipments', []):
+        if final['carrier'] != 'inpost' or not final['shipment_key'].startswith('inpost:'):
+            continue
+        sid = final['shipment_key'].split(':', 1)[1]
+        local = db.execute('SELECT * FROM inpost_tracking_notifications WHERE shipment_id=?', (sid,)).fetchone()
+        source = saved.get(sid)
+        if source and source['state'] not in terminal | {'sending','pending'}:
+            raise ValueError('Nieobsługiwany stan trwałego powiadomienia InPost.')
+        if local:
+            # Preserve a live local claim or a known outcome. A terminal receipt
+            # from another member takes precedence over pending/legacy unknown.
+            if not (source and source['state'] in terminal | {'sending'} and
+                    (local['state']=='pending' or
+                     (local['state']=='unknown' and local['result_text']==RESTORED_NOTICE_UNKNOWN))):
+                continue
+        if not source:
+            source = dict(shipment_id=sid,state='unknown',recipient='',result_text=RESTORED_NOTICE_UNKNOWN,
+                          updated_at=final['confirmed_at'],claim_token=None,lease_until=0)
+        db.execute('INSERT OR REPLACE INTO inpost_tracking_notifications VALUES(?,?,?,?,?,?,?)',
+                   tuple(source[k] for k in fields))
