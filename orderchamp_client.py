@@ -1,8 +1,9 @@
-"""Isolated, read-only Orderchamp client. No mutation transport is exposed."""
+"""Isolated Orderchamp inventory client; only one stock SET mutation is allowed."""
 from __future__ import annotations
 
 import os
 import time
+import uuid
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
@@ -22,6 +23,13 @@ VARIANT_QUERY = """query StockDryRunVariant($sku: String!) {
       }
       pageInfo { hasNextPage }
     }
+  }
+}"""
+STOCK_SET_MUTATION = """mutation SetOneInventoryLevel($input: InventoryLevelBulkAdjustInput!) {
+  inventoryLevelBulkAdjust(input: $input) {
+    clientMutationId
+    inventoryLevels { id quantity availableQuantity updatedAt }
+    userErrors { field message }
   }
 }"""
 
@@ -210,3 +218,49 @@ class OrderchampClient:
                 "inventory_quantity": _quantity(variant.get("inventoryQuantity")),
                 "inventory_policy": policy, "levels": levels,
                 "levels_complete": not page["hasNextPage"]}
+
+    def set_inventory_level(self, level_id, quantity):
+        """Single SET. Ambiguous transport failure is never retried automatically."""
+        if not isinstance(level_id, str) or not level_id or type(quantity) is not int or not 0 <= quantity <= 2147483647:
+            raise OrderchampError("INVALID_STOCK_SET_INPUT")
+        if self._fatal_error:
+            raise OrderchampError(self._fatal_error)
+        self._sleep(max(0.0, self._next_request - self._monotonic()))
+        self._next_request = self._monotonic() + 0.5
+        self.request_count += 1
+        response = None
+        try:
+            response = self._session.post(API_URL,
+                headers={"Authorization": "Bearer " + self._token, "Accept": "application/json"},
+                json={"query": STOCK_SET_MUTATION, "variables": {"input": {
+                    "clientMutationId": str(uuid.uuid4()), "inventoryLevels": [{
+                        "inventoryLevelId": level_id, "action": "SET", "adjustment": quantity,
+                    }]}}}, timeout=(5, 20), allow_redirects=False)
+            if response.status_code in (401, 403):
+                self._fatal_error = "AUTH_OR_SCOPE_ERROR"
+                raise OrderchampError(self._fatal_error)
+            if response.status_code != 200:
+                raise OrderchampError("MUTATION_OUTCOME_UNKNOWN")
+            try:
+                payload = response.json()
+            except ValueError:
+                raise OrderchampError("MUTATION_OUTCOME_UNKNOWN") from None
+            if not isinstance(payload, dict) or payload.get("errors"):
+                raise OrderchampError("MUTATION_REJECTED")
+            result = (payload.get("data") or {}).get("inventoryLevelBulkAdjust")
+            if not isinstance(result, dict):
+                raise OrderchampError("MUTATION_OUTCOME_UNKNOWN")
+            if result.get("userErrors"):
+                raise OrderchampError("MUTATION_REJECTED")
+            levels = result.get("inventoryLevels")
+            if not isinstance(levels, list) or len(levels) != 1 or not isinstance(levels[0], dict):
+                raise OrderchampError("MUTATION_OUTCOME_UNKNOWN")
+            updated = levels[0]
+            if updated.get("id") != level_id or _quantity(updated.get("quantity")) != quantity:
+                raise OrderchampError("MUTATION_OUTCOME_UNKNOWN")
+            return {"level_id": level_id, "quantity": quantity}
+        except (requests.Timeout, requests.ConnectionError, requests.RequestException):
+            raise OrderchampError("MUTATION_OUTCOME_UNKNOWN") from None
+        finally:
+            if response is not None:
+                response.close()

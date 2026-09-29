@@ -369,7 +369,8 @@ def select(db, data, *, mode='current'):
             return None
         clauses.append('substr(ps.confirmed_at,1,10)=?'); args.append(day)
     where = ' AND '.join(clauses) or '1=1'
-    ordering = 'ps.confirmed_at DESC,ps.shipment_key DESC' if mode == 'shipment' else 'pb.id DESC'
+    ordering = ('ps.confirmed_at DESC,ps.shipment_key DESC' if mode == 'shipment'
+                else 'pb.created_at DESC,pl.packing_list_id DESC')
     rows = db.execute(f'''SELECT DISTINCT {fields} FROM packing_lists pl {join}
                           JOIN packing_allocations pa ON pa.batch_id=pb.id
                           WHERE {where} ORDER BY {ordering}''', args).fetchall()

@@ -3245,7 +3245,7 @@ def ensure_business_operation_freshness(operation_name: str, input_data=None) ->
     if (operation_name == 'inventory.product.search'
             and isinstance(input_data, dict) and input_data.get('physical_only') is True):
         operation_name = 'inventory.product.physical'
-    if operation_name == 'shipment.read':
+    if operation_name in {'shipment.read', 'orders.packing_history.get'}:
         # Shipment identity and invoice contents have their own narrow snapshot.
         # Packing evidence remains an additional, insert-only reconciliation.
         base = ensure_business_operation_freshness('shipment.snapshot')
@@ -9029,7 +9029,8 @@ import remanent_source_routes as _remanent_source_routes
 _remanent_source_routes.register_routes(app, {"conn": conn, "BASE_URL": BASE_URL, "DB_PATH": DB_PATH})
 
 import orderchamp_http as _orderchamp_http
-_orderchamp_http.register_routes(app, lambda: DB_PATH)
+_orderchamp_http.register_routes(app, lambda: DB_PATH,
+    refresh_stock=lambda: _pull_business_freshness_group('inventory') if supabase_enabled() else None)
 
 import search_analytics as _search_analytics
 import sys as _search_sys

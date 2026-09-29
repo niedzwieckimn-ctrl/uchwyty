@@ -14,7 +14,7 @@ from flask import Blueprint, jsonify, render_template, request, session
 
 from internal_rbac import ACTOR_HUMAN, ALLOW, current_actor_context
 from orderchamp_client import API_URL, OrderchampClient, OrderchampError
-from orderchamp_stock_sync import dry_run_stock_sync, read_local_availability
+from orderchamp_stock_sync import dry_run_stock_sync, push_one_stock, read_local_availability
 
 
 class HttpBudget:
@@ -71,6 +71,11 @@ ERROR_STATUS = {
     "HTTP_CLIENT_ERROR": 502, "NETWORK_ERROR": 502,
     "UPSTREAM_UNAVAILABLE": 502, "RATE_LIMITED": 429,
     "RATE_LIMIT_WAIT_TOO_LONG": 429, "REMOTE_SKU_MISMATCH": 502,
+    "STOCK_SET_PRECONDITION_FAILED": 409, "LOCAL_STOCK_CHANGED": 409,
+    "REMOTE_STOCK_SCOPE_UNSAFE": 409, "REMOTE_STOCK_CHANGED_OR_RESERVED": 409,
+    "REMOTE_BELOW_LOCAL_ORDER_RECONCILIATION_REQUIRED": 409,
+    "INVALID_STOCK_SET_INPUT": 400, "MUTATION_REJECTED": 502,
+    "MUTATION_OUTCOME_UNKNOWN": 502, "STOCK_SET_NOT_VERIFIED": 502,
 }
 
 
@@ -100,6 +105,13 @@ def _error(code, status):
                   "error_code": code}, status)
 
 
+def _push_error(code, status):
+    uncertain = code in {'MUTATION_OUTCOME_UNKNOWN', 'STOCK_SET_NOT_VERIFIED'}
+    return _json({'ok': False, 'mode': 'stock_push',
+                  'outcome': 'unknown' if uncertain else 'not_written',
+                  'error_code': code}, status)
+
+
 def _admin_only(function):
     @wraps(function)
     def wrapped(*args, **kwargs):
@@ -127,7 +139,7 @@ def _admin_only(function):
     return wrapped
 
 
-def register_routes(app, db_path):
+def register_routes(app, db_path, *, refresh_stock=None):
     """db_path is a trusted backend callable; callers cannot choose the database."""
     blueprint = Blueprint("orderchamp_diagnostics", __name__)
     busy = threading.Lock()
@@ -236,5 +248,44 @@ def register_routes(app, db_path):
     @_admin_only
     def dry_run():
         return execute("dry_run")
+
+    @blueprint.post("/api/admin/orderchamp/push-one")
+    @_admin_only
+    def push_one():
+        if not request.is_json or request.content_length is None or request.content_length > 2048:
+            return _push_error('INVALID_JSON_BODY', 400)
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict) or set(body) != {'sku', 'expected_local', 'expected_remote_updated_at'}:
+            return _push_error('STOCK_SET_PRECONDITION_FAILED', 409)
+        sku, expected, updated = (body['sku'], body['expected_local'], body['expected_remote_updated_at'])
+        if (not isinstance(sku, str) or not sku or sku != sku.strip() or len(sku) > 256
+                or type(expected) is not int or not 0 <= expected <= 2147483647
+                or not isinstance(updated, str) or not updated or len(updated) > 80):
+            return _push_error('STOCK_SET_PRECONDITION_FAILED', 409)
+        if not busy.acquire(blocking=False):
+            return _push_error('DIAGNOSTIC_BUSY', 409)
+        client = None
+        try:
+            if refresh_stock is None:
+                return _push_error('LOCAL_AVAILABILITY_READ_FAILED', 503)
+            # A write must never use the TTL-based local business snapshot.
+            refresh_stock()
+            client = http_client(HttpBudget(seconds=25))
+            result = push_one_stock(client, db_path(), sku=sku, expected_local=expected,
+                                    expected_remote_updated_at=updated)
+            return _json(result)
+        except OrderchampError as exc:
+            code = exc.code if exc.code in ERROR_STATUS else 'MUTATION_OUTCOME_UNKNOWN'
+            return _push_error(code, ERROR_STATUS.get(code, 502))
+        except Exception:
+            app.logger.warning('ORDERCHAMP_STOCK_PUSH_FAILED')
+            return (_push_error('MUTATION_OUTCOME_UNKNOWN', 502) if client is not None
+                    else _push_error('LOCAL_AVAILABILITY_READ_FAILED', 503))
+        finally:
+            try:
+                if client is not None:
+                    client.close()
+            finally:
+                busy.release()
 
     app.register_blueprint(blueprint)

@@ -13,6 +13,7 @@ from test_orderchamp_stock import client_for, connected, found, missing, Respons
 
 CONNECTION = '/api/admin/orderchamp/test-connection'
 DRY_RUN = '/api/admin/orderchamp/dry-run'
+PUSH = '/api/admin/orderchamp/push-one'
 HEADERS = {'X-CSRF-Token': 'test'}
 
 
@@ -84,6 +85,23 @@ def test_connection_calls_existing_client(owner, monkeypatch):
     assert response.get_json() == {'connected':True, 'products_read':True, 'write_checked':False}
     assert called == [True] and session.closed
     assert response.headers['Cache-Control'] == 'no-store'
+
+
+def test_stock_push_requires_owner_csrf_and_backend_preconditions(owner, monkeypatch):
+    calls = []
+    client, session, _ = use_client(monkeypatch)
+    monkeypatch.setattr(http, 'push_one_stock', lambda supplied_client, path, **kwargs:
+                        calls.append(kwargs) or {'ok': True, 'status': 'VERIFIED', 'wrote': True})
+    body = {'sku': 'CH010-AB-N28', 'expected_local': 24,
+            'expected_remote_updated_at': '2026-09-29T08:00:00Z'}
+    assert owner.post(PUSH, json=body).status_code == 403
+    assert not calls
+    response = owner.post(PUSH, json=body, headers=HEADERS)
+    assert response.status_code == 200
+    assert response.get_json()['status'] == 'VERIFIED'
+    assert calls == [{'sku': body['sku'], 'expected_local': 24,
+                      'expected_remote_updated_at': body['expected_remote_updated_at']}]
+    assert session.closed
 
 
 def test_single_dry_run_reuses_service_no_writes_or_files(owner, monkeypatch):

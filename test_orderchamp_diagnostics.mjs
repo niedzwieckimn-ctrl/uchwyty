@@ -5,7 +5,7 @@ import {test} from 'node:test';
 
 const source = readFileSync(new URL('./static/orderchamp_diagnostics.js', import.meta.url), 'utf8');
 function harness(responses, onFetch) {
-  const elements = Object.fromEntries(['connection','single','all','stop','download','sku','status','result']
+  const elements = Object.fromEntries(['connection','single','all','push','push-all','stop','download','sku','status','result']
     .map(id => [id, {disabled:false, textContent:'', value:'CH010-AB-N28', handlers:{},
       addEventListener(event, handler) {this.handlers[event] = handler;}}]));
   const calls = [];
@@ -60,11 +60,28 @@ test('paged report does not count missing SKU as an API error', async () => {
   ]);
   await h.click('all');
   assert.equal(h.calls.length, 3);
-  assert.deepEqual(h.result().summary,{local_sku:3,matched:2,missing:1,errors:0,synchronized:0});
+  assert.deepEqual(h.result().summary,{local_sku:3,matched:2,missing:1,errors:0,synchronized:0,skipped:0});
   assert.equal(h.result().complete,true);
   assert.deepEqual(JSON.parse(h.calls[1].options.body), {offset:1,limit:1,catalog_version:'v'.repeat(64)});
   await h.click('download');
   assert.equal(JSON.parse(await h.download().text()).summary.missing,1);
+});
+
+test('checked SKU sends only its confirmed stock and remote timestamp', async () => {
+  const row = {status:'MATCHED', sku:'CH010-AB-N28', would_send:5,
+    remote:{inventory_policy:'DENY', inventory_quantity:7, levels_complete:true,
+      levels:[{id:'level-1',is_primary:true,quantity:7,available_quantity:7,
+        updated_at:'2026-09-29T08:00:00Z'}]}};
+  const h = harness([{data:{rows:[row],summary:{errors:0,missing:0}}},
+    {data:{ok:true,status:'VERIFIED',wrote:true,sku:row.sku,quantity:5}}]);
+  await h.click('single');
+  assert.equal(h.elements.push.disabled,false);
+  await h.click('push');
+  assert.equal(h.calls[1].url,'/api/admin/orderchamp/push-one');
+  assert.deepEqual(JSON.parse(h.calls[1].options.body),{
+    sku:row.sku,expected_local:5,expected_remote_updated_at:'2026-09-29T08:00:00Z'});
+  assert.equal(h.result().status,'VERIFIED');
+  assert.equal(h.elements.push.disabled,true);
 });
 
 test('catalog failure preserves partial report and stops requesting', async () => {

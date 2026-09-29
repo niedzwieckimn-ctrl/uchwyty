@@ -125,6 +125,7 @@ _write_success_observer: Callable[[str, Mapping[str, Any]], None] | None = None
 
 FRESHNESS_GROUP_BY_OPERATION = {
     shipment_read.OPERATION: 'shipment',
+    packing_history.OPERATION: 'shipment',
     "business.query": "inventory",
     "business.orders.state": "orders_state", "business.inventory.state": "inventory_state",
     "business.finance.state": "finance_state", "business.deliveries.state": "deliveries_state",

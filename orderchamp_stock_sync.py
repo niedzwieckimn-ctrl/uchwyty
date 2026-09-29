@@ -1,4 +1,4 @@
-"""Stock comparison only; live PUSH is unavailable until sales safety is resolved."""
+"""Stock comparison and guarded one-SKU stock SET."""
 from __future__ import annotations
 
 import sqlite3
@@ -55,8 +55,8 @@ def dry_run_stock_sync(client, db_path, *, sku=None):
         "availability_source": "inventory_analytics.build_replenishment_analysis.available_qty",
         "local_snapshot_at": utc_now(), "local_database": str(Path(db_path).resolve()),
         "writes_enabled": False,
-        "would_send_definition": "local available clamped to zero; not an approved Inventory SET value",
-        "write_blockers": ["STOCK_TARGET_SEMANTICS_UNCONFIRMED", "SALES_RECONCILIATION_NOT_IMPLEMENTED"],
+        "would_send_definition": "local available clamped to zero; SET only for a single unreserved primary level without increasing its current quantity",
+        "write_blockers": [],
         "source_freshness": "local SQLite snapshot; Supabase refresh not triggered",
         "rows": [], "warnings": [],
     }
@@ -67,7 +67,7 @@ def dry_run_stock_sync(client, db_path, *, sku=None):
     for row in sorted(local, key=lambda r: str(r.get("sku") or "")):
         item = {"product_id": row["id"], "sku": row["sku"],
                 "local_available": row["available_qty"], "would_send": None,
-                "status": "ERROR", "warnings": []}
+                "status": "ERROR", "warnings": [], "write_eligible": False}
         try:
             code = row["sku"]
             if not isinstance(code, str) or not code or code != code.strip():
@@ -92,8 +92,17 @@ def dry_run_stock_sync(client, db_path, *, sku=None):
                     item["warnings"].append("REMOTE_QUANTITY_UNKNOWN")
                 elif primary[0]["quantity"] != primary[0]["available_quantity"]:
                     item["warnings"].append("REMOTE_QUANTITY_DIFFERS_FROM_AVAILABLE")
+                elif item["would_send"] is not None and item["would_send"] > primary[0]["quantity"]:
+                    item["warnings"].append("REMOTE_BELOW_LOCAL_ORDER_RECONCILIATION_REQUIRED")
                 if len(variant["levels"]) > 1:
                     item["warnings"].append("MULTIPLE_REMOTE_LOCATIONS")
+                item["write_eligible"] = bool(
+                    variant["inventory_policy"] == "DENY" and variant["levels_complete"]
+                    and len(variant["levels"]) == 1 and primary == variant["levels"]
+                    and primary[0]["quantity"] is not None
+                    and primary[0]["quantity"] == primary[0]["available_quantity"]
+                    and variant["inventory_quantity"] == primary[0]["quantity"]
+                    and item["would_send"] <= primary[0]["quantity"])
         except OrderchampError as exc:
             item["error_code"] = exc.code
         report["rows"].append(item)
@@ -107,3 +116,42 @@ def dry_run_stock_sync(client, db_path, *, sku=None):
     }
     report["completed_at"] = utc_now()
     return report
+
+
+def push_one_stock(client, db_path, *, sku, expected_local, expected_remote_updated_at):
+    """Set exactly one proven, unreserved primary level from a fresh local read.
+
+    A changed local quantity or Orderchamp level makes the prior dry-run stale.
+    A timeout after mutation has an unknown outcome; caller must inspect again.
+    """
+    local = [row for row in read_local_availability(db_path) if row['sku'] == sku]
+    if len(local) != 1 or type(expected_local) is not int or not isinstance(expected_remote_updated_at, str):
+        raise OrderchampError('STOCK_SET_PRECONDITION_FAILED')
+    quantity = _candidate_quantity(local[0]['available_qty'])
+    if quantity != expected_local:
+        raise OrderchampError('LOCAL_STOCK_CHANGED')
+    variant = client.resolve_variant_by_sku(sku)
+    if not variant or not variant['levels_complete'] or len(variant['levels']) != 1:
+        raise OrderchampError('REMOTE_STOCK_SCOPE_UNSAFE')
+    level = variant['levels'][0]
+    if level['is_primary'] is not True or variant['inventory_policy'] != 'DENY':
+        raise OrderchampError('REMOTE_STOCK_SCOPE_UNSAFE')
+    if (level['updated_at'] != expected_remote_updated_at or
+            level['quantity'] is None or level['available_quantity'] is None or
+            level['quantity'] != level['available_quantity'] or
+            variant['inventory_quantity'] != level['quantity']):
+        raise OrderchampError('REMOTE_STOCK_CHANGED_OR_RESERVED')
+    # A lower remote count may reflect a sale not yet reserved locally. A SET
+    # that increases it would silently put the sold units back on sale.
+    if quantity > level['quantity']:
+        raise OrderchampError('REMOTE_BELOW_LOCAL_ORDER_RECONCILIATION_REQUIRED')
+    if level['quantity'] == quantity:
+        return {'ok': True, 'sku': sku, 'quantity': quantity, 'status': 'ALREADY_CURRENT',
+                'wrote': False}
+    client.set_inventory_level(level['id'], quantity)
+    verified = client.resolve_variant_by_sku(sku)
+    if (not verified or not verified['levels_complete'] or len(verified['levels']) != 1 or
+            verified['levels'][0]['id'] != level['id'] or
+            verified['levels'][0]['quantity'] != quantity):
+        raise OrderchampError('STOCK_SET_NOT_VERIFIED')
+    return {'ok': True, 'sku': sku, 'quantity': quantity, 'status': 'VERIFIED', 'wrote': True}

@@ -17,6 +17,131 @@ def initialize(db):
         payload TEXT NOT NULL,PRIMARY KEY(order_id,kind))''')
     db.execute('''CREATE TABLE IF NOT EXISTS fulfillment_reconciliation_pending(order_id INTEGER PRIMARY KEY,
         expected_revision INTEGER NOT NULL,payload TEXT NOT NULL)''')
+    db.execute('''CREATE TABLE IF NOT EXISTS fulfillment_packing_id_map(
+        identity_key TEXT PRIMARY KEY, local_id INTEGER NOT NULL)''')
+
+
+def _remap_packing_ids(db, payload):
+    """Give colliding SQLite-era IDs a local identity without changing durable evidence.
+
+    Separate Render files have each started their AUTOINCREMENT at one. The
+    immutable Supabase snapshots therefore cannot be inserted by bare integer ID.
+    Keep the mapping in the same transaction as the restored evidence so every
+    repeated member snapshot resolves to the same local batch and allocation.
+    """
+    db.execute('''CREATE TABLE IF NOT EXISTS fulfillment_packing_id_map(
+        identity_key TEXT PRIMARY KEY, local_id INTEGER NOT NULL)''')
+    result = dict(payload)
+    for name in ('packing_batches', 'packing_allocations', 'packing_lists',
+                 'packing_shipments', 'fulfillment_documents', 'fulfillment_document_history'):
+        if name in payload:
+            result[name] = [dict(row) for row in payload[name] or []]
+
+    batch_map = {}
+    batches = result.get('packing_batches') or []
+    next_batch = max(
+        int(db.execute('SELECT COALESCE(MAX(id),0) FROM packing_batches').fetchone()[0]),
+        *(int(row['id']) for row in batches),
+    ) + 1
+    rekey_batches = any(
+        (existing := db.execute('SELECT root_order_id,created_at FROM packing_batches WHERE id=?',
+                                (row['id'],)).fetchone()) and
+        (int(existing['root_order_id']) != int(row['root_order_id']) or
+         existing['created_at'] != row['created_at'])
+        for row in batches)
+    assigned_batches = set()
+    for row in sorted(batches, key=lambda item: int(item['id'])):
+        remote_id = int(row['id'])
+        identity = json.dumps(['batch', int(row['root_order_id']), remote_id,
+                               row['created_at']], separators=(',', ':'))
+        saved = db.execute('SELECT local_id FROM fulfillment_packing_id_map WHERE identity_key=?',
+                           (identity,)).fetchone()
+        if saved:
+            local_id = int(saved[0])
+        else:
+            existing = db.execute('SELECT * FROM packing_batches WHERE id=?', (remote_id,)).fetchone()
+            if existing and (int(existing['root_order_id']) != int(row['root_order_id'])
+                             or existing['created_at'] != row['created_at']):
+                matches = db.execute('''SELECT id,packing_list_id FROM packing_batches
+                    WHERE root_order_id=? AND created_at=?''',
+                    (row['root_order_id'], row['created_at'])).fetchall()
+                compatible = [match for match in matches if not (
+                    match['packing_list_id'] and row.get('packing_list_id') and
+                    match['packing_list_id'] != row['packing_list_id'])]
+                if len(compatible) == 1:
+                    local_id = int(compatible[0]['id'])
+                else:
+                    local_id, next_batch = next_batch, next_batch + 1
+            elif remote_id in assigned_batches:
+                raise ValueError('Powtórzony identyfikator różnych batchy w trwałej liście.')
+            elif rekey_batches and not existing:
+                local_id, next_batch = next_batch, next_batch + 1
+            else:
+                local_id = remote_id
+            db.execute('INSERT INTO fulfillment_packing_id_map VALUES(?,?)', (identity, local_id))
+        if remote_id in batch_map and batch_map[remote_id] != local_id:
+            raise ValueError('Niejednoznaczny identyfikator batcha w trwałej liście.')
+        batch_map[remote_id] = local_id
+        assigned_batches.add(local_id)
+        row['id'] = local_id
+    for row in batches:
+        if row.get('previous_batch_id') is not None:
+            row['previous_batch_id'] = batch_map.get(int(row['previous_batch_id']), row['previous_batch_id'])
+
+    allocations = result.get('packing_allocations') or []
+    next_allocation = max(
+        int(db.execute('SELECT COALESCE(MAX(id),0) FROM packing_allocations').fetchone()[0]),
+        *(int(row['id']) for row in allocations),
+    ) + 1
+    rekey_allocations = any(
+        (existing := db.execute('SELECT * FROM packing_allocations WHERE id=?',
+                                (row['id'],)).fetchone()) and
+        any(existing[key] != (batch_map.get(int(row['batch_id'])) if key == 'batch_id'
+                              else row[key]) for key in row if key != 'id')
+        for row in allocations)
+    assigned_allocations = set()
+    for row in sorted(allocations, key=lambda item: int(item['id'])):
+        remote_id, remote_batch = int(row['id']), int(row['batch_id'])
+        if remote_batch not in batch_map:
+            raise ValueError('Alokacja odwołuje się do brakującego trwałego batcha.')
+        row['batch_id'] = batch_map[remote_batch]
+        identity = json.dumps(['allocation', remote_batch, remote_id,
+                               int(row['order_id']), int(row['order_item_id']),
+                               row['created_at']], separators=(',', ':'))
+        saved = db.execute('SELECT local_id FROM fulfillment_packing_id_map WHERE identity_key=?',
+                           (identity,)).fetchone()
+        if saved:
+            local_id = int(saved[0])
+        else:
+            existing = db.execute('SELECT * FROM packing_allocations WHERE id=?', (remote_id,)).fetchone()
+            if existing and any(existing[key] != row[key] for key in row if key != 'id'):
+                fields = [key for key in row if key != 'id']
+                matches = db.execute('SELECT id FROM packing_allocations WHERE ' +
+                    ' AND '.join(f'{key} IS ?' for key in fields),
+                    tuple(row[key] for key in fields)).fetchall()
+                if len(matches) == 1:
+                    local_id = int(matches[0]['id'])
+                else:
+                    local_id, next_allocation = next_allocation, next_allocation + 1
+            elif remote_id in assigned_allocations:
+                raise ValueError('Powtórzony identyfikator różnych alokacji w trwałej liście.')
+            elif rekey_allocations and not existing:
+                local_id, next_allocation = next_allocation, next_allocation + 1
+            else:
+                local_id = remote_id
+            db.execute('INSERT INTO fulfillment_packing_id_map VALUES(?,?)', (identity, local_id))
+        assigned_allocations.add(local_id)
+        row['id'] = local_id
+
+    for row in result.get('packing_lists') or []:
+        row['current_batch_id'] = batch_map.get(int(row['current_batch_id']), row['current_batch_id'])
+    for row in result.get('packing_shipments') or []:
+        row['final_batch_id'] = batch_map.get(int(row['final_batch_id']), row['final_batch_id'])
+    for table in ('fulfillment_documents', 'fulfillment_document_history'):
+        for row in result.get(table) or []:
+            if row.get('kind') == 'packing_list':
+                row['document_id'] = batch_map.get(int(row['document_id']), row['document_id'])
+    return result
 
 
 def local_status(b, db, oid):
@@ -165,7 +290,7 @@ def _repair_missing_packing_documents(b, db, payload):
     immutable evidence/pointers only; never replay other fulfillment state.
     Caller has already excluded a pending local write.
     """
-    restore_packing_evidence(db, payload)
+    restore_packing_evidence(db, payload, already_translated=True)
     fields = ('order_id','kind','document_id','content_hash','path','created_at','file_hash')
     for table in ('fulfillment_document_history','fulfillment_documents'):
         for saved in payload.get(table, []):
@@ -216,18 +341,19 @@ def restore(b, oid):
                 c.execute('''INSERT INTO fulfillment_reconciliation_versions VALUES(?,?)
                     ON CONFLICT(order_id) DO UPDATE SET revision=MAX(revision,excluded.revision)''',
                     (oid, record['revision']))
-                _repair_same_revision_files(b, c, record['payload'])
+                _repair_same_revision_files(b, c, _remap_packing_ids(c, record['payload']))
                 c.commit()
                 return
             else:
                 return  # Keep the explicit unresolved result; never overwrite a competing revision.
         if local and int(local[0]) == int(record['revision']):
-            _repair_missing_packing_documents(b, c, record['payload'])
-            _repair_same_revision_files(b, c, record['payload'])
-            restore_inpost_notifications(c, record['payload'])
+            payload = _remap_packing_ids(c, record['payload'])
+            _repair_missing_packing_documents(b, c, payload)
+            _repair_same_revision_files(b, c, payload)
+            restore_inpost_notifications(c, payload)
             c.commit()
             return
-        payload = record['payload']
+        payload = _remap_packing_ids(c, record['payload'])
         for table in TABLES:
             entries = payload.get(table, [])
             if table not in {'fulfillment_shipping_attempts', 'fulfillment_shipping_members'}:
@@ -251,7 +377,7 @@ def restore(b, oid):
                     raise ValueError('Nieobsługiwana wersja metadanych realizacji.')
                 names = list(source)
                 c.execute(f'INSERT OR REPLACE INTO {table} ({",".join(names)}) VALUES ({",".join("?" for _ in names)})', tuple(source.values()))
-        restore_packing_evidence(c, payload)
+        restore_packing_evidence(c, payload, already_translated=True)
         restore_inpost_notifications(c, payload)
         for source in payload.get('fulfillment_document_history', []):
             source = dict(source)
@@ -281,7 +407,7 @@ def restore(b, oid):
                 c.execute('''INSERT INTO fulfillment_documents VALUES(?,?,?,?,?,?,?)
                     ON CONFLICT(order_id,kind) DO UPDATE SET document_id=excluded.document_id,
                     content_hash=excluded.content_hash,path=excluded.path,created_at=excluded.created_at,file_hash=excluded.file_hash
-                    WHERE fulfillment_documents.document_id<excluded.document_id''', tuple(document[k] for k in names))
+                    WHERE fulfillment_documents.document_id<>excluded.document_id''', tuple(document[k] for k in names))
         c.execute('INSERT OR REPLACE INTO fulfillment_reconciliation_versions VALUES(?,?)', (oid, record['revision']))
         c.commit()
     except Exception:
@@ -291,8 +417,10 @@ def restore(b, oid):
         c.close()
 
 
-def restore_packing_evidence(c, payload):
+def restore_packing_evidence(c, payload, *, already_translated=False):
     """Restore structural evidence only; never delete rows or regenerate a batch."""
+    if not already_translated:
+        payload = _remap_packing_ids(c, payload)
     for table in ('packing_batches', 'packing_allocations'):
         for source in payload.get(table) or []:
             names = list(source)
