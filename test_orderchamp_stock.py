@@ -82,6 +82,57 @@ def found(sku, **kwargs):
     return Response({"data": {"productVariantBySku": variant(sku, **kwargs)}})
 
 
+def no_orders():
+    return Response({"data": {"orders": {"totalCount": 0, "nodes": []}}})
+
+
+def stock_set(sku, quantity):
+    return Response({"data": {"inventoryLevelBulkAdjust": {
+        "clientMutationId": "test", "userErrors": [],
+        "inventoryLevels": [{"id": "level-" + sku, "quantity": quantity,
+                              "availableQuantity": quantity,
+                              "updatedAt": "2026-09-29T08:01:00Z"}]}}})
+
+
+def test_initial_seed_requires_zero_orders_and_fresh_zero_level(tmp_path):
+    path, _ = database(tmp_path)
+    client, session, _ = client_for(found('A', quantity=0, available=0), no_orders(),
+                                    found('A', quantity=0, available=0), stock_set('A', 24),
+                                    found('A', quantity=24, available=24))
+    result = sync.push_one_stock(client, path, sku='A', expected_local=24,
+                                 expected_remote_updated_at='2026-09-29T08:00:00Z',
+                                 initial_seed=True)
+    assert result['wrote'] is True and result['status'] == 'VERIFIED'
+    assert len(session.calls) == 5
+    assert session.calls[1][1]['json']['query'].startswith('query StockSalesProbe')
+    assert session.calls[3][1]['json']['query'].startswith('mutation SetOneInventoryLevel')
+
+
+def test_initial_seed_never_writes_with_existing_orders(tmp_path):
+    path, _ = database(tmp_path)
+    orders = Response({"data": {"orders": {"totalCount": 1, "nodes": [{
+        "id": "order-1", "createdAt": "2026-09-29T08:00:00Z",
+        "updatedAt": "2026-09-29T08:00:00Z", "status": "PENDING",
+        "isConfirmed": False, "isCancelled": False}]}}})
+    client, session, _ = client_for(found('A', quantity=0, available=0), orders)
+    with pytest.raises(OrderchampError, match='INITIAL_SEED_ORDERS_PRESENT'):
+        sync.push_one_stock(client, path, sku='A', expected_local=24,
+                            expected_remote_updated_at='2026-09-29T08:00:00Z',
+                            initial_seed=True)
+    assert len(session.calls) == 2
+
+
+def test_initial_seed_never_writes_when_remote_zero_changes(tmp_path):
+    path, _ = database(tmp_path)
+    client, session, _ = client_for(found('A', quantity=0, available=0), no_orders(),
+                                    found('A', quantity=1, available=1))
+    with pytest.raises(OrderchampError, match='REMOTE_STOCK_CHANGED_OR_RESERVED'):
+        sync.push_one_stock(client, path, sku='A', expected_local=24,
+                            expected_remote_updated_at='2026-09-29T08:00:00Z',
+                            initial_seed=True)
+    assert len(session.calls) == 3
+
+
 def missing():
     return Response({"data": {"productVariantBySku": None}})
 
