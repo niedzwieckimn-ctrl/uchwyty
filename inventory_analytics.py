@@ -18,10 +18,7 @@ from panel_performance import SQLiteReadCache
 _analysis_cache = SQLiteReadCache()
 
 
-ACTIVE_ORDER_STATUSES = {
-    "new", "pending", "unconfirmed", "confirmed", "packed", "packed_partial",
-    "in_delivery", "shipped", "partially_shipped"
-}
+from stock_availability import ACTIVE_ORDER_STATUSES, read_stock_availability
 # ``planned`` jest szkicem P/O, a nie potwierdzonym zakupem. Nie może jeszcze
 # zwiększać dostępności ani obniżać rekomendacji zakupowych.
 INCOMING_PACKAGE_STATUSES = {"ordered", "shipped", "problem"}
@@ -159,32 +156,8 @@ def _calculate_replenishment_analysis(conn_factory, today: date | None = None, h
 
     c = conn_factory()
     cur = c.cursor()
-    cur.execute("""
-      SELECT p.id, p.sku, p.model, p.name, p.ean, COALESCE(s.qty,0) AS stock_qty
-      FROM products p
-      LEFT JOIN stock s ON s.product_id=p.id
-      WHERE COALESCE(p.archived,0)=0
-      ORDER BY p.sku
-    """)
-    products = [dict(row) for row in cur.fetchall()]
-
-    active_statuses = tuple(sorted(ACTIVE_ORDER_STATUSES))
-    active_placeholders = ",".join("?" for _ in active_statuses)
-    cur.execute(f"""
-      SELECT oi.product_id,
-             COALESCE(SUM(MAX(0, oi.qty - COALESCE(a.allocated_qty,0))),0) AS reserved_qty
-      FROM order_items oi
-      JOIN orders o ON o.id=oi.order_id
-      LEFT JOIN (
-        SELECT order_item_id, SUM(qty) AS allocated_qty
-        FROM invoice_allocations
-        GROUP BY order_item_id
-      ) a ON a.order_item_id=oi.id
-      WHERE COALESCE(o.warehouse_issued,0)=0
-        AND lower(COALESCE(o.status,'')) IN ({active_placeholders})
-      GROUP BY oi.product_id
-    """, active_statuses)
-    reservations = {int(row["product_id"]): int(row["reserved_qty"] or 0) for row in cur.fetchall()}
+    products = read_stock_availability(c)
+    reservations = {int(row["id"]): row["reserved_qty"] for row in products}
 
     incoming_statuses = tuple(sorted(INCOMING_PACKAGE_STATUSES))
     incoming_placeholders = ",".join("?" for _ in incoming_statuses)

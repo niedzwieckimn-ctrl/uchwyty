@@ -1,0 +1,65 @@
+// Run using locally installed @electric-sql/pglite; never connects to Supabase.
+const { PGlite } = await import(process.env.ORDERCHAMP_PGLITE_MODULE || '@electric-sql/pglite');
+import { readFileSync } from 'node:fs';
+import assert from 'node:assert/strict';
+const db=new PGlite();
+process.on('uncaughtException',error=>{console.error(error.message,error.where||'');process.exit(1);});
+await db.exec(`CREATE ROLE anon; CREATE ROLE authenticated; CREATE ROLE service_role;
+CREATE TABLE products(id bigserial primary key,sku text not null,archived boolean not null default false);
+CREATE TABLE stock(product_id bigint primary key references products(id),qty integer not null);
+CREATE TABLE customers(id bigserial primary key,name text not null,address text,phone text,email text,nip text,price_list text,created_at text not null);
+CREATE TABLE orders(id bigserial primary key,order_no text unique not null,customer_id bigint references customers(id),customer_name text not null,customer_address text,customer_phone text,customer_email text,status text not null,note text,created_at text not null,warehouse_issued integer default 0,currency text,price_list text,tracking_no text);
+CREATE TABLE order_items(id bigserial primary key,order_id bigint not null references orders(id),product_id bigint not null references products(id),sku text not null,qty integer not null,unit_net_price numeric(12,2),unit_gross_price numeric(12,2),currency text,created_at text not null);
+CREATE TABLE invoice_allocations(id bigserial primary key,order_item_id bigint references order_items(id),qty integer);
+INSERT INTO products(sku) VALUES('A'),('B');INSERT INTO stock VALUES(1,24),(2,0);`);
+await db.exec(readFileSync(new URL('./sql/orderchamp_sync_v2.sql',import.meta.url),'utf8'));
+// Installation is idempotent; it must not enable a job or change inventory.
+await db.exec(readFileSync(new URL('./sql/orderchamp_sync_v2.sql',import.meta.url),'utf8'));
+const value=async(sql,args=[]) => (await db.query(sql,args)).rows[0].value;
+const token='00000000-0000-0000-0000-000000000001';
+const control=(action,data={})=>value('select orderchamp_job_v2($1,$2,$3) as value',[action,token,JSON.stringify(data)]);
+const snapshot=()=>value('select orderchamp_availability_v2() as value');
+const importOrder=orders=>value('select orderchamp_import_v2($1,$2) as value',[token,JSON.stringify(orders)]);
+const source={id:'remote1',number:'ORD1',company:'Real Buyer',email:'buyer@example.test',phone:'',vat_number:'PL123',currency:'PLN',billing_address:'Address',shipping_address:'Delivery',created_at:'2026-09-29T23:00:00Z',updated_at:'2026-09-30T00:00:00Z',cancelled:false,items:[{line_id:'line1',sku:'A',qty:3,unshipped_qty:3,unit_net:'10.00',unit_gross:'12.30'}]};
+assert.equal((await control('status')).enabled,false);
+assert.equal((await snapshot()).rows[0].available_qty,24);
+await control('queue');assert.deepEqual(await control('claim'),{only_sku:null});
+assert.equal(await value('select orderchamp_job_v2($1,$2) as value',['claim','00000000-0000-0000-0000-000000000002']),null);
+const inserted=await importOrder([source]);
+assert.equal(inserted.order_ids.length,1);
+assert.equal(inserted.customers[0].nip,'PL123');
+assert.equal(inserted.order_items[0].unit_net_price,10);
+let rows=(await snapshot()).rows;
+assert.equal(rows[0].available_qty,21);assert.equal(rows[0].oc_ordered,3);assert.equal(rows[0].oc_unshipped,3);
+assert.equal((await importOrder([source])).changed_count,0);
+assert.equal((await db.query('select count(*)::int as n from orders')).rows[0].n,1);
+const cancelled={...source,cancelled:true,updated_at:'2026-09-30T00:01:00Z'};
+await importOrder([cancelled]);assert.equal((await snapshot()).rows[0].available_qty,24);
+await importOrder([{...source,updated_at:'2026-09-30T00:02:00Z'}]);
+await db.exec(`INSERT INTO invoice_allocations(order_item_id,qty) SELECT id,1 FROM order_items;
+UPDATE stock SET qty=23 WHERE product_id=1;`);
+rows=(await snapshot()).rows;
+assert.equal(rows[0].available_qty,21); // issued one + reservation remaining two
+assert.equal(rows[0].oc_ordered,3); // basis unaffected by local invoicing
+await assert.rejects(importOrder([{...cancelled,updated_at:'2026-09-30T00:03:00Z'}]),/ORDER_ALREADY_IN_FULFILLMENT/);
+assert.equal((await snapshot()).rows[0].available_qty,21);
+const bad={...source,id:'bad',items:[{...source.items[0],sku:'unknown'}]};
+await assert.rejects(importOrder([{...source,id:'first-of-batch'},bad]));
+assert.equal((await db.query('select count(*)::int as n from orders')).rows[0].n,1); // whole RPC rolled back
+await control('save',{intent:{id:'unknown',at:'2026-01-01T00:00:00Z',rows:[{sku:'A',delta:3}]},anchors:{A:{basis:24},B:{basis:0}}});
+await db.exec("UPDATE orderchamp_sync_job SET lease_until=now()-interval '1 minute'");
+assert.equal(await control('claim'),null);
+assert.equal((await control('status')).review_required,true);
+await assert.rejects(control('queue'),/ORDERCHAMP_REVIEW_REQUIRED/);
+await control('reconcile');
+assert.equal((await control('status')).review_required,false);
+const reclaimed=await control('claim');assert.equal(reclaimed.anchors.A,undefined);assert.equal(reclaimed.anchors.B.basis,0);
+await db.exec('SET ROLE anon');
+await assert.rejects(snapshot(),/permission denied/);
+await assert.rejects(db.query('select * from orderchamp_order_links'),/permission denied/);
+await db.exec('RESET ROLE; SET ROLE service_role');assert.equal((await snapshot()).rows.length,2);
+await control('release',{});await control('queue',{only_sku:'B'});
+assert.equal((await control('claim')).only_sku,'B');
+await control('release',{only_sku:'B'});await control('enable');
+assert.equal((await control('claim')).only_sku,null);
+await db.close();console.log('PostgreSQL integration checks passed (isolated PGlite).');

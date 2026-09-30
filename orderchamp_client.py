@@ -62,6 +62,7 @@ def _string(value):
 
 
 class OrderchampClient:
+    read_queries = ()
     def __init__(self, token: str, api_url: str = API_URL, *, session=None,
                  sleep=time.sleep, monotonic=time.monotonic):
         if not token or any(ord(c) < 33 or ord(c) > 126 for c in token):
@@ -110,7 +111,7 @@ class OrderchampClient:
 
     def _read(self, query, variables):
         # Exact allowlist: dry run cannot submit arbitrary GraphQL or mutations.
-        if query not in (CONNECTION_QUERY, VARIANT_QUERY, ORDERS_PROBE_QUERY):
+        if query not in (CONNECTION_QUERY, VARIANT_QUERY, ORDERS_PROBE_QUERY, *self.read_queries):
             raise OrderchampError("READ_QUERY_NOT_ALLOWED")
         if self._fatal_error:
             raise OrderchampError(self._fatal_error)
