@@ -1,0 +1,1 @@
+-- Read-only preflight; exact packaged SQL is added in the following commit.
