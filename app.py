@@ -5928,6 +5928,7 @@ BASE = r"""
           <a href="{{ url_for('pricing') }}">Cennik</a>
           <a href="{{ url_for('company') }}">Dane mojej firmy</a>
           <a href="{{ url_for('cash_flow') }}">Cash flow</a>
+          <a href="{{ url_for('orderchamp_sync_v2.page') }}">Orderchamp</a>
           <a href="{{ url_for('email_test') }}">Test maili</a>
         </div>
       </div>
