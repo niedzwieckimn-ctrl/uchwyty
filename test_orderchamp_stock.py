@@ -323,13 +323,12 @@ def test_corrupt_database_is_error(tmp_path):
 
 def test_engine_connection_is_read_only_and_in_transaction(tmp_path, monkeypatch):
     path, _ = database(tmp_path)
-    def engine(factory):
-        connection = factory()
+    def engine(connection, sku=None):
         assert connection.in_transaction
         with pytest.raises(sqlite3.OperationalError, match="readonly"):
             connection.execute("UPDATE stock SET qty=0")
         return []
-    monkeypatch.setattr(sync, "build_replenishment_analysis", engine)
+    monkeypatch.setattr(sync, "read_stock_availability", engine)
     assert sync.read_local_availability(path) == []
 
 

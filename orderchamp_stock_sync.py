@@ -6,7 +6,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
-from inventory_analytics import build_replenishment_analysis
+from stock_availability import read_stock_availability
 from orderchamp_client import OrderchampError
 
 
@@ -14,7 +14,7 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def read_local_availability(db_path):
+def read_local_availability(db_path, sku=None):
     """Reuse the /stock engine inside a short, read-only SQLite snapshot."""
     path = Path(db_path).resolve()
     if not path.is_file():
@@ -26,7 +26,7 @@ def read_local_availability(db_path):
         connection.execute("PRAGMA query_only=ON")
         connection.execute("BEGIN")
         # The engine closes the connection before returning. Finally also covers errors.
-        rows = build_replenishment_analysis(lambda: connection)
+        rows = read_stock_availability(connection, sku=sku)
         return [{key: row[key] for key in ("id", "sku", "available_qty")} for row in rows]
     except (sqlite3.Error, KeyError, TypeError, ValueError, OverflowError):
         raise OrderchampError("LOCAL_AVAILABILITY_READ_FAILED") from None

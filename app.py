@@ -5781,6 +5781,8 @@ def security_gate():
     path = request.path
     if path == '/health/ksef-worker' and request.method in {'GET', 'HEAD'}:
         return None  # Liveness only; no invoice data, no scheduler trigger.
+    if path in {"/api/internal/orderchamp/tick", "/webhooks/orderchamp"}:
+        return None  # Dedicated Bearer / HMAC validation in the endpoint.
     if path in {"/webhooks/17track", "/webhooks/inpost"}:
         # Endpointy webhooków nie korzystają z sesji. 17TRACK sprawdza podpis,
         # a InPost dodatkowo potwierdza stan przesyłki swoim API przed zapisem.
@@ -6468,7 +6470,10 @@ def auto_sync_after_write(response):
         no_auto_sync_paths = {
             "/api/client_search_log", "/api/client_order_email", "/api/client/profile", "/searches/action"
         }
-        if response.status_code < 400 and request.method in ("POST", "PUT", "PATCH", "DELETE") and request.path not in no_auto_sync_paths:
+        if (response.status_code < 400 and request.method in ("POST", "PUT", "PATCH", "DELETE")
+                and request.path not in no_auto_sync_paths
+                and not request.path.startswith("/api/admin/orderchamp/")
+                and request.path not in {"/api/internal/orderchamp/tick", "/webhooks/orderchamp"}):
             trigger_background_supabase_sync(reason=f"{request.method} {request.path}")
     except Exception:
         pass
@@ -9028,9 +9033,8 @@ _remanent.register_routes(app, {"conn": conn, "BASE_URL": BASE_URL, "DB_PATH": D
 import remanent_source_routes as _remanent_source_routes
 _remanent_source_routes.register_routes(app, {"conn": conn, "BASE_URL": BASE_URL, "DB_PATH": DB_PATH})
 
-import orderchamp_http as _orderchamp_http
-_orderchamp_http.register_routes(app, lambda: DB_PATH,
-    refresh_stock=lambda: _pull_business_freshness_group('inventory') if supabase_enabled() else None)
+import orderchamp_sync_http as _orderchamp_sync_http
+_orderchamp_sync_http.register_routes(app, globals())
 
 import search_analytics as _search_analytics
 import sys as _search_sys
