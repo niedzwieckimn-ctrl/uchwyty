@@ -1,6 +1,7 @@
 """Mechanically extracted Flask routes; business logic is unchanged."""
 
 from pathlib import Path
+from orderchamp_invoice import saved_tax_context
 
 INVOICES_LIST_TEMPLATE = (Path(__file__).resolve().parent.parent / "templates" / "invoices_list.html").read_text(encoding="utf-8")
 
@@ -50,6 +51,22 @@ def register_routes(context):
         if not o:
             c.close()
             abort(404)
+        from orderchamp_invoice import context_for_order, reviewed_form, needs_price_review
+        try:
+            oc_context = context_for_order(o, supabase_request)
+            if oc_context:
+                oc_context['billing_requires_price_review'] = needs_price_review(oc_context)
+        except Exception:
+            c.close()
+            abort(503, description="Nie można odczytać danych fakturowych Orderchamp. Spróbuj ponownie.")
+        if (oc_context and request.method == "POST" and request.form.get("submit_action") != "packing"
+                and not reviewed_form(request.form, oc_context)):
+            c.close()
+            abort(400, description="Sprawdź nabywcę, dokumenty Orderchamp i wybierz rodzaj faktury.")
+        if (oc_context and oc_context['billing_requires_price_review'] and request.method == 'POST'
+                and request.form.get('submit_action') != 'packing'):
+            c.close()
+            abort(409, description="Rabaty Orderchamp dają ceny jednostkowe wymagające więcej niż dwóch miejsc po przecinku. Uzgodnij kwoty dokumentu przed wystawieniem; zachowano dokładne kwoty źródłowe.")
         packing_selection = session.get("latest_packing_selection") or load_open_packing_selection(order_id)
         packing_order_ids = {
             to_int(value, 0) for value in packing_selection.get("order_ids", [])
@@ -59,12 +76,13 @@ def register_routes(context):
         # statusu. O dostępności pozycji decydują ilości/alokacje, nie status.
         related_orders = [dict(o)]
         customer_email_key = _email_key(o["customer_email"])
-        if customer_email_key:
+        if customer_email_key and not oc_context:
             status_ph = ",".join(["?"] * len(CURRENT_ORDER_STATUSES))
             cur.execute(f"""
               SELECT *
               FROM orders
               WHERE LOWER(COALESCE(customer_email,'')) = ?
+                AND order_no NOT LIKE 'OC-%'
                 AND LOWER(COALESCE(status,'')) IN ({status_ph})
               ORDER BY created_at DESC, id DESC
             """, (customer_email_key, *sorted(CURRENT_ORDER_STATUSES)))
@@ -73,10 +91,17 @@ def register_routes(context):
                 related_orders.insert(0, dict(o))
 
         missing_packing_ids = packing_order_ids - {int(r["id"]) for r in related_orders}
+        if oc_context and missing_packing_ids:
+            c.close()
+            abort(409, description="Wystaw fakturę dla jednego zamówienia Orderchamp osobno.")
         if missing_packing_ids:
             packing_ph = ",".join(["?"] * len(missing_packing_ids))
             cur.execute(f"SELECT * FROM orders WHERE id IN ({packing_ph})", tuple(sorted(missing_packing_ids)))
-            related_orders.extend(dict(r) for r in cur.fetchall())
+            extra_orders = [dict(r) for r in cur.fetchall()]
+            if any(str(r.get('order_no') or '').startswith('OC-') for r in extra_orders):
+                c.close()
+                abort(409, description="Wystaw fakturę dla zamówienia Orderchamp osobno.")
+            related_orders.extend(extra_orders)
 
         related_order_ids = [int(r["id"]) for r in related_orders] or [-1]
         related_order_by_id = {int(r["id"]): r for r in related_orders}
@@ -181,6 +206,8 @@ def register_routes(context):
         except Exception as exc:
             app.logger.warning("Nie udało się pobrać profilu do faktury order_id=%s: %s", order_id, exc)
             client_profile = {}
+        if oc_context:
+            client_profile = {}  # Preserve imported buyer data until reviewed explicitly.
         buyer_address_source = (
             norm(client_profile.get("address"))
             or (norm(customer_row["address"]) if customer_row and customer_row["address"] else "")
@@ -191,6 +218,10 @@ def register_routes(context):
             norm(client_profile.get("nip"))
             or (norm(customer_row["nip"]) if customer_row and customer_row["nip"] else "")
         )
+        if oc_context:
+            buyer_address_source = oc_context.get("billing_address") or buyer_address_source
+            st, pc, city = split_address(buyer_address_source)
+            buyer_tax_no = oc_context.get("vat_number") or buyer_tax_no
         buyer_address_default = "\n".join([x for x in [st, f"{pc} {city}".strip()] if x]).strip()
 
         msg = ""
@@ -207,7 +238,10 @@ def register_routes(context):
         manual_invoice_no = False
         if request.method == "GET":
             order_currency = normalize_order_currency(o["currency"])
-            auto_type, order_currency, auto_country = automatic_invoice_tax_context(dict(o), buyer_tax_no, "")
+            if oc_context:
+                auto_type, auto_country = "", oc_context.get("billing_country", "")
+            else:
+                auto_type, order_currency, auto_country = automatic_invoice_tax_context(dict(o), buyer_tax_no, "")
             suggested_invoice_no = next_invoice_no(default_issue)
             data = {
                 "invoice_no": suggested_invoice_no,
@@ -216,7 +250,7 @@ def register_routes(context):
                 "sell_date": default_issue,
                 "payment_type": "przelew",
                 "payment_to": (app_now() + timedelta(days=7)).strftime("%Y-%m-%d"),
-                "buyer_name": norm(client_profile.get("name")) or o["customer_name"] or "",
+                "buyer_name": (oc_context.get("company") if oc_context else None) or norm(client_profile.get("name")) or o["customer_name"] or "",
                 "buyer_tax_no": buyer_tax_no,
                 "buyer_address": buyer_address_default,
                 "buyer_country": auto_country or ("" if order_currency == "EUR" else "PL"),
@@ -246,9 +280,10 @@ def register_routes(context):
             auto_type, auto_currency, auto_country = automatic_invoice_tax_context(dict(o), data.get("buyer_tax_no"), data.get("buyer_country"))
             # Zwykły flow jest całkowicie automatyczny: zamówienie z cennika UE
             # zawsze daje WDT/EUR, a kraj pochodzi z prefiksu VAT UE.
-            data["currency"] = auto_currency
-            data["invoice_type"] = auto_type
-            data["buyer_country"] = auto_country
+            if not oc_context:
+                data["currency"] = auto_currency
+                data["invoice_type"] = auto_type
+                data["buyer_country"] = auto_country
             if not data.get("buyer_address"):
                 data["buyer_address"] = buyer_address_default
             st, pc, city = split_address(data.get("buyer_address", ""))
@@ -462,11 +497,26 @@ def register_routes(context):
 
           <div class="card">
             <form method="post" class="row">
-              <input type="hidden" name="invoice_type" value="{{ d['invoice_type'] }}">
+              {% if oc_context %}
+              <div style="grid-column:1/-1" class="hint">
+                <b>Orderchamp — {{ oc_context.number }}</b><br>
+                Sprawdź dokumenty dostępne w Orderchamp, nabywcę, koszty dostawy i podatki.
+                Kwota zamówienia: {{ oc_context.total }} {{ oc_context.currency }}.
+                {% if oc_context.billing_requires_price_review %}<p class="error">Kwoty po rabacie wymagają uzgodnienia: cena jednostkowa ma więcej niż dwa miejsca po przecinku. Wystawienie faktury jest wstrzymane; dokładne wartości źródłowe pozostają zapisane.</p>{% endif %}
+                <label><input type="checkbox" name="oc_billing_reviewed" value="1" required>
+                Sprawdziłem dane i upewniłem się, że wystawiam właściwy dokument bez duplikatu.</label>
+                <label>Rodzaj faktury <select name="invoice_type" required>
+                  <option value="">Wybierz po sprawdzeniu danych</option>
+                  <option value="domestic" {% if d.invoice_type=='domestic' %}selected{% endif %}>Krajowa 23%</option>
+                  <option value="wdt" {% if d.invoice_type=='wdt' %}selected{% endif %}>WDT 0%</option>
+                  <option value="export" {% if d.invoice_type=='export' %}selected{% endif %}>Eksport 0%</option>
+                </select></label>
+              </div>
+              {% else %}<input type="hidden" name="invoice_type" value="{{ d['invoice_type'] }}">{% endif %}
               <input type="hidden" name="currency" value="{{ d['currency'] }}">
               <input type="hidden" name="suggested_invoice_no" value="{{ suggested_invoice_no }}">
               <input type="hidden" id="invoice_no_manual" name="invoice_no_manual" value="{{ '1' if manual_invoice_no else '0' }}">
-              <div><label class="muted small">Rozliczenie</label><div class="hint"><b>{{ 'WDT 0%' if d['invoice_type']=='wdt' else ('Eksport 0%' if d['invoice_type']=='export' else 'Krajowa 23%') }}</b> · {{ d['currency'] }} — ustawione automatycznie z zamówienia</div></div>
+              <div><label class="muted small">Rozliczenie</label><div class="hint"><b>{{ 'WDT 0%' if d['invoice_type']=='wdt' else ('Eksport 0%' if d['invoice_type']=='export' else 'Krajowa 23%') }}</b> · {{ d['currency'] }} — {{ 'wybierz po weryfikacji danych Orderchamp' if oc_context else 'ustawione automatycznie z zamówienia' }}</div></div>
               {% if d['invoice_type'] == 'wdt' %}
                 <div class="hint" style="grid-column:1/-1;">
                   <b>Faktura WDT 0% w EUR.</b> Przed wystawieniem sprawdź aktywny numer VAT UE nabywcy w VIES.
@@ -615,7 +665,7 @@ def register_routes(context):
           </div>
         {% endblock %}
         """
-        return render_template_string(tpl, title="Faktura", base_url=BASE_URL, db_path=DB_PATH, o=o, d=data, company=company, items=items, invoice_rows=invoice_rows, msg=msg, canonical_order_no=canonical_order_no, invoice_from_packing=invoice_from_packing, suggested_invoice_no=suggested_invoice_no, manual_invoice_no=manual_invoice_no)
+        return render_template_string(tpl, title="Faktura", base_url=BASE_URL, db_path=DB_PATH, o=o, oc_context=oc_context, d=data, company=company, items=items, invoice_rows=invoice_rows, msg=msg, canonical_order_no=canonical_order_no, invoice_from_packing=invoice_from_packing, suggested_invoice_no=suggested_invoice_no, manual_invoice_no=manual_invoice_no)
 
 
     @app.route("/orders/<int:order_id>/invoice", methods=["GET", "POST"])
@@ -1208,8 +1258,8 @@ def register_routes(context):
             return "Brak pozycji faktury", 400
 
         meta = invoice_meta_payload(inv)
-        auto_type, auto_currency, auto_country = automatic_invoice_tax_context(
-            dict(o), inv.get("buyer_tax_no"), inv.get("buyer_country")
+        auto_type, auto_currency, auto_country = saved_tax_context(
+            dict(o), inv, automatic_invoice_tax_context
         )
         meta.update(invoice_type=auto_type, currency=auto_currency, buyer_country=auto_country or inv.get("buyer_country"))
         # Starsze błędne PDF-y WDT mogły mieć w JSON ceny z lokalnego cennika PLN.
@@ -1576,8 +1626,8 @@ def register_routes(context):
         order_row = cur.fetchone()
         c.close()
 
-        auto_type, auto_currency, auto_country = automatic_invoice_tax_context(
-            dict(order_row) if order_row else {}, inv.get("buyer_tax_no"), inv.get("buyer_country")
+        auto_type, auto_currency, auto_country = saved_tax_context(
+            dict(order_row) if order_row else {}, inv, automatic_invoice_tax_context
         )
         inv["invoice_type"] = auto_type
         inv["currency"] = auto_currency
@@ -1591,8 +1641,9 @@ def register_routes(context):
                 "buyer_name", "buyer_tax_no", "buyer_address", "buyer_country",
                 "buyer_email", "buyer_phone", "invoice_type", "currency"
             ]}
-            data["invoice_type"], data["currency"], automatic_country = automatic_invoice_tax_context(
-                dict(order_row) if order_row else {}, data.get("buyer_tax_no"), data.get("buyer_country")
+            data["invoice_type"], data["currency"], automatic_country = saved_tax_context(
+                dict(order_row) if order_row else {}, inv, automatic_invoice_tax_context,
+                data.get("buyer_tax_no"), data.get("buyer_country")
             )
             country_aliases = {
                 "DEUTSCHLAND":"DE", "GERMANY":"DE", "NIEMCY":"DE",
@@ -1601,7 +1652,8 @@ def register_routes(context):
             }
             data["buyer_country"] = automatic_country or country_aliases.get(data["buyer_country"].upper(), data["buyer_country"].upper())
             refresh_foreign_prices = (
-                data["invoice_type"] == "wdt" and data["currency"] == "EUR"
+                not str(dict(order_row or {}).get('order_no') or '').startswith('OC-')
+                and data["invoice_type"] == "wdt" and data["currency"] == "EUR"
                 and any(
                     normalize_order_currency(item.get("currency")) != "EUR" or money_float(item.get("net_price")) <= 0
                     for item in edit_items if int(item.get("current_invoice_qty") or 0) > 0
