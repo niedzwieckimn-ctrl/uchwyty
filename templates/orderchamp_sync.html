@@ -1,0 +1,23 @@
+<!doctype html><html lang="pl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="csrf-token" content="{{ session.get('csrf_token','') }}">
+<title>Orderchamp — synchronizacja</title>
+<style>body{font:16px system-ui;background:#f5f6fa;color:#17233c;margin:0}main{max-width:980px;margin:28px auto;background:#fff;padding:24px;border-radius:18px}button{font:inherit;padding:12px;border:1px solid #bfc9df;background:#edf3ff;border-radius:8px;cursor:pointer;margin:4px}button:disabled{opacity:.5}table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:10px;border-bottom:1px solid #dde3ee}.error{color:#b22222}#message{min-height:2em}.muted{color:#58677e}</style>
+<script src="{{ url_for('static',filename='orderchamp_sync.js') }}" defer></script></head>
+<body><main><a href="/">← Powrót do aplikacji</a><h1>Orderchamp</h1>
+<p>Synchronizacja ilości „Dostępne” i rezerwacje zamówień z Orderchamp.</p>
+<p class="muted">Zadanie wykonuje serwer. Możesz zamknąć tę kartę. Faktury wystawiasz osobno po sprawdzeniu danych zamówienia.</p>
+{% if not configured %}<p class="error">Integracja oczekuje na konfigurację. Nie uruchomiono importu ani wysyłki stanów.</p>{% endif %}
+<div><label>Test jednego SKU (opcjonalnie, przy wyłączonym automacie): <input id="only-sku" maxlength="128" placeholder="SKU albo puste dla wszystkich"></label></div>
+<button data-action="queue" {% if not configured %}disabled{% endif %}>Synchronizuj teraz</button>
+<button data-action="compare" {% if not configured %}disabled{% endif %}>Porównaj cały katalog</button>
+<button data-action="enable" {% if not configured %}disabled{% endif %}>Włącz automat dla wszystkich SKU</button>
+<button data-action="pause" {% if not configured %}disabled{% endif %}>Wstrzymaj po bieżącej paczce</button>
+<button data-action="reconcile" disabled>Sprawdź ponownie niepotwierdzony zapis</button>
+<button id="refresh">Odśwież wynik</button>
+<p id="message" role="status" aria-live="polite">Odczytuję stan zadania…</p>
+<p class="muted">Automat sprawdza zmiany co minutę, a zgodność całego katalogu co 15 minut. Czas może się wydłużyć przy uśpieniu serwera lub błędzie połączenia.</p>
+<p id="timing" class="muted"></p>
+<dl><dt>Automat</dt><dd id="enabled">—</dd><dt>Etap</dt><dd id="phase">—</dd><dt>Ostatnie zakończenie</dt><dd id="completed">—</dd><dt>Wysłane zmiany SKU</dt><dd id="changed">—</dd><dt>Zaimportowane zamówienia</dt><dd id="imported">—</dd></dl>
+<h2>Pozycje wymagające uwagi</h2><table><thead><tr><th>SKU</th><th>Powód</th></tr></thead><tbody id="issues"></tbody></table>
+</main></body></html>
