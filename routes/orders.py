@@ -584,6 +584,36 @@ def register_routes(context):
 
 
 
+    @app.get("/orders/<int:order_id>/packing-documents/<file_hash>")
+    def order_saved_packing_document(order_id, file_hash):
+        import hashlib
+        import io
+        import re
+        from pathlib import Path
+        from flask import send_file
+        if not re.fullmatch(r'[0-9a-f]{64}', file_hash):
+            abort(404)
+        c = conn()
+        try:
+            document = c.execute('''SELECT d.path,d.file_hash FROM fulfillment_document_history d
+                WHERE d.order_id=? AND d.kind='packing_list' AND d.file_hash=?
+                AND EXISTS(SELECT 1 FROM packing_allocations a
+                           WHERE a.batch_id=d.document_id AND a.order_id=d.order_id) LIMIT 1''',
+                (order_id, file_hash)).fetchone()
+        finally:
+            c.close()
+        if not document:
+            abort(404)
+        try:
+            content = Path(document['path']).read_bytes()
+        except OSError:
+            return 'Zapisany oryginał listy jest chwilowo niedostępny.', 503
+        if hashlib.sha256(content).hexdigest() != document['file_hash']:
+            return 'Nie udało się potwierdzić oryginału zapisanej listy.', 409
+        return send_file(io.BytesIO(content), mimetype='application/pdf', as_attachment=True,
+                         download_name=f'lista-pakowa-{order_id}-{file_hash[:12]}.pdf')
+
+
     @app.get("/orders/<int:order_id>")
     def order_view(order_id):
         maybe_pull_shared_from_supabase()
@@ -750,6 +780,7 @@ def register_routes(context):
         packing_db = conn()
         try:
             current_package = packing_versions.current_for_order(packing_db, order_id)
+            saved_packing_documents = packing_versions.saved_documents_for_order(packing_db, order_id)
         finally:
             packing_db.close()
         pending_package = bool(current_package and not current_package.get('shipment_confirmed'))
@@ -823,8 +854,11 @@ def register_routes(context):
             <div class="card">
               <div class="panel-title"><span class="panel-icon">▤</span><h2>Dokumenty</h2></div>
               <div class="doc-list">
-                {% if invoice %}<div class="doc-row"><span class="doc-mark">F</span><div><b>Faktura</b><div class="muted">{{ invoice['invoice_no'] }}</div></div><a class="btn" href="{{ url_for('invoice_download_admin', invoice_id=invoice['id']) }}" target="_blank">Pobierz</a></div>{% else %}<div class="doc-row"><span class="doc-mark">F</span><div><b>Faktura</b><div class="muted">Jeszcze niewystawiona</div></div></div>{% endif %}
-                {% if invoice %}<div class="doc-row"><span class="doc-mark">L</span><div><b>Lista pakowa</b><div class="muted">Do faktury {{ invoice['invoice_no'] }}</div></div><a class="btn" href="{{ url_for('invoice_packing_list_download_admin', invoice_id=invoice['id']) }}" target="_blank">Pobierz</a></div>{% endif %}
+                {% if invoice %}<div class="doc-row"><span class="doc-mark">F</span><div><b>Faktura</b><div class="muted">{{ invoice['invoice_no'] }}{% if invoice['publication_state'] != 'complete' %} · zapis niedokończony{% endif %}</div></div>{% if invoice['publication_state'] == 'complete' %}<a class="btn" href="{{ url_for('invoice_download_admin', invoice_id=invoice['id']) }}" target="_blank">Pobierz</a>{% else %}<a class="btn" href="{{ url_for('order_invoice', order_id=o['id']) }}">Dokończ zapis</a>{% endif %}</div>{% else %}<div class="doc-row"><span class="doc-mark">F</span><div><b>Faktura</b><div class="muted">Jeszcze niewystawiona</div></div></div>{% endif %}
+                {% for doc in saved_packing_documents %}
+                <div class="doc-row"><span class="doc-mark">L</span><div><b>Lista pakowa{% if doc['shipped'] %} · wysłana{% elif not doc['is_current'] %} · wcześniejsza wersja{% endif %}</b><div class="muted">{{ doc['created_at'] }}<br>{{ doc['order_count'] }} zamówień · {{ doc['total_qty'] }} szt. w paczce</div></div><a class="btn" href="{{ url_for('order_saved_packing_document', order_id=o['id'], file_hash=doc['file_hash']) }}" target="_blank">Pobierz</a></div>
+                {% endfor %}
+                {% if not saved_packing_documents and invoice and invoice['publication_state'] == 'complete' %}<div class="doc-row"><span class="doc-mark">L</span><div><b>Lista pakowa</b><div class="muted">Do faktury {{ invoice['invoice_no'] }}</div></div><a class="btn" href="{{ url_for('invoice_packing_list_download_admin', invoice_id=invoice['id']) }}" target="_blank">Pobierz</a></div>{% endif %}
                 {% if o['inpost_shipment_id'] %}<div class="doc-row"><span class="doc-mark">E</span><div><b>Etykieta kurierska</b><div class="muted">{{ o['carrier'] or 'InPost' }}</div></div><a class="btn" href="{{ url_for('order_inpost_label', order_id=o['id']) }}">Pobierz</a></div>{% endif %}
               </div>
             </div>
@@ -999,7 +1033,7 @@ def register_routes(context):
           </div>
         {% endblock %}
         """
-        return render_template_string(tpl, title=canonical_order_no(o["id"], o["created_at"], o["order_no"]), base_url=BASE_URL, db_path=DB_PATH, o=o, items=items, open_selection=open_selection, pending_package=pending_package, resume_url=resume_url, invoice=dict(invoice_row) if invoice_row else None, shipment_status=shipment_status, shipment_status_error=shipment_status_error, shipment_state=shipment_state, shipment_work=shipment_work, refresh_result=refresh_result, notice=notice, notice_state=notice_state, shipment_scope=shipment_scope, inpost_status_label=inpost_tracking.status_label, inpost_result_label=inpost_tracking.result_label, inpost_notification_label=inpost_tracking.notification_label, order_url=order_url, products=products_rows, locked=(int(o["warehouse_issued"] or 0)==1), order_status_label=order_status_label, order_status_css=order_status_css, canonical_order_no=canonical_order_no)
+        return render_template_string(tpl, title=canonical_order_no(o["id"], o["created_at"], o["order_no"]), base_url=BASE_URL, db_path=DB_PATH, o=o, items=items, saved_packing_documents=saved_packing_documents, open_selection=open_selection, pending_package=pending_package, resume_url=resume_url, invoice=dict(invoice_row) if invoice_row else None, shipment_status=shipment_status, shipment_status_error=shipment_status_error, shipment_state=shipment_state, shipment_work=shipment_work, refresh_result=refresh_result, notice=notice, notice_state=notice_state, shipment_scope=shipment_scope, inpost_status_label=inpost_tracking.status_label, inpost_result_label=inpost_tracking.result_label, inpost_notification_label=inpost_tracking.notification_label, order_url=order_url, products=products_rows, locked=(int(o["warehouse_issued"] or 0)==1), order_status_label=order_status_label, order_status_css=order_status_css, canonical_order_no=canonical_order_no)
 
 
 

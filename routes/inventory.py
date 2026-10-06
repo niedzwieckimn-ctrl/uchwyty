@@ -311,7 +311,7 @@ def register_routes(context):
         c.close()
         if supabase_enabled():
             try:
-                sync_local_table_to_supabase("pricing", "model")
+                sync_local_rows_to_supabase("pricing", "model", list({row[1] for row in parsed_rows}))
             except Exception:
                 pass
             try:
@@ -360,7 +360,7 @@ def register_routes(context):
 
         if supabase_enabled():
             try:
-                sync_local_table_to_supabase("pricing_eur", "sku")
+                sync_local_rows_to_supabase("pricing_eur", "sku", [row[0] for row in parsed_rows])
             except Exception as exc:
                 error_detail = norm(str(exc))[:600] or type(exc).__name__
                 app.logger.exception("Nie udało się zsynchronizować cennika UE z Supabase")
@@ -762,6 +762,11 @@ def register_routes(context):
         new_qty = cur.fetchone()["qty"]
         c.commit()
         c.close()
+        if supabase_enabled():
+            try:
+                sync_local_rows_to_supabase("stock", "product_id", [pid])
+            except Exception:
+                app.logger.exception("Zmiana stanu zapisana lokalnie; oczekuje na synchronizację")
         return jsonify(ok=True, new_qty=new_qty)
 
 

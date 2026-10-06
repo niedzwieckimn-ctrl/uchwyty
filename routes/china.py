@@ -289,6 +289,7 @@ def register_routes(context):
         c.close()
         if changed_stock_ids:
             sync_china_rows("stock", "product_id", changed_stock_ids)
+            sync_china_rows("china_stock_receipts", "package_id", [package_id])
         sync_china_rows("china_packages", "id", [package_id])
         return redirect(url_for("china"))
 

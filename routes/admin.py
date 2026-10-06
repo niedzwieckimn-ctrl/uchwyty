@@ -215,6 +215,11 @@ def register_routes(context):
         """, (company_name, address, nip, phone, email, bank_account, bank_swift, now_iso()))
         c.commit()
         c.close()
+        if supabase_enabled():
+            try:
+                sync_local_rows_to_supabase("company_profile", "id", [1])
+            except Exception:
+                app.logger.exception("Dane firmy zapisane lokalnie; oczekują na synchronizację")
         return redirect(url_for("company"))
 
 
