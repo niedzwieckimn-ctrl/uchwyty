@@ -5372,14 +5372,19 @@ def save_packing_selection(
 def load_open_packing_selection(root_order_id: int) -> dict:
     c = conn()
     cur = c.cursor()
-    cur.execute(
-        """SELECT id FROM packing_batches
-           WHERE root_order_id=? AND invoice_id IS NULL
-             AND (packing_list_id IS NULL OR id IN (SELECT current_batch_id FROM packing_lists))
-           ORDER BY id DESC LIMIT 1""",
-        (int(root_order_id),),
-    )
-    batch = cur.fetchone()
+    # A combined list can be resumed from ANY member, including a browser
+    # session different from the agent's. The saved current pointer is authority.
+    batch = cur.execute('''SELECT pb.id,pb.root_order_id,pb.invoice_id
+        FROM fulfillment_documents fd JOIN packing_batches pb ON pb.id=fd.document_id
+        JOIN packing_lists pl ON pl.current_batch_id=pb.id AND pl.packing_list_id=pb.packing_list_id
+        WHERE fd.order_id=? AND fd.kind='packing_list' ''', (int(root_order_id),)).fetchone()
+    if batch and batch['invoice_id'] is not None:
+        c.close()
+        return {}
+    if not batch:
+        batch = cur.execute('''SELECT id,root_order_id,invoice_id FROM packing_batches
+            WHERE root_order_id=? AND invoice_id IS NULL AND packing_list_id IS NULL
+            ORDER BY id DESC LIMIT 1''', (int(root_order_id),)).fetchone()
     if not batch:
         c.close()
         return {}
@@ -5392,7 +5397,7 @@ def load_open_packing_selection(root_order_id: int) -> dict:
     c.close()
     return {
         "batch_id": batch_id,
-        "root_order_id": int(root_order_id),
+        "root_order_id": int(batch['root_order_id']),
         "order_ids": sorted({int(row["order_id"]) for row in rows}),
         "items": [[int(row["order_item_id"]), int(row["qty"])] for row in rows],
     }
@@ -5406,6 +5411,8 @@ def consume_packing_selection(batch_id: int, invoice_id: int):
         "UPDATE packing_batches SET invoice_id=? WHERE id=? AND invoice_id IS NULL",
         (int(invoice_id), int(batch_id)),
     )
+    c.execute('''UPDATE packing_lists SET invoice_id=? WHERE current_batch_id=? AND invoice_id IS NULL''',
+              (int(invoice_id), int(batch_id)))
     c.commit()
     c.close()
 

@@ -783,6 +783,53 @@ def finalize_packing_list(
     return batch_id
 
 
+def release_archived_shipping_attempts(c, package_ids):
+    """Release only overlapping, provider-verified previous shipment members.
+
+    Keep the old guard for members not included in this parcel. A SUCCESS is
+    never released just because the selected group or request parameters differ.
+    """
+    from inpost_module import InPostError
+    selected = set(package_ids)
+    marks = ','.join('?' for _ in package_ids)
+    attempts = c.execute(f'''SELECT DISTINCT a.* FROM fulfillment_shipping_attempts a
+        WHERE a.order_id IN ({marks}) OR a.order_id IN (
+            SELECT attempt_order_id FROM fulfillment_shipping_members WHERE order_id IN ({marks}))''',
+        tuple(package_ids + package_ids)).fetchall()
+    for old in attempts:
+        if old['state'] != 'SUCCESS':
+            continue
+        previous_id = str(json.loads(old['provider_json'] or '{}').get('id') or '')
+        original = set(json.loads(old['payload']).get('order_ids') or [old['order_id']])
+        overlap = original & selected
+        if not previous_id or not overlap or not all(
+            c.execute('SELECT 1 FROM inpost_shipment_history WHERE order_id=? AND shipment_id=?',
+                      (member, previous_id)).fetchone()
+            and not c.execute('SELECT 1 FROM orders WHERE id=? AND inpost_shipment_id=?',
+                              (member, previous_id)).fetchone() for member in overlap):
+            continue
+        # The previous cloud-conflict handler copied an old group's attempt onto
+        # the NEW root and linked unrelated members to it. Use its saved payload
+        # as membership authority; preserve the guard for all remaining members.
+        remaining = original - selected
+        owner = int(old['order_id'])
+        c.execute('DELETE FROM fulfillment_shipping_members WHERE attempt_order_id=?', (owner,))
+        if remaining:
+            new_owner = owner if owner in remaining else next((member for member in sorted(remaining)
+                if not c.execute('SELECT 1 FROM fulfillment_shipping_attempts WHERE order_id=?', (member,)).fetchone()), None)
+            if new_owner is None:
+                raise InPostError('Nie można bezpiecznie zachować wcześniejszego nadania pozostałych zamówień.')
+            if new_owner != owner:
+                c.execute('UPDATE fulfillment_shipping_attempts SET order_id=? WHERE order_id=?', (new_owner, owner))
+            for member in sorted(remaining):
+                existing = c.execute('SELECT attempt_order_id FROM fulfillment_shipping_members WHERE order_id=?', (member,)).fetchone()
+                if existing and existing[0] != new_owner:
+                    raise InPostError('Sprzeczne powiązania wcześniejszych nadań. Wymagana kontrola przesyłek.')
+                c.execute('INSERT OR IGNORE INTO fulfillment_shipping_members VALUES(?,?)', (member, new_owner))
+        else:
+            c.execute('DELETE FROM fulfillment_shipping_attempts WHERE order_id=?', (owner,))
+
+
 def safe_create_shipment(oid, recipient, parcel, reference, service, options):
     """Used by UI and the service. A lost POST response can only be reconciled."""
     from inpost_module import InPostError
@@ -791,24 +838,16 @@ def safe_create_shipment(oid, recipient, parcel, reference, service, options):
     c = b.conn()
     try:
         c.execute('BEGIN IMMEDIATE')
+        import packing_versions
+        packing = packing_versions.current_for_order(c, oid)
+        if packing and packing.get('shipment_confirmed'):
+            raise InPostError('Ta lista ma już przypisaną przesyłkę. Sprawdź zapisany numer; nie zamawiaj drugiego kuriera.')
         package_ids = sorted(int(o['id']) for o in b._packed_package_orders(c.cursor(), s['order']))
         payload['order_ids'] = package_ids
+        release_archived_shipping_attempts(c, package_ids)
         marks = ','.join('?' for _ in package_ids)
         old = c.execute(f'''SELECT a.* FROM fulfillment_shipping_attempts a WHERE a.order_id IN ({marks})
             OR a.order_id IN (SELECT attempt_order_id FROM fulfillment_shipping_members WHERE order_id IN ({marks})) LIMIT 1''', tuple(package_ids + package_ids)).fetchone()
-        if old and old['state'] == 'SUCCESS':
-            previous_id = str((json.loads(old['provider_json'] or '{}')).get('id') or '')
-            previous_ids = sorted(json.loads(old['payload']).get('order_ids') or [old['order_id']])
-            # Existing prepare_next archives only provider-verified collected
-            # shipments. That business evidence permits a genuinely new batch.
-            archived = previous_id and previous_ids == package_ids and all(
-                c.execute('SELECT 1 FROM inpost_shipment_history WHERE order_id=? AND shipment_id=?', (member, previous_id)).fetchone()
-                and not c.execute('SELECT 1 FROM orders WHERE id=? AND inpost_shipment_id=?', (member, previous_id)).fetchone()
-                for member in package_ids)
-            if archived:
-                c.execute('DELETE FROM fulfillment_shipping_members WHERE attempt_order_id=?', (old['order_id'],))
-                c.execute('DELETE FROM fulfillment_shipping_attempts WHERE order_id=?', (old['order_id'],))
-                old = None
         if old:
             if old['state'] == 'SUCCESS':
                 if json.loads(old['payload']) != payload or old['content_hash'] != shipment_content(s):
@@ -822,6 +861,7 @@ def safe_create_shipment(oid, recipient, parcel, reference, service, options):
         c.commit()
     finally:
         c.close()
+    carrier_request_started = False
     try:
         if b.supabase_enabled():
             try:
@@ -834,21 +874,31 @@ def safe_create_shipment(oid, recipient, parcel, reference, service, options):
                 raise InPostError('Nie potwierdzono trwałej rezerwacji nadania. Sprawdź migrację fulfillment.')
             saved = claim['claim']
             if not claim.get('acquired'):
-                c = b.conn()
-                c.execute('UPDATE fulfillment_shipping_attempts SET reference=?,payload=?,content_hash=?,state=?,provider_json=?,created_at=? WHERE order_id=?',
-                    (saved['reference'], json.dumps(saved['payload']), saved['content_hash'], saved['state'], json.dumps(saved.get('provider_json')) if saved.get('provider_json') else None, saved['created_at'], oid))
-                c.commit(); c.close()
                 if saved['state'] == 'SUCCESS' and saved.get('provider_json'):
                     if saved['payload'] != payload or saved['content_hash'] != shipment_content(s):
                         raise InPostError('Istnieje wcześniejsze nadanie w chmurze. Zweryfikuj jego zawartość i parametry.')
+                    c = b.conn()
+                    try:
+                        c.execute('UPDATE fulfillment_shipping_attempts SET reference=?,state=?,provider_json=? WHERE order_id=? AND reference=?',
+                            (saved['reference'], 'SUCCESS', json.dumps(saved['provider_json']), oid, stable))
+                        c.commit()
+                    finally:
+                        c.close()
                     return saved['provider_json']
                 raise InPostError('W chmurze istnieje niepewna próba nadania. Wolno tylko sprawdzić jej wynik.')
+        carrier_request_started = True
         result = b.create_courier_shipment(recipient, parcel, stable, service, options)
         if not result.get('id'):
             raise InPostError('Brak identyfikatora przesyłki w odpowiedzi.')
     except Exception:
         c = b.conn()
-        c.execute("UPDATE fulfillment_shipping_attempts SET state='UNKNOWN' WHERE order_id=?", (oid,))
+        if carrier_request_started:
+            c.execute("UPDATE fulfillment_shipping_attempts SET state='UNKNOWN' WHERE order_id=? AND reference=? AND state='SENDING'", (oid, stable))
+        else:
+            # No request reached the carrier. Discard only OUR local reservation;
+            # a possibly acquired cloud claim still prevents a second POST.
+            c.execute('DELETE FROM fulfillment_shipping_members WHERE attempt_order_id=? AND EXISTS(SELECT 1 FROM fulfillment_shipping_attempts WHERE order_id=? AND reference=?)', (oid, oid, stable))
+            c.execute('DELETE FROM fulfillment_shipping_attempts WHERE order_id=? AND reference=?', (oid, stable))
         c.commit()
         c.close()
         raise
