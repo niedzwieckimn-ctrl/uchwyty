@@ -67,7 +67,9 @@ def register_routes(context):
                 and request.form.get('submit_action') != 'packing'):
             c.close()
             abort(409, description="Rabaty Orderchamp dają ceny jednostkowe wymagające więcej niż dwóch miejsc po przecinku. Uzgodnij kwoty dokumentu przed wystawieniem; zachowano dokładne kwoty źródłowe.")
-        packing_selection = session.get("latest_packing_selection") or load_open_packing_selection(order_id)
+        # Cookies from an earlier packing revision must never select quantities
+        # over the saved, current list (the agent has a different session).
+        packing_selection = load_open_packing_selection(order_id)
         packing_order_ids = {
             to_int(value, 0) for value in packing_selection.get("order_ids", [])
             if to_int(value, 0) > 0

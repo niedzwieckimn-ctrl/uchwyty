@@ -745,6 +745,17 @@ def register_routes(context):
         c.close()
 
         order_url = build_public_url(url_for("order_view", order_id=order_id))
+        open_selection = load_open_packing_selection(order_id)
+        import packing_versions
+        packing_db = conn()
+        try:
+            current_package = packing_versions.current_for_order(packing_db, order_id)
+        finally:
+            packing_db.close()
+        pending_package = bool(current_package and not current_package.get('shipment_confirmed'))
+        resume_url = (url_for('order_invoice', order_id=order_id, from_packing='1') if open_selection
+                      else url_for('order_packing_list_download_admin', order_id=order_id, after_invoice='1') if pending_package
+                      else url_for('order_packing_list_download_admin', order_id=order_id))
 
         tpl = r"""
         {% extends "base.html" %}
@@ -772,9 +783,10 @@ def register_routes(context):
               </div>
               <span class="badge {{ order_status_css(o['status']) }}">{{ order_status_label(o['status']) }}</span>
               <div class="order-primary">
-                {% if finished %}<span class="btn ok">Zamówienie zrealizowane</span>
+                {% if pending_package %}<a class="btn primary" href="{{ resume_url }}">{% if open_selection %}Faktura z zapisanej listy →{% else %}Dokończ nadanie →{% endif %}</a>
+                {% elif finished %}<span class="btn ok">Zamówienie zrealizowane</span>
                 {% elif o['inpost_shipment_id'] %}<a class="btn primary" href="{{ url_for('order_inpost_label', order_id=o['id'], bundle='1') }}">Pobierz etykietę</a>
-                {% else %}<a class="btn primary" href="{{ url_for('order_packing_list_download_admin', order_id=o['id']) }}">Kontynuuj realizację →</a>{% endif %}
+                {% else %}<a class="btn primary" href="{{ resume_url }}">{% if open_selection %}Faktura z zapisanej listy →{% else %}Kontynuuj realizację →{% endif %}</a>{% endif %}
               </div>
             </div>
           </div>
@@ -791,7 +803,8 @@ def register_routes(context):
             <div class="card">
               <div class="panel-title"><span class="panel-icon">▣</span><div><h2>Realizacja zamówienia</h2><div class="muted">{{ order_status_label(o['status']) }}</div></div></div>
               <div class="order-actions">
-                {% if not finished %}<a class="btn primary" href="{{ url_for('order_packing_list_download_admin', order_id=o['id']) }}">Kontynuuj realizację →</a>{% endif %}
+                {% if open_selection or not finished %}<a class="btn primary" href="{{ resume_url }}">{% if open_selection %}Faktura z zapisanej listy →{% else %}Kontynuuj realizację →{% endif %}</a>{% endif %}
+                <a class="btn" href="{{ url_for('order_view', order_id=o['id'], manual_shipment='1') }}#manual-shipment">Wpisz numer nadanej przesyłki</a>
                 {% if o['tracking_no'] %}<a class="btn" target="_blank" href="{{ carrier_tracking_url(o['carrier'], o['tracking_no']) }}">Śledź przesyłkę</a>{% endif %}
                 {% if o['inpost_shipment_id'] %}<a class="btn" href="{{ url_for('order_inpost_label', order_id=o['id'], bundle='1') }}">PDF A4 + A6</a>{% endif %}
               </div>
@@ -830,7 +843,7 @@ def register_routes(context):
             </div>
           </div>
 
-          <details class="card more-options">
+          <details class="card more-options" {% if request.args.get('manual_shipment') == '1' %}open{% endif %}>
             <summary class="btn">Więcej opcji ▾</summary>
             <div class="manual-panel">
             <div class="flex">
@@ -862,7 +875,7 @@ def register_routes(context):
                   </form>
               </div>
             </div>
-            <form method="post" action="{{ url_for('order_mark_shipped', order_id=o['id']) }}" class="flex" style="margin-top:14px;padding:14px;border:1px solid #dbe4f2;border-radius:16px;background:#f8fbff;">
+            <form id="manual-shipment" method="post" action="{{ url_for('order_mark_shipped', order_id=o['id']) }}" class="flex" style="margin-top:14px;padding:14px;border:1px solid #dbe4f2;border-radius:16px;background:#f8fbff;">
               <div><b>Wysyłka do klienta</b><div class="muted">Wpisz numer przesyłki i oznacz zamówienie jako wysłane.</div></div>
               {% if o['inpost_shipment_id'] %}
                 <a class="btn primary" href="{{ url_for('order_inpost_label', order_id=o['id'], bundle='1') }}">Pobierz PDF A4 + A6</a>
@@ -875,8 +888,8 @@ def register_routes(context):
                   <option value="{{ carrier_key }}" {% if (o['carrier'] or '')|lower == carrier_key %}selected{% endif %}>{{ carrier_name }}</option>
                 {% endfor %}
               </select>
-              <input name="tracking_no" value="{{ o['tracking_no'] or '' }}" placeholder="Numer śledzenia" required style="min-width:260px;">
-              <label style="display:flex;align-items:center;gap:7px;"><input type="checkbox" name="notify_customer" value="1" checked> Wyślij e-mail klientowi</label>
+              <input name="tracking_no" value="{{ '' if pending_package else (o['tracking_no'] or '') }}" placeholder="Numer aktualnej przesyłki" required style="min-width:260px;">
+              <label style="display:flex;align-items:center;gap:7px;"><input type="checkbox" name="notify_customer" value="1"> Wyślij e-mail klientowi</label>
               <button class="btn primary" type="submit">Wysłane</button>
               {% if o['tracking_no'] %}<a class="btn" target="_blank" href="{{ carrier_tracking_url(o['carrier'], o['tracking_no']) }}">Śledź</a>{% endif %}
             </form>
@@ -986,7 +999,7 @@ def register_routes(context):
           </div>
         {% endblock %}
         """
-        return render_template_string(tpl, title=canonical_order_no(o["id"], o["created_at"], o["order_no"]), base_url=BASE_URL, db_path=DB_PATH, o=o, items=items, invoice=dict(invoice_row) if invoice_row else None, shipment_status=shipment_status, shipment_status_error=shipment_status_error, shipment_state=shipment_state, shipment_work=shipment_work, refresh_result=refresh_result, notice=notice, notice_state=notice_state, shipment_scope=shipment_scope, inpost_status_label=inpost_tracking.status_label, inpost_result_label=inpost_tracking.result_label, inpost_notification_label=inpost_tracking.notification_label, order_url=order_url, products=products_rows, locked=(int(o["warehouse_issued"] or 0)==1), order_status_label=order_status_label, order_status_css=order_status_css, canonical_order_no=canonical_order_no)
+        return render_template_string(tpl, title=canonical_order_no(o["id"], o["created_at"], o["order_no"]), base_url=BASE_URL, db_path=DB_PATH, o=o, items=items, open_selection=open_selection, pending_package=pending_package, resume_url=resume_url, invoice=dict(invoice_row) if invoice_row else None, shipment_status=shipment_status, shipment_status_error=shipment_status_error, shipment_state=shipment_state, shipment_work=shipment_work, refresh_result=refresh_result, notice=notice, notice_state=notice_state, shipment_scope=shipment_scope, inpost_status_label=inpost_tracking.status_label, inpost_result_label=inpost_tracking.result_label, inpost_notification_label=inpost_tracking.notification_label, order_url=order_url, products=products_rows, locked=(int(o["warehouse_issued"] or 0)==1), order_status_label=order_status_label, order_status_css=order_status_css, canonical_order_no=canonical_order_no)
 
 
 

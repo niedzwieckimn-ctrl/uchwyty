@@ -106,6 +106,17 @@ def register_routes(context):
         cfg = inpost_config_summary()
         bundle = request.form.get("bundle") == "1" or request.args.get("bundle") == "1"
         error = norm(request.args.get("inpost_error"))
+        if request.method == 'POST' and request.form.get('submit_action') == 'prepare_next_shipment':
+            import inpost_history, sys
+            try:
+                backend = sys.modules.get('app') or sys.modules['__main__']
+                inpost_history.prepare_current_package(backend, order_id)
+                return redirect(url_for('order_inpost_create', order_id=order_id, prepared='1'))
+            except (ValueError, InPostError) as exc:
+                error = str(exc)
+            except Exception:
+                app.logger.exception('INPOST_PREPARE_NEXT order_id=%s', order_id)
+                error = 'Nie udało się potwierdzić wcześniejszego nadania. Sprawdź wynik przed ponowieniem.'
         structured_package_error = None
         if structured and request.method == "POST" and not norm(order.get("inpost_shipment_id")):
             # The controlled operation ships the actual current parcel. An old
@@ -133,7 +144,7 @@ def register_routes(context):
                 if (linked_invoice and linked_invoice['invoice_id']
                         and linked_invoice['publication_state'] != 'complete'):
                     structured_package_error = 'Dokończ istniejącą fakturę przypisaną do tej paczki przed nadaniem.'
-        if request.method == "POST":
+        if request.method == "POST" and request.form.get('submit_action') != 'prepare_next_shipment':
             if not cfg["configured"]:
                 error = "Brak konfiguracji InPost na Renderze: " + ", ".join(cfg["missing"])
             elif norm(order.get("inpost_shipment_id")):
@@ -241,6 +252,8 @@ def register_routes(context):
             {% if created and o.inpost_shipment_id %}<div class="hint" style="border-color:#a7e8cf;background:#edfbf6;color:#17684e;margin-bottom:15px;"><b>Przesyłka InPost została utworzona. Stan podjazdu jest pokazany poniżej.</b>{% if o.tracking_no %} Numer: <b>{{ o.tracking_no }}</b>.{% else %} InPost przygotowuje jeszcze numer przesyłki.{% endif %} PDF pobierzesz przyciskiem poniżej.</div>{% endif %}
             {% if pickup %}<div class="hint"><b>{{ pickup.label }}</b>{% if pickup.dispatch_id %} — ID {{ pickup.dispatch_id }}{% endif %}{% if pickup.external_id %}, numer {{ pickup.external_id }}{% endif %}{% if pickup.error %}<p>{{ pickup.error }}</p>{% endif %}<a class="btn" href="{{ url_for('inpost_dispatch_order') }}">Podjazdy i dane odbioru</a></div>{% endif %}
             {% if error %}<div class="hint" style="border-color:#fecaca;background:#fff1f2;margin-bottom:15px;">{{ error }}</div>{% endif %}
+            {% if prepared %}<div class="hint">Poprzednie nadania zachowano w historii. Aktualna lista pakowa i faktura pozostają bez zmian. Możesz teraz nadać tę paczkę.</div>{% endif %}
+            {% if previous_shipments %}<div class="hint"><b>Część zamówień ma wcześniejsze nadanie.</b> Jeśli pakujesz kolejną dostawę, potwierdź zakończenie poprzedniego etapu. Aplikacja sprawdzi odbiór przez InPost i zachowa stare etykiety w historii. Lista pakowa nie zostanie wysłana ponownie.<form method="post"><button class="btn" name="submit_action" value="prepare_next_shipment" type="submit">Przygotuj kolejne nadanie dla tej listy</button></form></div>{% endif %}
             {% if not cfg.configured %}<div class="hint">Dodaj na Renderze zmienną <b>INPOST_API_TOKEN</b>. ID organizacji aplikacja pobierze automatycznie.</div>{% endif %}
             {% if o.inpost_shipment_id %}<div class="flex"><span class="badge">Przesyłka już utworzona</span><a class="btn primary" href="{{ url_for('order_inpost_label', order_id=o.id, bundle='1' if bundle else None) }}">{% if bundle %}Pobierz listę A4 + etykietę A6 (PDF){% else %}Pobierz etykietę A6 (PDF){% endif %}</a><a class="btn" href="{{ url_for('order_view', order_id=o.id) }}">Wróć do zamówienia</a></div>{% else %}
             <form method="post" class="row">
@@ -262,7 +275,7 @@ def register_routes(context):
         {% endblock %}
         """
         labels = [canonical_order_no(item["id"], item["created_at"], item["order_no"]) for item in package_orders]
-        return render_template_string(tpl, title="Etykieta InPost", base_url=BASE_URL, db_path=DB_PATH, o=order, cfg=cfg, error=error, package_labels=labels, bundle=bundle, created=just_created, pickup=inpost_pickup_status(order.get("inpost_shipment_id")))
+        return render_template_string(tpl, title="Etykieta InPost", base_url=BASE_URL, db_path=DB_PATH, o=order, cfg=cfg, error=error, package_labels=labels, bundle=bundle, created=just_created, pickup=inpost_pickup_status(order.get("inpost_shipment_id")), previous_shipments=any(item.get('inpost_shipment_id') for item in package_orders), prepared=request.args.get('prepared') == '1')
 
 
     @app.route("/orders/<int:order_id>/inpost", methods=["GET", "POST"])
@@ -396,7 +409,7 @@ def register_routes(context):
         import packing_versions, sys
         tracking_no = re.sub(r"\s+", "", norm(request.form.get("tracking_no")))
         carrier = norm(request.form.get("carrier")).lower()
-        notify_customer = request.form.get("notify_customer", "1") == "1"
+        notify_customer = request.form.get("notify_customer") == "1"
         if not tracking_no or len(tracking_no) > 120:
             return "Podaj poprawny numer przesyłki", 400
 
@@ -404,6 +417,12 @@ def register_routes(context):
             return "Wybierz poprawnego kuriera", 400
 
         maybe_pull_shared_from_supabase(force=True)
+        backend = sys.modules.get('app') or sys.modules['__main__']
+        try:
+            packing_versions.prepare_write_evidence(backend, [order_id])
+        except Exception:
+            app.logger.exception('MANUAL_SHIPMENT_RECONCILIATION order_id=%s', order_id)
+            return 'Nie potwierdzono zapisu bieżącej listy. Nie zmieniono przesyłki; ponów po sprawdzeniu połączenia.', 503
         c = conn()
         try:
             cur = c.cursor()
@@ -415,10 +434,14 @@ def register_routes(context):
             backend = sys.modules.get('app') or sys.modules['__main__']
             c.execute('BEGIN IMMEDIATE')
             version_before = packing_versions.current_for_order(c, order_id)
-            shipment_key = carrier + ':' + (str(order.get('inpost_shipment_id') or '') if carrier == 'inpost' and order.get('inpost_shipment_id') else tracking_no)
+            # A manually entered number identifies THIS shipment. A stale
+            # InPost ID on an older partial order must not select the old parcel.
+            shipment_key = carrier + ':' + tracking_no
             prior = c.execute('SELECT * FROM packing_shipments WHERE shipment_key=? OR (carrier=? AND tracking=?)',
                               (shipment_key, carrier, tracking_no)).fetchone()
             if prior:
+                if version_before and int(version_before['batch_id']) != int(prior['final_batch_id']):
+                    raise packing_versions.PackingConflict('Ten numer należy do wcześniejszej paczki. Wpisz numer aktualnej przesyłki.')
                 shipment_key = prior['shipment_key']
             packing = (packing_versions.batch_result(c, prior['final_batch_id'], mode='final') if prior else
                        packing_versions.ensure_current_for_shipment(backend, c, order_id))
@@ -435,6 +458,20 @@ def register_routes(context):
             packing_versions.confirm_shipment(c, batch_id=packing['batch_id'],
                 shipment_key=shipment_key, confirmed_at=shipped_at,
                 carrier=carrier, tracking=tracking_no, order_ids=package_order_ids)
+            previous_shipping_ids = {}
+            for member in package_orders:
+                old_id = str(member.get('inpost_shipment_id') or '')
+                if old_id and (carrier != 'inpost' or norm(member.get('tracking_no')) != tracking_no):
+                    # Keep a durable audit of the replaced pointer. This is NOT
+                    # provider collection evidence and does not release API claims.
+                    previous_shipping_ids[member['id']] = old_id
+                    proof = {'previous': {key: member.get(key) for key in
+                        ('inpost_shipment_id','tracking_no','carrier','shipped_at','inpost_label_format')},
+                        'shipment_key': shipment_key, 'batch_id': packing['batch_id'], 'recorded_at': shipped_at}
+                    c.execute('INSERT OR IGNORE INTO fulfillment_verifications VALUES(?,?,?)',
+                        (member['id'], 'external_shipment:' + shipment_key, json.dumps(proof)))
+                    c.execute("UPDATE orders SET inpost_shipment_id='',inpost_label_format='' WHERE id=? AND inpost_shipment_id=?",
+                              (member['id'], old_id))
             packing_versions.stage_evidence(backend, c, package_order_ids,
                 allow_replace=not version_before and not prior)
             # Status wysyłki nie zmienia magazynu. Stan schodzi dopiero podczas
@@ -467,6 +504,10 @@ def register_routes(context):
                 # opcjonalnego modułu mogłaby odrzucić PATCH i po kolejnym pullu
                 # cofnąć status oraz tracking do wartości sprzed wysyłki.
                 for package_order in package_orders:
+                    pointer_clear = ({'inpost_shipment_id': '', 'inpost_label_format': ''}
+                                     if package_order['id'] in previous_shipping_ids else {})
+                    pointer_filter = ({'inpost_shipment_id': [previous_shipping_ids[package_order['id']], '']}
+                                      if pointer_clear else {})
                     supabase_update_rows(
                         "orders",
                         {
@@ -475,8 +516,9 @@ def register_routes(context):
                             "carrier": carrier,
                             "shipped_at": shipped_at,
                             "warehouse_issued": int(package_order.get("warehouse_issued") or 0),
+                            **pointer_clear,
                         },
-                        {"id": int(package_order["id"])},
+                        {"id": int(package_order["id"]), **pointer_filter},
                     )
             except Exception as exc:
                 app.logger.exception("Nie udało się zsynchronizować wysyłki zamówienia %s: %s", order_id, exc)
@@ -485,6 +527,8 @@ def register_routes(context):
                     shipment_email_error="Nie zapisano statusu wysyłki w chmurze. E-mail nie został ponownie wysłany. Spróbuj ponownie po sprawdzeniu połączenia.",
                 ))
 
+        if not notify_customer:
+            return redirect(url_for('order_view', order_id=order_id, shipment_sent='1', notification_skipped='1'))
         try:
             result = _send_orders_shipped_email(package_orders, tracking_no, carrier, packing_attachment)
         except Exception as exc:
@@ -539,10 +583,10 @@ def register_routes(context):
                   <p class="muted">Uzupełnij dane paczki, utwórz etykietę A6 i zamów podjazd kuriera.</p>
                   <div class="carrier-action"><span class="btn primary">Wybierz InPost →</span></div>
                 </a>
-                <a class="card carrier-option other" href="{{ url_for('order_view', order_id=order_id) }}">
-                  <div class="carrier-option-head"><span class="carrier-icon">↗</span><h2>Inny przewoźnik</h2></div>
-                  <p class="muted">Wróć do zamówienia i wpisz numer nadania innego przewoźnika ręcznie.</p>
-                  <div class="carrier-action"><span class="btn">Inny przewoźnik →</span></div>
+                <a class="card carrier-option other" href="{{ url_for('order_view', order_id=order_id, manual_shipment='1') }}#manual-shipment">
+                  <div class="carrier-option-head"><span class="carrier-icon">↗</span><h2>Przesyłka już nadana</h2></div>
+                  <p class="muted">Wpisz numer przesyłki nadanej poza aplikacją — także InPost. Nie zamówisz kolejnego kuriera.</p>
+                  <div class="carrier-action"><span class="btn">Podłącz numer przesyłki →</span></div>
                 </a>
               </div>
             {% endblock %}
