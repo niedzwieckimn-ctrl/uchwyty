@@ -640,6 +640,35 @@ def register_routes(context):
             packed_item["qty"] = pack_qty
             items.append(packed_item)
 
+        def render_selection(message=None, status=200):
+            tpl = r"""
+            {% extends "base.html" %}{% block content %}
+              <div class="card">
+                <div class="flex"><div><h1 style="margin:0 0 8px;">Wybierz zawartość paczki</h1>
+                  <div class="muted">Po zatwierdzeniu przejdziesz do faktury z wybranymi pozycjami. Wybór kuriera nastąpi po jej wystawieniu.</div>
+                </div><a class="btn right" href="{{ url_for('order_view', order_id=order_id) }}">← Zamówienie</a></div>
+              </div>
+              {% if packing_error %}<div class="card" role="alert"><h2>Nie zakończono zapisu listy pakowej</h2><p>{{ packing_error }}</p><p>Wybrane ilości pozostają w formularzu poniżej.</p></div>{% endif %}
+              <div class="card"><form method="post">
+                <input type="hidden" name="carrier" value="{{ carrier }}">
+                <table><thead><tr><th>Zamówienie</th><th>Notatka</th><th>SKU</th><th>Model / nazwa</th><th>Zamówiono</th><th>Dostępne do paczki</th><th>Pakuj</th></tr></thead><tbody>
+                {% for item in rows %}<tr>
+                  <td><b>{{ item.source_order_no }}</b></td><td>{{ item.source_order_note or '-' }}</td>
+                  <td><b>{{ item.sku }}</b></td><td>{{ item.model or item.name or '' }}</td>
+                  <td>{{ item.qty }}</td><td>{{ item.max_pack_qty }}</td>
+                  <td><input type="number" min="0" max="{{ item.max_pack_qty }}" name="pack_qty_{{ item.id }}" value="{{ item.selected_pack_qty }}" style="width:110px;"></td>
+                </tr>{% endfor %}</tbody></table>
+                <button class="btn primary" type="submit" style="margin-top:16px;">
+                  Dalej: sprawdź fakturę
+                </button>
+              </form></div>
+            {% endblock %}
+            """
+            return render_template_string(
+                tpl, title="Zawartość paczki", base_url=BASE_URL, db_path=DB_PATH,
+                rows=selection_rows, carrier=selected_carrier, order_id=order_id, packing_error=message,
+            ), status
+
         if request.method == "GET":
             if structured:
                 preview_items = [
@@ -669,32 +698,7 @@ def register_routes(context):
                     "items": preview_items,
                     "total_quantity": sum(int(item["pack_qty"]) for item in preview_items),
                 }
-            tpl = r"""
-            {% extends "base.html" %}{% block content %}
-              <div class="card">
-                <div class="flex"><div><h1 style="margin:0 0 8px;">Wybierz zawartość paczki</h1>
-                  <div class="muted">Po zatwierdzeniu przejdziesz do faktury z wybranymi pozycjami. Wybór kuriera nastąpi po jej wystawieniu.</div>
-                </div><a class="btn right" href="{{ url_for('order_view', order_id=order_id) }}">← Zamówienie</a></div>
-              </div>
-              <div class="card"><form method="post">
-                <input type="hidden" name="carrier" value="{{ carrier }}">
-                <table><thead><tr><th>Zamówienie</th><th>Notatka</th><th>SKU</th><th>Model / nazwa</th><th>Zamówiono</th><th>Dostępne do paczki</th><th>Pakuj</th></tr></thead><tbody>
-                {% for item in rows %}<tr>
-                  <td><b>{{ item.source_order_no }}</b></td><td>{{ item.source_order_note or '-' }}</td>
-                  <td><b>{{ item.sku }}</b></td><td>{{ item.model or item.name or '' }}</td>
-                  <td>{{ item.qty }}</td><td>{{ item.max_pack_qty }}</td>
-                  <td><input type="number" min="0" max="{{ item.max_pack_qty }}" name="pack_qty_{{ item.id }}" value="{{ item.selected_pack_qty }}" style="width:110px;"></td>
-                </tr>{% endfor %}</tbody></table>
-                <button class="btn primary" type="submit" style="margin-top:16px;">
-                  Dalej: sprawdź fakturę
-                </button>
-              </form></div>
-            {% endblock %}
-            """
-            return render_template_string(
-                tpl, title="Zawartość paczki", base_url=BASE_URL, db_path=DB_PATH,
-                rows=selection_rows, carrier=selected_carrier, order_id=order_id,
-            )
+            return render_selection()
 
         # Dopiero zatwierdzenie formularza zapisuje status pakowania.
         if not items:
@@ -730,14 +734,26 @@ def register_routes(context):
                 'expected_current': expected_current,
             }
 
-        # PDF is prepared first.  The batch, allocations and statuses then use
-        # one transaction, so a later DB error cannot leave a completed status
-        # without a durable packing selection.
+        import sys
+        import reconciliation_store
+        backend = sys.modules.get('app') or sys.modules['__main__']
+        # Reconcile earlier writes before taking the SQLite write lock. The
+        # aggregate includes secondary/removed members, not only the URL order.
+        try:
+            packing_versions.prepare_write_evidence(backend, [order_id, *packed_order_ids])
+        except Exception as exc:
+            app.logger.warning('PACKING_RECONCILIATION_PREPARE order_id=%s error=%s', order_id, exc)
+            return render_selection(
+                'Nie udało się dokończyć wcześniejszego zapisu danych realizacji. '
+                'Nowa lista nie została zapisana. Ponów zapis; jeśli komunikat wróci, '
+                'wcześniejszy zapis wymaga sprawdzenia.',
+                409 if isinstance(exc, ValueError) else 503)
+
+        # Publish batch, allocations, documents and statuses atomically. Keep
+        # the pending-write guard active for a write racing the preflight.
         packing_db = conn()
         try:
             packing_db.execute("BEGIN IMMEDIATE")
-            import sys
-            backend = sys.modules.get('app') or sys.modules['__main__']
             packing_state["batch_id"] = packing_versions.publish(
                 backend, packing_db, order_id, items, pack_path,
                 expected_current=expected_current)
@@ -748,13 +764,26 @@ def register_routes(context):
             )
             pack_path = packing_versions.batch_result(packing_db, packing_state['batch_id'])['document_path']
             packing_db.commit()
+        except (packing_versions.PackingConflict, reconciliation_store.ReconciliationPending) as exc:
+            packing_db.rollback()
+            app.logger.warning('PACKING_RECONCILIATION_CONFLICT order_id=%s error=%s', order_id, exc)
+            return render_selection('Dane realizacji zmieniły się podczas zapisu. '
+                                    'Nowa lista nie została zapisana. Sprawdź wybór i ponów zapis.', 409)
         except Exception:
             packing_db.rollback()
             raise
         finally:
             packing_db.close()
         session["latest_packing_selection"] = packing_state
-        packing_versions.sync_evidence(backend, packed_order_ids)
+        try:
+            packing_versions.sync_evidence(backend, packed_order_ids)
+        except Exception as exc:
+            app.logger.warning('PACKING_RECONCILIATION_PUBLISH order_id=%s batch_id=%s error=%s',
+                               order_id, packing_state['batch_id'], exc)
+            return render_selection('Lista jest zapisana lokalnie, ale jej synchronizacja nie została potwierdzona. '
+                                    'Ponów zapis z tymi samymi ilościami, aby dokończyć tę listę. '
+                                    'Faktura nie została jeszcze wystawiona.',
+                                    409 if isinstance(exc, ValueError) else 503)
         complete_orders_packed_side_effects(packing_result, packing_path=pack_path)
         if structured:
             return {'ok': True, 'path': pack_path, 'batch_id': packing_state['batch_id'], 'order_ids': packed_order_ids}
