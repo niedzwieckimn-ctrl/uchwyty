@@ -1325,6 +1325,17 @@ def register_routes(context):
         if not inv:
             return "Nie znaleziono faktury", 404
 
+        items = invoice_items_from_saved_json(invoice_id)
+        if not items:
+            return "Brak pozycji faktury", 400
+        backend = sys.modules.get('app') or sys.modules['__main__']
+        order_ids = sorted({int(inv['order_id'])} | {
+            int(item.get('source_order_id') or item.get('order_id') or inv['order_id']) for item in items})
+        try:
+            packing_versions.prepare_write_evidence(backend, order_ids)
+        except ValueError as exc:
+            return str(exc), 409
+
         c = conn()
         cur = c.cursor()
         cur.execute("SELECT * FROM orders WHERE id=?", (inv["order_id"],))
@@ -1334,10 +1345,6 @@ def register_routes(context):
         c.close()
         if not o:
             return "Brak powiÄ…zanego zamĂłwienia", 404
-
-        items = invoice_items_from_saved_json(invoice_id)
-        if not items:
-            return "Brak pozycji faktury", 400
 
         meta = invoice_meta_payload(inv)
         auto_type, auto_currency, auto_country = saved_tax_context(
@@ -1354,7 +1361,6 @@ def register_routes(context):
             if corrected:
                 items = corrected
         pdf_path, total_net, total_gross = generate_order_invoice_pdf(o, items, meta)
-        backend = sys.modules.get('app') or sys.modules['__main__']
         try:
             packing_versions.publish_invoice(backend, invoice_id, items, None, expected_current=expected_batch)
         except packing_versions.PackingConflict as exc:
