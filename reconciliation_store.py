@@ -177,8 +177,8 @@ def _save(b, oid, revision, payload):
         c.close()
 
 
-def retry_pending(b, oid):
-    restore(b, oid)
+def retry_pending(b, oid, *, packing_only=False):
+    restore(b, oid, allow_packing_extension=packing_only)
     c = b.conn()
     try:
         pending = c.execute('SELECT * FROM fulfillment_reconciliation_pending WHERE order_id=?', (oid,)).fetchone()
@@ -186,6 +186,138 @@ def retry_pending(b, oid):
         c.close()
     if pending:
         _save(b, oid, pending['expected_revision'], json.loads(pending['payload']))
+
+
+def _extends_open_packing(remote, pending):
+    """Permit only a proven append to an open list, never last-writer-wins.
+
+    Both payloads use the local ID mapping. Every durable history row must
+    survive byte-for-byte; all non-packing state must be identical. A changed
+    current pointer must follow the original batch's explicit revision chain.
+    """
+    changing = {'packing_lists', 'packing_batches', 'packing_allocations',
+                'fulfillment_document_history', 'fulfillment_documents'}
+    def encoded(value):
+        return json.dumps(value, sort_keys=True, separators=(',', ':'))
+    def rows(value):
+        return sorted(encoded(row) for row in value or [])
+    for name in (set(remote) | set(pending)) - changing:
+        a, z = remote.get(name, []), pending.get(name, [])
+        different = rows(a) != rows(z) if isinstance(a, list) and isinstance(z, list) else a != z
+        if different:
+            return False
+    for name in ('packing_batches', 'packing_allocations', 'fulfillment_document_history'):
+        old, new = rows(remote.get(name)), rows(pending.get(name))
+        if len(new) != len(set(new)) or not set(old).issubset(new):
+            return False
+    old_lists = {r['packing_list_id']: r for r in remote.get('packing_lists', [])}
+    new_lists = {r['packing_list_id']: r for r in pending.get('packing_lists', [])}
+    if not old_lists or not old_lists.keys() <= new_lists.keys():
+        return False
+    batches = {r['id']: r for r in pending.get('packing_batches', [])}
+    if len(batches) != len(pending.get('packing_batches', [])):
+        return False
+    finalized = {r['packing_list_id'] for r in remote.get('packing_shipments', [])}
+    advanced = set()
+    for key, old in old_lists.items():
+        new = new_lists[key]
+        if old == new:
+            continue
+        if (old.get('invoice_id') or new.get('invoice_id') or key in finalized
+                or {k: v for k, v in old.items() if k not in {'revision', 'current_batch_id'}}
+                != {k: v for k, v in new.items() if k not in {'revision', 'current_batch_id'}}):
+            return False
+        steps = int(new['revision']) - int(old['revision'])
+        if steps <= 0 or steps > len(batches):
+            return False
+        cursor, seen = new['current_batch_id'], set()
+        for _ in range(steps):
+            batch = batches.get(cursor)
+            if (not batch or cursor in seen or batch['packing_list_id'] != key
+                    or batch.get('invoice_id') or cursor == old['current_batch_id']):
+                return False
+            seen.add(cursor)
+            cursor = batch.get('previous_batch_id')
+        if cursor != old['current_batch_id']:
+            return False
+        advanced.add(key)
+    # An incomplete cache can have created a separate open list. Accept that
+    # append only with a complete new chain and every older list unchanged.
+    added_lists = new_lists.keys() - old_lists.keys()
+    for key in added_lists:
+        logical = new_lists[key]
+        steps = int(logical['revision'])
+        cursor, seen = logical['current_batch_id'], set()
+        if logical.get('invoice_id') or steps <= 0 or steps > len(batches):
+            return False
+        for _ in range(steps):
+            batch = batches.get(cursor)
+            if (not batch or cursor in seen or batch['packing_list_id'] != key or batch.get('invoice_id')):
+                return False
+            seen.add(cursor)
+            cursor = batch.get('previous_batch_id')
+        if cursor is not None:
+            return False
+        advanced.add(key)
+    if not advanced:
+        return False
+    old_batch_ids = {r['id'] for r in remote.get('packing_batches', [])}
+    added_batches = set(batches) - old_batch_ids
+    if any(batches[bid]['packing_list_id'] not in advanced or batches[bid].get('invoice_id')
+           for bid in added_batches):
+        return False
+    old_allocations = set(rows(remote.get('packing_allocations')))
+    if any(encoded(r) not in old_allocations and r['batch_id'] not in added_batches
+           for r in pending.get('packing_allocations', [])):
+        return False
+    old_docs, new_docs = remote.get('fulfillment_documents', []), pending.get('fulfillment_documents', [])
+    if rows([d for d in old_docs if d['kind'] != 'packing_list']) != rows(
+            [d for d in new_docs if d['kind'] != 'packing_list']):
+        return False
+    history = set(rows(pending.get('fulfillment_document_history')))
+    for doc in old_docs + new_docs:
+        if doc['kind'] != 'packing_list':
+            continue
+        batch = batches.get(doc['document_id'])
+        if not batch or encoded(doc) not in history:
+            return False
+        logical = new_lists.get(batch['packing_list_id'])
+        if not logical:
+            return False
+    for doc in new_docs:
+        if doc['kind'] == 'packing_list':
+            batch = batches[doc['document_id']]
+            if new_lists[batch['packing_list_id']]['current_batch_id'] != doc['document_id']:
+                return False
+    # A removed member may lose its current pointer only on the advanced list.
+    for doc in old_docs:
+        if doc['kind'] == 'packing_list' and doc not in new_docs:
+            old_key = batches[doc['document_id']]['packing_list_id']
+            if old_key not in advanced:
+                replacement = next((d for d in new_docs if d['kind'] == 'packing_list'
+                                    and d['order_id'] == doc['order_id']), None)
+                if (old_lists[old_key].get('invoice_id') or old_key in finalized or not replacement
+                        or batches[replacement['document_id']]['packing_list_id'] not in added_lists):
+                    return False
+    return True
+
+
+def _merge_packing_history(remote, pending):
+    """Add missing immutable remote evidence; refuse identity/content conflicts."""
+    merged = dict(pending)
+    for name, keys in (
+            ('packing_batches', ('id',)), ('packing_allocations', ('id',)),
+            ('fulfillment_document_history', ('order_id', 'kind', 'document_id'))):
+        entries = {tuple(r[k] for k in keys): r for r in pending.get(name, [])}
+        if len(entries) != len(pending.get(name, [])):
+            return None
+        for row in remote.get(name, []):
+            identity = tuple(row[k] for k in keys)
+            if identity in entries and entries[identity] != row:
+                return None
+            entries[identity] = row
+        merged[name] = list(entries.values())
+    return merged if _extends_open_packing(remote, merged) else None
 
 
 def stage(b, oid, connection=None, allow_replace=False):
@@ -324,7 +456,7 @@ def _repair_missing_packing_documents(b, db, payload):
             db.execute(f'INSERT OR IGNORE INTO {table} VALUES(?,?,?,?,?,?,?)',tuple(source[k] for k in fields))
 
 
-def restore(b, oid):
+def restore(b, oid, *, allow_packing_extension=False):
     if not b.supabase_enabled():
         return
     rows = b.supabase_request('/rest/v1/fulfillment_reconciliation', params={'order_id': 'eq.' + str(oid), 'select': 'revision,payload'})
@@ -351,6 +483,20 @@ def restore(b, oid):
                 c.commit()
                 return
             else:
+                if allow_packing_extension and int(record['revision']) > int(pending['expected_revision']):
+                    durable = _remap_packing_ids(c, record['payload'])
+                    merged = _merge_packing_history(durable, json.loads(pending['payload']))
+                    if merged is not None:
+                        # Restore omitted immutable history before advancing the
+                        # CAS base. Current selection and other domain data stay intact.
+                        _repair_missing_packing_documents(b, c, durable)
+                        _repair_same_revision_files(b, c, durable)
+                        c.execute('''UPDATE fulfillment_reconciliation_pending SET expected_revision=?,payload=?
+                            WHERE order_id=? AND expected_revision=? AND payload=?''',
+                            (record['revision'], json.dumps(merged), oid, pending['expected_revision'], pending['payload']))
+                        c.commit()
+                        b.app.logger.info('PACKING_RECONCILIATION_REBASE order_id=%s from_revision=%s to_revision=%s',
+                                          oid, pending['expected_revision'], record['revision'])
                 return  # Keep the explicit unresolved result; never overwrite a competing revision.
         if local and int(local[0]) == int(record['revision']):
             payload = _remap_packing_ids(c, record['payload'])

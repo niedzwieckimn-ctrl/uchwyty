@@ -731,6 +731,8 @@ def finalize_packing_list(
     path = prepared['path']
     items = prepared['items']
     order_ids = sorted({int(value) for value in prepared['order_ids']})
+    import packing_versions
+    packing_versions.prepare_write_evidence(b, [root_order_id, *order_ids])
     db = b.conn()
     try:
         db.execute('BEGIN IMMEDIATE')

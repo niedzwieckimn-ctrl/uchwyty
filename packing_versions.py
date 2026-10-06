@@ -243,9 +243,9 @@ def sync_evidence(b, order_ids):
 def prepare_write_evidence(b, order_ids):
     """Finish earlier metadata writes before opening the local write transaction.
 
-    Fetch only pending affected order snapshots, once each. retry_pending preserves the
-    CAS revision and recognizes a saved payload whose acknowledgement was lost.
-    Never replace a pending payload with the newly selected packing contents.
+    Check revision numbers in one small, filtered request. Fetch full snapshots
+    only where this cache is behind. A pending open-list extension can advance
+    its CAS base only after proving it preserves all durable history.
     """
     if not b.supabase_enabled():
         return
@@ -259,10 +259,26 @@ def prepare_write_evidence(b, order_ids):
         db.close()
     for oid in pending:
         try:
-            reconciliation_store.retry_pending(b, oid)
+            reconciliation_store.retry_pending(b, oid, packing_only=True)
         except Exception:
             b.app.logger.warning('PACKING_RECONCILIATION_MEMBER order_id=%s', oid, exc_info=True)
             raise
+    clean = [oid for oid in members if oid not in pending]
+    if clean:
+        versions = b.supabase_request('/rest/v1/fulfillment_reconciliation', params={
+            'order_id': 'in.(' + ','.join(map(str, clean)) + ')', 'select': 'order_id,revision'})
+        if not isinstance(versions, list):
+            raise PackingConflict('Nie można potwierdzić wersji wcześniejszej listy pakowej.')
+        db = b.conn()
+        try:
+            stale = [int(row['order_id']) for row in versions
+                     if int(row['order_id']) in clean and int(row['revision']) > int((db.execute(
+                         'SELECT revision FROM fulfillment_reconciliation_versions WHERE order_id=?',
+                         (row['order_id'],)).fetchone() or [0])[0])]
+        finally:
+            db.close()
+        for oid in stale:
+            reconciliation_store.restore(b, oid)
     db = b.conn()
     try:
         # A restored snapshot can reveal additional historical members. Do not
