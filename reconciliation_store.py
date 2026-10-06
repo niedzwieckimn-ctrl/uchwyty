@@ -11,6 +11,12 @@ TABLES = {
 }
 
 
+class ReconciliationPending(ValueError):
+    def __init__(self, order_id):
+        self.order_id = int(order_id)
+        super().__init__('Najpierw uzgodnij wcześniejszy zapis metadanych.')
+
+
 def initialize(db):
     db.execute('CREATE TABLE IF NOT EXISTS fulfillment_reconciliation_versions(order_id INTEGER PRIMARY KEY, revision INTEGER NOT NULL)')
     db.execute('''CREATE TABLE IF NOT EXISTS fulfillment_verifications(order_id INTEGER NOT NULL,kind TEXT NOT NULL,
@@ -225,7 +231,7 @@ def stage(b, oid, connection=None, allow_replace=False):
             document['pdf_base64'] = base64.b64encode(content).decode('ascii')
             document.pop('path', None)
         if not allow_replace and c.execute('SELECT 1 FROM fulfillment_reconciliation_pending WHERE order_id=?', (oid,)).fetchone():
-            raise ValueError('Najpierw uzgodnij wcześniejszy zapis metadanych.')
+            raise ReconciliationPending(oid)
         c.execute('INSERT OR REPLACE INTO fulfillment_reconciliation_pending VALUES(?,?,?)', (oid, revision, json.dumps(payload)))
         if connection is None:
             c.commit()

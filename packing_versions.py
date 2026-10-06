@@ -240,6 +240,39 @@ def sync_evidence(b, order_ids):
         reconciliation_store.publish(b, oid)
 
 
+def prepare_write_evidence(b, order_ids):
+    """Finish earlier metadata writes before opening the local write transaction.
+
+    Fetch only pending affected order snapshots, once each. retry_pending preserves the
+    CAS revision and recognizes a saved payload whose acknowledgement was lost.
+    Never replace a pending payload with the newly selected packing contents.
+    """
+    if not b.supabase_enabled():
+        return
+    import reconciliation_store
+    db = b.conn()
+    try:
+        members = evidence_members(db, order_ids)
+        pending = [oid for oid in members if db.execute(
+            'SELECT 1 FROM fulfillment_reconciliation_pending WHERE order_id=?', (oid,)).fetchone()]
+    finally:
+        db.close()
+    for oid in pending:
+        try:
+            reconciliation_store.retry_pending(b, oid)
+        except Exception:
+            b.app.logger.warning('PACKING_RECONCILIATION_MEMBER order_id=%s', oid, exc_info=True)
+            raise
+    db = b.conn()
+    try:
+        # A restored snapshot can reveal additional historical members. Do not
+        # recursively fetch a customer's entire history during this request.
+        if not set(evidence_members(db, order_ids)).issubset(members):
+            raise PackingConflict('Odtworzono dodatkowe powiązania listy pakowej. Sprawdź wybór i ponów zapis.')
+    finally:
+        db.close()
+
+
 def batch_result(db, batch_id, *, mode='historical', shipment=None):
     """The shared structural READ used by the UI, the agent and PDF adapters."""
     batch = db.execute('SELECT * FROM packing_batches WHERE id=?', (batch_id,)).fetchone()
