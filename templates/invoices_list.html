@@ -23,7 +23,7 @@
       </td>
       <td class="actions-cell">
         {% if not inv.publication_complete %}
-        {% if inv.source_order_id %}<a class="compact-action" href="{{ url_for('order_invoice',order_id=inv.source_order_id) }}">Dokończ dokument</a>{% endif %}
+        {% if inv.source_order_id %}<form method="post" action="{{ url_for('invoice_resume',invoice_id=inv.id) }}"><button class="compact-action primary" type="submit">Dokończ zapis tej faktury</button></form>{% endif %}
         {% else %}
         <a class="compact-action" href="{{ url_for('invoice_download_admin', invoice_id=inv.id) }}" target="_blank">PDF</a>
         {% if not inv.sent_to_client %}<form method="post" action="{{ url_for('invoice_send_admin', invoice_id=inv.id) }}"><input type="hidden" name="next" value="{{ request.full_path }}"><button class="compact-action primary" type="submit">Wyślij</button></form>{% endif %}
