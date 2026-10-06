@@ -1,17 +1,4 @@
--- Service-role-only durable deduplication. No customer policy is changed.
-CREATE TABLE IF NOT EXISTS public.fulfillment_shipping_claims (
-    order_id bigint PRIMARY KEY,
-    reference text NOT NULL,
-    payload jsonb NOT NULL,
-    content_hash text NOT NULL,
-    state text NOT NULL CHECK (state IN ('SENDING','UNKNOWN','SUCCESS')),
-    provider_json jsonb,
-    created_at text NOT NULL
-);
-ALTER TABLE public.fulfillment_shipping_claims ENABLE ROW LEVEL SECURITY;
-REVOKE ALL ON public.fulfillment_shipping_claims FROM anon, authenticated;
-GRANT ALL ON public.fulfillment_shipping_claims TO service_role;
-
+-- V3: replace only the claim function; preserve existing tables and data.
 CREATE OR REPLACE FUNCTION public.claim_fulfillment_shipment(
     p_order_ids bigint[], p_reference text, p_payload jsonb,
     p_content_hash text, p_created_at text
