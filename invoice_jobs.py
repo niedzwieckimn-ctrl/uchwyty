@@ -21,6 +21,34 @@ def stage(cur, invoice_id, items, now):
           ON CONFLICT(invoice_id) DO UPDATE SET items_json=excluded.items_json,state='preparing',error=NULL,updated_at=excluded.updated_at''',
                 (invoice_id,json.dumps(items,ensure_ascii=False),now))
     cur.execute('UPDATE invoice_jobs SET packing_expected_batch=? WHERE invoice_id=?', (expected, invoice_id))
+    # Keep the exact selected lines in the already synchronized invoice metadata.
+    # Never reconstruct prices/quantities from today's stock after a restart.
+    cur.execute('''INSERT INTO invoice_meta(invoice_id,invoice_items_json,sent_to_client,updated_at)
+        VALUES(?,?,0,?) ON CONFLICT(invoice_id) DO UPDATE SET
+        invoice_items_json=excluded.invoice_items_json,updated_at=excluded.updated_at''',
+        (invoice_id,json.dumps(items,ensure_ascii=False),now))
+
+
+def pending_for_orders(b, order_ids):
+    """Find unfinished documents touching this saved parcel, including its peers."""
+    wanted = set(map(int, order_ids))
+    c = b.conn()
+    try:
+        rows = c.execute('''SELECT i.id,i.order_id,i.invoice_no,
+            COALESCE(j.items_json,m.invoice_items_json,'[]') AS items_json
+            FROM invoices i LEFT JOIN invoice_jobs j ON j.invoice_id=i.id
+            LEFT JOIN invoice_meta m ON m.invoice_id=i.id
+            WHERE i.publication_state!='complete' ORDER BY i.id''').fetchall()
+        result = []
+        for row in rows:
+            members = {int(row['order_id'] or 0)}
+            for item in json.loads(row['items_json'] or '[]'):
+                members.add(int(item.get('source_order_id') or item.get('order_id') or 0))
+            if wanted & members:
+                result.append(dict(row))
+        return result
+    finally:
+        c.close()
 
 def finish(b, invoice_id):
     import invoice_stock
@@ -29,6 +57,15 @@ def finish(b, invoice_id):
     try:
         job=c.execute('SELECT * FROM invoice_jobs WHERE invoice_id=?',(invoice_id,)).fetchone()
         inv=c.execute('SELECT * FROM invoices WHERE id=?',(invoice_id,)).fetchone()
+        if inv and inv['publication_state'] == 'complete':
+            return
+        if inv and not job:
+            saved = c.execute('SELECT invoice_items_json FROM invoice_meta WHERE invoice_id=?',(invoice_id,)).fetchone()
+            items = json.loads(saved[0] or '[]') if saved else []
+            if items:
+                stage(c,invoice_id,items,b.now_iso())
+                c.commit()
+                job=c.execute('SELECT * FROM invoice_jobs WHERE invoice_id=?',(invoice_id,)).fetchone()
         if not job or not inv:
             raise ValueError('Brak zapisanego zadania faktury')
         if job['state']=='complete':
@@ -38,8 +75,15 @@ def finish(b, invoice_id):
     finally:
         c.close()
     try:
-        if job['state'] == 'ready':
-            packing_versions.sync_evidence(b, sorted({int(i.get('source_order_id') or i.get('order_id')) for i in items}))
+        # A previous packing/shipping write can still be awaiting its cloud ACK.
+        # Reconcile it BEFORE uploading the invoice or issuing stock, on every
+        # attempt (including the first 'preparing' attempt). Never replace it.
+        order_ids = sorted({int(i.get('source_order_id') or i.get('order_id')) for i in items})
+        packing_versions.prepare_write_evidence(b, order_ids)
+        if b.supabase_enabled():
+            # Persist the exact job input before the first remote stock change.
+            b.sync_local_rows_to_supabase('invoices','id',[invoice_id])
+            b.sync_invoice_meta_to_supabase(invoice_id)
         pdf,net,gross=b.generate_order_invoice_pdf(order,items,b.invoice_meta_payload(inv))
         path=b.upload_invoice_pdfs_to_supabase(invoice_id,inv['invoice_no'],pdf,None)
         if not path:
