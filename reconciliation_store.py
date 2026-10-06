@@ -157,16 +157,46 @@ def local_status(b, db, oid):
     return {'durable': not bool(pending), 'source': 'supabase', 'pending': bool(pending)}
 
 
-def _save(b, oid, revision, payload):
-    result = b.supabase_request('/rest/v1/rpc/save_fulfillment_reconciliation', method='POST',
-                               payload={'p_order_id': oid, 'p_expected_revision': revision, 'p_payload': payload})
-    if not isinstance(result, dict) or not result.get('saved'):
-        raise ValueError('Nie zapisano trwałych metadanych realizacji. Wymagane jest uzgodnienie konfliktu wersji.')
+def _identical_remote_revision(b, oid, revision, payload):
+    """A fresh, complete read can acknowledge evidence already stored durably.
+
+    This is only a no-op optimization. Missing/unreadable/different evidence
+    continues through the existing atomic CAS; it never advances its base.
+    """
+    try:
+        rows = b.supabase_request('/rest/v1/fulfillment_reconciliation', params={
+            'order_id': 'eq.' + str(oid), 'select': 'revision,payload'})
+        if not isinstance(rows, list) or len(rows) != 1:
+            return None
+        remote = rows[0]
+        confirmed = remote.get('revision')
+        if (not isinstance(confirmed, int) or isinstance(confirmed, bool)
+                or confirmed < revision or not isinstance(remote.get('payload'), dict)):
+            return None
+        if _same_evidence(remote['payload'], payload):
+            return confirmed
+        # Durable IDs may have been rekeyed after a cold-cache collision. Use
+        # the established identity mapping without persisting a speculative map.
+        c = b.conn()
+        try:
+            c.execute('BEGIN')
+            translated = _remap_packing_ids(c, remote['payload'])
+            if _same_evidence(translated, payload):
+                return confirmed
+        finally:
+            c.rollback()
+            c.close()
+    except Exception:
+        return None
+    return None
+
+
+def _acknowledge(b, oid, revision, payload, confirmed_revision):
     c = b.conn()
     try:
         c.execute('''INSERT INTO fulfillment_reconciliation_versions VALUES(?,?)
                      ON CONFLICT(order_id) DO UPDATE SET revision=MAX(revision,excluded.revision)''',
-                  (oid, result['revision']))
+                  (oid, confirmed_revision))
         # An acknowledgement of an earlier payload must not discard a newer
         # local write staged while the remote request was in flight.
         c.execute('''DELETE FROM fulfillment_reconciliation_pending
@@ -175,6 +205,19 @@ def _save(b, oid, revision, payload):
         c.commit()
     finally:
         c.close()
+
+
+def _save(b, oid, revision, payload):
+    confirmed = _identical_remote_revision(b, oid, revision, payload)
+    if confirmed is not None:
+        _acknowledge(b, oid, revision, payload, confirmed)
+        b.app.logger.info('RECONCILIATION_SAVE_SKIPPED order_id=%s revision=%s skipped=true', oid, confirmed)
+        return
+    result = b.supabase_request('/rest/v1/rpc/save_fulfillment_reconciliation', method='POST',
+                               payload={'p_order_id': oid, 'p_expected_revision': revision, 'p_payload': payload})
+    if not isinstance(result, dict) or not result.get('saved'):
+        raise ValueError('Nie zapisano trwałych metadanych realizacji. Wymagane jest uzgodnienie konfliktu wersji.')
+    _acknowledge(b, oid, revision, payload, result['revision'])
 
 
 def retry_pending(b, oid, *, packing_only=False):
