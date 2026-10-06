@@ -23,6 +23,25 @@ def require_complete_invoice(invoice_id):
         )
     return row
 
+
+def invoice_preparation_response(invoice_id, order_id, *, failed=False, conflict=False):
+    """A saved draft is recoverable, never an invitation to issue a duplicate."""
+    inv = load_invoice_with_meta(invoice_id)
+    if not inv:
+        abort(404, description="Nie znaleziono faktury")
+    tpl = """{% extends 'base.html' %}{% block content %}<div class="card">
+      <h1>Dokończ zapis faktury {{ inv.invoice_no }}</h1>
+      <p>Numer i pozycje są zapisane. Dokument nie jest jeszcze gotowy do pobrania ani wysłania.</p>
+      {% if failed %}<p>Nie udało się zakończyć zapisu danych realizacji.
+      {% if conflict %}Wcześniejszy zapis lub zmiana listy wymaga uzgodnienia.{% else %}Ponów dokończenie zapisu po przywróceniu połączenia.{% endif %}</p>{% endif %}
+      <p>Przycisk poniżej wznawia tę samą fakturę. Nie tworzy nowego numeru i nie wysyła wiadomości klientowi.</p>
+      <form method="post" action="{{ url_for('invoice_resume',invoice_id=inv.id) }}">
+        <button class="btn primary" type="submit">Dokończ zapis tej faktury</button></form>
+      <a class="btn" href="{{ url_for('order_invoice',order_id=order_id) }}">Wróć do faktur zamówienia</a>
+      </div>{% endblock %}"""
+    return render_template_string(tpl,inv=inv,order_id=order_id,failed=failed,conflict=conflict,
+                                  title="Dokończ zapis faktury"), (409 if conflict else 503 if failed else 409)
+
 def register_routes(context):
     globals().update(context)
 
@@ -30,7 +49,7 @@ def register_routes(context):
     def order_invoice_service(order_id, *, request, session=None, structured=False):
         if not structured:
             maybe_pull_shared_from_supabase()
-        sent_invoice_id = to_int(request.args.get("invoice_id"), 0) if norm(request.args.get("sent")) == "1" else 0
+        sent_invoice_id = to_int(request.args.get("invoice_id"), 0) if request.method == 'GET' and norm(request.args.get("sent")) == "1" else 0
         if sent_invoice_id:
             meta = load_invoice_meta(sent_invoice_id) or {}
             upsert_invoice_meta(
@@ -74,6 +93,15 @@ def register_routes(context):
             to_int(value, 0) for value in packing_selection.get("order_ids", [])
             if to_int(value, 0) > 0
         } if isinstance(packing_selection, dict) else set()
+        import invoice_jobs, sys
+        backend = sys.modules.get('app') or sys.modules['__main__']
+        pending_invoices = invoice_jobs.pending_for_orders(backend, packing_order_ids | {order_id})
+        if pending_invoices and request.method == 'POST':
+            c.close()
+            if structured:
+                return {'ok':False,'invoice_id':pending_invoices[0]['id'],
+                        'error':'Dokończ wcześniej zapisaną fakturę.'}
+            return invoice_preparation_response(pending_invoices[0]['id'],order_id)
         # Fakturę można wystawić również po wysyłce lub po ręcznej korekcie
         # statusu. O dostępności pozycji decydują ilości/alokacje, nie status.
         related_orders = [dict(o)]
@@ -226,15 +254,15 @@ def register_routes(context):
             buyer_tax_no = oc_context.get("vat_number") or buyer_tax_no
         buyer_address_default = "\n".join([x for x in [st, f"{pc} {city}".strip()] if x]).strip()
 
+        # Redirect notices must not participate in POST validation.
         msg = ""
-        if request.args.get("generated") == "1":
-            msg = "Faktura zostaĹ‚a zapisana."
-        if request.args.get("sent") == "1":
-            msg = "Faktura zostaĹ‚a udostÄ™pniona klientowi."
-        if request.args.get("deleted") == "1":
-            msg = "Faktura zostaĹ‚a usuniÄ™ta."
-        if request.args.get("deleted") == "1":
-            msg = "Faktura zostaĹ‚a usuniÄ™ta."
+        if request.method == 'GET':
+            if request.args.get("generated") == "1" or request.args.get("resumed") == "1":
+                msg = "Faktura została zapisana."
+            if request.args.get("sent") == "1":
+                msg = "Faktura została udostępniona klientowi."
+            if request.args.get("deleted") == "1":
+                msg = "Faktura została usunięta."
 
         suggested_invoice_no = ""
         manual_invoice_no = False
@@ -434,7 +462,13 @@ def register_routes(context):
                 invoice_jobs.stage(cur,invoice_id,invoice_items,now_iso())
                 c.commit()
                 c.close()
-                resume_invoice_job(invoice_id)
+                try:
+                    resume_invoice_job(invoice_id)
+                except Exception as exc:
+                    app.logger.exception('INVOICE_PREPARATION_PENDING invoice_id=%s',invoice_id)
+                    if structured:
+                        return {'ok':False,'invoice_id':invoice_id,'error':'Nie zakończono zapisu faktury. Wznów ten sam dokument.'}
+                    return invoice_preparation_response(invoice_id,order_id,failed=True,conflict=isinstance(exc,ValueError))
                 c=conn()
                 allocation_ids=[row[0] for row in c.execute("SELECT id FROM invoice_allocations WHERE invoice_id=?",(invoice_id,))]
                 c.close()
@@ -497,8 +531,16 @@ def register_routes(context):
             {% endif %}
           </div>
 
+          {% if pending_invoices %}
+          <div class="card"><h2>Faktura oczekuje na dokończenie zapisu</h2>
+            <p>Dokończ istniejący dokument przed wystawieniem kolejnego dla tej paczki.</p>
+            {% for inv in pending_invoices %}<form method="post" action="{{ url_for('invoice_resume',invoice_id=inv.id) }}">
+              <button class="btn primary" type="submit">Dokończ zapis {{ inv.invoice_no }}</button>
+            </form>{% endfor %}
+          </div>
+          {% else %}
           <div class="card">
-            <form method="post" class="row">
+            <form method="post" action="{{ url_for('order_invoice', order_id=o['id']) }}" class="row">
               {% if oc_context %}
               <div style="grid-column:1/-1" class="hint">
                 <b>Orderchamp — {{ oc_context.number }}</b><br>
@@ -586,6 +628,7 @@ def register_routes(context):
             </form>
           </div>
 
+          {% endif %}
           <script>
           (() => {
             const issueDate = document.getElementById('invoice_issue_date');
@@ -625,6 +668,12 @@ def register_routes(context):
                     </td>
                     <td>
                       <div class="flex">
+                        {% if inv['publication_state'] != 'complete' %}
+                        <span class="badge">W przygotowaniu</span>
+                        <form method="post" action="{{ url_for('invoice_resume',invoice_id=inv['id']) }}">
+                          <button class="btn primary" type="submit">Dokończ zapis tej faktury</button>
+                        </form>
+                        {% else %}
                         <a class="btn" href="{{ url_for('invoice_download_admin', invoice_id=inv['id']) }}" target="_blank">Pobierz PDF</a>
                         <a class="btn" href="{{ url_for('order_packing_list_download_admin', order_id=inv['order_id'] or o['id']) }}" target="_blank">Pakuj</a>
                         <form method="post" action="{{ url_for('invoice_regenerate_admin', invoice_id=inv['id']) }}">
@@ -655,6 +704,7 @@ def register_routes(context):
                         <form method="post" action="{{ url_for('order_invoice_delete', order_id=o['id'], invoice_id=inv['id']) }}" onsubmit="return confirm('UsunÄ…Ä‡ fakturÄ™?')">
                           <button class="btn danger" type="submit">UsuĹ„ fakturÄ™</button>
                         </form>
+                        {% endif %}
                       </div>
                     </td>
                   </tr>
@@ -667,7 +717,7 @@ def register_routes(context):
           </div>
         {% endblock %}
         """
-        return render_template_string(tpl, title="Faktura", base_url=BASE_URL, db_path=DB_PATH, o=o, oc_context=oc_context, d=data, company=company, items=items, invoice_rows=invoice_rows, msg=msg, canonical_order_no=canonical_order_no, invoice_from_packing=invoice_from_packing, suggested_invoice_no=suggested_invoice_no, manual_invoice_no=manual_invoice_no)
+        return render_template_string(tpl, title="Faktura", base_url=BASE_URL, db_path=DB_PATH, o=o, oc_context=oc_context, d=data, company=company, items=items, invoice_rows=invoice_rows, msg=msg, canonical_order_no=canonical_order_no, invoice_from_packing=invoice_from_packing, suggested_invoice_no=suggested_invoice_no, manual_invoice_no=manual_invoice_no, pending_invoices=pending_invoices)
 
 
     @app.route("/orders/<int:order_id>/invoice", methods=["GET", "POST"])
@@ -1028,13 +1078,25 @@ def register_routes(context):
 
     @app.post("/invoices/<int:invoice_id>/resume")
     def invoice_resume(invoice_id):
-        assert_invoice_mutable(invoice_id)
-        resume_invoice_job(invoice_id)
+        inv=load_invoice_with_meta(invoice_id)
+        if not inv:
+            abort(404,description="Nie znaleziono faktury")
+        from fulfillment_operations import ui_write
+        from werkzeug.exceptions import HTTPException
+        try:
+            assert_invoice_mutable(invoice_id)
+            with ui_write(inv['order_id']):
+                resume_invoice_job(invoice_id)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            app.logger.exception('INVOICE_RESUME_PENDING invoice_id=%s',invoice_id)
+            return invoice_preparation_response(invoice_id,inv['order_id'],failed=True,conflict=isinstance(exc,ValueError))
         c=conn()
         ids=[row[0] for row in c.execute("SELECT DISTINCT order_id FROM invoice_allocations WHERE invoice_id=?",(invoice_id,))]
         c.close()
         finalize_fully_invoiced_orders(ids)
-        return redirect(url_for("invoices"))
+        return redirect(url_for("order_invoice",order_id=inv['order_id'],resumed="1"))
 
 
     @app.post("/invoices/<int:invoice_id>/ksef/send")
