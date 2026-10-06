@@ -22,6 +22,8 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
+from contextlib import contextmanager
+from functools import wraps
 
 _STARTUP_STARTED = time.monotonic()
 _startup_logger = logging.getLogger("app.startup")
@@ -47,7 +49,7 @@ from flask import (
     Flask, request, redirect, url_for, jsonify, session, g,
     send_file, abort
 )
-from flask import render_template, render_template_string
+from flask import render_template, render_template_string, has_request_context
 from panel_performance import render_cached_template_string, SignedURLCache
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from agent_streaming import StreamTrace, sse_response
@@ -2364,6 +2366,96 @@ _supabase_sync_state = {
 }
 
 
+class _SupabaseReadRows(list):
+    """Local provenance only; JSON output remains an ordinary array."""
+    def __init__(self):
+        super().__init__()
+        self.read_started_at = time.monotonic()
+
+
+def _scoped_context():
+    return (DB_PATH, id(conn), SUPABASE_URL)
+
+
+def _ensure_scoped_state_locked():
+    context = _scoped_context()
+    if _supabase_sync_state.get("row_scope_context") != context:
+        for name in ("pending_rows", "active_retry_rows", "row_writes", "row_write_finished"):
+            _supabase_sync_state[name] = {}
+        _supabase_sync_state.update(row_scope_context=context, running=False,
+                                    retry_after_ts=0.0, last_started_ts=0.0)
+    return context
+
+
+@contextmanager
+def _scoped_write_guard(table, conflict_col, ids):
+    keys = [(table, conflict_col, str(key)) for key in ids if key is not None]
+    with _supabase_sync_lock:
+        context = _ensure_scoped_state_locked()
+        active = _supabase_sync_state.setdefault("row_writes", {})
+        for key in keys:
+            active[key] = active.get(key, 0) + 1
+    succeeded = False
+    try:
+        yield
+        succeeded = True
+    finally:
+        with _supabase_sync_lock:
+            if context == _ensure_scoped_state_locked():
+                active = _supabase_sync_state.setdefault("row_writes", {})
+                completed = _supabase_sync_state.setdefault("row_write_finished", {})
+                for key in keys:
+                    remaining = active.get(key, 1) - 1
+                    if remaining:
+                        active[key] = remaining
+                    else:
+                        active.pop(key, None)
+                    if succeeded:
+                        completed[key] = time.monotonic()
+
+
+def _scoped_protected_keys(table, conflict_col, read_started_at=None):
+    spec = (table, conflict_col)
+    with _supabase_sync_lock:
+        _ensure_scoped_state_locked()
+        protected = set()
+        for name in ("pending_rows", "active_retry_rows"):
+            protected.update(str(key) for key in _supabase_sync_state.get(name, {}).get(spec, ()))
+        protected.update(key[2] for key in _supabase_sync_state.get("row_writes", {}) if key[:2] == spec)
+        if read_started_at is not None:
+            protected.update(key[2] for key, finished in _supabase_sync_state.get("row_write_finished", {}).items()
+                             if key[:2] == spec and finished >= read_started_at)
+        return protected
+
+
+def _guard_upsert(function):
+    @wraps(function)
+    def guarded(table, rows, on_conflict):
+        with _scoped_write_guard(table, on_conflict, [row.get(on_conflict) for row in rows]):
+            return function(table, rows, on_conflict)
+    return guarded
+
+
+def _guard_row_sync(function):
+    @wraps(function)
+    def guarded(table, conflict_col, ids):
+        with _scoped_write_guard(table, conflict_col, ids):
+            return function(table, conflict_col, ids)
+    return guarded
+
+
+def _supabase_transport_failed(exc):
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, urllib.error.HTTPError):
+            return exc.code >= 500
+        if isinstance(exc, (TimeoutError, ConnectionError, urllib.error.URLError)):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
 def _local_supabase_bootstrap_complete() -> bool:
     """True only after a complete successful cloud bootstrap of this SQLite DB."""
     c = conn()
@@ -2427,6 +2519,7 @@ def _chunks(seq, size):
     for i in range(0, len(seq), size):
         yield seq[i:i + size]
 
+@_guard_upsert
 def supabase_upsert_rows(table: str, rows: list, on_conflict: str):
     if not rows:
         return
@@ -2491,26 +2584,71 @@ def trigger_background_supabase_sync(reason: str = "write"):
     if not supabase_enabled():
         return False, "not_configured"
 
+    # Only failed, explicitly scoped writes belong here. A successful POST
+    # (including an AI read) is not a reason to republish every business table.
+    requested = getattr(g, "supabase_failed_rows", {}) if has_request_context() else {}
     now_ts = time.time()
     with _supabase_sync_lock:
+        context = _ensure_scoped_state_locked()
+        pending = _supabase_sync_state.setdefault("pending_rows", {})
+        for spec, ids in requested.items():
+            pending.setdefault(spec, set()).update(ids)
+        if not pending:
+            return False, "no_pending_rows"
         if _supabase_sync_state["running"]:
             return False, "already_running"
+        if now_ts < float(_supabase_sync_state.get("retry_after_ts") or 0.0):
+            return False, "backoff"
         if (now_ts - float(_supabase_sync_state["last_started_ts"])) < SUPABASE_MIN_SYNC_INTERVAL_SEC:
             return False, "throttled"
         _supabase_sync_state["running"] = True
         _supabase_sync_state["last_started_ts"] = now_ts
+        batch = {spec: set(ids) for spec, ids in pending.items()}
+        _supabase_sync_state["pending_rows"] = {}
+        _supabase_sync_state["active_retry_rows"] = batch
 
     def _job():
+        result = {"ok": True, "tables": {}, "synced_at": now_iso(), "reason": reason}
+        failed = {}
         try:
             with _supabase_full_io_lock:
-                result = sync_all_to_supabase()
-            result["reason"] = reason
+                if context != _scoped_context():
+                    result.update(ok=False, cancelled=True)
+                    return
+                priorities = {table: n for n, (table, _) in enumerate(SUPABASE_SYNC_TABLES)}
+                specs = sorted(batch, key=lambda spec: (priorities.get(spec[0], 999), spec[0]))
+                for index, (table, conflict_col) in enumerate(specs):
+                    if context != _scoped_context():
+                        result.update(ok=False, cancelled=True)
+                        return
+                    ids = batch[(table, conflict_col)]
+                    try:
+                        # Retry current committed rows, never an earlier payload
+                        # or an entire table. Deleted rows are not resurrected.
+                        sync_local_rows_to_supabase(table, conflict_col, list(ids))
+                        result["tables"][table] = {"status": "ok", "requested_rows": len(ids)}
+                    except Exception as exc:
+                        failed[(table, conflict_col)] = ids
+                        result["ok"] = False
+                        result["tables"][table] = {"status": "error", "error_type": type(exc).__name__}
+                        if _supabase_transport_failed(exc):
+                            for remaining in specs[index + 1:]:
+                                failed[remaining] = batch[remaining]
+                            break
         except Exception as e:
-            result = {"ok": False, "error": str(e), "reason": reason, "synced_at": now_iso()}
+            result.update(ok=False, error_type=type(e).__name__)
+            failed = batch
         finally:
             with _supabase_sync_lock:
+                if context != _ensure_scoped_state_locked():
+                    return
+                pending = _supabase_sync_state.setdefault("pending_rows", {})
+                for spec, ids in failed.items():
+                    pending.setdefault(spec, set()).update(ids)
+                _supabase_sync_state["active_retry_rows"] = {}
                 _supabase_sync_state["running"] = False
                 _supabase_sync_state["last_result"] = result
+                _supabase_sync_state["retry_after_ts"] = time.time() + 60 if failed else 0.0
 
     th = threading.Thread(target=_job, daemon=True)
     th.start()
@@ -2724,7 +2862,7 @@ def supabase_delete_rows(table: str, filters: dict):
 
 
 def supabase_select_rows(table: str, order_by: str = "id", page_size: int = 1000, extra_params: dict | None = None):
-    rows = []
+    rows = _SupabaseReadRows()
     offset = 0
     while True:
         params = {"select": "*", "limit": page_size, "offset": offset}
@@ -2924,6 +3062,12 @@ def sqlite_upsert_rows(table: str, rows: list, conflict_col: str):
     c = conn()
     try:
         c.execute('BEGIN IMMEDIATE')
+        protected = _scoped_protected_keys(table, conflict_col, getattr(rows, 'read_started_at', None))
+        if protected:
+            local = {str(row[conflict_col]): dict(row) for row in c.execute(f'SELECT * FROM {table}')
+                     if str(row[conflict_col]) in protected}
+            rows = [local[str(row[conflict_col])] if str(row.get(conflict_col)) in protected else row
+                    for row in rows if str(row.get(conflict_col)) not in protected or str(row.get(conflict_col)) in local]
         rows = invoice_payment_sync.protect_incoming(c, table, rows)
         if table == 'orders':
             import inpost_tracking
@@ -2982,11 +3126,11 @@ def _sqlite_upsert_rows_in_transaction(c, table, rows, conflict_col):
         c.close()
 
 
-def sqlite_delete_missing_rows(table: str, conflict_col: str, remote_keys: list):
+def sqlite_delete_missing_rows(table: str, conflict_col: str, remote_keys: list, read_started_at=None):
     c = conn()
     try:
         c.execute('BEGIN IMMEDIATE')
-        protected_keys = invoice_payment_sync.protected_keys(c, table)
+        protected_keys = invoice_payment_sync.protected_keys(c, table) | _scoped_protected_keys(table, conflict_col, read_started_at)
         if table == 'orders':
             import inpost_tracking
             protected_keys = protected_keys | {str(i) for i in inpost_tracking.protected_order_ids(c)}
@@ -3178,8 +3322,12 @@ def _pull_business_freshness_group(group: str) -> dict:
         for table, conflict in specs:
             sqlite_upsert_rows(table, fetched[(table, conflict)], conflict)
         for table, conflict in reversed(specs):
-            keys = [row.get(conflict) for row in fetched[(table, conflict)] if row.get(conflict) is not None]
-            sqlite_delete_missing_rows(table, conflict, keys)
+            remote_rows = fetched[(table, conflict)]
+            keys = [row.get(conflict) for row in remote_rows if row.get(conflict) is not None]
+            if getattr(remote_rows, 'read_started_at', None) is not None:
+                sqlite_delete_missing_rows(table, conflict, keys, read_started_at=remote_rows.read_started_at)
+            else:
+                sqlite_delete_missing_rows(table, conflict, keys)
     if not _business_group_has_local_data(group):
         raise RuntimeError(f"empty local snapshot after Supabase pull for group {group}")
     completed_at = time.time()
@@ -3319,10 +3467,6 @@ def ensure_business_operation_freshness(operation_name: str, input_data=None) ->
 def pull_shared_tables_from_supabase(force: bool = False, delete_missing: bool = True):
     if not supabase_enabled():
         return {"ok": False, "error": "not_configured"}
-    invoice_payment_sync.flush_pending(sys.modules[__name__])
-    import inpost_tracking
-    inpost_tracking.flush_pending(sys.modules[__name__])
-
     now_ts = time.time()
     with _supabase_sync_lock:
         last_started = float(_supabase_sync_state.get("last_pull_started_ts") or 0.0)
@@ -3390,7 +3534,11 @@ def pull_shared_tables_from_supabase(force: bool = False, delete_missing: bool =
         try:
             remote_rows = fetched[(table, conflict_col)]
             remote_keys = [row.get(conflict_col) for row in remote_rows if row.get(conflict_col) is not None]
-            deleted = sqlite_delete_missing_rows(table, conflict_col, remote_keys)
+            if getattr(remote_rows, 'read_started_at', None) is not None:
+                deleted = sqlite_delete_missing_rows(table, conflict_col, remote_keys,
+                                                     read_started_at=remote_rows.read_started_at)
+            else:
+                deleted = sqlite_delete_missing_rows(table, conflict_col, remote_keys)
             result["tables"].setdefault(table, {})
             result["tables"][table]["deleted_local"] = deleted
             if result["tables"][table].get("upsert") == "ok":
@@ -3445,6 +3593,11 @@ def trigger_background_supabase_pull(reason: str = "read"):
                 # possibly stale snapshot could otherwise erase a newer local write.
                 result = pull_shared_tables_from_supabase(force=True, delete_missing=False)
                 if result.get("ok"):
+                    # Replay only a small batch after the cloud has answered.
+                    # GET/bootstrap does not wait behind payment/shipment retries.
+                    invoice_payment_sync.flush_pending(sys.modules[__name__], limit=3)
+                    import inpost_tracking
+                    inpost_tracking.flush_pending(sys.modules[__name__], limit=1)
                     _run_post_pull_reconciliation()
                     if _local_supabase_data_present():
                         _mark_local_supabase_bootstrap_complete()
@@ -3546,6 +3699,7 @@ def maybe_pull_shared_from_supabase(force: bool = False, required: bool = False)
     return None
 
 
+@_guard_row_sync
 def sync_local_rows_to_supabase(table: str, conflict_col: str, ids: list):
     ids = [x for x in ids if x is not None]
     if not ids or not supabase_enabled():
@@ -3558,7 +3712,37 @@ def sync_local_rows_to_supabase(table: str, conflict_col: str, ids: list):
     rows = [dict(r) for r in cur.fetchall()]
     c.close()
     if rows:
-        supabase_upsert_rows(table, rows, conflict_col)
+        try:
+            supabase_upsert_rows(table, rows, conflict_col)
+        except Exception:
+            failed_ids = {row[conflict_col] for row in rows}
+            with _supabase_sync_lock:
+                _ensure_scoped_state_locked()
+                _supabase_sync_state.setdefault("pending_rows", {}).setdefault(
+                    (table, conflict_col), set()).update(failed_ids)
+            if has_request_context():
+                failed = getattr(g, "supabase_failed_rows", None)
+                if failed is None:
+                    failed = g.supabase_failed_rows = {}
+                failed.setdefault((table, conflict_col), set()).update(failed_ids)
+            raise
+        # A later successful write settles a prior retry only while the same
+        # committed rows still exist. Do not erase a newer local intent.
+        check = conn()
+        try:
+            check.execute('BEGIN IMMEDIATE')
+            current = {str(row[conflict_col]): dict(row) for row in check.execute(
+                f"SELECT * FROM {table} WHERE {conflict_col} IN ({ph})", tuple(ids))}
+            settled = {row[conflict_col] for row in rows if current.get(str(row[conflict_col])) == row}
+            with _supabase_sync_lock:
+                _ensure_scoped_state_locked()
+                pending = _supabase_sync_state.get("pending_rows", {}).get((table, conflict_col))
+                if pending is not None:
+                    pending.difference_update(settled)
+                    if not pending:
+                        _supabase_sync_state["pending_rows"].pop((table, conflict_col), None)
+        finally:
+            check.close()
     return len(rows)
 
 
@@ -6476,7 +6660,10 @@ def auto_sync_after_write(response):
             response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
 
         no_auto_sync_paths = {
-            "/api/client_search_log", "/api/client_order_email", "/api/client/profile", "/searches/action"
+            "/api/client_search_log", "/api/client_order_email", "/api/client/profile", "/searches/action",
+            # Authentication and audio processing do not modify business rows.
+            # Their successful POST responses must not publish the entire DB.
+            "/login", "/api/internal/ai/voice/transcribe", "/api/internal/ai/voice/synthesize",
         }
         if (response.status_code < 400 and request.method in ("POST", "PUT", "PATCH", "DELETE")
                 and request.path not in no_auto_sync_paths

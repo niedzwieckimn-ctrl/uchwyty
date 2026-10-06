@@ -287,15 +287,22 @@ def flush_pending(backend, invoice_id=None, limit=50):
             continue
         attempted += 1
         code = ''
+        unavailable = False
         try:
             _publish(backend,claim)
         except Exception as exc:
+            import urllib.error
+            unavailable = isinstance(exc, (TimeoutError, ConnectionError)) or (
+                isinstance(exc, urllib.error.URLError) and
+                (not isinstance(exc, urllib.error.HTTPError) or exc.code >= 500))
             text = str(exc).lower()
             code = (exc.code if isinstance(exc,SyncVerificationError) else
                     'REMOTE_SCHEMA_INCOMPATIBLE' if any(part in text for part in ('column','schema cache','pgrst204','pgrst200'))
                     else 'REMOTE_SYNC_FAILED')
             errors.append({'table':table,'record_id':key,'error_code':code})
         _complete_claim(backend,claim,code)
+        if unavailable:
+            break  # Preserve untouched pending rows; do not amplify an outage.
     result = {'attempted':attempted,'errors':errors}
     if invoice_id is not None:
         result.update(status(backend,invoice_id))

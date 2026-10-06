@@ -712,9 +712,9 @@ def scope_diagnostic(db, order):
             'final_tracking': final['tracking'] if final else '', 'error': error}
 
 
-def flush_pending(b):
+def flush_pending(b, limit=20):
     import inpost_reconciliation as work
-    return work.flush(b)
+    return work.flush(b) if limit == 20 else work.flush(b, limit=limit)
 
 
 def read_state_result(b, shipment_id):

@@ -188,6 +188,20 @@ def retry_pending(b, oid, *, packing_only=False):
         _save(b, oid, pending['expected_revision'], json.loads(pending['payload']))
 
 
+def _evidence_section(value):
+    # A table snapshot has no row-order semantics. Keep duplicate rows and all
+    # fields in the comparison; sorting must never hide changed quantities,
+    # invoice bindings, shipment identifiers or document bytes.
+    if isinstance(value, list):
+        return sorted(json.dumps(row, sort_keys=True, separators=(',', ':')) for row in value)
+    return value
+
+
+def _same_evidence(left, right):
+    return left.keys() == right.keys() and all(
+        _evidence_section(left[key]) == _evidence_section(right[key]) for key in left)
+
+
 def _extends_open_packing(remote, pending):
     """Permit only a proven append to an open list, never last-writer-wins.
 
@@ -473,19 +487,20 @@ def restore(b, oid, *, allow_packing_extension=False):
             return  # A delayed response can never move this cache backwards.
         pending = c.execute('SELECT * FROM fulfillment_reconciliation_pending WHERE order_id=?', (oid,)).fetchone()
         if pending:
+            proposed = json.loads(pending['payload'])
+            durable = _remap_packing_ids(c, record['payload'])
             if (int(record['revision']) > int(pending['expected_revision'])
-                    and record['payload'] == json.loads(pending['payload'])):
+                    and (_same_evidence(record['payload'], proposed) or _same_evidence(durable, proposed))):
                 c.execute('DELETE FROM fulfillment_reconciliation_pending WHERE order_id=?', (oid,))
                 c.execute('''INSERT INTO fulfillment_reconciliation_versions VALUES(?,?)
                     ON CONFLICT(order_id) DO UPDATE SET revision=MAX(revision,excluded.revision)''',
                     (oid, record['revision']))
-                _repair_same_revision_files(b, c, _remap_packing_ids(c, record['payload']))
+                _repair_same_revision_files(b, c, durable)
                 c.commit()
                 return
             else:
                 if allow_packing_extension and int(record['revision']) > int(pending['expected_revision']):
-                    durable = _remap_packing_ids(c, record['payload'])
-                    merged = _merge_packing_history(durable, json.loads(pending['payload']))
+                    merged = _merge_packing_history(durable, proposed)
                     if merged is not None:
                         # Restore omitted immutable history before advancing the
                         # CAS base. Current selection and other domain data stay intact.
@@ -497,6 +512,11 @@ def restore(b, oid, *, allow_packing_extension=False):
                         c.commit()
                         b.app.logger.info('PACKING_RECONCILIATION_REBASE order_id=%s from_revision=%s to_revision=%s',
                                           oid, pending['expected_revision'], record['revision'])
+                    else:
+                        different = sorted(key for key in set(durable) | set(proposed)
+                            if _evidence_section(durable.get(key)) != _evidence_section(proposed.get(key)))
+                        b.app.logger.warning('PACKING_RECONCILIATION_CONFLICT order_id=%s local_revision=%s remote_revision=%s sections=%s',
+                            oid, pending['expected_revision'], record['revision'], ','.join(different))
                 return  # Keep the explicit unresolved result; never overwrite a competing revision.
         if local and int(local[0]) == int(record['revision']):
             payload = _remap_packing_ids(c, record['payload'])

@@ -89,13 +89,39 @@ def resolve_list(db, root_order_id, invoice_id=None, packing_list_id=None):
             raise PackingConflict('Faktura ma kilka list pakowych. Wskaż konkretną listę.')
         if rows:
             return rows[0]
-    # Reuse only the explicitly current, open packing list. A completed shipment
-    # starts a new logical list on the next packing action, including partial orders.
+    # A new packing action starts a new parcel after shipment. An invoice may
+    # still need to bind the existing, already shipped and unbilled parcel.
     return db.execute('''SELECT pl.* FROM packing_lists pl
                          JOIN fulfillment_documents fd ON fd.document_id=pl.current_batch_id AND fd.kind='packing_list'
                          WHERE fd.order_id=? AND pl.invoice_id IS NULL
-                         AND NOT EXISTS(SELECT 1 FROM packing_shipments ps WHERE ps.packing_list_id=pl.packing_list_id)
-                         ORDER BY pl.current_batch_id DESC LIMIT 1''', (root_order_id,)).fetchone()
+                         AND (? OR NOT EXISTS(SELECT 1 FROM packing_shipments ps WHERE ps.packing_list_id=pl.packing_list_id))
+                         ORDER BY pl.current_batch_id DESC LIMIT 1''', (root_order_id, bool(invoice_id))).fetchone()
+
+
+def validate_shipped_invoice_scope(db, logical, items):
+    """Bill exactly the saved parcel; neither repack nor regenerate its PDF."""
+    if not logical or not db.execute('SELECT 1 FROM packing_shipments WHERE packing_list_id=?',
+                                    (logical['packing_list_id'],)).fetchone():
+        return False
+    batch_id = int(logical['current_batch_id'])
+    shipped = {int(row[0]) for row in db.execute('SELECT final_batch_id FROM packing_shipments WHERE packing_list_id=?',
+                                               (logical['packing_list_id'],))}
+    if shipped != {batch_id}:
+        raise PackingConflict('Wersja listy nie odpowiada zapisanej wysyłce.')
+    saved = sorted(tuple(row) for row in db.execute(
+        'SELECT order_id,order_item_id,qty FROM packing_allocations WHERE batch_id=?', (batch_id,)))
+    selected = sorted((int(i.get('source_order_id') or i.get('order_id') or 0),
+                       int(i.get('order_item_id') or i.get('id') or 0), int(i.get('qty') or 0))
+                      for i in items if int(i.get('qty') or 0) > 0)
+    if not saved or selected != saved:
+        raise PackingConflict('Pozycje faktury nie odpowiadają zapisanej zawartości wysłanej paczki.')
+    for oid in {row[0] for row in saved}:
+        document = db.execute('''SELECT path,file_hash FROM fulfillment_document_history
+            WHERE order_id=? AND kind='packing_list' AND document_id=?''', (oid, batch_id)).fetchone()
+        if (not document or not Path(document['path']).is_file()
+                or hashlib.sha256(Path(document['path']).read_bytes()).hexdigest() != document['file_hash']):
+            raise PackingConflict('Brak potwierdzonego oryginału listy wysłanej paczki.')
+    return True
 
 
 def publish(b, db, root_order_id, items, path, *, invoice_id=None,
@@ -141,6 +167,14 @@ def publish(b, db, root_order_id, items, path, *, invoice_id=None,
     actual = int(logical['current_batch_id']) if logical else 0
     if expected_current is not None and actual != int(expected_current):
         raise PackingConflict('Lista pakowa zmieniła się podczas przygotowania. Odśwież i ponów.')
+    if invoice_id and validate_shipped_invoice_scope(db, logical, items):
+        if logical['invoice_id'] not in (None, invoice_id):
+            raise PackingConflict('Wysłana paczka jest już powiązana z inną fakturą.')
+        db.execute('UPDATE packing_batches SET invoice_id=? WHERE id=?', (invoice_id, actual))
+        db.execute('UPDATE packing_lists SET invoice_id=? WHERE packing_list_id=?',
+                   (invoice_id, logical['packing_list_id']))
+        stage_evidence(b, db, sorted({i['source_order_id'] for i in items}))
+        return actual
     digest = _scope_hash(items)
     batch = db.execute('SELECT * FROM packing_batches WHERE id=?', (actual,)).fetchone() if actual else None
     source_current = True
@@ -327,6 +361,21 @@ def pdf_items(result):
                  order_id=r['order_id'], source_order_id=r['order_id'], source_order_no=r['order_number'],
                  source_order_note=r['note'], sku=r['sku'], model=r['model_name'], qty=r['packed_qty'])
             for r in result['allocations']]
+
+
+def saved_documents_for_order(db, order_id):
+    """All original packing PDFs that actually contain this order, without billing."""
+    return [dict(row) for row in db.execute('''
+        SELECT d.file_hash,d.created_at,pb.id AS batch_id,
+          CASE WHEN pl.current_batch_id=pb.id OR pl.packing_list_id IS NULL THEN 1 ELSE 0 END AS is_current,
+          EXISTS(SELECT 1 FROM packing_shipments ps WHERE ps.final_batch_id=pb.id) AS shipped,
+          (SELECT COUNT(DISTINCT a.order_id) FROM packing_allocations a WHERE a.batch_id=pb.id) AS order_count,
+          (SELECT SUM(a.qty) FROM packing_allocations a WHERE a.batch_id=pb.id) AS total_qty
+        FROM fulfillment_document_history d JOIN packing_batches pb ON pb.id=d.document_id
+        LEFT JOIN packing_lists pl ON pl.packing_list_id=pb.packing_list_id
+        WHERE d.order_id=? AND d.kind='packing_list'
+          AND EXISTS(SELECT 1 FROM packing_allocations a WHERE a.batch_id=pb.id AND a.order_id=d.order_id)
+        ORDER BY d.created_at DESC,pb.id DESC''', (order_id,))]
 
 
 def legacy_invoice_result(db, invoice_id):

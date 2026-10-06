@@ -189,7 +189,7 @@ def publish(b, claim):
             db.close()
 
 
-def flush(b, shipment_id=None):
+def flush(b, shipment_id=None, limit=20):
     if not b.supabase_enabled():
         return 0
     db = b.conn()
@@ -197,7 +197,7 @@ def flush(b, shipment_id=None):
         sids = [row[0] for row in db.execute('''SELECT s.shipment_id FROM inpost_tracking_state s
             JOIN inpost_reconciliation j ON j.shipment_id=s.shipment_id
             WHERE s.sync_state='pending' AND (? IS NULL OR s.shipment_id=?)
-            ORDER BY s.verified_at LIMIT 20''', (shipment_id, shipment_id))]
+            ORDER BY s.verified_at LIMIT ?''', (shipment_id, shipment_id, max(1,min(int(limit),20))))]
     finally:
         db.close()
     done = 0
@@ -209,6 +209,11 @@ def flush(b, shipment_id=None):
             publish(b, claim)
         except Exception as exc:
             _finish_sync(b, claim, str(exc), isinstance(exc, SyncConflict))
+            import urllib.error
+            if isinstance(exc, (TimeoutError, ConnectionError)) or (
+                    isinstance(exc, urllib.error.URLError) and
+                    (not isinstance(exc, urllib.error.HTTPError) or exc.code >= 500)):
+                break  # Keep remaining shipments pending for a later retry.
         else:
             done += int(_finish_sync(b, claim))
     return done

@@ -80,6 +80,19 @@ def finish(b, invoice_id):
         # attempt (including the first 'preparing' attempt). Never replace it.
         order_ids = sorted({int(i.get('source_order_id') or i.get('order_id')) for i in items})
         packing_versions.prepare_write_evidence(b, order_ids)
+        c=b.conn()
+        try:
+            logical = packing_versions.resolve_list(c, inv['order_id'], invoice_id)
+            expected = job['packing_expected_batch']
+            if packing_versions.validate_shipped_invoice_scope(c, logical, items):
+                # Older jobs treated a shipped, unbilled list as absent. Recover
+                # that target only after exact item/quantity and original-PDF proof.
+                actual = int(logical['current_batch_id'])
+                if expected not in (0, actual):
+                    raise packing_versions.PackingConflict('Lista faktury nie odpowiada zapisanej wysyłce.')
+                expected = actual
+        finally:
+            c.close()
         if b.supabase_enabled():
             # Persist the exact job input before the first remote stock change.
             b.sync_local_rows_to_supabase('invoices','id',[invoice_id])
@@ -113,7 +126,6 @@ def finish(b, invoice_id):
                        (invoice_id,path,job['items_json'],b.now_iso()))
             logical = packing_versions.resolve_list(c, inv['order_id'], invoice_id)
             # A completed local publication may only be retried with identical data.
-            expected = job['packing_expected_batch']
             if job['state'] == 'ready':
                 expected = int(logical['current_batch_id']) if logical else 0
             batch_id = packing_versions.publish(b, c, inv['order_id'], items, None,
