@@ -49,6 +49,24 @@ def register_routes(context):
     def order_invoice_service(order_id, *, request, session=None, structured=False):
         if not structured:
             maybe_pull_shared_from_supabase()
+        if supabase_enabled():
+            # A direct invoice URL can be the first page after a Render restart.
+            # Restore only this order's missing LP cache before suggesting any
+            # quantities; the cloud business-table bootstrap does not contain it.
+            cached = conn()
+            try:
+                packing_cached = cached.execute("SELECT 1 FROM fulfillment_documents WHERE order_id=? AND kind='packing_list'",
+                                                (order_id,)).fetchone()
+            finally:
+                cached.close()
+            if not packing_cached:
+                import reconciliation_store, sys
+                backend = sys.modules.get('app') or sys.modules['__main__']
+                try:
+                    reconciliation_store.restore(backend, order_id)
+                except Exception:
+                    app.logger.exception('INVOICE_PACKING_CACHE_UNAVAILABLE order_id=%s', order_id)
+                    abort(503, description='Nie można odczytać zapisanej listy pakowej. Ponów otwarcie faktury.')
         sent_invoice_id = to_int(request.args.get("invoice_id"), 0) if request.method == 'GET' and norm(request.args.get("sent")) == "1" else 0
         if sent_invoice_id:
             meta = load_invoice_meta(sent_invoice_id) or {}
