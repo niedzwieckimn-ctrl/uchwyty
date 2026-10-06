@@ -202,6 +202,54 @@ def _same_evidence(left, right):
         _evidence_section(left[key]) == _evidence_section(right[key]) for key in left)
 
 
+def _same_cold_packing_cache(remote, pending, oid):
+    """Recognize an unchanged aggregate copied through another LP member.
+
+    That read restores packing rows, but can omit this member's verification
+    and synthesize an unknown mail outcome. These are cache differences only
+    when every other section is identical and no real local receipt/proof
+    contradicts the cloud. Never merge a quantity, document or shipment change.
+    """
+    cache_sections = {'fulfillment_verifications', 'inpost_notifications'}
+    if remote.keys() != pending.keys() or not remote.get('packing_shipments'):
+        return False
+    if any(_evidence_section(remote[key]) != _evidence_section(pending[key])
+           for key in remote.keys() - cache_sections):
+        return False
+    proofs = {}
+    for row in remote.get('fulfillment_verifications', []):
+        identity = (row.get('order_id'), row.get('kind'))
+        if row.get('order_id') != oid or identity in proofs:
+            return False
+        proofs[identity] = row
+    seen = set()
+    for row in pending.get('fulfillment_verifications', []):
+        identity = (row.get('order_id'), row.get('kind'))
+        if identity in seen or row != proofs.get(identity):
+            return False
+        seen.add(identity)
+    notices = {}
+    for row in remote.get('inpost_notifications', []):
+        sid = row.get('shipment_id')
+        if not sid or sid in notices:
+            return False
+        notices[sid] = row
+    placeholders = {}
+    for final in remote['packing_shipments']:
+        if final['carrier'] == 'inpost' and final['shipment_key'].startswith('inpost:'):
+            sid = final['shipment_key'].split(':', 1)[1]
+            placeholders[sid] = dict(shipment_id=sid, state='unknown', recipient='',
+                result_text=RESTORED_NOTICE_UNKNOWN, updated_at=final['confirmed_at'],
+                claim_token=None, lease_until=0)
+    seen = set()
+    for row in pending.get('inpost_notifications', []):
+        sid = row.get('shipment_id')
+        if sid in seen or (row != notices.get(sid) and row != placeholders.get(sid)):
+            return False
+        seen.add(sid)
+    return True
+
+
 def _extends_open_packing(remote, pending):
     """Permit only a proven append to an open list, never last-writer-wins.
 
@@ -489,6 +537,30 @@ def restore(b, oid, *, allow_packing_extension=False):
         if pending:
             proposed = json.loads(pending['payload'])
             durable = _remap_packing_ids(c, record['payload'])
+            if (allow_packing_extension and int(pending['expected_revision']) == 0
+                    and int(record['revision']) > 0
+                    and _same_cold_packing_cache(durable, proposed, oid)):
+                # Hydrate only omitted receipts. The queued payload contains no
+                # business change, so acknowledge the existing durable revision
+                # locally without republishing or replacing its history.
+                for source in durable.get('fulfillment_verifications', []):
+                    existing = c.execute('SELECT * FROM fulfillment_verifications WHERE order_id=? AND kind=?',
+                        (source['order_id'], source['kind'])).fetchone()
+                    if existing and dict(existing) != source:
+                        raise ValueError('Konflikt potwierdzenia realizacji; zachowano lokalny zapis.')
+                    c.execute('INSERT OR IGNORE INTO fulfillment_verifications VALUES(?,?,?)',
+                        (source['order_id'], source['kind'], source['payload']))
+                _repair_missing_packing_documents(b, c, durable)
+                _repair_same_revision_files(b, c, durable)
+                restore_inpost_notifications(c, durable)
+                c.execute('DELETE FROM fulfillment_reconciliation_pending WHERE order_id=? AND expected_revision=? AND payload=?',
+                    (oid, pending['expected_revision'], pending['payload']))
+                c.execute('''INSERT INTO fulfillment_reconciliation_versions VALUES(?,?)
+                    ON CONFLICT(order_id) DO UPDATE SET revision=MAX(revision,excluded.revision)''',
+                    (oid, record['revision']))
+                c.commit()
+                b.app.logger.info('PACKING_COLD_CACHE_RESTORED order_id=%s revision=%s', oid, record['revision'])
+                return
             if (int(record['revision']) > int(pending['expected_revision'])
                     and (_same_evidence(record['payload'], proposed) or _same_evidence(durable, proposed))):
                 c.execute('DELETE FROM fulfillment_reconciliation_pending WHERE order_id=?', (oid,))

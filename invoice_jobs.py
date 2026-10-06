@@ -75,6 +75,13 @@ def finish(b, invoice_id):
     finally:
         c.close()
     try:
+        if b.supabase_enabled():
+            # Keep the preparing document and exact job input durable even if
+            # the packing preflight cannot finish. It is still unavailable to
+            # download/send and has not issued stock. A cold cache must be able
+            # to recover this same number and selection after that failure.
+            b.sync_local_rows_to_supabase('invoices','id',[invoice_id])
+            b.sync_invoice_meta_to_supabase(invoice_id)
         # A previous packing/shipping write can still be awaiting its cloud ACK.
         # Reconcile it BEFORE uploading the invoice or issuing stock, on every
         # attempt (including the first 'preparing' attempt). Never replace it.
@@ -93,10 +100,6 @@ def finish(b, invoice_id):
                 expected = actual
         finally:
             c.close()
-        if b.supabase_enabled():
-            # Persist the exact job input before the first remote stock change.
-            b.sync_local_rows_to_supabase('invoices','id',[invoice_id])
-            b.sync_invoice_meta_to_supabase(invoice_id)
         pdf,net,gross=b.generate_order_invoice_pdf(order,items,b.invoice_meta_payload(inv))
         path=b.upload_invoice_pdfs_to_supabase(invoice_id,inv['invoice_no'],pdf,None)
         if not path:
