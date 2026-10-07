@@ -4,6 +4,16 @@ def register_routes(context):
     globals().update(context)
 
 
+    def saved_inpost_result(saved, order_id):
+        if (not saved or saved.get('state') != 'SUCCESS'
+                or order_id not in saved.get('payload', {}).get('order_ids', [])):
+            return {}
+        result = saved.get('provider_json') or {}
+        if isinstance(result, str):
+            result = json.loads(result)
+        return result if isinstance(result, dict) and norm(result.get('id')) else {}
+
+
     def persist_inpost_result(package_ids, shipment_id, tracking_number, *, enqueue_pickup=True):
         c = conn()
         try:
@@ -310,6 +320,12 @@ def register_routes(context):
                 error = recipient_error
         saved_recipient = (recipient_context or {}).get('saved')
         recipient_preview = (saved_recipient or {}).get('payload', {}).get('receiver') or (recipient_context or {}).get('default')
+        # The confirmed carrier receipt is enough to show/download the existing
+        # label even while the order's pointer is missing from the local cache.
+        saved_result = saved_inpost_result(saved_recipient, order_id)
+        if not norm(order.get('inpost_shipment_id')) and saved_result:
+            order = dict(order, inpost_shipment_id=norm(saved_result['id']),
+                         tracking_no=norm(saved_result.get('tracking_number')))
 
         tpl = r"""
         {% extends "base.html" %}{% block content %}
@@ -325,7 +341,7 @@ def register_routes(context):
               <div class="hint"><b>Odbiorca zapisany dla przesyłki</b><p>{{ recipient_preview.name }}<br>{{ recipient_preview.street }}<br>{{ recipient_preview.post_code }} {{ recipient_preview.city }}<br>{{ recipient_preview.phone }} · {{ recipient_preview.email }}</p>
               {% if saved_recipient and saved_recipient.state != 'SUCCESS' %}<p>Trwa wyjaśnianie wyniku nadania. Dane odbiorcy są zablokowane, aby nie utworzyć drugiej przesyłki.</p>{% endif %}</div>
             {% endif %}
-            {% if o.inpost_shipment_id %}<div class="flex"><span class="badge">Przesyłka już utworzona</span><a class="btn primary" href="{{ url_for('order_inpost_label', order_id=o.id, bundle='1' if bundle else None) }}">{% if bundle %}Pobierz listę A4 + etykietę A6 (PDF){% else %}Pobierz etykietę A6 (PDF){% endif %}</a><a class="btn" href="{{ url_for('order_view', order_id=o.id) }}">Wróć do zamówienia</a></div>{% else %}
+            {% if o.inpost_shipment_id %}<div class="flex"><span class="badge">Przesyłka już utworzona</span><a class="btn primary" href="{{ url_for('order_inpost_label', order_id=o.id, bundle='1' if bundle else None) }}">Pokaż etykietę</a><a class="btn" href="{{ url_for('order_view', order_id=o.id) }}">Wróć do zamówienia</a></div>{% else %}
             <form method="post" class="row">
               {% if bundle %}<input type="hidden" name="bundle" value="1">{% endif %}
               {% if not saved_recipient %}
@@ -368,13 +384,13 @@ def register_routes(context):
               <div><label class="muted small">Uwagi dla InPost</label><input name="comments" maxlength="100" value="{{ request.form.get('comments', '') }}"></div>
               <div style="grid-column:1/-1" class="flex"><label><input type="checkbox" name="sms" value="1" {% if request.form.get('sms') == '1' %}checked{% endif %}> Serwis SMS</label><label><input type="checkbox" name="email" value="1" {% if request.form.get('email') == '1' %}checked{% endif %}> Serwis Email</label><label><input type="checkbox" name="rod" value="1" {% if request.form.get('rod') == '1' %}checked{% endif %}> Zwrot dokumentów</label><label><input type="checkbox" name="saturday" value="1" {% if request.form.get('saturday') == '1' %}checked{% endif %}> Doręczenie w sobotę</label></div>
               </fieldset>
-              <div style="grid-column:1/-1"><button class="btn primary" type="submit" {% if recipient_error or (saved_recipient and saved_recipient.state != 'SUCCESS') %}disabled{% endif %} onclick="return confirm('Potwierdzasz odbiorcę widocznego w formularzu oraz utworzenie przesyłki InPost i podjazd?')">{{ 'Odczytaj zapisany wynik nadania' if saved_recipient else 'Utwórz przesyłkę i zamów podjazd' }}</button></div>
+              <div style="grid-column:1/-1"><button class="btn primary" type="submit" {% if recipient_error or (saved_recipient and saved_recipient.state != 'SUCCESS') %}disabled{% endif %} {% if not saved_recipient %}onclick="return confirm('Nadać przesyłkę do wskazanego odbiorcy i zamówić podjazd kuriera?')"{% endif %}>{{ 'Sprawdź przesyłkę' if saved_recipient else 'Nadaj przesyłkę' }}</button></div>
             </form>{% endif %}
           </div>
         {% endblock %}
         """
         labels = [canonical_order_no(item["id"], item["created_at"], item["order_no"]) for item in package_orders]
-        return render_template_string(tpl, title="Etykieta InPost", base_url=BASE_URL, db_path=DB_PATH, o=order, cfg=cfg, error=error, package_labels=labels, bundle=bundle, created=just_created, pickup=inpost_pickup_status(order.get("inpost_shipment_id")), previous_shipments=any(item.get('inpost_shipment_id') for item in package_orders), prepared=request.args.get('prepared') == '1', recipient_context=recipient_context, recipient_mode=recipient_mode, recipient_values=recipient_values, recipient_preview=recipient_preview, saved_recipient=saved_recipient, recipient_error=recipient_error)
+        return render_template_string(tpl, title="Etykieta InPost", base_url=BASE_URL, db_path=DB_PATH, o=order, cfg=cfg, error=error, package_labels=labels, bundle=bundle, created=just_created, pickup=inpost_pickup_status(order.get("inpost_shipment_id")), previous_shipments=any(norm(item.get('inpost_shipment_id')) and norm(item.get('inpost_shipment_id')) != norm(saved_result.get('id')) for item in package_orders), prepared=request.args.get('prepared') == '1', recipient_context=recipient_context, recipient_mode=recipient_mode, recipient_values=recipient_values, recipient_preview=recipient_preview, saved_recipient=saved_recipient, recipient_error=recipient_error)
 
 
     @app.route("/orders/<int:order_id>/inpost", methods=["GET", "POST"])
@@ -400,7 +416,18 @@ def register_routes(context):
             abort(404)
         shipment_id = norm(row["inpost_shipment_id"])
         if not shipment_id:
-            return redirect(url_for("order_inpost_create", order_id=order_id))
+            from fulfillment_operations import shipment_recipient_context
+            try:
+                saved = shipment_recipient_context(order_id).get('saved')
+                result = saved_inpost_result(saved, order_id)
+            except Exception:
+                app.logger.exception('INPOST_LABEL_RECEIPT_READ order_id=%s', order_id)
+                result = {}
+            if not result:
+                return redirect(url_for("order_inpost_create", order_id=order_id))
+            shipment_id = norm(result['id'])
+            row = dict(row, inpost_shipment_id=shipment_id,
+                       tracking_no=norm(result.get('tracking_number')))
         # Przy okazji pobrania uzupełnij numer, jeśli pierwsza odpowiedź ShipX
         # podczas tworzenia przesyłki jeszcze go nie zawierała.
         if not norm(row["tracking_no"]):
