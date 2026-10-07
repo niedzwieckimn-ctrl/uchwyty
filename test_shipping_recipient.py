@@ -42,6 +42,7 @@ def test_form_shows_default_and_custom_fields(ready):
     assert 'Odbiorca przesyłki' in html and 'Inny odbiorca — dropshipping' in html
     assert 'Testowa 1' in html and '00-001 Warszawa' in html
     assert 'hidden disabled' in html
+    assert '>Nadaj przesyłkę</button>' in html
     assert not ready['calls']
 
 
@@ -64,6 +65,7 @@ def test_custom_booking_preserves_customer_invoice_and_documents(ready):
     db.close()
     html = request()
     assert 'Odbiorca zapisany' in html and CUSTOM['street'] in html
+    assert 'Przygotuj kolejne nadanie dla tej listy' not in html
     assert 'name="recipient_mode"' not in html
     request(form(recipient_street='Inna 99'))
     assert len(ready['calls']) == 1
@@ -118,6 +120,28 @@ def test_success_retry_uses_saved_recipient_and_parcel_without_carrier_post(read
     assert request({}).status_code == 302
     assert len(ready['calls']) == 1
     assert context()['saved']['payload']['receiver'] == CUSTOM
+
+
+def test_confirmed_receipt_shows_label_without_recovery_post(ready, monkeypatch):
+    request(form())
+    db = b.conn()
+    db.execute("UPDATE orders SET inpost_shipment_id='',tracking_no='' WHERE id=702")
+    db.commit(); db.close()
+    html = request()
+    assert '>Pokaż etykietę</a>' in html
+    assert 'Odczytaj zapisany wynik' not in html and '>Nadaj przesyłkę</button>' not in html
+    labels = []
+    monkeypatch.setattr(b, 'inpost_get_label', lambda sid, *a: labels.append(sid) or b'%PDF-1.4\nlabel')
+    with b.app.test_request_context('/orders/702/inpost/label'):
+        b._refresh_domain_route_context()
+        response = b.order_inpost_label(702)
+        assert response.status_code == 200 and response.mimetype == 'application/pdf'
+        response.close()
+    assert labels == ['123456']
+    assert len(ready['calls']) == 1 and len(ready['pickup']) == 1
+    db = b.conn()
+    assert db.execute('SELECT inpost_shipment_id FROM orders WHERE id=702').fetchone()[0] == ''
+    db.close()
 
 
 def test_next_package_defaults_to_client_without_overwriting_requirements(ready):
