@@ -106,6 +106,19 @@ def register_routes(context):
         cfg = inpost_config_summary()
         bundle = request.form.get("bundle") == "1" or request.args.get("bundle") == "1"
         error = norm(request.args.get("inpost_error"))
+        recipient_context = None
+        recipient_error = ''
+        recipient_mode = request.form.get('recipient_mode', 'client')
+        recipient_fields = ('name', 'street', 'post_code', 'city', 'phone', 'email')
+        recipient_values = {key: norm(request.form.get('recipient_' + key)) for key in recipient_fields}
+        if not structured:
+            from fulfillment_operations import shipment_recipient_context
+            try:
+                recipient_context = shipment_recipient_context(order_id)
+            except Exception:
+                app.logger.exception('INPOST_RECIPIENT_READ order_id=%s', order_id)
+                recipient_error = 'Nie można potwierdzić danych odbiorcy. Odśwież formularz przed nadaniem.'
+                error = recipient_error
         if request.method == 'POST' and request.form.get('submit_action') == 'prepare_next_shipment':
             import inpost_history, sys
             try:
@@ -159,6 +172,8 @@ def register_routes(context):
                 return redirect(url_for("order_invoice", order_id=order_id, from_packing="1"))
             elif not inpost_label_allowed_for_status(order.get("status")):
                 error = "Najpierw wybierz zawartość paczki w kreatorze Pakuj."
+            elif recipient_error:
+                error = recipient_error
             else:
                 address_source = norm(order.get("customer_address"))
                 phone = norm(order.get("customer_phone"))
@@ -177,11 +192,42 @@ def register_routes(context):
                 if structured and receiver_override is not None:
                     receiver = dict(receiver_override)
                 try:
+                    recipient_selection = None
+                    saved_recipient = (recipient_context or {}).get('saved')
+                    if not structured:
+                        if saved_recipient:
+                            if saved_recipient['state'] != 'SUCCESS':
+                                raise InPostError('Wynik wcześniejszego nadania jest niepewny. Odbiorca został zapisany. Sprawdź istniejącą przesyłkę; nie twórz kolejnej.')
+                            receiver = dict(saved_recipient['payload']['receiver'])
+                            recipient_selection = saved_recipient['payload']['recipient_selection']
+                        else:
+                            if recipient_mode not in ('client', 'custom'):
+                                raise InPostError('Wybierz odbiorcę przesyłki.')
+                            if (request.form.get('recipient_mode') is not None
+                                    and request.form.get('recipient_fingerprint') != recipient_context['fingerprint']):
+                                raise InPostError('Dane klienta lub paczki zmieniły się. Odśwież formularz i sprawdź odbiorcę.')
+                            receiver = dict(recipient_context['default'] if recipient_mode == 'client' else recipient_values)
+                            labels = dict(name='Nazwa odbiorcy', street='Ulica i numer', post_code='Kod pocztowy',
+                                          city='Miejscowość', phone='Telefon', email='E-mail')
+                            for key in recipient_fields:
+                                receiver[key] = norm(receiver.get(key))
+                                if not receiver[key] or len(receiver[key]) > 200:
+                                    raise InPostError('Uzupełnij dane odbiorcy: ' + labels[key] + '. W razie potrzeby wybierz innego odbiorcę.')
+                            if not re.fullmatch(r'\d{2}-\d{3}', receiver['post_code']):
+                                raise InPostError('Kod pocztowy odbiorcy musi mieć format 00-000.')
+                            from inpost_module import normalize_polish_phone
+                            if len(normalize_polish_phone(receiver['phone'])) != 9:
+                                raise InPostError('Podaj 9-cyfrowy telefon odbiorcy (może zawierać +48).')
+                            if not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', receiver['email']):
+                                raise InPostError('Podaj poprawny e-mail odbiorcy.')
+                            if not re.search(r'[,\s]+\d+[A-Za-z0-9/\-]*$', receiver['street']):
+                                raise InPostError('Podaj ulicę i numer budynku/lokalu, np. Długa 10/2.')
+                            recipient_selection = {'mode': recipient_mode, 'scope': recipient_context['scope']}
                     allowed_services = {
                         "inpost_courier_standard", "inpost_courier_express_1700",
                         "inpost_courier_express_1200", "inpost_courier_express_1000",
                     }
-                    service = norm(request.form.get("service"))
+                    service = saved_recipient['payload']['service'] if saved_recipient else norm(request.form.get("service"))
                     if service not in allowed_services:
                         raise InPostError("Wybierz poprawny serwis kurierski")
                     parcel = {
@@ -202,12 +248,17 @@ def register_routes(context):
                         "insurance": max(0, to_float(request.form.get("insurance"), 0)),
                         "cod": max(0, to_float(request.form.get("cod"), 0)),
                     }
+                    if saved_recipient:
+                        parcel = saved_recipient['payload']['parcel']
+                        service = saved_recipient['payload']['service']
+                        options = saved_recipient['payload']['options']
                     reference = ", ".join(
                         canonical_order_no(item["id"], item["created_at"], item["order_no"])
                         for item in package_orders
                     )
                     from fulfillment_operations import safe_create_shipment
-                    shipment = safe_create_shipment(order_id, receiver, parcel, reference, service, options)
+                    shipment = safe_create_shipment(order_id, receiver, parcel, reference, service, options,
+                                                    **({'recipient_selection': recipient_selection} if recipient_selection else {}))
                     shipment_id = norm(shipment.get("id"))
                     tracking_number = norm(shipment.get("tracking_number"))
                     if not shipment_id:
@@ -239,11 +290,26 @@ def register_routes(context):
                     ))
                 except InPostError as exc:
                     error = str(exc)
+                except Exception:
+                    app.logger.exception('INPOST_CREATE_RESULT order_id=%s', order_id)
+                    if structured:
+                        raise
+                    error = 'Nie potwierdzono wyniku nadania. Sprawdź istniejącą przesyłkę przed ponowieniem.'
 
         if structured:
             if error:
                 return {'ok': False, 'error': error}
             return {'ok': False, 'error': 'Nie potwierdzono utworzenia przesyłki.'}
+
+        # A lost carrier response locks the submitted recipient on this page too.
+        if request.method == 'POST' and recipient_context:
+            try:
+                recipient_context = shipment_recipient_context(order_id)
+            except Exception:
+                recipient_error = 'Nie można potwierdzić wyniku nadania. Odśwież formularz przed kolejną próbą.'
+                error = recipient_error
+        saved_recipient = (recipient_context or {}).get('saved')
+        recipient_preview = (saved_recipient or {}).get('payload', {}).get('receiver') or (recipient_context or {}).get('default')
 
         tpl = r"""
         {% extends "base.html" %}{% block content %}
@@ -255,27 +321,60 @@ def register_routes(context):
             {% if prepared %}<div class="hint">Poprzednie nadania zachowano w historii. Aktualna lista pakowa i faktura pozostają bez zmian. Możesz teraz nadać tę paczkę.</div>{% endif %}
             {% if previous_shipments %}<div class="hint"><b>Część zamówień ma wcześniejsze nadanie.</b> Jeśli pakujesz kolejną dostawę, potwierdź zakończenie poprzedniego etapu. Aplikacja sprawdzi odbiór przez InPost i zachowa stare etykiety w historii. Lista pakowa nie zostanie wysłana ponownie.<form method="post"><button class="btn" name="submit_action" value="prepare_next_shipment" type="submit">Przygotuj kolejne nadanie dla tej listy</button></form></div>{% endif %}
             {% if not cfg.configured %}<div class="hint">Dodaj na Renderze zmienną <b>INPOST_API_TOKEN</b>. ID organizacji aplikacja pobierze automatycznie.</div>{% endif %}
+            {% if saved_recipient and recipient_preview %}
+              <div class="hint"><b>Odbiorca zapisany dla przesyłki</b><p>{{ recipient_preview.name }}<br>{{ recipient_preview.street }}<br>{{ recipient_preview.post_code }} {{ recipient_preview.city }}<br>{{ recipient_preview.phone }} · {{ recipient_preview.email }}</p>
+              {% if saved_recipient and saved_recipient.state != 'SUCCESS' %}<p>Trwa wyjaśnianie wyniku nadania. Dane odbiorcy są zablokowane, aby nie utworzyć drugiej przesyłki.</p>{% endif %}</div>
+            {% endif %}
             {% if o.inpost_shipment_id %}<div class="flex"><span class="badge">Przesyłka już utworzona</span><a class="btn primary" href="{{ url_for('order_inpost_label', order_id=o.id, bundle='1' if bundle else None) }}">{% if bundle %}Pobierz listę A4 + etykietę A6 (PDF){% else %}Pobierz etykietę A6 (PDF){% endif %}</a><a class="btn" href="{{ url_for('order_view', order_id=o.id) }}">Wróć do zamówienia</a></div>{% else %}
             <form method="post" class="row">
               {% if bundle %}<input type="hidden" name="bundle" value="1">{% endif %}
-              <div><label class="muted small">Serwis</label><select name="service" required><option value="inpost_courier_standard">Kurier Standard</option><option value="inpost_courier_express_1700">Doręczenie 17:00</option><option value="inpost_courier_express_1200">Doręczenie 12:00</option><option value="inpost_courier_express_1000">Doręczenie 10:00</option></select></div>
-              <div><label class="muted small">Liczba paczek</label><input type="number" name="quantity" value="1" min="1" max="99" required></div>
-              <div><label class="muted small">Długość (cm)</label><input type="number" name="length" value="40" min="0.1" max="350" step="0.1" required></div>
-              <div><label class="muted small">Szerokość (cm)</label><input type="number" name="width" value="30" min="0.1" max="240" step="0.1" required></div>
-              <div><label class="muted small">Wysokość (cm)</label><input type="number" name="height" value="20" min="0.1" max="240" step="0.1" required></div>
-              <div><label class="muted small">Waga (kg)</label><input type="number" name="weight" value="5" min="0.01" max="50" step="0.01" required></div>
-              <div><label class="muted small">Rodzaj</label><select name="non_standard"><option value="0">Standardowa</option><option value="1">Niestandardowa</option></select></div>
-              <div><label class="muted small">Dodatkowa ochrona (PLN)</label><input type="number" name="insurance" value="0" min="0" step="0.01"></div>
-              <div><label class="muted small">Pobranie COD (PLN)</label><input type="number" name="cod" value="0" min="0" step="0.01"><div class="muted small">Ochrona musi być ≥ pobraniu.</div></div>
-              <div><label class="muted small">Uwagi dla InPost</label><input name="comments" maxlength="100"></div>
-              <div style="grid-column:1/-1" class="flex"><label><input type="checkbox" name="sms" value="1"> Serwis SMS</label><label><input type="checkbox" name="email" value="1"> Serwis Email</label><label><input type="checkbox" name="rod" value="1"> Zwrot dokumentów</label><label><input type="checkbox" name="saturday" value="1"> Doręczenie w sobotę</label></div>
-              <div style="grid-column:1/-1"><button class="btn primary" type="submit" onclick="return confirm('Utworzyć płatną przesyłkę InPost i automatycznie zamówić podjazd?')">Utwórz przesyłkę i zamów podjazd</button></div>
+              {% if not saved_recipient %}
+              <section style="grid-column:1/-1">
+                <h2>Odbiorca przesyłki</h2>
+                <p class="muted small">Jeden odbiorca dla całej paczki. Wybór dotyczy tego nadania i nie zmienia danych klienta ani faktury.</p>
+                <input type="hidden" name="recipient_fingerprint" value="{{ recipient_context.fingerprint if recipient_context else '' }}">
+                <label for="recipient-mode">Adres dostawy</label>
+                <select id="recipient-mode" name="recipient_mode"><option value="client" {% if recipient_mode == 'client' %}selected{% endif %}>Adres wysyłki klienta</option><option value="custom" {% if recipient_mode == 'custom' %}selected{% endif %}>Inny odbiorca — dropshipping</option></select>
+                <div id="recipient-client" class="hint" {% if recipient_mode == 'custom' %}hidden{% endif %}>
+                  {% if recipient_context %}{% set r = recipient_context.default %}<b>{{ r.name }}</b><br>{{ r.street }}<br>{{ r.post_code }} {{ r.city }}<br>{{ r.phone }} · {{ r.email }}{% endif %}
+                </div>
+                <fieldset id="recipient-custom" style="border:0;padding:16px 0 0;margin:0" {% if recipient_mode != 'custom' %}hidden disabled{% endif %}>
+                  <div class="row">
+                    {% for key, label in [('name','Imię i nazwisko lub nazwa firmy'),('street','Ulica i numer budynku/lokalu'),('post_code','Kod pocztowy'),('city','Miejscowość'),('phone','Telefon odbiorcy'),('email','E-mail odbiorcy')] %}
+                    <div><label for="recipient-{{ key }}">{{ label }}</label><input id="recipient-{{ key }}" name="recipient_{{ key }}" type="{{ 'email' if key == 'email' else 'tel' if key == 'phone' else 'text' }}" value="{{ recipient_values[key] }}" maxlength="200" required {% if key == 'post_code' %}placeholder="00-000" pattern="[0-9]{2}-[0-9]{3}"{% endif %}></div>
+                    {% endfor %}
+                  </div>
+                  <p class="muted small">Dostawa na terenie Polski. Telefon i e-mail służą do obsługi przesyłki i powiadomień InPost. Faktura trafia do dotychczasowego klienta.</p>
+                </fieldset>
+              </section>
+              <script>
+                (() => { const mode = document.getElementById('recipient-mode');
+                  const update = () => { const custom = mode.value === 'custom';
+                    document.getElementById('recipient-client').hidden = custom;
+                    const fields = document.getElementById('recipient-custom'); fields.hidden = !custom; fields.disabled = !custom;
+                  }; mode.addEventListener('change', update); update(); })();
+              </script>
+              {% endif %}
+              <fieldset class="row" style="grid-column:1/-1;border:0;padding:0;margin:0" {% if saved_recipient %}disabled{% endif %}>
+              <div><label class="muted small">Serwis</label><select name="service" required><option value="inpost_courier_standard" {% if request.form.get('service', 'inpost_courier_standard') == 'inpost_courier_standard' %}selected{% endif %}>Kurier Standard</option><option value="inpost_courier_express_1700" {% if request.form.get('service', 'inpost_courier_standard') == 'inpost_courier_express_1700' %}selected{% endif %}>Doręczenie 17:00</option><option value="inpost_courier_express_1200" {% if request.form.get('service', 'inpost_courier_standard') == 'inpost_courier_express_1200' %}selected{% endif %}>Doręczenie 12:00</option><option value="inpost_courier_express_1000" {% if request.form.get('service', 'inpost_courier_standard') == 'inpost_courier_express_1000' %}selected{% endif %}>Doręczenie 10:00</option></select></div>
+              <div><label class="muted small">Liczba paczek</label><input type="number" name="quantity" value="{{ request.form.get('quantity', '1') }}" min="1" max="99" required></div>
+              <div><label class="muted small">Długość (cm)</label><input type="number" name="length" value="{{ request.form.get('length', '40') }}" min="0.1" max="350" step="0.1" required></div>
+              <div><label class="muted small">Szerokość (cm)</label><input type="number" name="width" value="{{ request.form.get('width', '30') }}" min="0.1" max="240" step="0.1" required></div>
+              <div><label class="muted small">Wysokość (cm)</label><input type="number" name="height" value="{{ request.form.get('height', '20') }}" min="0.1" max="240" step="0.1" required></div>
+              <div><label class="muted small">Waga (kg)</label><input type="number" name="weight" value="{{ request.form.get('weight', '5') }}" min="0.01" max="50" step="0.01" required></div>
+              <div><label class="muted small">Rodzaj</label><select name="non_standard"><option value="0">Standardowa</option><option value="1" {% if request.form.get('non_standard') == '1' %}selected{% endif %}>Niestandardowa</option></select></div>
+              <div><label class="muted small">Dodatkowa ochrona (PLN)</label><input type="number" name="insurance" value="{{ request.form.get('insurance', '0') }}" min="0" step="0.01"></div>
+              <div><label class="muted small">Pobranie COD (PLN)</label><input type="number" name="cod" value="{{ request.form.get('cod', '0') }}" min="0" step="0.01"><div class="muted small">Ochrona musi być ≥ pobraniu.</div></div>
+              <div><label class="muted small">Uwagi dla InPost</label><input name="comments" maxlength="100" value="{{ request.form.get('comments', '') }}"></div>
+              <div style="grid-column:1/-1" class="flex"><label><input type="checkbox" name="sms" value="1" {% if request.form.get('sms') == '1' %}checked{% endif %}> Serwis SMS</label><label><input type="checkbox" name="email" value="1" {% if request.form.get('email') == '1' %}checked{% endif %}> Serwis Email</label><label><input type="checkbox" name="rod" value="1" {% if request.form.get('rod') == '1' %}checked{% endif %}> Zwrot dokumentów</label><label><input type="checkbox" name="saturday" value="1" {% if request.form.get('saturday') == '1' %}checked{% endif %}> Doręczenie w sobotę</label></div>
+              </fieldset>
+              <div style="grid-column:1/-1"><button class="btn primary" type="submit" {% if recipient_error or (saved_recipient and saved_recipient.state != 'SUCCESS') %}disabled{% endif %} onclick="return confirm('Potwierdzasz odbiorcę widocznego w formularzu oraz utworzenie przesyłki InPost i podjazd?')">{{ 'Odczytaj zapisany wynik nadania' if saved_recipient else 'Utwórz przesyłkę i zamów podjazd' }}</button></div>
             </form>{% endif %}
           </div>
         {% endblock %}
         """
         labels = [canonical_order_no(item["id"], item["created_at"], item["order_no"]) for item in package_orders]
-        return render_template_string(tpl, title="Etykieta InPost", base_url=BASE_URL, db_path=DB_PATH, o=order, cfg=cfg, error=error, package_labels=labels, bundle=bundle, created=just_created, pickup=inpost_pickup_status(order.get("inpost_shipment_id")), previous_shipments=any(item.get('inpost_shipment_id') for item in package_orders), prepared=request.args.get('prepared') == '1')
+        return render_template_string(tpl, title="Etykieta InPost", base_url=BASE_URL, db_path=DB_PATH, o=order, cfg=cfg, error=error, package_labels=labels, bundle=bundle, created=just_created, pickup=inpost_pickup_status(order.get("inpost_shipment_id")), previous_shipments=any(item.get('inpost_shipment_id') for item in package_orders), prepared=request.args.get('prepared') == '1', recipient_context=recipient_context, recipient_mode=recipient_mode, recipient_values=recipient_values, recipient_preview=recipient_preview, saved_recipient=saved_recipient, recipient_error=recipient_error)
 
 
     @app.route("/orders/<int:order_id>/inpost", methods=["GET", "POST"])
