@@ -174,7 +174,7 @@ def version(s):
     return int(_hash(s)[:15], 16)
 
 
-def shipment_content(s):
+def shipment_content(s, recipient_override=None):
     packing = next((d for d in s['documents'] if d['kind'] == 'packing_list'), None)
     batch = next((x for x in s['batches'] if packing and x['id'] == packing['document_id']), None)
     if batch and batch.get('selection_hash'):
@@ -186,7 +186,8 @@ def shipment_content(s):
             sources = {oid: snapshot(oid, c, include_package=False) for oid in members}
             root = sources.get(batch['root_order_id']) or snapshot(batch['root_order_id'], c, include_package=False)
             return _hash((batch['packing_list_id'], batch['selection_hash'],
-                          [(oid, sources[oid]['content_hash']) for oid in members], effective_receiver(root)))
+                          [(oid, sources[oid]['content_hash']) for oid in members],
+                          recipient_override if recipient_override is not None else effective_receiver(root)))
         finally:
             c.close()
     if len(s['package_ids']) == 1:
@@ -204,7 +205,50 @@ def receiver(order):
 
 
 def effective_receiver(s):
+    # A panel selection belongs to this parcel, never to the customer master.
+    # Keep its recipient stable after booking, also when read from a member order.
+    for attempt in s['attempts']:
+        payload = json.loads(attempt['payload'])
+        if payload.get('recipient_selection', {}).get('scope') == recipient_scope(s):
+            return dict(payload['receiver'])
     return {key: s['requirements'].get('recipient_' + key, value) for key, value in s['receiver'].items()}
+
+
+def recipient_scope(s):
+    document = next((d for d in s['documents'] if d['kind'] == 'packing_list'), None)
+    batch = next((x for x in s['batches'] if document and x['id'] == document['document_id']), None)
+    # Logical IDs survive restoration into a cold SQLite cache.
+    return {'packing_list': batch.get('packing_list_id') or str(batch['id']),
+            'selection': batch.get('selection_hash') or ''} if batch else {'orders': s['package_ids']}
+
+
+def shipment_recipient_context(oid):
+    """Read the form default and an immutable booking, including after cache loss."""
+    from inpost_module import InPostError
+    s = snapshot(oid)
+    scope = recipient_scope(s)
+    document = next((d for d in s['documents'] if d['kind'] == 'packing_list'), None)
+    batch = next((x for x in s['batches'] if document and x['id'] == document['document_id']), None)
+    default = s['receiver']
+    if batch and batch['root_order_id'] != oid:
+        default = snapshot(batch['root_order_id'], include_package=False)['receiver']
+    attempts = [dict(a, payload=json.loads(a['payload'])) for a in s['attempts']]
+    if b.supabase_enabled():
+        remote = b.supabase_request('/rest/v1/fulfillment_shipping_claims', params={
+            'order_id': 'in.(' + ','.join(map(str, s['package_ids'])) + ')',
+            'select': 'order_id,reference,payload,state,provider_json'})
+        if not isinstance(remote, list):
+            raise InPostError('Nie można odczytać zapisanego odbiorcy. Odśwież formularz przed nadaniem.')
+        attempts.extend(remote)
+    relevant = {}
+    for attempt in attempts:
+        if attempt['payload'].get('recipient_selection', {}).get('scope') == scope:
+            relevant.setdefault(attempt['reference'], attempt)
+    if len(relevant) > 1:
+        raise InPostError('Sprzeczne próby nadania. Sprawdź istniejącą przesyłkę przed kolejnym nadaniem.')
+    saved = next(iter(relevant.values()), None)
+    return {'default': default, 'saved': saved, 'scope': scope,
+            'fingerprint': _hash((scope, s['package_ids'], default, s['content_hash']))}
 
 
 def capabilities(data, actor=None, correlation_id='', transaction_connection=None):
@@ -318,6 +362,10 @@ def preflight(name, data, actor=None):
                     'Wynik wcześniejszego nadania jest niepewny. Użyj shipping.shipment.refresh; nie tworzę kolejnej przesyłki.')
     if s['persistence']['pending'] and name != 'orders.fulfillment.reconcile':
         raise error('RECONCILIATION_PENDING', 'Najpierw uzgodnij wcześniejszy zapis metadanych realizacji.', 'CONFLICT')
+    if name == 'shipping.requirements.update' and any(k.startswith('recipient_') for k in data):
+        if any(json.loads(a['payload']).get('recipient_selection', {}).get('scope') == recipient_scope(s)
+               for a in s['attempts']):
+            raise error('RECIPIENT_LOCKED', 'Odbiorca został zapisany przy nadaniu. Sprawdź istniejącą przesyłkę; nie zmieniaj jej adresu w aplikacji.')
     if name == 'shipping.shipment.confirm_parameters':
         if not data.get('human_confirmed'):
             raise error('CONFIRMATION_REQUIRED', 'Człowiek musi potwierdzić dane istniejącej przesyłki.')
@@ -830,11 +878,16 @@ def release_archived_shipping_attempts(c, package_ids):
             c.execute('DELETE FROM fulfillment_shipping_attempts WHERE order_id=?', (owner,))
 
 
-def safe_create_shipment(oid, recipient, parcel, reference, service, options):
+def safe_create_shipment(oid, recipient, parcel, reference, service, options, *, recipient_selection=None):
     """Used by UI and the service. A lost POST response can only be reconciled."""
     from inpost_module import InPostError
     payload = {'receiver': recipient, 'parcel': parcel, 'service': service, 'options': options}
     s = snapshot(oid)
+    if recipient_selection is not None:
+        if recipient_selection.get('scope') != recipient_scope(s):
+            raise InPostError('Zmieniła się zawartość paczki. Odśwież formularz i ponownie wybierz odbiorcę.')
+        payload['recipient_selection'] = recipient_selection
+    content = shipment_content(s, recipient if recipient_selection is not None else None)
     c = b.conn()
     try:
         c.execute('BEGIN IMMEDIATE')
@@ -850,13 +903,13 @@ def safe_create_shipment(oid, recipient, parcel, reference, service, options):
             OR a.order_id IN (SELECT attempt_order_id FROM fulfillment_shipping_members WHERE order_id IN ({marks})) LIMIT 1''', tuple(package_ids + package_ids)).fetchone()
         if old:
             if old['state'] == 'SUCCESS':
-                if json.loads(old['payload']) != payload or old['content_hash'] != shipment_content(s):
+                if json.loads(old['payload']) != payload or old['content_hash'] != content:
                     raise InPostError('Istnieje wcześniejsze nadanie z inną zawartością lub parametrami. Zweryfikuj przesyłkę przed kolejną paczką.')
                 return json.loads(old['provider_json'])
             raise InPostError('Wynik wcześniejszego nadania jest niepewny. Sprawdź przesyłkę; nie twórz kolejnej.')
         stable = 'fulfillment-' + str(uuid.uuid4())
         c.execute('INSERT INTO fulfillment_shipping_attempts VALUES(?,?,?,?,?,?,?)',
-            (oid, stable, json.dumps(payload), shipment_content(s), 'SENDING', None, b.now_iso()))
+            (oid, stable, json.dumps(payload), content, 'SENDING', None, b.now_iso()))
         c.executemany('INSERT INTO fulfillment_shipping_members VALUES(?,?)', [(member, oid) for member in package_ids])
         c.commit()
     finally:
@@ -867,7 +920,7 @@ def safe_create_shipment(oid, recipient, parcel, reference, service, options):
             try:
                 claim = b.supabase_request('/rest/v1/rpc/claim_fulfillment_shipment', method='POST',
                     payload={'p_order_ids': package_ids, 'p_reference': stable, 'p_payload': payload,
-                             'p_content_hash': shipment_content(s), 'p_created_at': b.now_iso()})
+                             'p_content_hash': content, 'p_created_at': b.now_iso()})
             except Exception as exc:
                 raise error('SHIPPING_RESERVATION_UNAVAILABLE', 'Nie można potwierdzić rezerwacji nadania w Supabase. Sprawdź migrację i dostępność RPC; nie wysłano nowego żądania do przewoźnika.') from exc
             if not isinstance(claim, dict) or not isinstance(claim.get('claim'), dict):
@@ -875,7 +928,7 @@ def safe_create_shipment(oid, recipient, parcel, reference, service, options):
             saved = claim['claim']
             if not claim.get('acquired'):
                 if saved['state'] == 'SUCCESS' and saved.get('provider_json'):
-                    if saved['payload'] != payload or saved['content_hash'] != shipment_content(s):
+                    if saved['payload'] != payload or saved['content_hash'] != content:
                         raise InPostError('Istnieje wcześniejsze nadanie w chmurze. Zweryfikuj jego zawartość i parametry.')
                     c = b.conn()
                     try:
