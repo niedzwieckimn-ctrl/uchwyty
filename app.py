@@ -2,6 +2,8 @@
 import os
 import sys
 import io
+import gzip
+import supabase_read_cache
 import html
 import csv
 import base64
@@ -2511,6 +2513,8 @@ def _mark_local_supabase_bootstrap_complete():
         c.commit()
     finally:
         c.close()
+    with _supabase_sync_lock:
+        _supabase_sync_state["complete_bootstrap_context"] = _scoped_context()
 
 def supabase_enabled() -> bool:
     return bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
@@ -2673,13 +2677,21 @@ def supabase_request(path: str, method: str = "GET", params: dict | None = None,
     req.add_header("apikey", SUPABASE_SERVICE_ROLE_KEY)
     req.add_header("Authorization", f"Bearer {SUPABASE_SERVICE_ROLE_KEY}")
     req.add_header("Content-Type", "application/json")
+    req.add_header("Accept-Encoding", "gzip")
     if prefer:
         req.add_header("Prefer", prefer)
 
     started = time.perf_counter()
+    response_bytes = decoded_bytes = 0
+    response_status = "error"
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
+            response_status = getattr(resp, "status", 200)
             raw = resp.read()
+            response_bytes = len(raw)
+            if (resp.headers.get("Content-Encoding") or "").lower().strip() == "gzip":
+                raw = gzip.decompress(raw)
+            decoded_bytes = len(raw)
             if not raw:
                 return None
             ctype = (resp.headers.get("Content-Type") or "").lower()
@@ -2689,8 +2701,12 @@ def supabase_request(path: str, method: str = "GET", params: dict | None = None,
     finally:
         elapsed = time.perf_counter() - started
         _perf_add("supabase_http", elapsed)
-        if PERF_LOG_ENABLED and elapsed >= 0.25:
-            app.logger.info("PERF SUPABASE %s %s %.2f ms", method, path, elapsed * 1000)
+        if PERF_LOG_ENABLED:
+            # Paths only: never log tokens, filters, customer data or bodies.
+            app.logger.info("SUPABASE_TRANSFER method=%s path=%s status=%s response_bytes=%d decoded_bytes=%d elapsed_ms=%.2f",
+                            method, path.split("?", 1)[0], response_status, response_bytes, decoded_bytes, elapsed * 1000)
+            if elapsed >= 0.25:
+                app.logger.info("PERF SUPABASE %s %s %.2f ms", method, path, elapsed * 1000)
 
 
 def supabase_storage_ref(object_path: str, bucket: str | None = None) -> str:
@@ -3464,9 +3480,17 @@ def ensure_business_operation_freshness(operation_name: str, input_data=None) ->
     return base
 
 
-def pull_shared_tables_from_supabase(force: bool = False, delete_missing: bool = True):
+def pull_shared_tables_from_supabase(force: bool = False, delete_missing: bool = True, *, tables=None, filters=None):
     if not supabase_enabled():
         return {"ok": False, "error": "not_configured"}
+    table_specs = list(SUPABASE_PULL_TABLES if tables is None else tables)
+    allowed_specs = set(SUPABASE_PULL_TABLES)
+    if any(spec not in allowed_specs for spec in table_specs):
+        raise ValueError("Unknown Supabase read table")
+    filters = filters or {}
+    # A partial snapshot must never be used to infer deletions.
+    if tables is not None or filters:
+        delete_missing = False
     now_ts = time.time()
     with _supabase_sync_lock:
         last_started = float(_supabase_sync_state.get("last_pull_started_ts") or 0.0)
@@ -3480,7 +3504,8 @@ def pull_shared_tables_from_supabase(force: bool = False, delete_missing: bool =
     def fetch_table(table, conflict_col):
         table_started = time.perf_counter()
         try:
-            rows = supabase_select_rows(table, order_by=conflict_col)
+            kwargs = {"extra_params": filters[table]} if filters.get(table) else {}
+            rows = supabase_select_rows(table, order_by=conflict_col, **kwargs)
             return rows, {"fetch_ms": round((time.perf_counter() - table_started) * 1000, 2)}
         except Exception as exc:
             return None, {"status": "error", "stage": "fetch", "error": str(exc),
@@ -3490,7 +3515,7 @@ def pull_shared_tables_from_supabase(force: bool = False, delete_missing: bool =
     # the existing publication/outbox guards retain their original ordering.
     with ThreadPoolExecutor(max_workers=4, thread_name_prefix="supabase-read") as pool:
         futures = {pool.submit(fetch_table, table, col): (table, col)
-                   for table, col in SUPABASE_PULL_TABLES}
+                   for table, col in table_specs}
         for future in as_completed(futures):
             table, conflict_col = futures[future]
             rows, state = future.result()
@@ -3500,7 +3525,7 @@ def pull_shared_tables_from_supabase(force: bool = False, delete_missing: bool =
             else:
                 fetched[(table, conflict_col)] = rows
 
-    for table, conflict_col in SUPABASE_PULL_TABLES:
+    for table, conflict_col in table_specs:
         if (table, conflict_col) not in fetched:
             continue
         table_started = time.perf_counter()
@@ -3517,7 +3542,7 @@ def pull_shared_tables_from_supabase(force: bool = False, delete_missing: bool =
             elapsed = time.perf_counter() - table_started
             result["tables"].setdefault(table, {})["upsert_ms"] = round(elapsed * 1000, 2)
 
-    for table, conflict_col in reversed(SUPABASE_PULL_TABLES):
+    for table, conflict_col in reversed(table_specs):
         if (table, conflict_col) not in fetched:
             continue
         if table in {"ksef_documents", "china_stock_receipts"}:
@@ -3549,12 +3574,15 @@ def pull_shared_tables_from_supabase(force: bool = False, delete_missing: bool =
             result["tables"][table].update({"status": "error", "stage": "cleanup", "error": str(e)})
 
     try:
-        normalize_temp_order_numbers()
+        if tables is None:
+            normalize_temp_order_numbers()
         # A cloud-to-local bootstrap is a READ path. Reconciliation may update
         # the local copy, but must never write back to Supabase from this pull.
-        link_orders_to_customers_by_email(sync_remote=False)
+        if tables is None:
+            link_orders_to_customers_by_email(sync_remote=False)
     except Exception:
         pass
+    supabase_read_cache.record(sys.modules[__name__], result, filters)
     return result
 
 
@@ -3640,6 +3668,7 @@ def maybe_pull_shared_from_supabase(force: bool = False, required: bool = False)
                 if _local_supabase_bootstrap_complete():
                     with _supabase_sync_lock:
                         _supabase_sync_state["initial_pull_attempted"] = True
+                        _supabase_sync_state["complete_bootstrap_context"] = _scoped_context()
                 else:
                     started = time.perf_counter()
                     with _supabase_full_io_lock:
@@ -3676,6 +3705,9 @@ def maybe_pull_shared_from_supabase(force: bool = False, required: bool = False)
                         if required and not result.get("ok") and not _local_supabase_data_present():
                             _raise_required_bootstrap_failure(result)
                         return result
+            if _supabase_sync_state.get("complete_bootstrap_context") == _scoped_context():
+                return supabase_read_cache.schedule(sys.modules[__name__], request)
+            # Incomplete bootstraps still retry the complete snapshot.
             return trigger_background_supabase_pull(reason=f"GET {request.path}")
         if force:
             started = time.perf_counter()
