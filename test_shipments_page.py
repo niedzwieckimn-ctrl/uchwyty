@@ -49,8 +49,15 @@ def test_remote_cold_and_warm_reads_omit_document_bytes(ready,monkeypatch):
         calls.append(params)
         if params['select']=='order_id,revision':
             return [dict(order_id=oid,revision=r['revision']) for oid,r in cloud.items()]
-        assert 'pdf' not in params['select'] and 'fulfillment_document' not in params['select']
-        return [dict(order_id=oid,revision=r['revision'],**{k:copy.deepcopy(r['payload'].get(k,[])) for k in page.SECTIONS}) for oid,r in cloud.items()]
+        assert 'pdf' not in params['select']
+        assert 'payload->fulfillment_documents' not in params['select'].split(',')
+        result=[]
+        for oid,r in cloud.items():
+            record=dict(order_id=oid,revision=r['revision'],**{k:copy.deepcopy(r['payload'].get(k,[])) for k in page.SECTIONS})
+            for i,doc in enumerate(r['payload'].get('fulfillment_documents',[])):
+                for field in page.DOC_FIELDS: record[f'doc{i}_{field}']=doc.get(field)
+            result.append(record)
+        return result
     monkeypatch.setattr(b,'supabase_request',remote)
     page._cache.clear()
     first,_=page.records(b); second,_=page.records(b)
@@ -80,3 +87,15 @@ def test_partial_shipments_stay_separate_and_invoice_action_uses_real_route(read
     db.commit(); db.close()
     response=client.get('/shipments/'+key+'/continue')
     assert response.status_code==302 and response.location.endswith('/packing-list')
+
+def test_replaced_draft_is_not_an_actionable_parcel(ready,monkeypatch):
+    monkeypatch.setattr(b,'supabase_enabled',lambda:False)
+    rows,_=page.records(b)
+    record=rows[0]
+    old=copy.deepcopy(record['packing_lists'][0])
+    old.update(packing_list_id='superseded-draft',current_batch_id=999)
+    batch=copy.deepcopy(record['packing_batches'][0])
+    batch.update(id=999,packing_list_id=old['packing_list_id'],created_at='2026-09-01 10:00:00')
+    allocation=copy.deepcopy(record['packing_allocations'][0]); allocation.update(batch_id=999)
+    record['packing_lists'].append(old); record['packing_batches'].append(batch); record['packing_allocations'].append(allocation)
+    assert len(page.cards_from_records(rows))==1

@@ -8,7 +8,13 @@ from werkzeug.exceptions import HTTPException
 
 SECTIONS = ('packing_lists', 'packing_batches', 'packing_allocations', 'packing_shipments',
             'fulfillment_shipping_attempts')
-PROJECTION = 'order_id,revision,' + ','.join('payload->' + name for name in SECTIONS)
+# Existing current document kinds: packing_list, invoice, label. Read only
+# their identities, including for legacy snapshots that still contain PDF bytes.
+DOC_FIELDS = ('kind', 'document_id')
+PROJECTION = 'order_id,revision,' + ','.join(
+    ['payload->' + name for name in SECTIONS] +
+    [f'doc{i}_{field}:payload->fulfillment_documents->{i}->{field}'
+     for i in range(3) for field in DOC_FIELDS])
 _cache = {}
 _lock = threading.Lock()
 
@@ -18,6 +24,8 @@ def records(b):
         db = b.conn()
         try:
             payload = {name: [dict(row) for row in db.execute('SELECT * FROM ' + name)] for name in SECTIONS}
+            payload['current_documents'] = [dict(row) for row in db.execute(
+                'SELECT kind,document_id FROM fulfillment_documents')]
             return [dict(order_id=0, revision=0, **payload)], False
         finally:
             db.close()
@@ -48,7 +56,16 @@ def records(b):
 
 def cards_from_records(rows):
     sources = {}
+    current = set()
     for record in rows:
+        documents = record.get('current_documents', [
+            {field: record.get(f'doc{i}_{field}') for field in DOC_FIELDS} for i in range(3)])
+        for document in documents:
+            if document.get('kind') == 'packing_list':
+                batch = next((r for r in record.get('packing_batches') or []
+                              if r['id'] == document.get('document_id')), None)
+                if batch:
+                    current.add((batch.get('packing_list_id'), batch['created_at'], batch.get('selection_hash') or ''))
         for packing in record.get('packing_lists') or []:
             key = packing['packing_list_id']
             rank = (int(record['order_id']) == int(packing['root_order_id']), int(record.get('revision') or 0))
@@ -67,6 +84,8 @@ def cards_from_records(rows):
                          if r['packing_list_id'] == key and r['final_batch_id'] == batch_id),
                         key=lambda r: r['confirmed_at'])
         final = finals[-1] if finals else {}
+        if not final and (key, batch['created_at'], batch.get('selection_hash') or '') not in current:
+            continue  # An old draft is not a new parcel after its pointer was replaced.
         receiver, booked_tracking, booked_carrier = {}, '', ''
         for attempt in record.get('fulfillment_shipping_attempts') or []:
             try:
