@@ -732,6 +732,8 @@ def register_routes(context):
         import packing_versions
         logical = packing_versions.resolve_list(c, order_id)
         expected_current = int(logical['current_batch_id']) if logical else 0
+        import packing_correction
+        packing_form_version = packing_correction.form_version(c, order_id)
         candidate_orders = [dict(order_row)]
         recipient = _email_key(order_row["customer_email"])
         if recipient:
@@ -821,6 +823,7 @@ def register_routes(context):
               {% if packing_error %}<div class="card" role="alert"><h2>Nie zakończono zapisu listy pakowej</h2><p>{{ packing_error }}</p><p>Wybrane ilości pozostają w formularzu poniżej.</p></div>{% endif %}
               <div class="card"><form method="post">
                 <input type="hidden" name="carrier" value="{{ carrier }}">
+                <input type="hidden" name="packing_form_version" value="{{ packing_form_version }}">
                 <table><thead><tr><th>Zamówienie</th><th>Notatka</th><th>SKU</th><th>Model / nazwa</th><th>Zamówiono</th><th>Dostępne do paczki</th><th>Pakuj</th></tr></thead><tbody>
                 {% for item in rows %}<tr>
                   <td><b>{{ item.source_order_no }}</b></td><td>{{ item.source_order_note or '-' }}</td>
@@ -836,7 +839,7 @@ def register_routes(context):
             """
             return render_template_string(
                 tpl, title="Zawartość paczki", base_url=BASE_URL, db_path=DB_PATH,
-                rows=selection_rows, carrier=selected_carrier, order_id=order_id, packing_error=message,
+                rows=selection_rows, carrier=selected_carrier, order_id=order_id, packing_error=message, packing_form_version=packing_form_version,
             ), status
 
         if request.method == "GET":
@@ -924,6 +927,9 @@ def register_routes(context):
         packing_db = conn()
         try:
             packing_db.execute("BEGIN IMMEDIATE")
+            submitted_version = request.form.get('packing_form_version')
+            if submitted_version is not None and submitted_version != packing_correction.form_version(packing_db, order_id):
+                raise packing_versions.PackingConflict('Formularz pochodzi ze starszej karty. Odśwież i sprawdź ilości.')
             packing_state["batch_id"] = packing_versions.publish(
                 backend, packing_db, order_id, items, pack_path,
                 expected_current=expected_current)
@@ -975,6 +981,8 @@ def register_routes(context):
     def order_packing_list_download_admin(order_id):
         from fulfillment_operations import ui_write
         if request.method == 'POST':
+            if not request.form.get('packing_form_version'):
+                return 'Ten formularz pochodzi ze starszej wersji. Odśwież stronę pakowania i sprawdź ilości przed zapisem.', 409
             with ui_write(order_id):
                 return order_packing_list_download_admin_service(order_id, request=request, session=session)
         return order_packing_list_download_admin_service(order_id, request=request, session=session)

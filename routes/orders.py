@@ -614,6 +614,76 @@ def register_routes(context):
                          download_name=f'lista-pakowa-{order_id}-{file_hash[:12]}.pdf')
 
 
+    @app.route('/orders/<int:order_id>/packing-correction/<file_hash>', methods=['GET', 'POST'])
+    def order_packing_correction(order_id, file_hash):
+        import sys
+        import packing_correction
+        import packing_versions
+        backend = sys.modules['app']
+        message, info, code = '', None, 200
+        try:
+            if request.method == 'POST':
+                result = packing_correction.send(backend, order_id, file_hash)
+                message = result['message']
+            info = packing_correction.current(backend, order_id, file_hash)
+        except (packing_correction.CorrectionConflict, packing_versions.PackingConflict) as exc:
+            message, code = str(exc), 409
+        except Exception:
+            app.logger.exception('PACKING_CORRECTION order_id=%s', order_id)
+            message, code = 'Nie udało się potwierdzić danych lub wyniku wysyłki. Sprawdź połączenie i aktualną listę.', 503
+        return render_template_string(r"""{% extends "base.html" %}{% block content %}
+          <div class="card"><h1>Wyślij poprawioną listę klientowi</h1>
+          {% if message %}<p role="status">{{ message }}</p>{% endif %}
+          {% if info %}<p><b>{{ info['package']['customer']['name'] }}</b><br>{{ info['recipient'] }}</p>
+          <p>{{ info['package']['orders']|length }} zamówień · <b>{{ info['package']['total_qty'] }} szt.</b></p>
+          <p>Klient otrzyma aktualną listę z informacją, że zastępuje ona poprzednią wersję dla tej paczki.</p>
+          <p><a class="btn" target="_blank" href="{{ url_for('order_packing_current_print',order_id=order_id,file_hash=file_hash) }}">Sprawdź PDF przed wysłaniem</a></p>
+          {% if not info['receipt'] or info['receipt']['status']=='rejected' %}
+          <form method="post" onsubmit="this.querySelector('button').disabled=true;this.querySelector('button').textContent='Wysyłanie…';">
+          <button class="btn primary" type="submit">Wyślij poprawioną listę klientowi</button></form>
+          {% elif not message %}<p>{{ 'Ta poprawiona lista została już przekazana do wysyłki.' if info['receipt']['status']=='accepted' else 'Poprzednia próba wysyłki wymaga sprawdzenia; ponowna wysyłka jest zablokowana.' }}</p>{% endif %}
+          {% endif %}<p><a class="btn" href="{{ url_for('order_view',order_id=order_id) }}">Wróć do zamówienia</a></p></div>
+          {% endblock %}""", info=info, message=message, order_id=order_id, file_hash=file_hash), code
+
+    @app.get('/orders/<int:order_id>/packing-documents/<file_hash>/print')
+    def order_packing_current_print(order_id, file_hash):
+        import sys
+        import packing_correction
+        import packing_versions
+        try:
+            info = packing_correction.current(sys.modules['app'], order_id, file_hash)
+            path = packing_correction.print_current(sys.modules['app'], info)
+        except (packing_correction.CorrectionConflict, packing_versions.PackingConflict) as exc:
+            return str(exc), 409
+        return send_file(path, mimetype='application/pdf', as_attachment=True,
+                         download_name=f'lista-pakowa-{order_id}.pdf')
+
+    @app.route('/orders/<int:order_id>/packing-withdraw/<file_hash>', methods=['GET', 'POST'])
+    def order_packing_withdraw(order_id, file_hash):
+        import sys
+        import packing_correction
+        message, code, info = '', 200, None
+        try:
+            if request.method == 'POST':
+                message = packing_correction.withdraw(sys.modules['app'], order_id, file_hash)
+            else:
+                info = packing_correction.current(sys.modules['app'], order_id, file_hash)
+        except ValueError as exc:
+            message, code = str(exc), 409
+        except Exception:
+            app.logger.exception('PACKING_WITHDRAW order_id=%s', order_id)
+            message, code = 'Nie potwierdzono wycofania listy w chmurze. Sprawdź aktualny stan przed dalszym pakowaniem.', 503
+        return render_template_string(r"""{% extends "base.html" %}{% block content %}
+          <div class="card"><h1>Wycofaj błędną listę pakową</h1>
+          {% if message %}<p role="status">{{ message }}</p>{% endif %}
+          {% if info %}<p>{{ info['package']['customer']['name'] }} · {{ info['package']['total_qty'] }} szt.</p>
+          <p>Lista przestanie być podstawą nowej faktury. Jej PDF i pozycje pozostaną w historii.
+          Wycofanie nie wysyła e-maila i nie zmienia ilości na magazynie.</p>
+          {% if not info['package']['invoice_id'] %}<form method="post"><button class="btn danger" type="submit">Wycofaj tę listę</button></form>
+          {% else %}<p>Ta lista jest już powiązana z fakturą i nie może zostać wycofana.</p>{% endif %}{% endif %}
+          <p><a class="btn" href="{{ url_for('order_view',order_id=order_id) }}">Wróć do zamówienia</a></p></div>
+          {% endblock %}""", message=message, info=info, order_id=order_id), code
+
     @app.get("/orders/<int:order_id>")
     def order_view(order_id):
         maybe_pull_shared_from_supabase()
@@ -856,7 +926,8 @@ def register_routes(context):
               <div class="doc-list">
                 {% if invoice %}<div class="doc-row"><span class="doc-mark">F</span><div><b>Faktura</b><div class="muted">{{ invoice['invoice_no'] }}{% if invoice['publication_state'] != 'complete' %} · zapis niedokończony{% endif %}</div></div>{% if invoice['publication_state'] == 'complete' %}<a class="btn" href="{{ url_for('invoice_download_admin', invoice_id=invoice['id']) }}" target="_blank">Pobierz</a>{% else %}<a class="btn" href="{{ url_for('order_invoice', order_id=o['id']) }}">Dokończ zapis</a>{% endif %}</div>{% else %}<div class="doc-row"><span class="doc-mark">F</span><div><b>Faktura</b><div class="muted">Jeszcze niewystawiona</div></div></div>{% endif %}
                 {% for doc in saved_packing_documents %}
-                <div class="doc-row"><span class="doc-mark">L</span><div><b>Lista pakowa{% if doc['shipped'] %} · wysłana{% elif not doc['is_current'] %} · wcześniejsza wersja{% endif %}</b><div class="muted">{{ doc['created_at'] }}<br>{{ doc['order_count'] }} zamówień · {{ doc['total_qty'] }} szt. w paczce</div></div><a class="btn" href="{{ url_for('order_saved_packing_document', order_id=o['id'], file_hash=doc['file_hash']) }}" target="_blank">Pobierz</a></div>
+                <div class="doc-row"><span class="doc-mark">L</span><div><b>Lista pakowa{% if doc['shipped'] %} · wysłana{% elif doc['withdrawn'] %} · wycofana{% elif not doc['is_current'] %} · wcześniejsza wersja{% endif %}</b><div class="muted">{{ doc['created_at'] }}<br>{{ doc['order_count'] }} zamówień · {{ doc['total_qty'] }} szt. w paczce</div></div><a class="btn" href="{{ url_for('order_packing_current_print' if doc['is_current'] and not doc['shipped'] else 'order_saved_packing_document', order_id=o['id'], file_hash=doc['file_hash']) }}" target="_blank">Pobierz</a></div>
+                {% if doc['is_current'] and not doc['shipped'] %}<a class="btn" style="white-space:normal;text-align:center" href="{{ url_for('order_packing_correction',order_id=o['id'],file_hash=doc['file_hash']) }}">Wyślij poprawioną listę klientowi</a>{% if not doc['invoice_id'] %}<a class="btn" href="{{ url_for('order_packing_withdraw',order_id=o['id'],file_hash=doc['file_hash']) }}">Wycofaj błędną listę</a>{% endif %}{% endif %}
                 {% endfor %}
                 {% if not saved_packing_documents and invoice and invoice['publication_state'] == 'complete' %}<div class="doc-row"><span class="doc-mark">L</span><div><b>Lista pakowa</b><div class="muted">Do faktury {{ invoice['invoice_no'] }}</div></div><a class="btn" href="{{ url_for('invoice_packing_list_download_admin', invoice_id=invoice['id']) }}" target="_blank">Pobierz</a></div>{% endif %}
                 {% if o['inpost_shipment_id'] %}<div class="doc-row"><span class="doc-mark">E</span><div><b>Etykieta kurierska</b><div class="muted">{{ o['carrier'] or 'InPost' }}</div></div><a class="btn" href="{{ url_for('order_inpost_label', order_id=o['id']) }}">Pobierz</a></div>{% endif %}
