@@ -733,7 +733,17 @@ def restore_packing_evidence(c, payload, *, already_translated=False):
                                   (source['packing_list_id'], source.get('previous_batch_id'), source.get('selection_hash'), source['id']))
             c.execute(f'INSERT OR IGNORE INTO {table} ({",".join(names)}) VALUES ({",".join("?" for _ in names)})', tuple(source.values()))
     for source in payload.get('packing_lists') or []:
-        if not c.execute('SELECT 1 FROM packing_batches WHERE id=?', (source['current_batch_id'],)).fetchone():
+        withdrawn = int(source['current_batch_id']) == 0
+        if withdrawn:
+            key = source['packing_list_id']
+            receipt = any(r.get('kind') == 'packing_cancel:' + key
+                          for r in payload.get('fulfillment_verifications', []))
+            finalized = (source.get('invoice_id') or any(r['packing_list_id'] == key
+                         for r in payload.get('packing_shipments', [])) or
+                         c.execute('SELECT 1 FROM packing_shipments WHERE packing_list_id=?', (key,)).fetchone())
+            if not receipt or finalized:
+                raise ValueError('Brak potwierdzenia wycofania otwartej listy pakowej.')
+        elif not c.execute('SELECT 1 FROM packing_batches WHERE id=?', (source['current_batch_id'],)).fetchone():
             raise ValueError('Brak bieżącego batcha w trwałej historii LP.')
         existing = c.execute('SELECT * FROM packing_lists WHERE packing_list_id=?', (source['packing_list_id'],)).fetchone()
         if existing and existing['revision'] == source['revision'] and existing['current_batch_id'] != source['current_batch_id']:

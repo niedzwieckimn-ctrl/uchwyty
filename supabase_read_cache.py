@@ -47,6 +47,8 @@ def plan(request):
         return CATALOG | {'orders', 'order_items', 'customers', 'company_profile'}, {}
     if path.startswith('/orders/by-code/'):
         return {'orders'}, {}
+    if re.fullmatch(r'/orders/\d+/(?:packing-correction|packing-withdraw|packing-documents)/[0-9a-f]{64}(?:/print)?', path):
+        return FLOW | {'customers', 'company_profile'}, {}
     order = re.fullmatch(r'/orders/\d+(?:/(invoice|inpost|packing-list|proforma))?', path)
     if order:
         # Packing/invoicing can combine several orders: never filter their

@@ -366,7 +366,8 @@ def pdf_items(result):
 def saved_documents_for_order(db, order_id):
     """All original packing PDFs that actually contain this order, without billing."""
     return [dict(row) for row in db.execute('''
-        SELECT d.file_hash,d.created_at,pb.id AS batch_id,
+        SELECT d.file_hash,d.created_at,pb.id AS batch_id,pb.invoice_id,
+          CASE WHEN pl.current_batch_id=0 THEN 1 ELSE 0 END AS withdrawn,
           CASE WHEN pl.current_batch_id=pb.id OR pl.packing_list_id IS NULL THEN 1 ELSE 0 END AS is_current,
           EXISTS(SELECT 1 FROM packing_shipments ps WHERE ps.final_batch_id=pb.id) AS shipped,
           (SELECT COUNT(DISTINCT a.order_id) FROM packing_allocations a WHERE a.batch_id=pb.id) AS order_count,

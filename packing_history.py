@@ -79,6 +79,24 @@ def _document_rows(content: bytes) -> tuple[list[dict[str, Any]], int | None, in
             "Nie udało się odczytać zapisanej historycznej listy pakowej.",
         ) from exc
 
+    subject = str((reader.metadata or {}).get('/Subject') or '')
+    if subject.startswith('packing-rows-v2:'):
+        try:
+            rows = json.loads(subject.removeprefix('packing-rows-v2:'))
+            fields = {'order_number', 'sku', 'model_name', 'note', 'packed_qty'}
+            if (not isinstance(rows, list) or not rows or any(
+                    not isinstance(row, dict) or set(row) != fields
+                    or type(row['packed_qty']) is not int or row['packed_qty'] <= 0
+                    or any(not isinstance(row[key], str) for key in fields - {'packed_qty'})
+                    for row in rows)):
+                raise ValueError('Invalid packing rows')
+        except (ValueError, TypeError) as exc:
+            raise PackingHistoryError('PACKING_HISTORY_DOCUMENT_UNREADABLE',
+                                      'Nieprawidłowe dane pozycji w zapisanej liście pakowej.') from exc
+        # The caller verifies the PDF hash and matches every row against saved
+        # allocations/audit evidence, exactly as for the original text layout.
+        return rows, len(rows), sum(row['packed_qty'] for row in rows)
+
     rows: list[dict[str, Any]] = []
     footer_lines: int | None = None
     footer_qty: int | None = None

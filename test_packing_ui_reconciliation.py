@@ -41,7 +41,14 @@ def packing_cloud(multi_order_flow, monkeypatch):
 
 
 def post(client, root=103):
+    from packing_correction import form_version
+    db = backend.conn()
+    try:
+        token = form_version(db, root)
+    finally:
+        db.close()
     return client.post(f'/orders/{root}/packing-list', data={
+        'packing_form_version': token,
         'csrf_token': 'csrf', 'carrier': 'pending',
         'pack_qty_1001': '3', 'pack_qty_1002': '0', 'pack_qty_1003': '2'})
 
@@ -162,7 +169,12 @@ def test_removed_member_pending_is_finished_too(packing_cloud):
     client, cloud, calls = packing_cloud
     assert post(client).status_code == 302
     pending(101)
+    from packing_correction import form_version
+    db = backend.conn()
+    token = form_version(db, 103)
+    db.close()
     response = client.post('/orders/103/packing-list', data={
+        'packing_form_version': token,
         'csrf_token': 'csrf', 'carrier': 'pending', 'pack_qty_1001': '0', 'pack_qty_1003': '2'})
     assert response.status_code == 302, response.get_data(as_text=True)
     db = backend.conn()

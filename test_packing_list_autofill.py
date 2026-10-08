@@ -177,9 +177,16 @@ def test_post_cannot_pack_more_than_remaining(packing_app, tmp_path, monkeypatch
     monkeypatch.setattr(backend, "generate_invoice_packing_list_pdf", fake_pdf)
     monkeypatch.setattr(shipping_routes, "generate_invoice_packing_list_pdf", fake_pdf)
 
+    import packing_correction
+    db = backend.conn()
+    try:
+        token = packing_correction.form_version(db, ORDER_ID)
+    finally:
+        db.close()
     response = packing_app.post(
         f"/orders/{ORDER_ID}/packing-list",
-        data={"csrf_token": "csrf", "carrier": "pending", f"pack_qty_{ORDER_ITEM_ID}": "99"},
+        data={"csrf_token": "csrf", "carrier": "pending", "packing_form_version": token,
+              f"pack_qty_{ORDER_ITEM_ID}": "99"},
     )
 
     assert response.status_code == 302
