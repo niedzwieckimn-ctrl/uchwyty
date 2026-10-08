@@ -139,6 +139,49 @@ def form_version(db, order_id):
     return hashlib.sha256(json.dumps([list(r) for r in rows]).encode()).hexdigest()
 
 
+def _assert_no_current_shipping(db, package):
+    """Old parcel identifiers may remain on a partially fulfilled order."""
+    members = package['order_ids']
+    marks = ','.join('?' for _ in members)
+    attempts = db.execute(f'''SELECT a.* FROM fulfillment_shipping_attempts a
+        WHERE a.order_id IN ({marks}) OR a.order_id IN
+        (SELECT attempt_order_id FROM fulfillment_shipping_members WHERE order_id IN ({marks}))''',
+        (*members, *members)).fetchall()
+    for attempt in attempts:
+        result = json.loads(attempt['provider_json'] or '{}')
+        sid = str(result.get('id') or '')
+        old = db.execute('''SELECT 1 FROM packing_shipments ps
+            JOIN packing_allocations pa ON pa.batch_id=ps.final_batch_id
+            JOIN packing_batches current ON current.id=?
+            WHERE ps.shipment_key=? AND ps.packing_list_id<>?
+              AND pa.order_id=? AND julianday(ps.confirmed_at)<=julianday(current.created_at)''',
+            (package['batch_id'], 'inpost:' + sid, package['packing_list_key'], attempt['order_id'])).fetchone()
+        if attempt['state'] != 'SUCCESS' or not sid or not old:
+            raise CorrectionConflict('Istnieje niepotwierdzona lub bieżąca próba nadania. Sprawdź jej wynik przed zmianą listy.')
+    for order in db.execute(f'SELECT * FROM orders WHERE id IN ({marks})', members):
+        if order['warehouse_issued']:
+            raise CorrectionConflict('Lista ma wydanie magazynowe. Najpierw sprawdź realizację.')
+        sid = str(order['inpost_shipment_id'] or '').strip()
+        tracking = str(order['tracking_no'] or '').strip()
+        if not sid and not tracking:
+            continue
+        # A matching immutable shipment must predate this packing version and
+        # explicitly include this order. Unknown or mixed identities stay blocked.
+        old = db.execute('''SELECT 1 FROM packing_shipments ps
+            JOIN packing_allocations pa ON pa.batch_id=ps.final_batch_id
+            JOIN packing_batches current ON current.id=?
+            WHERE pa.order_id=? AND ps.packing_list_id<>?
+              AND julianday(ps.confirmed_at)<=julianday(current.created_at)
+              AND LOWER(ps.carrier)=?
+              AND (?='' OR ps.tracking=?)
+              AND (?='' OR ps.shipment_key=?)''',
+            (package['batch_id'], order['id'], package['packing_list_key'],
+             str(order['carrier'] or '').strip().lower(), tracking, tracking,
+             sid, 'inpost:' + sid)).fetchone()
+        if not old:
+            raise CorrectionConflict('Lista ma nadanie, którego nie można przypisać do wcześniejszej paczki. Najpierw sprawdź realizację.')
+
+
 def withdraw(b, order_id, file_hash):
     """Withdraw an unbilled parcel; retain its immutable PDF/allocations as history."""
     from fulfillment_operations import ui_write
@@ -164,9 +207,7 @@ def withdraw(b, order_id, file_hash):
             if db.execute('SELECT 1 FROM packing_shipments WHERE packing_list_id=?',
                           (package['packing_list_key'],)).fetchone():
                 raise CorrectionConflict('Paczka została już wysłana. Nie można wycofać listy.')
-            if db.execute(f'''SELECT 1 FROM orders WHERE id IN ({marks}) AND
-                (COALESCE(inpost_shipment_id,'')<>'' OR COALESCE(tracking_no,'')<>'' OR COALESCE(warehouse_issued,0)=1)''', members).fetchone():
-                raise CorrectionConflict('Lista ma już nadanie lub wydanie magazynowe. Najpierw sprawdź realizację.')
+            _assert_no_current_shipping(db, package)
             for member in packing_versions.evidence_members(db, members):
                 db.execute('''INSERT INTO fulfillment_verifications VALUES(?,?,?)''',
                            (member, 'packing_cancel:' + package['packing_list_key'],
