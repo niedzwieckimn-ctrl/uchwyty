@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block content %}
+<style>
+.shipments-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,390px),1fr));gap:16px}
+.shipment-card{margin:0;display:flex;flex-direction:column;gap:12px;min-width:0}
+.shipment-card h2{font-size:18px;margin:0;overflow-wrap:anywhere}
+.shipment-card p{margin:0;overflow-wrap:anywhere}.shipment-card .flex{flex-wrap:wrap;gap:8px}
+.shipment-top{display:flex;justify-content:space-between;gap:12px;align-items:start}
+.shipment-history{margin-top:24px}.shipment-history summary{cursor:pointer;font-weight:700;padding:16px 0}
+</style>
+<div class="card"><h1>Przesyłki</h1><p class="muted">Paczka, lista pakowa i numer śledzenia w jednym miejscu.</p>
+<form method="get" class="flex"><input name="q" value="{{ q }}" placeholder="Klient, zamówienie lub numer przesyłki" aria-label="Szukaj przesyłki"><button class="btn" type="submit">Szukaj</button></form></div>
+{% if message %}<div class="card">{{ message }} <a href="{{ url_for('shipments',q=q) }}">Spróbuj ponownie</a></div>{% endif %}
+{% if limited %}<p class="muted small">Widok obejmuje przesyłki z 200 ostatnich zapisów zamówień. Starsze znajdziesz w szczegółach zamówienia.</p>{% endif %}
+{% macro shipment(c) %}
+<article class="card shipment-card" data-shipment="{{ c.key }}">
+  <div class="shipment-top"><h2>{{ c.customer }}</h2><span class="badge">{{ c.status }}</span></div>
+  <p><b>{{ c.total }} szt.</b> · {{ c.orders|length }} zamówień <span class="muted small">· {{ c.created[:16]|replace('T',' ') }}</span></p>
+  <p class="muted small">{{ c.orders|join(', ') }}</p>
+  {% if c.receiver %}<p class="small"><b>Odbiorca:</b> {{ c.receiver.name }}<br>{{ c.receiver.street }} · {{ c.receiver.post_code }} {{ c.receiver.city }}</p>{% endif %}
+  {% if c.tracking %}<p><b>{{ c.carrier|upper }}</b> · {{ c.tracking }}</p>{% else %}<p class="muted">Numer przesyłki pojawi się po nadaniu.</p>{% endif %}
+  <div class="flex">
+    <a class="btn" href="{{ url_for('shipment_packing_pdf',key=c.key) }}">Lista pakowa PDF</a>
+    {% if c.invoice and c.invoice.publication_state == 'complete' %}<a class="btn" href="/invoices/{{ c.invoice.id }}/download">{{ c.invoice.invoice_no }}</a>{% endif %}
+  </div>
+  <div class="flex">
+    {% if c.tracking_url %}<a class="btn primary" href="{{ c.tracking_url }}" target="_blank" rel="noopener">Śledź przesyłkę</a>
+    {% elif c.sent %}<a class="btn primary" href="/orders/{{ c.root }}">Zamówienie</a>
+    {% elif c.invoice_id %}<a class="btn primary" href="{{ url_for('shipment_continue',key=c.key) }}">{{ 'Nadaj przesyłkę' if c.invoice and c.invoice.publication_state == 'complete' else 'Dokończ fakturę' }}</a>
+    {% else %}<a class="btn primary" href="{{ url_for('shipment_continue',key=c.key) }}">Wystaw fakturę</a>{% endif %}
+    {% if not c.sent or c.tracking_url %}<a class="btn" href="/orders/{{ c.root }}">Zamówienie</a>{% endif %}
+  </div>
+</article>
+{% endmacro %}
+<div class="shipments-grid">{% for c in active %}{{ shipment(c) }}{% endfor %}</div>
+{% if not active and not message %}<div class="card muted">{% if q %}Brak przygotowywanych przesyłek dla tego wyszukiwania.{% else %}Wszystkie przygotowane paczki zostały wysłane. Nowa pojawi się po zapisaniu listy pakowej.{% endif %}</div>{% endif %}
+{% if history %}<details class="shipment-history" {% if q %}open{% endif %}><summary>Historia wysyłek ({{ history|length }})</summary><div class="shipments-grid">{% for c in history %}{{ shipment(c) }}{% endfor %}</div></details>{% endif %}
+{% endblock %}
