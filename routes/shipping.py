@@ -532,6 +532,20 @@ def register_routes(context):
 
     @app.post("/orders/<int:order_id>/shipped")
     def order_mark_shipped(order_id):
+        import packing_versions
+        from fulfillment_operations import ui_write
+        c = conn()
+        try:
+            package = packing_versions.current_for_order(c, order_id)
+            root = c.execute('SELECT root_order_id FROM packing_batches WHERE id=?',
+                (package['batch_id'],)).fetchone() if package else None
+        finally:
+            c.close()
+        with ui_write(root[0] if root else order_id):
+            return order_mark_shipped_service(order_id)
+
+
+    def order_mark_shipped_service(order_id):
         import packing_versions, sys
         tracking_no = re.sub(r"\s+", "", norm(request.form.get("tracking_no")))
         carrier = norm(request.form.get("carrier")).lower()
@@ -560,6 +574,9 @@ def register_routes(context):
             backend = sys.modules.get('app') or sys.modules['__main__']
             c.execute('BEGIN IMMEDIATE')
             version_before = packing_versions.current_for_order(c, order_id)
+            expected = packing_versions.shipment_form_version(c, version_before)
+            if not expected or request.form.get('shipment_form_version') != expected:
+                raise packing_versions.PackingConflict('Lista lub numer przesyłki zmieniły się. Odśwież zamówienie i wpisz numer dla aktualnej paczki.')
             # A manually entered number identifies THIS shipment. A stale
             # InPost ID on an older partial order must not select the old parcel.
             shipment_key = carrier + ':' + tracking_no

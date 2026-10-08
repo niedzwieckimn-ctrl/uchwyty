@@ -3,6 +3,22 @@
 def register_routes(context):
     globals().update(context)
 
+    @app.route('/maintenance/packing-storage', methods=['GET', 'POST'])
+    def packing_storage_maintenance():
+        # Existing admin session and CSRF gate apply; intentionally no sidebar entry.
+        import reconciliation_migration, sys
+        if request.method == 'POST':
+            reconciliation_migration.start(sys.modules[app.import_name])
+            return redirect(url_for('packing_storage_maintenance'))
+        return render_template_string('''{% extends "base.html" %}{% block content %}
+          <div class="card"><h1>Magazyn dokumentów</h1><p>Przeniesienie zapisanych PDF-ów do prywatnego magazynu plików.
+          Historia, ilości i powiązania dokumentów zostają zachowane. Przed zmianą powstaje sprawdzona kopia bezpieczeństwa.</p>
+          <p>Stan: {{ state.state }} · Przeniesione: {{ state.converted }} · Bez zmian: {{ state.unchanged }} · Równoczesne zmiany: {{ state.conflicts }}</p>
+          {% if state.error %}<p>{{ state.error }}</p>{% endif %}
+          {% if state.state != 'running' %}<form method="post"><button class="btn primary">Przenieś dokumenty</button></form>{% endif %}
+          <a class="btn" href="{{ url_for('packing_storage_maintenance') }}">Odśwież wynik</a></div>
+          {% endblock %}''', title='Magazyn dokumentów', state=reconciliation_migration.status())
+
 
     @app.get("/orders/stock-issue-audit")
     def stock_issue_audit():
@@ -850,7 +866,19 @@ def register_routes(context):
         packing_db = conn()
         try:
             current_package = packing_versions.current_for_order(packing_db, order_id)
+            shipment_form_version = packing_versions.shipment_form_version(packing_db, current_package)
             saved_packing_documents = packing_versions.saved_documents_for_order(packing_db, order_id)
+            current_document = next((doc for doc in saved_packing_documents if current_package
+                and doc['batch_id'] == current_package['batch_id']), None)
+            packing_history_documents = [doc for doc in saved_packing_documents if doc is not current_document]
+            can_edit_packing = False
+            if current_document and not current_document['invoice_id'] and not current_document['shipped']:
+                import packing_correction, invoice_jobs, sys
+                try:
+                    packing_correction._assert_no_current_shipping(packing_db, current_package)
+                    can_edit_packing = not invoice_jobs.pending_for_orders(sys.modules[app.import_name], current_package['order_ids'])
+                except packing_correction.CorrectionConflict:
+                    pass
         finally:
             packing_db.close()
         pending_package = bool(current_package and not current_package.get('shipment_confirmed'))
@@ -925,10 +953,18 @@ def register_routes(context):
               <div class="panel-title"><span class="panel-icon">▤</span><h2>Dokumenty</h2></div>
               <div class="doc-list">
                 {% if invoice %}<div class="doc-row"><span class="doc-mark">F</span><div><b>Faktura</b><div class="muted">{{ invoice['invoice_no'] }}{% if invoice['publication_state'] != 'complete' %} · zapis niedokończony{% endif %}</div></div>{% if invoice['publication_state'] == 'complete' %}<a class="btn" href="{{ url_for('invoice_download_admin', invoice_id=invoice['id']) }}" target="_blank">Pobierz</a>{% else %}<a class="btn" href="{{ url_for('order_invoice', order_id=o['id']) }}">Dokończ zapis</a>{% endif %}</div>{% else %}<div class="doc-row"><span class="doc-mark">F</span><div><b>Faktura</b><div class="muted">Jeszcze niewystawiona</div></div></div>{% endif %}
-                {% for doc in saved_packing_documents %}
-                <div class="doc-row"><span class="doc-mark">L</span><div><b>Lista pakowa{% if doc['shipped'] %} · wysłana{% elif doc['withdrawn'] %} · wycofana{% elif not doc['is_current'] %} · wcześniejsza wersja{% endif %}</b><div class="muted">{{ doc['created_at'] }}<br>{{ doc['order_count'] }} zamówień · {{ doc['total_qty'] }} szt. w paczce</div></div><a class="btn" href="{{ url_for('order_packing_current_print' if doc['is_current'] and not doc['shipped'] else 'order_saved_packing_document', order_id=o['id'], file_hash=doc['file_hash']) }}" target="_blank">Pobierz</a></div>
-                {% if doc['is_current'] and not doc['shipped'] %}<a class="btn" style="white-space:normal;text-align:center" href="{{ url_for('order_packing_correction',order_id=o['id'],file_hash=doc['file_hash']) }}">Wyślij poprawioną listę klientowi</a>{% if not doc['invoice_id'] %}<a class="btn" href="{{ url_for('order_packing_list_download_admin',order_id=o['id']) }}">Zmień ilości w paczce</a><a class="btn" href="{{ url_for('order_packing_withdraw',order_id=o['id'],file_hash=doc['file_hash']) }}">Wycofaj błędną listę</a>{% endif %}{% endif %}
-                {% endfor %}
+                {% if current_document %}{% set doc=current_document %}
+                <div class="doc-row" data-current-packing><span class="doc-mark">L</span><div style="min-width:0"><b>Lista pakowa{% if doc['shipped'] %} · wysłana{% endif %}</b><div class="muted">{{ doc['created_at'] }}<br>{{ doc['total_qty'] }} szt. · {{ doc['order_count'] }} zamówień</div></div><a class="btn" href="{{ url_for('order_saved_packing_document' if doc['shipped'] else 'order_packing_current_print', order_id=o['id'], file_hash=doc['file_hash']) }}" target="_blank">Pobierz PDF</a></div>
+                {% if not doc['shipped'] %}<div class="order-actions">
+                  {% if can_edit_packing %}<a class="btn" href="{{ url_for('order_packing_list_download_admin',order_id=o['id']) }}">Zmień ilości</a>{% endif %}
+                  <details class="packing-actions"><summary class="btn" aria-label="Opcje listy pakowej">⋯</summary><div class="doc-list" style="margin-top:8px">
+                    <a class="btn" style="white-space:normal" href="{{ url_for('order_packing_correction',order_id=o['id'],file_hash=doc['file_hash']) }}">Wyślij poprawioną listę klientowi</a>
+                    {% if can_edit_packing %}<a class="btn" href="{{ url_for('order_packing_withdraw',order_id=o['id'],file_hash=doc['file_hash']) }}">Wycofaj listę</a>{% endif %}
+                  </div></details>
+                </div>{% endif %}{% endif %}
+                {% if packing_history_documents %}<details class="packing-history"><summary style="cursor:pointer;padding:10px 0">Historia list ({{ packing_history_documents|length }})</summary><div class="doc-list">
+                  {% for doc in packing_history_documents %}<div class="doc-row"><div style="min-width:0"><b>{% if doc['shipped'] %}Wysłana{% elif doc['withdrawn'] %}Wycofana{% else %}Wcześniejsza wersja{% endif %}</b><div class="muted">{{ doc['created_at'] }}<br>{{ doc['total_qty'] }} szt. · {{ doc['order_count'] }} zamówień</div></div><a class="btn" href="{{ url_for('order_saved_packing_document',order_id=o['id'],file_hash=doc['file_hash']) }}" target="_blank">PDF</a></div>{% endfor %}
+                </div></details>{% endif %}
                 {% if not saved_packing_documents and invoice and invoice['publication_state'] == 'complete' %}<div class="doc-row"><span class="doc-mark">L</span><div><b>Lista pakowa</b><div class="muted">Do faktury {{ invoice['invoice_no'] }}</div></div><a class="btn" href="{{ url_for('invoice_packing_list_download_admin', invoice_id=invoice['id']) }}" target="_blank">Pobierz</a></div>{% endif %}
                 {% if o['inpost_shipment_id'] %}<div class="doc-row"><span class="doc-mark">E</span><div><b>Etykieta kurierska</b><div class="muted">{{ o['carrier'] or 'InPost' }}</div></div><a class="btn" href="{{ url_for('order_inpost_label', order_id=o['id']) }}">Pobierz</a></div>{% endif %}
               </div>
@@ -981,7 +1017,8 @@ def register_routes(context):
               </div>
             </div>
             <form id="manual-shipment" method="post" action="{{ url_for('order_mark_shipped', order_id=o['id']) }}" class="flex" style="margin-top:14px;padding:14px;border:1px solid #dbe4f2;border-radius:16px;background:#f8fbff;">
-              <div><b>Wysyłka do klienta</b><div class="muted">Wpisz numer przesyłki i oznacz zamówienie jako wysłane.</div></div>
+              <input type="hidden" name="shipment_form_version" value="{{ shipment_form_version }}">
+              <div><b>{% if pending_package %}Numer nowej przesyłki{% else %}Numer ostatniej przesyłki{% endif %}</b><div class="muted">{% if current_package %}Lista z {{ current_package['created_at'] }} · {{ current_package['total_qty'] }} szt.{% else %}Najpierw zapisz listę pakową.{% endif %}</div>{% if pending_package and o['tracking_no'] %}<div class="muted">Poprzednia przesyłka: {{ o['tracking_no'] }}</div>{% endif %}</div>
               {% if o['inpost_shipment_id'] %}
                 <a class="btn primary" href="{{ url_for('order_inpost_label', order_id=o['id'], bundle='1') }}">Pobierz PDF A4 + A6</a>
               {% else %}
@@ -995,7 +1032,7 @@ def register_routes(context):
               </select>
               <input name="tracking_no" value="{{ '' if pending_package else (o['tracking_no'] or '') }}" placeholder="Numer aktualnej przesyłki" required style="min-width:260px;">
               <label style="display:flex;align-items:center;gap:7px;"><input type="checkbox" name="notify_customer" value="1"> Wyślij e-mail klientowi</label>
-              <button class="btn primary" type="submit">Wysłane</button>
+              <button class="btn primary" type="submit" {% if not current_package %}disabled{% endif %}>Zapisz numer przesyłki</button>
               {% if o['tracking_no'] %}<a class="btn" target="_blank" href="{{ carrier_tracking_url(o['carrier'], o['tracking_no']) }}">Śledź</a>{% endif %}
             </form>
             {% if request.args.get('shipment_sent') == '1' %}<div class="hint" style="margin-top:10px;">Status i numer przesyłki zapisane.{% if request.args.get('notification_skipped') == '1' %} Powiadomienie klienta zostało pominięte.{% else %} Klient otrzymał e-mail.{% endif %}</div>{% endif %}
@@ -1104,7 +1141,7 @@ def register_routes(context):
           </div>
         {% endblock %}
         """
-        return render_template_string(tpl, title=canonical_order_no(o["id"], o["created_at"], o["order_no"]), base_url=BASE_URL, db_path=DB_PATH, o=o, items=items, saved_packing_documents=saved_packing_documents, open_selection=open_selection, pending_package=pending_package, resume_url=resume_url, invoice=dict(invoice_row) if invoice_row else None, shipment_status=shipment_status, shipment_status_error=shipment_status_error, shipment_state=shipment_state, shipment_work=shipment_work, refresh_result=refresh_result, notice=notice, notice_state=notice_state, shipment_scope=shipment_scope, inpost_status_label=inpost_tracking.status_label, inpost_result_label=inpost_tracking.result_label, inpost_notification_label=inpost_tracking.notification_label, order_url=order_url, products=products_rows, locked=(int(o["warehouse_issued"] or 0)==1), order_status_label=order_status_label, order_status_css=order_status_css, canonical_order_no=canonical_order_no)
+        return render_template_string(tpl, title=canonical_order_no(o["id"], o["created_at"], o["order_no"]), base_url=BASE_URL, db_path=DB_PATH, o=o, items=items, saved_packing_documents=saved_packing_documents, current_document=current_document, packing_history_documents=packing_history_documents, can_edit_packing=can_edit_packing, current_package=current_package, shipment_form_version=shipment_form_version, open_selection=open_selection, pending_package=pending_package, resume_url=resume_url, invoice=dict(invoice_row) if invoice_row else None, shipment_status=shipment_status, shipment_status_error=shipment_status_error, shipment_state=shipment_state, shipment_work=shipment_work, refresh_result=refresh_result, notice=notice, notice_state=notice_state, shipment_scope=shipment_scope, inpost_status_label=inpost_tracking.status_label, inpost_result_label=inpost_tracking.result_label, inpost_notification_label=inpost_tracking.notification_label, order_url=order_url, products=products_rows, locked=(int(o["warehouse_issued"] or 0)==1), order_status_label=order_status_label, order_status_css=order_status_css, canonical_order_no=canonical_order_no)
 
 
 
