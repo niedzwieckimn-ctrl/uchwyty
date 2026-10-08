@@ -1868,6 +1868,11 @@ def register_routes(context):
             order["customer_phone"] = profile.get("phone") or order.get("customer_phone")
         except Exception:
             language = "en"
+        import payment_bank
+        try:
+            bank = payment_bank.foreign_bank()
+        except payment_bank.BankConfigurationError as exc:
+            abort(409, description=str(exc))
         company["pdf_font"], company["pdf_font_bold"] = get_pdf_font_names()
         pdf_buffer, filename = generate_proforma_pdf(
             order,
@@ -1875,9 +1880,9 @@ def register_routes(context):
             company,
             language=language,
             logo_path=find_logo_path(),
-            iban=norm(os.environ.get("PROFORMA_EUR_IBAN") or company.get("bank_account")),
-            bic=norm(os.environ.get("PROFORMA_EUR_BIC")),
-            bank_name=norm(os.environ.get("PROFORMA_EUR_BANK")),
+            iban=payment_bank.display_iban(bank['iban']),
+            bic=bank['bic'],
+            bank_name=bank['bank_name'],
             place=norm(os.environ.get("PROFORMA_PLACE") or "Kotuszów"),
         )
         return send_file(pdf_buffer, mimetype="application/pdf", as_attachment=True, download_name=filename, max_age=0)

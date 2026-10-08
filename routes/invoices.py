@@ -352,6 +352,13 @@ def register_routes(context):
                 data["payment_to"] = (issue_day + timedelta(days=7)).strftime("%Y-%m-%d")
 
             invoice_items = prepare_invoice_items(items, request.form)
+            if norm(request.form.get("submit_action")) != "packing":
+                import payment_bank
+                try:
+                    payment_bank.for_invoice(company, data, invoice_items)
+                except payment_bank.BankConfigurationError as exc:
+                    c.close()
+                    abort(409, description=str(exc))
             if norm(request.form.get("submit_action")) != "packing" and invoice_from_packing:
                 actual = {int(x.get("order_item_id") or x.get("id") or 0): int(x.get("qty") or 0) for x in invoice_items if int(x.get("qty") or 0)>0}
                 if actual != packing_qty_by_item:
