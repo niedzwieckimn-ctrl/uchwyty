@@ -172,7 +172,7 @@ def execute(execution_id, definition, actor, data, approval_id, entity_type, ent
             raise _error('REMOVAL_UNVERIFIED', 'Nie potwierdzono usunięcia faktury. Nie ponawiaj usuwania.')
         after = [dict(db.execute('SELECT * FROM orders WHERE id=?', (oid,)).fetchone()) for oid in affected]
         for old, new in zip(before['orders'], after):
-            if any(old.get(k) != new.get(k) for k in ('inpost_shipment_id', 'tracking_no', 'carrier', 'status')):
+            if any(old.get(k) != new.get(k) for k in ('inpost_shipment_id', 'tracking_no', 'carrier')):
                 raise _error('ORDER_CHANGED', 'W trakcie usuwania zmienił się stan zamówienia. Sprawdź aktualne dane.')
         if b.supabase_enabled():
             for table, key in (('invoices', 'id'), ('invoice_allocations', 'invoice_id'),

@@ -5585,6 +5585,13 @@ def reconcile_orders_after_invoice_change(order_ids: list[int]):
         for oid in touched:
             fully=order_fully_invoiced(cur,oid)
             cur.execute("UPDATE orders SET warehouse_issued=? WHERE id=?",(int(fully),oid))
+            row = cur.execute('SELECT status,shipped_at,packed_at FROM orders WHERE id=?', (oid,)).fetchone()
+            if row and not fully and row['status'] in {'completed','issued','shipped'}:
+                # Deleting a later invoice reopens only the unfinished remainder.
+                # Earlier shipment evidence must remain intact.
+                status = 'partially_shipped' if row['shipped_at'] else ('packed_partial' if row['packed_at'] else 'confirmed')
+                cur.execute('UPDATE orders SET status=? WHERE id=?', (status, oid))
+                invoice_payment_sync.refresh_order_snapshot(c, oid)
         c.commit()
     finally:c.close()
     if supabase_enabled() and touched:
@@ -8582,16 +8589,19 @@ def _all_order_invoices_paid(cur, order_id: int) -> bool:
     cur.execute(f"""
       SELECT i.id AS invoice_id, m.invoice_id AS meta_invoice_id,
              COALESCE(m.sent_to_client,0) AS sent_to_client,
-             COALESCE(m.paid,0) AS paid
+             COALESCE(m.paid,0) AS paid,
+             EXISTS(SELECT 1 FROM invoice_allocations a WHERE a.invoice_id=i.id AND a.order_id=? AND a.qty>0) AS allocates_order
       FROM invoices i
       LEFT JOIN invoice_meta m ON m.invoice_id=i.id
       WHERE i.id IN ({placeholders})
-    """, tuple(invoice_ids))
+    """, (order_id, *invoice_ids))
     rows = [dict(row) for row in cur.fetchall()]
     # Niewysłany szkic starej faktury nie jest należnością klienta i nie może
     # blokować zamknięcia zamówienia. Rekordy bez invoice_meta są historycznie
     # widoczne, więc nadal wymagają jawnego oznaczenia płatności.
-    payable = [row for row in rows if row["meta_invoice_id"] is None or int(row["sent_to_client"] or 0) == 1 or int(row["paid"] or 0) == 1]
+    # An invoice contributing quantities is payable even before its email is sent.
+    # Ignoring it used to close partially shipped orders using only an older paid invoice.
+    payable = [row for row in rows if row['allocates_order'] or row["meta_invoice_id"] is None or int(row["sent_to_client"] or 0) == 1 or int(row["paid"] or 0) == 1]
     return bool(payable) and all(int(row["paid"] or 0) == 1 for row in payable)
 
 
@@ -8746,6 +8756,15 @@ def _set_invoice_payment_state(invoice_id: int, *, reminder: int | None = None, 
     return changed_order_ids
 
 def _delete_invoice_everywhere(invoice_id: int):
+    from fulfillment_operations import ui_write
+    invoice = load_invoice_with_meta(invoice_id)
+    if not invoice:
+        abort(404)
+    with ui_write(int(invoice['order_id'])):
+        return _delete_invoice_everywhere_locked(invoice_id)
+
+
+def _delete_invoice_everywhere_locked(invoice_id: int):
     assert_invoice_mutable(invoice_id)
     inv = load_invoice_with_meta(invoice_id)
     if not inv:
@@ -8771,6 +8790,8 @@ def _delete_invoice_everywhere(invoice_id: int):
     c.close()
 
     import invoice_stock, sys
+    import packing_versions
+    packing_versions.prepare_write_evidence(sys.modules[__name__], touched_order_ids)
     invoice_stock.clear(sys.modules[__name__], invoice_id)
 
     ok_pdf, abs_path = invoice_pdf_exists(inv.get("pdf_path", ""), inv.get("invoice_no", ""))
@@ -8785,6 +8806,14 @@ def _delete_invoice_everywhere(invoice_id: int):
 
     c = conn()
     cur = c.cursor()
+    import invoice_removal_packing
+    try:
+        c.execute('BEGIN IMMEDIATE')
+        packing_members = invoice_removal_packing.detach(sys.modules[__name__], c, inv)
+    except Exception:
+        c.rollback()
+        c.close()
+        raise
     cur.execute("DELETE FROM invoice_allocations WHERE invoice_id=?", (invoice_id,))
     cur.execute("DELETE FROM invoice_meta WHERE invoice_id=?", (invoice_id,))
     cur.execute("DELETE FROM ksef_documents WHERE invoice_id=?", (invoice_id,))
@@ -8792,6 +8821,7 @@ def _delete_invoice_everywhere(invoice_id: int):
     c.commit()
     c.close()
 
+    packing_versions.sync_evidence(sys.modules[__name__], packing_members)
     changed_order_ids, changed_product_ids = reconcile_orders_after_invoice_change(touched_order_ids)
 
     if supabase_enabled():
