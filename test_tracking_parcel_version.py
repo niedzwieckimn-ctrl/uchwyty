@@ -71,3 +71,17 @@ def test_order_view_shows_one_current_list_and_collapsed_history(ready, monkeypa
     assert '<details class="packing-history">' in page.text
     assert 'Historia list (1)' in page.text
     assert 'name="shipment_form_version"' in page.text
+
+
+def test_order_view_restores_manually_shipped_parcel_after_cold_cache(ready):
+    client, cloud, _, _ = ready
+    c = b.conn()
+    c.execute('DELETE FROM fulfillment_documents')
+    c.execute('DELETE FROM fulfillment_reconciliation_versions')
+    c.commit(); c.close()
+    # No InPost identifier exists; opening the order must hydrate cloud evidence.
+    page = client.get('/orders/103?manual_shipment=1')
+    assert page.status_code == 200, page.text
+    assert 'data-current-packing' in page.text
+    assert 'Najpierw zapisz listę pakową.' not in page.text
+    assert 'disabled>Zapisz numer przesyłki' not in page.text
