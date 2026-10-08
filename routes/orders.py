@@ -718,6 +718,11 @@ def register_routes(context):
         c.close()
         try:
             inpost_tracking.restore_packing_scope(sys.modules[app.import_name], dict(o))
+            if not norm(o['inpost_shipment_id']):
+                # Manually shipped parcels have no InPost provider ID. Their
+                # durable packing evidence must also survive a cold Render cache.
+                import reconciliation_store
+                reconciliation_store.restore(sys.modules[app.import_name], order_id)
         except Exception as exc:
             shipment_status_error = str(exc)
         c = conn()
@@ -873,7 +878,7 @@ def register_routes(context):
             packing_history_documents = [doc for doc in saved_packing_documents if doc is not current_document]
             can_edit_packing = False
             if current_document and not current_document['invoice_id'] and not current_document['shipped']:
-                import packing_correction, invoice_jobs, sys
+                import packing_correction, invoice_jobs
                 try:
                     packing_correction._assert_no_current_shipping(packing_db, current_package)
                     can_edit_packing = not invoice_jobs.pending_for_orders(sys.modules[app.import_name], current_package['order_ids'])
@@ -951,6 +956,7 @@ def register_routes(context):
             </div>
             <div class="card">
               <div class="panel-title"><span class="panel-icon">▤</span><h2>Dokumenty</h2></div>
+              {% if shipment_status_error and not o['inpost_shipment_id'] %}<p class="hint">Nie udało się odczytać aktualnej listy pakowej. Odśwież stronę po przywróceniu połączenia.</p>{% endif %}
               <div class="doc-list">
                 {% if invoice %}<div class="doc-row"><span class="doc-mark">F</span><div><b>Faktura</b><div class="muted">{{ invoice['invoice_no'] }}{% if invoice['publication_state'] != 'complete' %} · zapis niedokończony{% endif %}</div></div>{% if invoice['publication_state'] == 'complete' %}<a class="btn" href="{{ url_for('invoice_download_admin', invoice_id=invoice['id']) }}" target="_blank">Pobierz</a>{% else %}<a class="btn" href="{{ url_for('order_invoice', order_id=o['id']) }}">Dokończ zapis</a>{% endif %}</div>{% else %}<div class="doc-row"><span class="doc-mark">F</span><div><b>Faktura</b><div class="muted">Jeszcze niewystawiona</div></div></div>{% endif %}
                 {% if current_document %}{% set doc=current_document %}
