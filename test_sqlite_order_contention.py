@@ -176,6 +176,8 @@ def test_consecutive_packing_and_invoice_requests_release_lock(order_actions):
         ('invoice', _invoice_form()),
     ]
     for operation, form in requests:
+        if operation == 'packing-list':
+            form['packing_form_version'] = _packing_form_version()
         responses = []
         worker = threading.Thread(
             target=lambda: responses.append(order_actions.post('/orders/99/' + operation, data=form)),
@@ -235,11 +237,21 @@ def _invoice_form():
     }
 
 
+def _packing_form_version():
+    import packing_correction
+    db = backend.conn()
+    try:
+        return packing_correction.form_version(db,99)
+    finally:
+        db.close()
+
+
 @pytest.mark.parametrize('operation', ['packing-list', 'invoice'])
 @pytest.mark.parametrize('failed_sync', [False, True])
 def test_order_actions_complete_with_background_sync_active(
     order_actions, monkeypatch, operation, failed_sync,
 ):
+    packing_token = _packing_form_version()
     main_id = threading.get_ident()
     sync_threads = set()
     trigger_enabled = [True]
@@ -316,6 +328,7 @@ def test_order_actions_complete_with_background_sync_active(
         try:
             form = _invoice_form() if operation == 'invoice' else {
                 'csrf_token': 'test', 'carrier': 'pending', 'pack_qty_99': '7',
+                'packing_form_version': packing_token,
             }
             captured['response'] = order_actions.post('/orders/99/' + operation, data=form)
         except BaseException as exc:

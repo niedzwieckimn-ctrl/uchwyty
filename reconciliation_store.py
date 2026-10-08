@@ -3,6 +3,38 @@ import base64
 import hashlib
 import json
 from pathlib import Path
+import reconciliation_documents
+from collections import OrderedDict
+import threading
+
+_remote_cache = OrderedDict()
+_remote_cache_lock = threading.Lock()
+
+
+def _read_remote(b, oid):
+    """Warm reads check a small revision first; changed evidence is never cached away."""
+    key = (str(Path(getattr(b, 'DB_PATH', b.DATA_DIR)).resolve()), int(oid)) if reconciliation_documents.enabled(b) else None
+    if key is not None:
+        with _remote_cache_lock:
+            cached = _remote_cache.get(key)
+        if cached is not None:
+            rows = b.supabase_request('/rest/v1/fulfillment_reconciliation',
+                params={'order_id': 'eq.' + str(oid), 'select': 'revision'})
+            if isinstance(rows, list) and len(rows) == 1 and rows[0].get('revision') == cached['revision']:
+                return [cached]
+    rows = b.supabase_request('/rest/v1/fulfillment_reconciliation',
+        params={'order_id': 'eq.' + str(oid), 'select': 'revision,payload'})
+    # Do not retain legacy inline PDFs in the process cache on a small server.
+    compact = (isinstance(rows, list) and len(rows) == 1 and
+        not any(d.get('pdf_base64') for section in reconciliation_documents.SECTIONS
+                for d in rows[0].get('payload', {}).get(section, [])))
+    if key is not None and compact:
+        with _remote_cache_lock:
+            _remote_cache[key] = rows[0]
+            _remote_cache.move_to_end(key)
+            while len(_remote_cache) > 64:
+                _remote_cache.popitem(last=False)
+    return rows
 
 TABLES = {
     'order_shipping_requirements': 'order_id', 'fulfillment_documents': 'order_id',
@@ -164,8 +196,7 @@ def _identical_remote_revision(b, oid, revision, payload):
     continues through the existing atomic CAS; it never advances its base.
     """
     try:
-        rows = b.supabase_request('/rest/v1/fulfillment_reconciliation', params={
-            'order_id': 'eq.' + str(oid), 'select': 'revision,payload'})
+        rows = _read_remote(b, oid)
         if not isinstance(rows, list) or len(rows) != 1:
             return None
         remote = rows[0]
@@ -173,6 +204,7 @@ def _identical_remote_revision(b, oid, revision, payload):
         if (not isinstance(confirmed, int) or isinstance(confirmed, bool)
                 or confirmed < revision or not isinstance(remote.get('payload'), dict)):
             return None
+        remote = dict(remote, payload=reconciliation_documents.hydrate(b, remote['payload']))
         if _same_evidence(remote['payload'], payload):
             return confirmed
         # Durable IDs may have been rekeyed after a cold-cache collision. Use
@@ -213,8 +245,9 @@ def _save(b, oid, revision, payload):
         _acknowledge(b, oid, revision, payload, confirmed)
         b.app.logger.info('RECONCILIATION_SAVE_SKIPPED order_id=%s revision=%s skipped=true', oid, confirmed)
         return
+    wire_payload = reconciliation_documents.externalize(b, payload)
     result = b.supabase_request('/rest/v1/rpc/save_fulfillment_reconciliation', method='POST',
-                               payload={'p_order_id': oid, 'p_expected_revision': revision, 'p_payload': payload})
+                               payload={'p_order_id': oid, 'p_expected_revision': revision, 'p_payload': wire_payload})
     if not isinstance(result, dict) or not result.get('saved'):
         raise ValueError('Nie zapisano trwałych metadanych realizacji. Wymagane jest uzgodnienie konfliktu wersji.')
     _acknowledge(b, oid, revision, payload, result['revision'])
@@ -564,12 +597,13 @@ def _repair_missing_packing_documents(b, db, payload):
 def restore(b, oid, *, allow_packing_extension=False):
     if not b.supabase_enabled():
         return
-    rows = b.supabase_request('/rest/v1/fulfillment_reconciliation', params={'order_id': 'eq.' + str(oid), 'select': 'revision,payload'})
+    rows = _read_remote(b, oid)
     if not isinstance(rows, list):
         raise ValueError('Nie można odczytać trwałego stanu realizacji. Sprawdź migrację reconciliation.')
     if not rows:
         return
-    record = rows[0]
+    # Download and verify missing files before taking a SQLite write lock.
+    record = dict(rows[0], payload=reconciliation_documents.hydrate(b, rows[0]['payload']))
     c = b.conn()
     try:
         c.execute('BEGIN IMMEDIATE')

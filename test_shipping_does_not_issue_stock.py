@@ -49,11 +49,12 @@ def test_marking_order_shipped_does_not_change_stock(tmp_path, monkeypatch):
     item_id = c.execute('SELECT id FROM order_items WHERE order_id=880101').fetchone()[0]
     packing_versions.publish(backend, c, 880101,
         [{'source_order_id':880101, 'order_item_id':item_id, 'qty':2}], str(path))
+    version = packing_versions.shipment_form_version(c, packing_versions.current_for_order(c,880101))
     c.commit()
     c.close()
     response = client.post(
         "/orders/880101/shipped",
-        data={"tracking_no": "123456789", "carrier": "inpost", "notify_customer": "1", "csrf_token": "test-csrf"},
+        data={"tracking_no": "123456789", "carrier": "inpost", "notify_customer": "1", "csrf_token": "test-csrf", "shipment_form_version": version},
     )
     assert response.status_code == 302
 

@@ -543,6 +543,19 @@ def current_for_order(db, order_id):
     return batch_result(db, batch[0], mode='current') if batch else None
 
 
+def shipment_form_version(db, package):
+    """Bind manual tracking to the displayed parcel and its existing pointers."""
+    if not package:
+        return ''
+    members = package['order_ids']
+    marks = ','.join('?' for _ in members)
+    pointers = [list(r) for r in db.execute(f'''SELECT id,carrier,tracking_no,inpost_shipment_id
+        FROM orders WHERE id IN ({marks}) ORDER BY id''', members)]
+    docs = [list(r) for r in db.execute('''SELECT order_id,file_hash FROM fulfillment_document_history
+        WHERE kind='packing_list' AND document_id=? ORDER BY order_id''', (package['batch_id'],))]
+    return hashlib.sha256(json.dumps([package['packing_list_key'], docs, pointers]).encode()).hexdigest()
+
+
 def ensure_current_for_shipment(b, db, order_id):
     result = current_for_order(db, order_id)
     if result:
