@@ -291,6 +291,9 @@ def test_xml_generation_is_pure_for_inputs():
 
 @pytest.fixture()
 def historical_db(tmp_path, monkeypatch):
+    monkeypatch.setenv('FOREIGN_INVOICE_IBAN', 'DE89370400440532013000')
+    monkeypatch.setenv('FOREIGN_INVOICE_BIC', 'REVOLT21')
+    monkeypatch.setenv('FOREIGN_INVOICE_BANK', 'Test Foreign Bank')
     monkeypatch.setattr(backend, "DB_PATH", str(tmp_path / "history.db"))
     monkeypatch.setattr(backend, "DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setattr(backend, "supabase_enabled", lambda: False)

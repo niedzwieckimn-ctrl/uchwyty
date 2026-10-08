@@ -165,7 +165,12 @@ def generate(invoice, company, items):
             due_node = SubElement(payment, _tag("TerminPlatnosci")); _add(due_node, "Termin", due)
         payment_code = _payment_code(_invoice_payment_type(invoice))
         _add(payment, "FormaPlatnosci", payment_code)
-        account = _pln_bank_account(company.get("bank_account"))
+        raw_account = re.sub(r"\s+", "", _text(company.get("bank_account")).upper())
+        account = _pln_bank_account(raw_account)
+        if not account and re.fullmatch(r"[A-Z]{2}\d{2}[A-Z0-9]{11,30}", raw_account):
+            digits = ''.join(str(ord(c)-55) if c.isalpha() else c for c in raw_account[4:]+raw_account[:4])
+            if int(digits) % 97 == 1:
+                account = raw_account
         if payment_code == "6" and account:
             bank = SubElement(payment, _tag("RachunekBankowy")); _add(bank, "NrRB", account)
             swift = _swift(company.get("bank_swift"))

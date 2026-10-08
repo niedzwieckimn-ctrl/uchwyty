@@ -4787,7 +4787,9 @@ def _legacy_generate_order_invoice_pdf(order_row, items, meta):
     seller_addr = pdf_txt((company["address"] if company else "") or "-")
     seller_phone = pdf_txt((company["phone"] if company else "") or "")
     seller_email = pdf_txt((company["email"] if company else "") or "")
-    seller_bank = pdf_txt((company["bank_account"] if company else "") or "")
+    import payment_bank
+    selected_bank = payment_bank.for_invoice(company, meta, items)
+    seller_bank = pdf_txt(payment_bank.display_iban(selected_bank['iban']) if selected_bank['foreign'] else selected_bank['iban'])
 
     buyer_name = pdf_txt(meta.get("buyer_name") or (order_row["customer_name"] if order_row and "customer_name" in order_row.keys() else "") or "-")
     buyer_tax_no = pdf_txt(meta.get("buyer_tax_no") or "-")
@@ -4813,8 +4815,10 @@ def _legacy_generate_order_invoice_pdf(order_row, items, meta):
         seller_lines.append(f"{pdf_copy['phone']}: {seller_phone}")
     if seller_email:
         seller_lines.append(f"{pdf_copy['email']}: {seller_email}")
-    if seller_bank and not is_paid:
-        seller_lines.append(f"{pdf_copy['account']}: {seller_bank}")
+    if seller_bank and (not is_paid or selected_bank['foreign']):
+        seller_lines.append(f"{'IBAN' if selected_bank['foreign'] else pdf_copy['account']}: {seller_bank}")
+        if selected_bank['foreign']:
+            seller_lines.extend([f"BIC / SWIFT: {selected_bank['bic']}", selected_bank['bank_name']])
 
     buyer_lines = [buyer_name, buyer_tax_line, buyer_street, f"{buyer_post} {buyer_city}".strip(), buyer_country]
     if buyer_phone:
@@ -5932,7 +5936,7 @@ BASE = r"""
     .nav>a.nav-searches{--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M15%2015l6%206M17%2010a7%207%200%201%201-14%200%207%207%200%201%201%2014%200%22%2F%3E%3C%2Fsvg%3E")}
     .nav>a.nav-stock{--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M3%207l9-5%209%205v10l-9%205-9-5ZM3%207l9%205%209-5M12%2012v10%22%2F%3E%3C%2Fsvg%3E")}
     .nav>a.nav-remanent{--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M5%204h14v18H5zM9%204V2h6v2M8%2010l1.5%201.5L12%209M14%2010h3M8%2016l1.5%201.5L12%2015M14%2016h3%22%2F%3E%3C%2Fsvg%3E")}
-    .nav>a.nav-import{--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M2%205h12v12H2ZM14%209h4l4%205v3h-8M8%2019a2%202%200%201%201-4%200%202%202%200%201%201%204%200M20%2019a2%202%200%201%201-4%200%202%202%200%201%201%204%200%22%2F%3E%3C%2Fsvg%3E")}
+    .nav>a.nav-import,.nav>a.nav-shipments{--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M2%205h12v12H2ZM14%209h4l4%205v3h-8M8%2019a2%202%200%201%201-4%200%202%202%200%201%201%204%200M20%2019a2%202%200%201%201-4%200%202%202%200%201%201%204%200%22%2F%3E%3C%2Fsvg%3E")}
     .nav>a.nav-scan{--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M8%202H2v6M16%202h6v6M22%2016v6h-6M8%2022H2v-6M6%206h4v4H6ZM14%206h4v4h-4ZM6%2014h4v4H6ZM14%2014h4v4h-4Z%22%2F%3E%3C%2Fsvg%3E")}
     .nav>a.nav-ai{--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M5%204h14a2%202%200%200%201%202%202v9a2%202%200%200%201-2%202H9l-5%204v-4a2%202%200%200%201-1-2V6a2%202%200%200%201%202-2Z%22%2F%3E%3Cpath%20d%3D%22m12%207%20.7%201.8L15%209.5l-2.3.7L12%2012l-.7-1.8L9%209.5l2.3-.7L12%207Z%22%2F%3E%3C%2Fsvg%3E")}
     .nav-drop-btn{--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M4%206h16M4%2012h16M4%2018h16M8%203v6M16%209v6M10%2015v6%22%2F%3E%3C%2Fsvg%3E")}
@@ -5944,6 +5948,7 @@ BASE = r"""
     <div class="nav flex">
       <a class="nav-home {% if request.endpoint == 'home' %}active{% endif %}" href="{{ url_for('home') }}">Pulpit</a>
       <a class="nav-orders {% if request.endpoint in ['orders','order_view'] %}active{% endif %}" href="{{ url_for('orders') }}">Zamówienia</a>
+      <a class="nav-shipments {% if request.endpoint == 'shipments' %}active{% endif %}" href="{{ url_for('shipments') }}">Przesyłki</a>
       <a class="nav-invoices" href="{{ url_for('invoices') }}">Faktury</a>
       <a class="nav-ksef" href="{{ url_for('ksef_dashboard') }}">KSeF</a>
       <a class="nav-searches {% if request.endpoint == 'client_searches' %}active{% endif %}" href="{{ url_for('client_searches') }}">Wyszukiwania</a>
@@ -8499,7 +8504,10 @@ def build_ksef_draft_xml(invoice, company, items):
             payload, company, items, generator=_legacy_build_ksef_draft_xml
         )
     if invoice_type in {"wdt", "export"}:
-        return ksef_foreign.generate(payload, company, items)
+        import payment_bank
+        bank = payment_bank.foreign_bank()
+        foreign_company = dict(company, bank_account=bank['iban'], bank_swift=bank['bic'])
+        return ksef_foreign.generate(payload, foreign_company, items)
     raise ValueError("Nieobsługiwany typ faktury")
 
 
@@ -9089,6 +9097,9 @@ for _routes_module in (routes_admin, routes_customers, routes_orders, routes_inv
     globals().update(_routes_module.register_routes(globals()))
 if "client_searches_v2" in globals():
     app.view_functions["client_searches"] = client_searches_v2
+
+import shipments_page as _shipments_page
+_shipments_page.register_routes(app, _amendment_sys.modules[__name__])
 
 import remanent as _remanent
 _remanent.register_routes(app, {"conn": conn, "BASE_URL": BASE_URL, "DB_PATH": DB_PATH})
