@@ -14,7 +14,7 @@ def register_routes(context):
         return result if isinstance(result, dict) and norm(result.get('id')) else {}
 
 
-    def persist_inpost_result(package_ids, shipment_id, tracking_number, *, enqueue_pickup=True):
+    def persist_inpost_result(package_ids, shipment_id, tracking_number, *, enqueue_pickup=True, parcel_count=1):
         c = conn()
         try:
             placeholders = ",".join(["?"] * len(package_ids))
@@ -29,7 +29,7 @@ def register_routes(context):
             c.close()
         try:
             if enqueue_pickup:
-                enqueue_automatic_inpost_pickup(shipment_id)
+                enqueue_automatic_inpost_pickup(shipment_id, parcel_count=parcel_count)
         except Exception:
             app.logger.exception("Etykieta utworzona, ale kolejka podjazdu wymaga sprawdzenia")
         if supabase_enabled():
@@ -291,7 +291,8 @@ def register_routes(context):
                                 break
                     package_ids = [int(item["id"]) for item in package_orders]
                     persist_inpost_result(package_ids, shipment_id, tracking_number,
-                                          enqueue_pickup=not structured)
+                                          enqueue_pickup=not structured,
+                                          parcel_count=parcel.get('quantity',1))
                     if structured:
                         return {'ok': True, 'shipment_id': shipment_id, 'tracking': tracking_number}
                     return redirect(url_for(
@@ -384,7 +385,7 @@ def register_routes(context):
               <div><label class="muted small">Uwagi dla InPost</label><input name="comments" maxlength="100" value="{{ request.form.get('comments', '') }}"></div>
               <div style="grid-column:1/-1" class="flex"><label><input type="checkbox" name="sms" value="1" {% if request.form.get('sms') == '1' %}checked{% endif %}> Serwis SMS</label><label><input type="checkbox" name="email" value="1" {% if request.form.get('email') == '1' %}checked{% endif %}> Serwis Email</label><label><input type="checkbox" name="rod" value="1" {% if request.form.get('rod') == '1' %}checked{% endif %}> Zwrot dokumentów</label><label><input type="checkbox" name="saturday" value="1" {% if request.form.get('saturday') == '1' %}checked{% endif %}> Doręczenie w sobotę</label></div>
               </fieldset>
-              <div style="grid-column:1/-1"><button class="btn primary" type="submit" {% if recipient_error or (saved_recipient and saved_recipient.state != 'SUCCESS') %}disabled{% endif %} {% if not saved_recipient %}onclick="return confirm('Nadać przesyłkę do wskazanego odbiorcy i zamówić podjazd kuriera?')"{% endif %}>{{ 'Sprawdź przesyłkę' if saved_recipient else 'Nadaj przesyłkę' }}</button></div>
+              <div style="grid-column:1/-1"><button class="btn primary" type="submit" {% if recipient_error or (saved_recipient and saved_recipient.state != 'SUCCESS') %}disabled{% endif %} {% if not saved_recipient %}onclick="return confirm('Nadać przesyłkę do wskazanego odbiorcy i dodać ją do najbliższego podjazdu?')"{% endif %}>{{ 'Sprawdź przesyłkę' if saved_recipient else 'Nadaj przesyłkę' }}</button></div>
             </form>{% endif %}
           </div>
         {% endblock %}
