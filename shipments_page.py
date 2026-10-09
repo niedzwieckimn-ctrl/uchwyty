@@ -190,9 +190,32 @@ def register_routes(app, b):
             needle = query.casefold()
             cards = [c for c in cards if needle in ' '.join([c['customer'], c['tracking'],
                 ' '.join(c['orders']), str(c.get('receiver', {}))]).casefold()]
+        try:
+            import inpost_pickups
+            pickup=inpost_pickups.dashboard_state(b)
+        except Exception:
+            app.logger.exception('INPOST_DAILY_PICKUP_READ_FAILED')
+            pickup={'unavailable':True,'cutoff':'12:20','today':None,'next':None,'can_order':False}
+        pickup_notice={
+            'ordered':'Podjazd został przekazany do InPost.',
+            'waiting':'Podjazd jest już sprawdzany. Odśwież widok za chwilę.',
+            'failed':'Nie potwierdzono zamówienia podjazdu. Sprawdź komunikat w kafelku.',
+        }.get(request.args.get('pickup'),'')
         return render_template('shipments.html', title='Przesyłki', base_url=b.BASE_URL,
             db_path=b.DB_PATH, active=[c for c in cards if not c['sent']],
-            history=[c for c in cards if c['sent']], q=query, message=message, limited=limited), (503 if message else 200)
+            history=[c for c in cards if c['sent']], q=query, message=message, limited=limited,
+            pickup=pickup,pickup_notice=pickup_notice), (503 if message else 200)
+
+    @app.post('/shipments/pickup/order-now')
+    def shipment_pickup_order_now():
+        try:
+            import inpost_pickups
+            result=inpost_pickups.order_today(b)
+            state='ordered' if result.get('ok') else ('waiting' if 'sprawdzany' in result.get('message','') else 'failed')
+        except Exception:
+            app.logger.exception('INPOST_DAILY_PICKUP_ORDER_FAILED')
+            state='failed'
+        return redirect(url_for('shipments',pickup=state))
 
     @app.get('/shipments/<key>/packing-list')
     def shipment_packing_pdf(key):

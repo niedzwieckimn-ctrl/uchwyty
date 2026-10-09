@@ -6923,13 +6923,12 @@ def apply_verified_inpost_status(order: dict, shipment: dict) -> dict:
 
 
 
-def enqueue_automatic_inpost_pickup(shipment_id):
+def enqueue_automatic_inpost_pickup(shipment_id, parcel_count=1):
     import inpost_pickups, sys
     if not inpost_pickups.enabled():
         return
     backend=sys.modules[__name__]
-    inpost_pickups.Store(backend).enqueue(shipment_id,inpost_pickups.company_pickup(backend))
-    inpost_pickups.process_one(backend,shipment_id)
+    inpost_pickups.Store(backend).enqueue(shipment_id,inpost_pickups.company_pickup(backend),parcel_count)
     inpost_pickups.start_worker(backend)
 
 
@@ -6941,7 +6940,12 @@ def inpost_pickup_status(shipment_id):
         rows=inpost_pickups.Store(sys.modules[__name__]).rows(shipment_id)
         if not rows:return {"label":"Podjazd nie został jeszcze zlecony","error":""}
         row=rows[0]
-        return dict(row,label=inpost_pickups.LABELS.get(row["state"],row["state"]))
+        payload=inpost_pickups._job_payload(row)
+        planned=inpost_pickups._pickup_meta(payload).get('scheduled_date')
+        label=inpost_pickups.LABELS.get(row["state"],row["state"])
+        if planned and row.get('state')=='pending':
+            label=f"Przesyłka zaplanowana na podjazd {planned}; automat do 12:20"
+        return dict(row,label=label,scheduled_date=planned)
     except Exception:
         app.logger.exception("Nie udało się odczytać stanu podjazdu")
         return {"label":"Nie udało się sprawdzić podjazdu","error":"Sprawdź połączenie z bazą i migrację kolejki podjazdów."}

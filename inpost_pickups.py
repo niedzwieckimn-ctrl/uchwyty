@@ -10,6 +10,11 @@ import re
 import threading
 import time
 import uuid
+from datetime import datetime, time as clock_time, timedelta
+from zoneinfo import ZoneInfo
+
+WARSAW = ZoneInfo('Europe/Warsaw')
+DAILY_META = '_daily_pickup'
 
 SCHEMA = '''CREATE TABLE IF NOT EXISTS inpost_pickup_jobs(
  shipment_id TEXT PRIMARY KEY,pickup_json TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'pending',
@@ -18,7 +23,7 @@ SCHEMA = '''CREATE TABLE IF NOT EXISTS inpost_pickup_jobs(
  created_at TEXT NOT NULL,updated_at TEXT NOT NULL)'''
 
 LABELS = {
- 'pending':'Podjazd oczekuje na gotowość przesyłki',
+ 'pending':'Przesyłka czeka na dzienny podjazd',
  'new':'Zlecenie podjazdu utworzone — trwa weryfikacja InPost',
  'sent':'Zlecenie podjazdu przekazane do realizacji',
  'unknown':'Wynik zamówienia podjazdu wymaga sprawdzenia',
@@ -32,6 +37,57 @@ def initialize(c):
 
 def enabled():
     return os.environ.get('INPOST_AUTO_PICKUP','1').lower() not in {'0','false','no','off'}
+
+def _local_now():
+    return datetime.now(WARSAW)
+
+def _parse_clock(name, default):
+    raw=os.environ.get(name,default).strip()
+    try:
+        hour,minute=(int(value) for value in raw.split(':',1))
+        return clock_time(hour,minute)
+    except (TypeError,ValueError):
+        return clock_time(*(int(value) for value in default.split(':',1)))
+
+def cutoff_time():
+    return _parse_clock('INPOST_DAILY_PICKUP_CUTOFF','12:20')
+
+def next_business_day(value):
+    value=value+timedelta(days=1)
+    while value.weekday()>=5:
+        value=value+timedelta(days=1)
+    return value
+
+def _pickup_meta(payload):
+    value=(payload or {}).get(DAILY_META) or {}
+    return value if isinstance(value,dict) else {}
+
+def _job_payload(job):
+    try:return json.loads(job.get('pickup_json') or '{}')
+    except (TypeError,ValueError):return {}
+
+def _job_date(job):
+    return str(_pickup_meta(_job_payload(job)).get('scheduled_date') or '')
+
+def _parcel_count(job):
+    try:return max(1,int(_pickup_meta(_job_payload(job)).get('parcel_count') or 1))
+    except (TypeError,ValueError):return 1
+
+def _closed(rows,scheduled_date):
+    return any(_job_date(row)==scheduled_date and
+               (int(row.get('attempted') or 0) or row.get('dispatch_id') or
+                row.get('state') in {'new','sent','unknown','collected'}) for row in rows)
+
+def scheduled_date(rows=None,now=None):
+    now=now or _local_now();today=now.date()
+    if today.weekday()>=5:
+        while today.weekday()>=5:today=next_business_day(today)
+        return today.isoformat()
+    cutoff=cutoff_time()
+    after_cutoff=now.time() > clock_time(cutoff.hour,cutoff.minute,59,999999)
+    if after_cutoff or _closed(rows or [],today.isoformat()):
+        return next_business_day(today).isoformat()
+    return today.isoformat()
 
 def company_pickup(b):
     c=b.conn()
@@ -63,9 +119,18 @@ def _validation_error(error):
 
 class Store:
     def __init__(self,b):self.b=b
-    def enqueue(self,sid,pickup):
+    def enqueue(self,sid,pickup,parcel_count=1):
         sid=str(sid);now=self.b.now_iso()
-        data={'shipment_id':sid,'pickup_json':json.dumps(pickup,ensure_ascii=False),'created_at':now,'updated_at':now}
+        # The existing JSON column keeps the daily plan without a database
+        # migration. Old jobs without this marker retain their legacy handling.
+        payload=dict(pickup)
+        rows=self.rows()
+        payload[DAILY_META]={
+            'scheduled_date':scheduled_date(rows),
+            'parcel_count':max(1,min(99,int(parcel_count or 1))),
+            'cutoff':cutoff_time().strftime('%H:%M'),
+        }
+        data={'shipment_id':sid,'pickup_json':json.dumps(payload,ensure_ascii=False),'created_at':now,'updated_at':now}
         if self.b.supabase_enabled():
             self.b.supabase_request('/rest/v1/inpost_pickup_jobs',method='POST',params={'on_conflict':'shipment_id'},payload=data,prefer='resolution=ignore-duplicates')
         else:
@@ -74,11 +139,11 @@ class Store:
             finally:c.close()
     def rows(self,sid=None):
         if self.b.supabase_enabled():
-            params={'select':'*','order':'created_at.asc','limit':1000}
+            params={'select':'*','order':'created_at.desc','limit':1000}
             if sid is not None:params['shipment_id']='eq.'+str(sid)
             return self.b.supabase_request('/rest/v1/inpost_pickup_jobs',params=params) or []
         c=self.b.conn()
-        try:return [dict(r) for r in c.execute('SELECT * FROM inpost_pickup_jobs'+(' WHERE shipment_id=?' if sid is not None else '')+' ORDER BY created_at', (str(sid),) if sid is not None else ())]
+        try:return [dict(r) for r in c.execute('SELECT * FROM inpost_pickup_jobs'+(' WHERE shipment_id=?' if sid is not None else '')+' ORDER BY created_at DESC', (str(sid),) if sid is not None else ())]
         finally:c.close()
     def claim(self,sid):
         token=str(uuid.uuid4());now=time.time()
@@ -94,7 +159,11 @@ class Store:
         finally:c.close()
     def correct_address(self,sid,pickup):
         validate(pickup)
-        payload=json.dumps(pickup,ensure_ascii=False)
+        current=next(iter(self.rows(sid)),None)
+        payload=dict(pickup)
+        meta=_pickup_meta(_job_payload(current or {}))
+        if meta:payload[DAILY_META]=meta
+        payload=json.dumps(payload,ensure_ascii=False)
         if self.b.supabase_enabled():
             return self.b.supabase_request('/rest/v1/rpc/correct_inpost_pickup_address',method='POST',payload={'p_shipment':str(sid),'p_pickup':payload})
         c=self.b.conn()
@@ -117,8 +186,85 @@ class Store:
             c.commit()
         finally:c.close()
 
+    def replace_payload(self,job,payload):
+        claimed=self.claim(job['shipment_id'])
+        if not claimed:return False
+        self.update(claimed,pickup_json=json.dumps(payload,ensure_ascii=False),state='pending',error='')
+        return True
+
+def _result_values(result):
+    dispatch_id=str(result.get('id') or '')
+    if not dispatch_id:raise RuntimeError('InPost nie zwrócił identyfikatora podjazdu')
+    status=str(result.get('status') or 'new').lower()
+    if status not in {'new','sent','rejected'}:status='unknown'
+    error=json.dumps(result.get('errors') or {},ensure_ascii=False) if status=='rejected' else ''
+    return dict(state=status,dispatch_id=dispatch_id,
+                external_id=str(result.get('external_id') or ''),error=error)
+
+def _update_group(store,rows,values,leader=None):
+    for row in rows:
+        if leader and str(row['shipment_id'])==str(leader['shipment_id']):continue
+        claimed=store.claim(row['shipment_id'])
+        if claimed:
+            store.update(claimed,**values)
+
+def process_date(b,day):
+    """Create one DispatchOrder for every parcel planned for one workday."""
+    store=Store(b)
+    rows=sorted((row for row in store.rows() if _job_date(row)==day),
+                key=lambda row:(row.get('created_at') or '',str(row['shipment_id'])))
+    if not rows:return {'ok':False,'message':'Brak przesyłek zaplanowanych na ten podjazd.'}
+    leader=store.claim(rows[0]['shipment_id'])
+    if not leader:
+        return {'ok':False,'message':'Podjazd jest już sprawdzany. Odśwież widok za chwilę.'}
+    try:
+        if leader.get('dispatch_id'):
+            result=b.inpost_get_dispatch_order(leader['dispatch_id'])
+        elif int(leader.get('attempted') or 0):
+            result=b.inpost_find_dispatch_order(leader['shipment_id'])
+            if not result:
+                values=dict(state='unknown',error='Nie potwierdzono wyniku poprzedniej próby. Nie ponowiono zamówienia kuriera. Sprawdź historię w InPost.')
+                store.update(leader,**values);_update_group(store,rows,values,leader)
+                return {'ok':False,'message':values['error']}
+        else:
+            pickup=_job_payload(leader)
+            try:validate(pickup)
+            except ValueError as exc:
+                values=dict(state='configuration_error',error=str(exc))
+                store.update(leader,**values);_update_group(store,rows,values,leader)
+                return {'ok':False,'message':str(exc)}
+            shipment_ids=[]
+            for row in rows:
+                shipment=b.inpost_get_shipment(row['shipment_id'])
+                if str(shipment.get('status') or '').lower()!='confirmed':
+                    store.update(leader,state='pending',error='InPost przygotowuje jedną z przesyłek; podjazd zostanie zamówiony po jej potwierdzeniu.')
+                    return {'ok':False,'message':'Jedna z przesyłek nie jest jeszcze potwierdzona przez InPost.'}
+                shipment_ids.append(str(row['shipment_id']))
+            # The leader is the durable at-most-once marker for the whole day.
+            # After this write a timeout is reconciled by GET, never re-POSTed.
+            store.update(leader,release=False,attempted=1,state='unknown')
+            leader['attempted']=1
+            result=b.inpost_create_dispatch_order(shipment_ids,pickup)
+        values=_result_values(result)
+        store.update(leader,**values)
+        _update_group(store,rows,values,leader)
+        return {'ok':values['state'] in {'new','sent'},'message':LABELS.get(values['state'],values['state']),
+                'dispatch_id':values['dispatch_id']}
+    except Exception as exc:
+        if _validation_error(exc):
+            values=dict(state='configuration_error',attempted=0,error=str(exc))
+            store.update(leader,**values);_update_group(store,rows,values,leader)
+        else:
+            state='unknown' if int(leader.get('attempted') or 0) or leader.get('dispatch_id') else 'pending'
+            store.update(leader,state=state,error=str(exc))
+        return {'ok':False,'message':str(exc)}
+
 def process_one(b,sid):
-    store=Store(b);job=store.claim(sid)
+    store=Store(b)
+    current=next(iter(store.rows(sid)),None)
+    if current and _job_date(current):
+        return process_date(b,_job_date(current))
+    job=store.claim(sid)
     if not job:return
     try:
         # HTTP 400 is a definite rejection: it is safe to correct the data and
@@ -149,12 +295,7 @@ def process_one(b,sid):
             store.update(job,release=False,attempted=1,state='unknown')
             job['attempted']=1
             result=b.inpost_create_dispatch_order([str(sid)],pickup)
-        dispatch_id=str(result.get('id') or '')
-        if not dispatch_id:raise RuntimeError('InPost nie zwrócił identyfikatora podjazdu')
-        status=str(result.get('status') or 'new').lower()
-        if status not in {'new','sent','rejected'}:status='unknown'
-        error=json.dumps(result.get('errors') or {},ensure_ascii=False) if status=='rejected' else ''
-        store.update(job,state=status,dispatch_id=dispatch_id,external_id=str(result.get('external_id') or ''),error=error)
+        store.update(job,**_result_values(result))
     except Exception as exc:
         # Preserve durable intent; failure of this update leaves the lease and
         # attempted flag for a future worker to reconcile safely.
@@ -163,13 +304,77 @@ def process_one(b,sid):
         else:
             store.update(job,state='unknown' if job['attempted'] or job.get('dispatch_id') else 'pending',error=str(exc))
 
+def _reschedule_expired(store,rows,now):
+    target=scheduled_date([],now)
+    changed=False
+    for row in rows:
+        if int(row.get('attempted') or 0) or row.get('dispatch_id'):continue
+        payload=_job_payload(row);meta=_pickup_meta(payload)
+        if not meta:continue
+        meta['scheduled_date']=target;payload[DAILY_META]=meta
+        changed=store.replace_payload(row,payload) or changed
+    return changed
+
+def order_today(b,now=None):
+    now=now or _local_now();cutoff=cutoff_time()
+    if now.weekday()>=5 or now.time()>clock_time(cutoff.hour,cutoff.minute,59,999999):
+        return {'ok':False,'message':'Dzisiejszy termin 12:20 minął. Nowe przesyłki są zaplanowane na następny dzień roboczy.'}
+    return process_date(b,now.date().isoformat())
+
+def dashboard_state(b,now=None):
+    now=now or _local_now();rows=Store(b).rows();today=now.date().isoformat()
+    groups={}
+    for row in rows:
+        day=_job_date(row)
+        if not day:continue
+        group=groups.setdefault(day,[]);group.append(row)
+    def summary(day,items):
+        attempted=any(int(row.get('attempted') or 0) or row.get('dispatch_id') for row in items)
+        states={str(row.get('state') or '') for row in items}
+        return {'date':day,'parcel_count':sum(_parcel_count(row) for row in items),
+                'shipment_count':len(items),'ordered':attempted,
+                'state':('problem' if states & {'unknown','rejected','configuration_error'} else
+                         'ordered' if attempted else 'planned'),
+                'label':next((LABELS.get(row.get('state'),row.get('state')) for row in items
+                              if row.get('state')!='pending'),LABELS['pending'])}
+    future=sorted(day for day in groups if day>today)
+    cutoff=cutoff_time()
+    return {'today':summary(today,groups[today]) if groups.get(today) else None,
+            'next':summary(future[0],groups[future[0]]) if future else None,
+            'cutoff':cutoff.strftime('%H:%M'),
+            'can_order':bool(groups.get(today)) and not _closed(rows,today)
+                and now.weekday()<5 and now.time()<=clock_time(cutoff.hour,cutoff.minute,59,999999)}
+
 def process_due(b):
     if not enabled():return
-    now=time.time()
-    for job in Store(b).rows():
-        if float(job.get('next_check') or 0)<=now and job['state'] not in {'rejected','configuration_error','collected'}:
+    epoch=time.time();now=_local_now();store=Store(b);rows=store.rows()
+    # Legacy rows keep their original immediate/reconciliation path.
+    for job in rows:
+        if _job_date(job):continue
+        if float(job.get('next_check') or 0)<=epoch and job['state'] not in {'rejected','configuration_error','collected'}:
             try:process_one(b,job['shipment_id'])
             except Exception:b.app.logger.exception('Nie udało się utrwalić wyniku podjazdu InPost')
+    groups={}
+    for job in rows:
+        day=_job_date(job)
+        if day:groups.setdefault(day,[]).append(job)
+    today=now.date().isoformat();cutoff=cutoff_time()
+    for day,jobs in sorted(groups.items()):
+        needs_reconciliation=any(job.get('state') in {'unknown','new'} for job in jobs)
+        if needs_reconciliation and any(float(job.get('next_check') or 0)<=epoch for job in jobs):
+            try:process_date(b,day)
+            except Exception:b.app.logger.exception('Nie udało się uzgodnić dziennego podjazdu InPost')
+            continue
+        if day<today and not _closed(rows,day):
+            _reschedule_expired(store,jobs,now);continue
+        if day!=today:continue
+        due=now.time()>=cutoff
+        still_open=now.time()<=clock_time(cutoff.hour,cutoff.minute,59,999999)
+        if due and still_open and any(float(job.get('next_check') or 0)<=epoch for job in jobs):
+            try:process_date(b,day)
+            except Exception:b.app.logger.exception('Nie udało się zamówić dziennego podjazdu InPost')
+        elif not still_open and not _closed(rows,day):
+            _reschedule_expired(store,jobs,now)
 
 _worker_lock=threading.Lock()
 _worker=None

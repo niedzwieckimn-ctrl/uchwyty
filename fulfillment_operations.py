@@ -1200,6 +1200,10 @@ def perform(name, data, actor, *, correlation_id='', approval_id='', before_stat
         if not s['order'].get('inpost_shipment_id'):
             raise error('NO_SHIPMENT', 'Najpierw utwórz przesyłkę.')
         b.enqueue_automatic_inpost_pickup(s['order']['inpost_shipment_id'])
+        import inpost_pickups
+        pickup_result = inpost_pickups.order_today(b)
+        if not pickup_result.get('ok'):
+            raise error('PICKUP_NOT_ORDERED', pickup_result.get('message') or 'Nie potwierdzono zamówienia podjazdu.')
     elif name == 'shipping.shipment.confirm_parameters':
         if not data.get('human_confirmed'):
             raise error('CONFIRMATION_REQUIRED', 'Człowiek musi potwierdzić dane istniejącej przesyłki po zmianie zawartości.')
