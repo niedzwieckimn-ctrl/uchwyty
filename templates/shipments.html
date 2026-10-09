@@ -7,9 +7,22 @@
 .shipment-card p{margin:0;overflow-wrap:anywhere}.shipment-card .flex{flex-wrap:wrap;gap:8px}
 .shipment-top{display:flex;justify-content:space-between;gap:12px;align-items:start}
 .shipment-history{margin-top:24px}.shipment-history summary{cursor:pointer;font-weight:700;padding:16px 0}
+.pickup-card{display:flex;justify-content:space-between;gap:18px;align-items:center;flex-wrap:wrap}.pickup-card h2{margin:0 0 6px}.pickup-card p{margin:3px 0}
 </style>
 <div class="card"><h1>Przesyłki</h1><p class="muted">Paczka, lista pakowa i numer śledzenia w jednym miejscu.</p>
 <form method="get" class="flex"><input name="q" value="{{ q }}" placeholder="Klient, zamówienie lub numer przesyłki" aria-label="Szukaj przesyłki"><button class="btn" type="submit">Szukaj</button></form></div>
+<section class="card pickup-card">
+  <div><h2>Podjazd InPost</h2>
+    {% if pickup.unavailable %}<p>Nie udało się odczytać planu podjazdu.</p>
+    {% elif pickup.today %}
+      <p><b>Dzisiaj: {{ pickup.today.parcel_count }} {{ 'paczka' if pickup.today.parcel_count == 1 else 'paczki' if pickup.today.parcel_count in [2,3,4] else 'paczek' }}</b> · {{ 'podjazd zamówiony' if pickup.today.ordered else 'podjazd oczekuje' }}</p>
+      <p class="muted small">{{ pickup.today.label }}{% if not pickup.today.ordered %} · automat najpóźniej o {{ pickup.cutoff }}{% endif %}</p>
+    {% else %}<p class="muted">Brak paczek na dzisiejszy podjazd.</p>{% endif %}
+    {% if pickup.next %}<p class="small"><b>{{ pickup.next.date }}:</b> {{ pickup.next.parcel_count }} paczek zaplanowanych na następny podjazd.</p>{% endif %}
+    {% if pickup_notice %}<p class="hint">{{ pickup_notice }}</p>{% endif %}
+  </div>
+  {% if pickup.can_order %}<form method="post" action="{{ url_for('shipment_pickup_order_now') }}"><button class="btn primary" type="submit" onclick="return confirm('Zamówić teraz jeden podjazd dla {{ pickup.today.parcel_count }} paczek? Kolejne przesyłki trafią na następny dzień roboczy.')">Zamów kuriera teraz</button></form>{% endif %}
+</section>
 {% if message %}<div class="card">{{ message }} <a href="{{ url_for('shipments',q=q) }}">Spróbuj ponownie</a></div>{% endif %}
 {% if limited %}<p class="muted small">Widok obejmuje przesyłki z 200 ostatnich zapisów zamówień. Starsze znajdziesz w szczegółach zamówienia.</p>{% endif %}
 {% macro shipment(c) %}
