@@ -2364,6 +2364,8 @@ def _assert_count_conversation(db, actor, conversation_id):
 
 
 def _assert_count_session(db, data, actor, *, require_open=True):
+    import remanent_remote
+    remanent_remote.ensure_ready(db)
     session = db.execute('SELECT * FROM internal_inventory_count_sessions WHERE session_id=?',
                          (data['count_session_id'],)).fetchone()
     if session is None:
@@ -2382,6 +2384,8 @@ def _assert_count_session(db, data, actor, *, require_open=True):
 
 def _open_count_session(db, owner_id, conversation_id):
     """Only an explicitly selected yearly sheet belongs to this conversation."""
+    import remanent_remote
+    remanent_remote.ensure_ready(db)
     row = db.execute("""SELECT * FROM internal_inventory_count_sessions
                         WHERE created_by=? AND status='OPEN' AND inventory_year IS NOT NULL
                           AND phase='IN_PROGRESS' AND conversation_id=? ORDER BY created_at DESC LIMIT 1""",
@@ -3164,6 +3168,9 @@ def _execute_local_approved(
     """Consume approval, mutate pilot and record success in one SQLite transaction."""
     db = _factory()()
     try:
+        if definition.operation_name.startswith('inventory.count.') or definition.operation_name == 'inventory.adjust':
+            import remanent_remote
+            remanent_remote.ensure_ready(db)
         db.execute("BEGIN IMMEDIATE")
         if definition.operation_name in LOCAL_WRITES:
             binding = db.execute('SELECT human_id FROM internal_business_write_actors WHERE execution_id=?',

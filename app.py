@@ -85,6 +85,7 @@ from agent_conversation import (
     configure as configure_agent_conversation,
     initialize_schema as initialize_agent_conversation_schema,
 )
+import remanent_remote
 from internal_audit import (
     configure as configure_internal_audit,
     initialize_schema as initialize_internal_audit_schema,
@@ -435,6 +436,7 @@ class _SerializedWriteConnection(sqlite3.Connection):
 
     def commit(self):
         try:
+            remanent_remote.persist_dirty_before_commit(self)
             return super().commit()
         finally:
             self._release_write_lock_if_idle()
@@ -485,6 +487,36 @@ configure_agent_conversation(
     remote_memory_enabled=lambda: supabase_enabled(),
     remote_memory_select=lambda: supabase_select_rows('internal_agent_memory', order_by='updated_at'),
     remote_memory_upsert=lambda row: supabase_upsert_rows('internal_agent_memory', [row], 'memory_id'),
+    remote_history_enabled=lambda: supabase_enabled(),
+    remote_conversation_select=lambda conversation_id: supabase_request(
+        '/rest/v1/internal_agent_conversations', method='GET', params={
+            'select':'*', 'conversation_id':f'eq.{conversation_id}', 'limit':1,
+        }),
+    remote_conversation_upsert=lambda row: supabase_upsert_rows(
+        'internal_agent_conversations', [row], 'conversation_id'),
+    remote_turns_select=lambda conversation_id: supabase_request(
+        '/rest/v1/internal_agent_turns', method='GET', params={
+            'select':'run_id,conversation_id,user_text,assistant_text,evidence_json,created_at',
+            'conversation_id':f'eq.{conversation_id}', 'assistant_text':'not.is.null',
+            'order':'turn_id.desc', 'limit':6,
+        }),
+    remote_turn_upsert=lambda row: supabase_upsert_rows(
+        'internal_agent_turns', [row], 'run_id'),
+)
+remanent_remote.configure(
+    enabled=lambda: supabase_enabled(),
+    remote_select=lambda: supabase_request(
+        '/rest/v1/internal_remanent_state', method='GET', params={
+            'select':'scope_id,state_json,checksum,schema_version,revision,updated_at',
+            'order':'scope_id.asc',
+        }),
+    remote_persist=lambda scope_id, state, checksum, expected_revision: supabase_request(
+        '/rest/v1/rpc/persist_internal_remanent_state', method='POST', payload={
+            'p_scope_id':scope_id,
+            'p_state_json':state,
+            'p_checksum':checksum,
+            'p_expected_revision':expected_revision,
+        }, timeout=30),
 )
 _startup_step("business_operations_configured")
 configure_external_execution(conn)
@@ -9109,6 +9141,7 @@ import remanent as _remanent
 _remanent.register_routes(app, {"conn": conn, "BASE_URL": BASE_URL, "DB_PATH": DB_PATH})
 import remanent_source_routes as _remanent_source_routes
 _remanent_source_routes.register_routes(app, {"conn": conn, "BASE_URL": BASE_URL, "DB_PATH": DB_PATH})
+remanent_remote.activate()
 
 import orderchamp_sync_http as _orderchamp_sync_http
 _orderchamp_sync_http.register_routes(app, globals())

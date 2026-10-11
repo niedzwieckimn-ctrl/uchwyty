@@ -22,15 +22,19 @@ def assert_storage(db):
     A deployment flag is not evidence of a mounted volume. Database location
     must resolve inside that volume; ordinary local installations use local DB.
     """
-    if not os.environ.get('RENDER'):
+    if not os.environ.get('RENDER') and (os.environ.get('REMANENT_STORAGE_MODE') or '').lower() != 'supabase':
+        return
+    import remanent_remote
+    if remanent_remote.remote_required():
+        remanent_remote.ensure_ready(db)
         return
     root = Path(os.environ.get('REMANENT_DURABLE_ROOT') or '/var/data').resolve()
     files = [Path(row[2]).resolve() for row in db.execute('PRAGMA database_list') if row[1] == 'main' and row[2]]
     if (not os.path.ismount(root) or not files or not files[0].is_relative_to(root)
             or os.environ.get('REMANENT_STORAGE_MODE') != 'sqlite_single_instance'
             or os.environ.get('WEB_CONCURRENCY', '1') != '1'):
-        raise ValueError('COUNT_STORAGE_NOT_DURABLE: wymagany SQLite na zamontowanym trwałym dysku, '
-                         'REMANENT_DURABLE_ROOT i REMANENT_STORAGE_MODE=sqlite_single_instance; jedna instancja i WEB_CONCURRENCY=1.')
+        raise ValueError('COUNT_STORAGE_NOT_DURABLE: wymagany trwały zapis remanentu w Supabase albo SQLite '
+                         'na zamontowanym trwałym dysku; jedna instancja i WEB_CONCURRENCY=1.')
 
 
 def event(db, session_id, actor_id, action):

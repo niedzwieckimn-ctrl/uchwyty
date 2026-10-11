@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS internal_inventory_count_sessions(
 );
 CREATE TABLE IF NOT EXISTS internal_inventory_count_items(
     item_id INTEGER PRIMARY KEY,
+    remote_key TEXT UNIQUE,
     session_id TEXT NOT NULL REFERENCES internal_inventory_count_sessions(session_id),
     product_id INTEGER NOT NULL REFERENCES products(id),
     expected_quantity INTEGER NOT NULL CHECK(expected_quantity >= 0),
