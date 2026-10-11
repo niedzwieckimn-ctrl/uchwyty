@@ -6,7 +6,7 @@
 -- Source inventory_voice_context.py SHA256 36371a4f62a0c786d7476c9d25ce81bf27937a19d54d079f87dfd58d76c6a3c6
 
 CREATE TABLE IF NOT EXISTS internal_count_activity(
-        id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+        id INTEGER PRIMARY KEY AUTOINCREMENT, remote_key TEXT UNIQUE, session_id TEXT NOT NULL,
         event TEXT NOT NULL CHECK(event IN ('start','resume','pause','complete')),
         happened_at TEXT NOT NULL, actor_id TEXT NOT NULL);
 
