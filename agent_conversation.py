@@ -24,6 +24,11 @@ _connection_factory = None
 _remote_memory_enabled = None
 _remote_memory_select = None
 _remote_memory_upsert = None
+_remote_history_enabled = None
+_remote_conversation_select = None
+_remote_conversation_upsert = None
+_remote_turns_select = None
+_remote_turn_upsert = None
 logger = logging.getLogger(__name__)
 
 class ConversationAccessDenied(RuntimeError):
@@ -32,14 +37,23 @@ class ConversationAccessDenied(RuntimeError):
 class ConversationBusy(RuntimeError):
     pass
 
-def configure(connection_factory, *, remote_memory_enabled=None, remote_memory_select=None, remote_memory_upsert=None):
+def configure(connection_factory, *, remote_memory_enabled=None, remote_memory_select=None, remote_memory_upsert=None,
+              remote_history_enabled=None, remote_conversation_select=None, remote_conversation_upsert=None,
+              remote_turns_select=None, remote_turn_upsert=None):
     global _connection_factory, _remote_memory_enabled, _remote_memory_select, _remote_memory_upsert
+    global _remote_history_enabled, _remote_conversation_select, _remote_conversation_upsert
+    global _remote_turns_select, _remote_turn_upsert
     if not callable(connection_factory):
         raise TypeError('connection_factory must be callable')
     _connection_factory = connection_factory
     _remote_memory_enabled = remote_memory_enabled
     _remote_memory_select = remote_memory_select
     _remote_memory_upsert = remote_memory_upsert
+    _remote_history_enabled = remote_history_enabled
+    _remote_conversation_select = remote_conversation_select
+    _remote_conversation_upsert = remote_conversation_upsert
+    _remote_turns_select = remote_turns_select
+    _remote_turn_upsert = remote_turn_upsert
 
 @contextmanager
 def connection():
@@ -73,6 +87,124 @@ def _audit(event, human, cid, ai_id):
         after_state={'initiated_by_actor_id': human.actor_id, 'executed_by_actor_id': ai_id},
         source='agent_conversation')
 
+
+def _remote_history_available():
+    return bool(
+        _remote_history_enabled and _remote_history_enabled()
+        and _remote_conversation_select and _remote_conversation_upsert
+        and _remote_turns_select and _remote_turn_upsert
+    )
+
+
+def _remote_history_failure(stage, exc):
+    logger.error('AGENT_HISTORY_REMOTE_FAILURE %s', json.dumps({
+        'stage':stage,
+        'exception_type':type(exc).__name__,
+        'exception_message':sanitize_audit_text(exc)[:500],
+    }, ensure_ascii=False, sort_keys=True))
+
+
+def _conversation_remote_row(row):
+    result = dict(row)
+    state = result.get('state_json', {})
+    if isinstance(state, str):
+        try:
+            state = json.loads(state)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            state = {}
+    result['state_json'] = state if isinstance(state, dict) else {}
+    return {key: result.get(key) for key in (
+        'conversation_id', 'human_actor_id', 'ai_actor_id', 'state_json',
+        'created_at', 'last_active_at', 'expires_at', 'reset_at',
+    )}
+
+
+def _turn_remote_row(row):
+    result = dict(row)
+    evidence = result.get('evidence_json', [])
+    if isinstance(evidence, str):
+        try:
+            evidence = json.loads(evidence)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            evidence = []
+    result['evidence_json'] = evidence if isinstance(evidence, list) else []
+    return {key: result.get(key) for key in (
+        'run_id', 'conversation_id', 'user_text', 'assistant_text',
+        'evidence_json', 'created_at',
+    )}
+
+
+def _mirror_conversation(row):
+    if not _remote_history_available():
+        return
+    try:
+        _remote_conversation_upsert(_conversation_remote_row(row))
+    except Exception as exc:
+        # The local request remains usable during a short Supabase outage. A stale
+        # browser tab has a separate one-shot recovery path and never replays a
+        # turn that reached the model.
+        _remote_history_failure('conversation_upsert', exc)
+
+
+def _mirror_turn(row):
+    if not _remote_history_available():
+        return
+    try:
+        _remote_turn_upsert(_turn_remote_row(row))
+    except Exception as exc:
+        _remote_history_failure('turn_upsert', exc)
+
+
+def _hydrate_remote_conversation(db, human, ai, cid):
+    """Restore a verified conversation after an ephemeral Render restart."""
+    if not _remote_history_available():
+        return None
+    try:
+        rows = list(_remote_conversation_select(cid) or [])
+    except Exception as exc:
+        _remote_history_failure('conversation_select', exc)
+        return None
+    if len(rows) != 1:
+        return None
+    row = dict(rows[0])
+    if row.get('human_actor_id') != human.actor_id or row.get('ai_actor_id') != ai.actor_id:
+        # Do not copy a conversation before its ownership has been verified.
+        raise ConversationAccessDenied('Conversation not owned by actor')
+    state = row.get('state_json', {})
+    if not isinstance(state, str):
+        state = json.dumps(state if isinstance(state, dict) else {}, ensure_ascii=False, separators=(',', ':'))
+    db.execute('''INSERT OR IGNORE INTO internal_agent_conversations(
+        conversation_id,human_actor_id,ai_actor_id,state_json,created_at,last_active_at,expires_at,reset_at
+    ) VALUES(?,?,?,?,?,?,?,?)''', (
+        cid, row['human_actor_id'], row['ai_actor_id'], state,
+        row['created_at'], row['last_active_at'], row['expires_at'], row.get('reset_at'),
+    ))
+    reset_at = str(row.get('reset_at') or '')
+    try:
+        turns = list(_remote_turns_select(cid) or [])
+    except Exception as exc:
+        _remote_history_failure('turns_select', exc)
+        turns = []
+    for turn in reversed(turns):
+        turn = dict(turn)
+        if turn.get('conversation_id') != cid or turn.get('assistant_text') is None:
+            continue
+        if reset_at and str(turn.get('created_at') or '') <= reset_at:
+            continue
+        evidence = turn.get('evidence_json', [])
+        if not isinstance(evidence, str):
+            evidence = json.dumps(evidence if isinstance(evidence, list) else [], ensure_ascii=False, separators=(',', ':'))
+        db.execute('''INSERT OR IGNORE INTO internal_agent_turns(
+            run_id,conversation_id,user_text,assistant_text,evidence_json,created_at
+        ) VALUES(?,?,?,?,?,?)''', (
+            turn['run_id'], cid, turn.get('user_text') or '', turn['assistant_text'],
+            evidence, turn['created_at'],
+        ))
+    logger.info('AGENT_HISTORY_REMOTE_RESTORED %s', json.dumps({
+        'conversation_id':cid, 'completed_turns':len(turns),
+    }, sort_keys=True))
+    return db.execute('SELECT * FROM internal_agent_conversations WHERE conversation_id=?', (cid,)).fetchone()
+
 def _owned(db, human, ai, cid):
     try:
         cid = str(uuid.UUID(str(cid)))
@@ -86,22 +218,34 @@ def _owned(db, human, ai, cid):
 def open_conversation(human, ai, conversation_id=''):
     now = _utc_now()
     with connection() as db:
-        db.execute('BEGIN IMMEDIATE')
         status = 'created'
         if conversation_id:
+            try:
+                conversation_id = str(uuid.UUID(str(conversation_id)))
+            except (ValueError, TypeError):
+                raise ConversationAccessDenied('Invalid conversation')
+            row = db.execute('SELECT * FROM internal_agent_conversations WHERE conversation_id=?', (conversation_id,)).fetchone()
+            if row is None:
+                row = _hydrate_remote_conversation(db, human, ai, conversation_id)
+                if row is not None:
+                    db.commit()
+            db.execute('BEGIN IMMEDIATE')
             row = _owned(db, human, ai, conversation_id)
             conversation_id = row['conversation_id']
             status = 'resumed'
             if datetime.fromisoformat(row['expires_at']) <= now:
                 db.execute('DELETE FROM internal_agent_turns WHERE conversation_id=?', (conversation_id,))
-                db.execute("UPDATE internal_agent_conversations SET state_json='{}' WHERE conversation_id=?", (conversation_id,))
+                db.execute("UPDATE internal_agent_conversations SET state_json='{}',reset_at=? WHERE conversation_id=?", (_iso(now), conversation_id))
                 status = 'expired'
             db.execute("UPDATE internal_agent_conversations SET last_active_at=?,expires_at=? WHERE conversation_id=?",
                 (_iso(now), _iso(now+timedelta(minutes=CONVERSATION_TTL_MINUTES)), conversation_id))
         else:
+            db.execute('BEGIN IMMEDIATE')
             conversation_id = str(uuid.uuid4())
             db.execute("INSERT INTO internal_agent_conversations(conversation_id,human_actor_id,ai_actor_id,created_at,last_active_at,expires_at) VALUES(?,?,?,?,?,?)",
                 (conversation_id, human.actor_id, ai.actor_id, _iso(now), _iso(now), _iso(now+timedelta(minutes=CONVERSATION_TTL_MINUTES))))
+        persisted = dict(db.execute('SELECT * FROM internal_agent_conversations WHERE conversation_id=?', (conversation_id,)).fetchone())
+    _mirror_conversation(persisted)
     _audit('agent.conversation.'+status, human, conversation_id, ai.actor_id)
     return conversation_id, {}, status
 
@@ -114,6 +258,8 @@ def reset_conversation(human, ai, conversation_id):
             raise ConversationBusy('Conversation is running')
         db.execute('DELETE FROM internal_agent_turns WHERE conversation_id=?', (conversation_id,))
         db.execute("UPDATE internal_agent_conversations SET state_json='{}', reset_at=? WHERE conversation_id=?", (_iso(_utc_now()), conversation_id))
+        persisted = dict(db.execute('SELECT * FROM internal_agent_conversations WHERE conversation_id=?', (conversation_id,)).fetchone())
+    _mirror_conversation(persisted)
     _audit('agent.conversation.reset', human, conversation_id, ai.actor_id)
 
 def _process_owner(pid=None):
@@ -210,6 +356,8 @@ def finish_turn(human, ai, cid, run_id, answer, evidence):
             (answer, json.dumps(evidence,ensure_ascii=False,separators=(',',':')), run_id, cid))
         db.execute('DELETE FROM internal_agent_turn_leases WHERE conversation_id=? AND run_id=?', (cid,run_id))
         db.execute('DELETE FROM internal_agent_turn_owners WHERE conversation_id=? AND run_id=?', (cid,run_id))
+        persisted = dict(db.execute('SELECT * FROM internal_agent_turns WHERE run_id=? AND conversation_id=?', (run_id, cid)).fetchone())
+    _mirror_turn(persisted)
 
 
 def release_turn(human, ai, cid, run_id):
@@ -248,6 +396,8 @@ def save_turn_state(human, ai, cid, run_id, state):
         if not lease or lease['run_id'] != run_id:
             raise ConversationBusy('Turn lease lost')
         db.execute('UPDATE internal_agent_conversations SET state_json=? WHERE conversation_id=?', (encoded, cid))
+        persisted = dict(db.execute('SELECT * FROM internal_agent_conversations WHERE conversation_id=?', (cid,)).fetchone())
+    _mirror_conversation(persisted)
 
 
 def _tokens(value):

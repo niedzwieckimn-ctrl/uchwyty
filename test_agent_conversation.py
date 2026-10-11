@@ -14,6 +14,11 @@ def isolated(tmp_path,monkeypatch):
         conversations._remote_memory_enabled,
         conversations._remote_memory_select,
         conversations._remote_memory_upsert,
+        conversations._remote_history_enabled,
+        conversations._remote_conversation_select,
+        conversations._remote_conversation_upsert,
+        conversations._remote_turns_select,
+        conversations._remote_turn_upsert,
     )
     monkeypatch.setattr(backend,'DB_PATH',str(tmp_path/'conversation.db'))
     backend.init_db()
@@ -23,6 +28,11 @@ def isolated(tmp_path,monkeypatch):
         remote_memory_enabled=configured_dependencies[1],
         remote_memory_select=configured_dependencies[2],
         remote_memory_upsert=configured_dependencies[3],
+        remote_history_enabled=configured_dependencies[4],
+        remote_conversation_select=configured_dependencies[5],
+        remote_conversation_upsert=configured_dependencies[6],
+        remote_turns_select=configured_dependencies[7],
+        remote_turn_upsert=configured_dependencies[8],
     )
 
 def actors():
@@ -118,3 +128,77 @@ def test_schema_is_additive_and_repeatable():
     human,ai=actors();cid=conversations.open_conversation(human,ai)[0];saved_turn(cid)
     db=backend.conn();conversations.initialize_schema(db);conversations.initialize_schema(db);db.close()
     assert conversations.history_for_model(human,ai,cid,'x')
+
+
+def test_remote_history_restores_verified_conversation_after_local_restart(tmp_path, monkeypatch):
+    remote_conversations = {}
+    remote_turns = {}
+
+    def select_conversation(cid):
+        return [remote_conversations[cid]] if cid in remote_conversations else []
+
+    def upsert_conversation(row):
+        remote_conversations[row['conversation_id']] = dict(row)
+
+    def select_turns(cid):
+        return [dict(row) for row in remote_turns.values() if row['conversation_id'] == cid]
+
+    def upsert_turn(row):
+        remote_turns[row['run_id']] = dict(row)
+
+    conversations.configure(
+        backend.conn,
+        remote_history_enabled=lambda: True,
+        remote_conversation_select=select_conversation,
+        remote_conversation_upsert=upsert_conversation,
+        remote_turns_select=select_turns,
+        remote_turn_upsert=upsert_turn,
+    )
+    human, ai = actors()
+    cid = conversations.open_conversation(human, ai)[0]
+    saved_turn(cid, 'Ile mam Cerne?', 'Masz jedną sztukę.')
+    assert cid in remote_conversations
+    assert len(remote_turns) == 1
+
+    monkeypatch.setattr(backend, 'DB_PATH', str(tmp_path / 'after-render-restart.db'))
+    backend.init_db()
+
+    assert conversations.open_conversation(human, ai, cid)[2] == 'resumed'
+    assert conversations.history_for_model(human, ai, cid, 'next') == [
+        {'role':'user','content':'Ile mam Cerne?'},
+        {'role':'assistant','content':'Masz jedną sztukę.'},
+    ]
+
+
+def test_remote_history_never_hydrates_another_users_conversation():
+    from dataclasses import replace
+    human, ai = actors()
+    other = replace(human, actor_id=str(uuid.uuid4()))
+    cid = str(uuid.uuid4())
+    remote = [{
+        'conversation_id':cid,
+        'human_actor_id':other.actor_id,
+        'ai_actor_id':ai.actor_id,
+        'state_json':{},
+        'created_at':conversations._iso(conversations._utc_now()),
+        'last_active_at':conversations._iso(conversations._utc_now()),
+        'expires_at':conversations._iso(conversations._utc_now()+timedelta(minutes=45)),
+        'reset_at':None,
+    }]
+    conversations.configure(
+        backend.conn,
+        remote_history_enabled=lambda: True,
+        remote_conversation_select=lambda _cid: remote,
+        remote_conversation_upsert=lambda _row: None,
+        remote_turns_select=lambda _cid: [],
+        remote_turn_upsert=lambda _row: None,
+    )
+    with pytest.raises(conversations.ConversationAccessDenied):
+        conversations.open_conversation(human, ai, cid)
+    db = backend.conn()
+    try:
+        assert db.execute(
+            'SELECT 1 FROM internal_agent_conversations WHERE conversation_id=?', (cid,)
+        ).fetchone() is None
+    finally:
+        db.close()

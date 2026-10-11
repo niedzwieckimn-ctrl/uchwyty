@@ -97,6 +97,16 @@ def test_ui_has_controlled_error_mapping(client):
     assert "Sesja wygasła. Zaloguj się ponownie." in html
 
 
+def test_stale_browser_conversation_is_retried_once_without_duplicate_ui_message(client):
+    login(client)
+    html = client.get("/ai-assistant").get_data(as_text=True)
+    assert "data.error_code === 'CONVERSATION_ACCESS_DENIED'" in html
+    assert "const submittedConversation = conversationId" in html
+    assert "attempt = await requestChat('')" in html
+    assert "Asystent odnawia rozmowę..." in html
+    assert html.count("addMessage('user', message)") == 1
+
+
 def test_assistant_ui_has_supervised_approval_and_push_to_talk(client):
     login(client)
     response = client.get("/ai-assistant")

@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 from invoice_sales import sales_by_sku
 import inventory_count_lifecycle as count_lifecycle
 import remanent_sources
+import remanent_remote
 
 WARSAW = ZoneInfo('Europe/Warsaw')
 MONEY = Decimal('0.01')
@@ -52,6 +53,7 @@ def initialize_schema(db):
     db.execute('''CREATE UNIQUE INDEX IF NOT EXISTS uq_remanent_open_owner ON internal_inventory_count_sessions(created_by)
                   WHERE status='OPEN' AND inventory_year IS NOT NULL''')
     remanent_sources.initialize(db)
+    remanent_remote.initialize_schema(db)
     db.commit()
 
 
@@ -81,6 +83,9 @@ def create_draft(db, owner, year):
     except sqlite3.IntegrityError:
         db.rollback()
         raise ValueError('Najpierw zamknij istniejący otwarty remanent') from None
+    except Exception:
+        db.rollback()
+        raise
     return session_id
 
 
@@ -499,10 +504,12 @@ def register_routes(app, deps):
 
     @app.before_request
     def require_durable_remanent_storage():
-        if request.path.startswith('/remanent') and request.method == 'POST':
+        if request.path.startswith('/remanent'):
             db = deps['conn']()
             try:
-                count_lifecycle.assert_storage(db)
+                remanent_remote.ensure_ready(db)
+                if request.method == 'POST':
+                    count_lifecycle.assert_storage(db)
             except ValueError as exc:
                 return str(exc),503
             finally:
