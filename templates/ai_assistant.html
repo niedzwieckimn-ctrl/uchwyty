@@ -639,32 +639,53 @@
     let response;
     const trace = {};
     try {
-      response = await fetch('/api/internal/ai/chat', {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: {'Content-Type': 'application/json', 'Accept': acceptsAgentStream() ? 'text/event-stream' : 'application/json'},
-        body: JSON.stringify({message: message, conversation_id: conversationId,
-          voice_fast_mode: fromVoice}),
-        signal: controller.signal
-      });
-      const showAgentEvent = agentDisplayHandler(loading, controller, generation, agentStarted, trace);
-      const data = await readAgentResponse(response, (event, value) => {
-        showAgentEvent(event, value);
-        if (fromVoice && event === 'speech_ready' && !earlySpeechStarted
-            && typeof value.tts_text === 'string' && value.tts_text.trim() && isCurrent()) {
-          earlySpeechStarted = true;
-          inventoryFastVoiceActive = true;
-          voiceDiagnostic('VOICE_FAST_TTS_READY', {stage:'tts_ready',
-            latency_ms:Math.round(performance.now() - agentStarted)});
-          if (value.retry_ready === true) {
-            inventoryFastRetryReady = true;
-            setAgentBusy(false);
-            voiceDiagnostic('VOICE_FAST_INPUT_UNLOCKED', {stage:'input_unlocked',
+      const requestChat = async sentConversationId => {
+        const currentResponse = await fetch('/api/internal/ai/chat', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: {'Content-Type': 'application/json', 'Accept': acceptsAgentStream() ? 'text/event-stream' : 'application/json'},
+          body: JSON.stringify({message: message, conversation_id: sentConversationId,
+            voice_fast_mode: fromVoice}),
+          signal: controller.signal
+        });
+        const showAgentEvent = agentDisplayHandler(loading, controller, generation, agentStarted, trace);
+        const currentData = await readAgentResponse(currentResponse, (event, value) => {
+          showAgentEvent(event, value);
+          if (fromVoice && event === 'speech_ready' && !earlySpeechStarted
+              && typeof value.tts_text === 'string' && value.tts_text.trim() && isCurrent()) {
+            earlySpeechStarted = true;
+            inventoryFastVoiceActive = true;
+            voiceDiagnostic('VOICE_FAST_TTS_READY', {stage:'tts_ready',
               latency_ms:Math.round(performance.now() - agentStarted)});
+            if (value.retry_ready === true) {
+              inventoryFastRetryReady = true;
+              setAgentBusy(false);
+              voiceDiagnostic('VOICE_FAST_INPUT_UNLOCKED', {stage:'input_unlocked',
+                latency_ms:Math.round(performance.now() - agentStarted)});
+            }
+            playSpeech(value.tts_text, voiceRoundtripStarted);
           }
-          playSpeech(value.tts_text, voiceRoundtripStarted);
-        }
-      }, controller.signal);
+        }, controller.signal);
+        return {response:currentResponse, data:currentData};
+      };
+      const submittedConversation = conversationId;
+      let attempt = await requestChat(submittedConversation);
+      response = attempt.response;
+      let data = attempt.data;
+      if (submittedConversation && response.status === 403
+          && data.error_code === 'CONVERSATION_ACCESS_DENIED' && isCurrent()) {
+        // A Render restart may remove only the ephemeral SQLite cache while an
+        // old browser tab still holds its conversation id. The denied request
+        // stops before the model and tools, so this one retry cannot repeat a write.
+        agentDiagnostic('chat_conversation_recovery', {response, data, trace});
+        conversationId = '';
+        loading.classList.toggle('ai-loading', true);
+        loading.classList.toggle('error', false);
+        bubble.textContent = 'Asystent odnawia rozmowę...';
+        attempt = await requestChat('');
+        response = attempt.response;
+        data = attempt.data;
+      }
       if (!isCurrent()) return;
       if (controller.signal.aborted) throw new Error('AGENT_STREAM_CANCELLED');
       if (fromVoice) voiceDiagnostic('VOICE_AGENT_RESPONSE', {stage:'agent_response',
