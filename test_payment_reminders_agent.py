@@ -3,6 +3,8 @@ import business_operations as operations
 import internal_approval as approvals
 import internal_rbac as rbac
 import payment_reminders
+import human_approval
+import invoice_payment_operations
 from test_agent_runtime import isolated, owner
 
 
@@ -111,3 +113,74 @@ def test_reminder_operations_publish_machine_readable_capability_contract():
         operations.OPERATION_REGISTRY[payment_reminders.WRITE])
     assert read_descriptor['capability_contract']['implemented'] is True
     assert write_descriptor['capability_contract']['approval_required'] is True
+
+
+def test_approval_button_executes_payment_reminder(isolated, monkeypatch):
+    monkeypatch.setattr(backend, 'send_payment_reminder',
+                        lambda *_a, **_k: {'ok': True, 'body': {'id': 'mail-button-1'}})
+    db = backend.conn()
+    db.execute("UPDATE customers SET email='customer@example.test' WHERE id=10")
+    db.execute("UPDATE orders SET customer_email='customer@example.test' WHERE id=10")
+    db.commit(); db.close()
+
+    human = owner()
+    ai = rbac.load_actor_context(
+        rbac.AI_OWNER_ASSISTANT_ACTOR_ID,
+        delegated_by_actor_id=human.actor_id,
+        source='agent_runtime',
+    )
+    pending = operations.execute_business_operation(ai, payment_reminders.WRITE, {
+        'invoice_id': 10,
+        'idempotency_key': 'reminder-button-10',
+    })
+    human_approval.bind(operations, pending.approval_id, 'reminder-button-cid',
+                        human, 'reminder-button-turn')
+
+    client = backend.app.test_client()
+    with client.session_transaction() as session:
+        session['admin_authenticated'] = True
+        rbac.bind_bootstrap_owner_session(session)
+    response = client.post(
+        f'/api/internal/ai/approvals/{pending.approval_id}/approve',
+        json={},
+    )
+
+    assert response.status_code == 200, response.get_data(as_text=True)
+    assert response.get_json()['status'] == 'SUCCESS'
+    assert response.get_json()['message'] == (
+        'Gotowe. Przypomnienie o płatności zostało wysłane do klienta.'
+    )
+    assert _meta() == {'payment_reminder': 1, 'paid': 0}
+
+
+def test_approval_button_executes_payment_status_change(isolated):
+    human = owner()
+    ai = rbac.load_actor_context(
+        rbac.AI_OWNER_ASSISTANT_ACTOR_ID,
+        delegated_by_actor_id=human.actor_id,
+        source='agent_runtime',
+    )
+    pending = operations.execute_business_operation(ai, invoice_payment_operations.WRITE, {
+        'invoice_id': 10,
+        'paid': True,
+        'expected_version': invoice_payment_operations.version(10),
+        'idempotency_key': 'payment-button-10',
+    })
+    human_approval.bind(operations, pending.approval_id, 'payment-button-cid',
+                        human, 'payment-button-turn')
+
+    client = backend.app.test_client()
+    with client.session_transaction() as session:
+        session['admin_authenticated'] = True
+        rbac.bind_bootstrap_owner_session(session)
+    response = client.post(
+        f'/api/internal/ai/approvals/{pending.approval_id}/approve',
+        json={},
+    )
+
+    assert response.status_code == 200, response.get_data(as_text=True)
+    assert response.get_json()['status'] == 'SUCCESS'
+    assert response.get_json()['message'] == (
+        'Gotowe. Status płatności faktury został zapisany.'
+    )
+    assert _meta() == {'payment_reminder': 0, 'paid': 1}

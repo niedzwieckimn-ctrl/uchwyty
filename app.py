@@ -1370,6 +1370,8 @@ def _stored_execution_confirmation(db, execution) -> dict | None:
         'orders.status.transition':'Gotowe. Zmiana statusu zamówienia została zapisana.',
         'inventory.adjust':'Gotowe. Korekta stanu magazynowego została zapisana.',
         'invoices.remove':'Gotowe. Zatwierdzona zmiana faktury została wykonana.',
+        'payments.reminders.send':'Gotowe. Przypomnienie o płatności zostało wysłane do klienta.',
+        'invoices.payment.set_status':'Gotowe. Status płatności faktury został zapisany.',
     }
     return {'message':messages.get(operation, 'Gotowe. Zatwierdzona operacja została wykonana.')}
 
@@ -1494,7 +1496,10 @@ def api_ai_approval_decide(approval_id, decision):
         'orders.status.transition', 'inventory.adjust', 'orders.packing.confirm', 'invoices.remove',
     }
     from fulfillment_operations import WRITES as _fulfillment_writes
+    from invoice_payment_operations import WRITES as _invoice_payment_writes
+    from payment_reminders import WRITES as _payment_reminder_writes
     allowed_approval_operations |= _fulfillment_writes
+    allowed_approval_operations |= _invoice_payment_writes | _payment_reminder_writes
     if not snapshot or snapshot['operation'] not in allowed_approval_operations:
         return jsonify(status='DENIED'), 404
     db = conn()

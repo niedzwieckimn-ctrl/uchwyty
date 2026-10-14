@@ -108,7 +108,8 @@ def build_artifact_sources(
     allowed = {
         'product': ('id', 'sku', 'model', 'name', 'stock'),
         'order': ('id', 'order_number', 'customer_name', 'created_at', 'status'),
-        'invoice': ('id', 'invoice_number', 'buyer_name', 'issue_date'),
+        'invoice': ('id', 'invoice_number', 'buyer_name', 'issue_date', 'due_date',
+                    'currency', 'total_gross', 'payment_status', 'amount_outstanding'),
         'customer': ('id', 'name', 'nip'),
         'china_order': ('id', 'po_number', 'supplier', 'order_status', 'delivery_stage'),
     }[entity_type]

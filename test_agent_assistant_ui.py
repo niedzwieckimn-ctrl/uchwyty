@@ -112,6 +112,8 @@ def test_assistant_ui_has_supervised_approval_and_push_to_talk(client):
     response = client.get("/ai-assistant")
     html = response.get_data(as_text=True)
     assert "Zmiana wymaga zatwierdzenia" in html
+    assert "Wysłanie przypomnienia o płatności" in html
+    assert "Oznaczenie faktury jako zapłaconej" in html
     assert "Zatwierdź" in html and "Odrzuć" in html
     assert "/api/internal/ai/approvals/" in html
     assert "recoverApprovedExecution" in html
