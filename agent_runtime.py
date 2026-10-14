@@ -457,11 +457,23 @@ _GENERIC_QUERY_INTENTS = frozenset({
 def _is_business_write_request(value: str) -> bool:
     """Keep execution tools available while the user is requesting a change."""
     normalized = ' '.join(str(value or '').casefold().split())
-    return bool(re.search(
+    explicit_command = bool(re.search(
         r'\b(?:realizuj|realizujemy|kontynuuj\w*|pakuj|spakuj|zapakuj|wystaw|utw[oó]rz|dodaj|'
         r'zmień|zmien|ustaw|odnotuj|zaznacz|usuń|usun|anuluj|nadaj|zam[oó]w|zamawiam\w*|zamawiaj\w*|zatwierdź|zatwierdz|'
         r'zatwierdzam|odrzuć|odrzuc|odrzucam|wydrukuj|zapisz|oznacz|potwierdź|potwierdz|'
         r'wykonaj|przygotuj|edytuj|zaktualizuj|wyślij|wyslij|wstrzymaj|wznów|wznow|zatrzymaj|zachowaj)\b', normalized))
+    if explicit_command:
+        return True
+    # The owner also uses a short bookkeeping command: "Klient X, zapłacone".
+    # Keep questions and status lookups read-only.
+    payment_statement = bool(re.search(
+        r'(?:^|[,;:\-]\s*)[^?]{2,}\b(?:zapłacon[aeąy]|zaplacon[aeąy]|opłacon[aeąy]|oplacon[aeąy])\.?$',
+        normalized,
+    ))
+    asks_for_status = bool(re.search(
+        r'\b(?:czy|sprawdź|sprawdz|pokaż|pokaz|jaki|jaka|jakie|status)\b', normalized,
+    ))
+    return payment_statement and not asks_for_status
 
 
 def _prefers_generic_business_read(value: str, intent: str = '') -> bool:
@@ -1259,6 +1271,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
     historical_entity_types = set()
     previous_turn_entities = {}
     previous_turn_sources = {}
+    fresh_invoice_records = {}
     memory_write_receipts = []
     executed_operations = []
     conversation_state = {}
@@ -2936,6 +2949,61 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                             'product_id':active_product,
                             'operation':fresh_name,
                         }, sort_keys=True))
+                    if (not definition.read_only and call.name != 'approval.decide'
+                            and arguments.get('invoice_id') and 'invoice' not in resolved_entities):
+                        target_invoice_id = int(arguments['invoice_id'])
+                        previous_invoice_ids = {
+                            int(source.get('entity_id') or 0)
+                            for source in previous_turn_sources.get('invoice', [])
+                        }
+                        if target_invoice_id in previous_invoice_ids:
+                            if timings['tool_calls_count'] + 1 >= MAX_TOOL_CALLS_PER_TURN:
+                                return finish('FAILED','Osiągnięto limit operacji. Zawęź pytanie.','TOOL_LIMIT_EXCEEDED')
+                            fresh_name = 'invoices.get'
+                            fresh_definition = business_operations.OPERATION_REGISTRY[fresh_name]
+                            if current is None or current.permission_decision(fresh_definition.required_permission) == DENY:
+                                return finish('DENIED','Brak uprawnień do operacji.','PERMISSION_DENIED')
+                            timings['tool_calls_count'] += 1
+                            _audit('agent.tool_selected', ai_actor, run_id, correlation_id, SUCCESS,
+                                   human_actor.actor_id, tool_name=fresh_name,
+                                   conversation_id=conversation_id,
+                                   selection_reason='trusted_invoice_followup')
+                            fresh_started = time.perf_counter()
+                            fresh_result = business_operations.execute_business_operation(
+                                ai_actor, fresh_name, {'id': target_invoice_id},
+                                correlation_id=correlation_id,
+                            )
+                            fresh_elapsed = round((time.perf_counter()-fresh_started)*1000,2)
+                            timings['business_operation_ms'] = round(timings['business_operation_ms']+fresh_elapsed,2)
+                            timings['tool_execution_ms'] = round(timings['tool_execution_ms']+fresh_elapsed,2)
+                            timings['supabase_business_reads_ms'] = round(
+                                timings['supabase_business_reads_ms']+fresh_elapsed,2)
+                            _audit('agent.tool_result', ai_actor, run_id, correlation_id,
+                                   SUCCESS if fresh_result.status == 'SUCCESS' else FAILED,
+                                   human_actor.actor_id, tool_name=fresh_name,
+                                   execution_id=fresh_result.execution_id,
+                                   result_status=fresh_result.status,
+                                   conversation_id=conversation_id)
+                            if fresh_result.status != 'SUCCESS':
+                                return finish(
+                                    fresh_result.status,
+                                    fresh_result.safe_error_message or 'Nie udało się odczytać aktualnej faktury.',
+                                    fresh_result.error_code or 'DATA_UNAVAILABLE',
+                                )
+                            fresh_record = (fresh_result.data or {}).get('record') or {}
+                            if int(fresh_record.get('id') or 0) != target_invoice_id:
+                                return finish('DENIED','Nie ustalono jednoznacznie faktury.','ENTITY_SCOPE_CONFLICT')
+                            resolved_entities['invoice'] = target_invoice_id
+                            ambiguous_entities.discard('invoice')
+                            fresh_invoice_records[target_invoice_id] = dict(fresh_record)
+                            if (call.name == 'invoices.payment.set_status'
+                                    and fresh_record.get('expected_version') is not None):
+                                arguments['expected_version'] = int(fresh_record['expected_version'])
+                            logger.info('AI_TRUSTED_INVOICE_FRESH_READ %s', json.dumps({
+                                'agent_run_id':run_id,
+                                'invoice_id':target_invoice_id,
+                                'operation':fresh_name,
+                            }, sort_keys=True))
                     fingerprint = call.name+json.dumps(arguments,sort_keys=True,ensure_ascii=False)
                     if fingerprint in seen:
                         return finish('FAILED','Model powtórzył tę samą operację.','REPEATED_TOOL_CALL')
@@ -3044,6 +3112,16 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                         removal = removal_preview({'invoice_id': arguments['invoice_id']})
                         approval['invoice_number'] = removal['invoice_number']
                         approval['order_numbers'] = [o['order_number'] for o in removal['affected_orders']]
+                    if arguments.get('invoice_id'):
+                        invoice_record = fresh_invoice_records.get(int(arguments['invoice_id'])) or {}
+                        for source in previous_turn_sources.get('invoice', []):
+                            if int(source.get('entity_id') or 0) == int(arguments['invoice_id']):
+                                invoice_record = {**(source.get('trusted_result_subset') or {}), **invoice_record}
+                                break
+                        approval['invoice_number'] = str(invoice_record.get('invoice_number') or '')
+                        approval['buyer_name'] = str(invoice_record.get('buyer_name') or '')
+                    if call.name == 'invoices.payment.set_status':
+                        approval['paid'] = bool(arguments.get('paid'))
                     if call.name == 'inventory.adjust':
                         business_operations.set_inventory_count_voice_state(
                             ai_actor, human_actor, conversation_id, 'WAIT_APPROVAL',

@@ -115,6 +115,31 @@ def test_direct_followup_reuses_previous_fresh_order_and_runs_write_preflight(is
     db.close()
 
 
+def test_invoice_write_followup_refreshes_trusted_previous_invoice(isolated):
+    first = runtime.run_agent_turn(owner(), 'pokaż nieopłacone faktury', runtime.FakeModelProvider([
+        tool('invoices.search', {'payment_status': 'unpaid'}),
+        respond('Masz jedną nieopłaconą fakturę.'),
+    ]))
+
+    second = runtime.run_agent_turn(owner(), 'Wyślij przypomnienie do tej faktury.',
+        runtime.FakeModelProvider([
+            tool('payments.reminders.send', {
+                'invoice_id': 10,
+                'idempotency_key': 'trusted-followup-reminder-10',
+            }),
+            respond('Przypomnienie oczekuje na zatwierdzenie.'),
+        ]), conversation_id=first['conversation_id'])
+
+    assert second['status'] == 'SUCCESS', second
+    assert second['tool_calls'] == 2
+    assert len(second['pending_approvals']) == 1
+    approval = second['pending_approvals'][0]
+    assert approval['operation'] == 'payments.reminders.send'
+    assert approval['invoice_id'] == 10
+    assert approval['invoice_number'] == 'FVAT 8/09/2026'
+    assert approval['buyer_name'] == 'AM Interiors'
+
+
 def test_explicit_new_order_wins_and_prevents_write_to_previous_order(isolated):
     db = b.conn(); now = b.now_iso()
     db.execute("INSERT INTO orders(id,order_no,customer_name,status,created_at,currency,price_list) VALUES(20,'ZAM-B','Klient B','confirmed',?,'PLN','pln')", (now,))

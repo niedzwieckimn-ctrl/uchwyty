@@ -64,6 +64,22 @@ def test_write_command_retains_write_and_preflight_tools(question, operation):
     assert ('invoices.get' if operation.startswith('invoices.') else 'orders.get') in names
 
 
+@pytest.mark.parametrize('message', [
+    'D.I.M. ZBRÓŻEK DAMIAN, BOBER PIOTR, zapłacone.',
+    'Artystyczna Manufaktura - opłacona',
+])
+def test_short_payment_statement_is_treated_as_write_request(message):
+    assert runtime._is_business_write_request(message)
+
+
+@pytest.mark.parametrize('message', [
+    'Czy faktura D.I.M. jest zapłacona?',
+    'Sprawdź, czy Artystyczna Manufaktura jest opłacona.',
+])
+def test_payment_status_question_stays_read_only(message):
+    assert not runtime._is_business_write_request(message)
+
+
 def test_count_controls_use_backend_bound_conversation_session():
     import internal_rbac as rbac
     ai = rbac.load_actor_context(rbac.AI_OWNER_ASSISTANT_ACTOR_ID,delegated_by_actor_id=owner().actor_id)

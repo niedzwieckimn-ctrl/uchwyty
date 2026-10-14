@@ -718,6 +718,16 @@
           const orders = Array.isArray(approval.order_numbers) ? approval.order_numbers.join(', ') : '';
           approvalLabel = `Usunięcie faktury ${number}\nZamówienia: ${orders}\nUsunięte zostaną dokumenty faktury, a jej rozliczenie magazynowe zostanie cofnięte. Przesyłka pozostaje.`;
         }
+        if (approval.operation === 'payments.reminders.send') {
+          const number = typeof approval.invoice_number === 'string' ? approval.invoice_number : '';
+          const buyer = typeof approval.buyer_name === 'string' ? approval.buyer_name : '';
+          approvalLabel = `Wysłanie przypomnienia o płatności\n${[number, buyer].filter(Boolean).join(' · ')}`;
+        }
+        if (approval.operation === 'invoices.payment.set_status') {
+          const number = typeof approval.invoice_number === 'string' ? approval.invoice_number : '';
+          const buyer = typeof approval.buyer_name === 'string' ? approval.buyer_name : '';
+          approvalLabel = `${approval.paid ? 'Oznaczenie faktury jako zapłaconej' : 'Cofnięcie oznaczenia zapłaty'}\n${[number, buyer].filter(Boolean).join(' · ')}`;
+        }
         if (approval.operation === 'orders.status.transition') approvalLabel = 'Zmiana statusu zamówienia';
         if (approval.operation === 'inventory.adjust') {
           const productName = typeof approval.product_name === 'string' && approval.product_name ? approval.product_name : 'Produkt';
