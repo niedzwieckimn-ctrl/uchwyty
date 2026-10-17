@@ -431,10 +431,15 @@ def _is_customer_partial_shipping_question(value: str) -> bool:
     normalized = ' '.join(str(value or '').casefold().split())
     prospective = bool(re.search(r'\b(?:mogę|moge|możemy|mozemy|można|mozna|do\s+wysyłki|do\s+wysylki)\b', normalized))
     shipping = bool(re.search(r'\b(?:wysłać|wyslac|wysyłać|wysylac|spakować|spakowac|nadać|nadac)\b', normalized))
-    customer = bool(re.search(r'\b(?:(?:do|dla|klientowi|klientce|firmie)\s+)[\wąćęłńóśźż]+', normalized))
+    if re.search(r'\b(?:faktur\w*|proform\w*|dokument\w*|pdf|mail\w*|e-mail\w*)\b', normalized):
+        return False
+    target = re.search(r'\b(?:do|dla|klientowi|klientce|firmie)\s+([\wąćęłńóśźż]+)\s+([\wąćęłńóśźż]+)', normalized)
+    customer = bool(target and target.group(1) not in {
+        'paczkomatu', 'paczkomat', 'punktu', 'magazynu', 'domu', 'adresu', 'kuriera',
+    })
     named_customer = bool(re.search(
         r'\b(?:wysłać|wyslac|wysyłać|wysylac|spakować|spakowac|nadać|nadac)\s+'
-        r'[A-ZĄĆĘŁŃÓŚŹŻ][\wąćęłńóśźż]+\s+[A-ZĄĆĘŁŃÓŚŹŻ][\wąćęłńóśźż]+',
+        r'[A-ZĄĆĘŁŃÓŚŹŻ]{2,4}\s+[A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]{3,}',
         str(value or '')))
     mixed_quantities = bool(re.search(r'\bzam[oó]wieni\w*\b', normalized)
                             and re.search(r'\b(?:dostępn\w*|dostepn\w*|stan\w*|iloś\w*|ilos\w*)\b', normalized))
