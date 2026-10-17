@@ -102,3 +102,21 @@ def test_customer_shipping_followup_uses_same_bounded_read_catalog():
                 'Przecież te dostępne ilości mogę już wysłać.')
     assert runtime._detect_read_intent(question) == 'customer_partial_shipping'
     assert runtime._detect_read_intent('Co mogę dziś wysłać?') == 'order_readiness'
+
+
+def test_customer_shipping_routes_natural_customer_phrasings():
+    for question in (
+        'Ile mogę wysłać klientowi AM Interiors?',
+        'Ile mogę wysłać AM Interiors?',
+        'Co mogę nadać do AM Interiors?',
+    ):
+        assert runtime._detect_read_intent(question) == 'customer_partial_shipping'
+
+
+def test_customer_shipping_does_not_treat_products_documents_or_destinations_as_customers():
+    for question in (
+        'Ile mogę wysłać Winsor BB?',
+        'Czy mogę wysłać klientowi fakturę?',
+        'Co mogę nadać do paczkomatu InPost?',
+    ):
+        assert runtime._detect_read_intent(question) != 'customer_partial_shipping'
