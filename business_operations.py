@@ -42,7 +42,7 @@ from cash_flow_module import (
     cash_flow_overdue_invoices, invoice_sales_units,
 )
 from inventory_analytics import build_replenishment_analysis, recommended_replenishments
-from fulfillment_readiness import calculate_fulfillment_readiness
+from fulfillment_readiness import calculate_fulfillment_readiness, customer_shipping_options
 from internal_audit import (
     CONFLICT, DENIED, FAILED, NOOP, PENDING_APPROVAL, SUCCESS,
     current_correlation_id, record_audit_event, sanitize_audit_data,
@@ -71,6 +71,7 @@ DIRECT_READ_RESULT_OPERATIONS = GENERIC_READ_OPERATIONS | HIGH_LEVEL_READ_OPERAT
     packing_history.OPERATION, shipment_read.OPERATION, payment_reminders.READ,
     search_analytics.OPERATION,
     CASHFLOW_READ_OPERATION, "dashboard.read",
+    "orders.customer_shipping_options",
     'inventory.count.summary', 'inventory.count.history',
 }
 CAPABILITY_CONTRACTS = {
@@ -135,6 +136,7 @@ FRESHNESS_GROUP_BY_OPERATION = {
     "inventory.replenishment.ranking": "inventory",
     "orders.search": "orders", "orders.get": "orders", "orders.summary": "orders",
     "orders.fulfillment.readiness": "fulfillment",
+    "orders.customer_shipping_options": "fulfillment",
     "inventory.count.get_expected": "inventory", "inventory.count.summary": "inventory",
     "orders.packing.check": "fulfillment",
     "customers.search": "customers", "customers.get": "customers",
@@ -448,6 +450,21 @@ FULFILLMENT_READINESS_OUTPUT = {
     "required": ["ok", "results", "count", "ready_count", "truncated"],
     "properties": {"ok": {"type": "boolean"}, "results": {"type": "array", "maxItems": MAX_BUSINESS_SEARCH_RESULTS},
                    "count": {"type": "integer"}, "ready_count": {"type": "integer"}, "truncated": {"type": "boolean"}},
+}
+CUSTOMER_SHIPPING_OPTIONS_INPUT = {
+    "type": "object", "additionalProperties": False, "required": ["customer"],
+    "properties": {"customer": {"type": "string", "minLength": 2, "maxLength": 160},
+                   "limit": _LIMIT},
+}
+CUSTOMER_SHIPPING_OPTIONS_OUTPUT = {
+    "type": "object", "additionalProperties": False,
+    "required": ["ok", "customer", "ambiguous", "matches", "orders", "truncated"],
+    "properties": {"ok": {"type": "boolean"}, "customer": {"type": "string"},
+                   "ambiguous": {"type": "boolean"},
+                   "matches": {"type": "array", "items": {"type": "string"}},
+                   "orders": {"type": "array", "items": {"type": "object"}},
+                   "truncated": {"type": "boolean"},
+                   "stock_basis": {"type": "string"}},
 }
 PACKING_HISTORY_INPUT = {
     "type": "object", "additionalProperties": False, "properties": {
@@ -771,6 +788,14 @@ OPERATION_REGISTRY: dict[str, BusinessOperationDefinition] = {
         "Deterministically checks whether order items can be fully fulfilled from currently available inventory and reports shortages.",
         "orders.read_full", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
         FULFILLMENT_READINESS_INPUT, FULFILLMENT_READINESS_OUTPUT, IDEMPOTENCY_NONE, "READ_STANDARD", True,
+    ),
+    "orders.customer_shipping_options": BusinessOperationDefinition(
+        "orders.customer_shipping_options", 1,
+        "Odczytuje pozostałe pozycje aktywnych zamówień wskazanego klienta oraz fizyczny stan dokładnych SKU. potential_now_qty to wstępny pułap pakowania w obrębie tego klienta, a nie rezerwacja ani potwierdzenie nadania. Przy wielu pasujących klientach zwraca matches bez zgadywania.",
+        "orders.read_full", approvals.GREEN, "NONE", frozenset({"HUMAN", "AI_AGENT"}),
+        CUSTOMER_SHIPPING_OPTIONS_INPUT, CUSTOMER_SHIPPING_OPTIONS_OUTPUT,
+        IDEMPOTENCY_NONE, "READ_STANDARD", True,
+        additional_required_permissions=("inventory.read",),
     ),
     packing_history.OPERATION: BusinessOperationDefinition(
         packing_history.OPERATION, 1,
@@ -1318,6 +1343,8 @@ def _entity(definition: BusinessOperationDefinition, data: Mapping[str, Any]) ->
         return "orders_summary", str(data.get("customer_id") or data.get("period") or "all"), None
     if definition.operation_name == "orders.fulfillment.readiness":
         return "order_fulfillment_readiness", str(data.get("order_id") or "all"), None
+    if definition.operation_name == "orders.customer_shipping_options":
+        return "customer_shipping_options", sanitize_audit_text(data["customer"])[:160], None
     if definition.operation_name in {"orders.get", "invoices.get"}:
         return definition.operation_name.split(".")[0][:-1], str(data.get("id") or data.get("number") or ("latest" if data.get("latest") else "")), None
     if definition.operation_name == "customers.get":
@@ -2091,6 +2118,16 @@ def _orders_fulfillment_readiness(data, actor, correlation_id, transaction_conne
         selected = rows[:limit]
         return {"ok": True, "results": selected, "count": len(selected),
                 "ready_count": sum(1 for row in selected if row["ready"]), "truncated": len(rows) > limit}
+    finally:
+        if transaction_connection is None:
+            db.close()
+
+
+def _orders_customer_shipping_options(data, actor, correlation_id, transaction_connection=None):
+    del actor, correlation_id
+    db = transaction_connection or _factory()()
+    try:
+        return customer_shipping_options(db, data["customer"], _limit(data))
     finally:
         if transaction_connection is None:
             db.close()
@@ -3137,6 +3174,7 @@ _HANDLERS: dict[str, Callable[[Mapping[str, Any], ActorContext, str, sqlite3.Con
     "orders.get": _orders_get,
     "orders.summary": _orders_summary,
     "orders.fulfillment.readiness": _orders_fulfillment_readiness,
+    "orders.customer_shipping_options": _orders_customer_shipping_options,
     packing_history.OPERATION: lambda data, actor, correlation_id, transaction_connection=None:
         _packing_history_read(data),
     shipment_read.OPERATION: _shipment_read,

@@ -369,6 +369,8 @@ def _is_packing_history_document_followup(value: str) -> bool:
 def _detect_read_intent(value: str) -> str:
     """Choose one primary read intent without another model round-trip."""
     normalized = ' '.join(str(value or '').casefold().split()).strip(' ?!.')
+    if _is_customer_partial_shipping_question(normalized):
+        return 'customer_partial_shipping'
     if shipment_read.is_readiness_question(normalized):
         return 'order_readiness'
     if shipment_read.is_question(normalized):
@@ -423,6 +425,16 @@ def _detect_read_intent(value: str) -> str:
     if re.search(r'\b(?:produkt\w*|sku|ean|model\w*|uchwyt\w*)\b', normalized):
         return 'product_lookup'
     return 'ambiguous'
+
+
+def _is_customer_partial_shipping_question(value: str) -> bool:
+    normalized = ' '.join(str(value or '').casefold().split())
+    prospective = bool(re.search(r'\b(?:mogę|moge|możemy|mozemy|można|mozna|do\s+wysyłki|do\s+wysylki)\b', normalized))
+    shipping = bool(re.search(r'\b(?:wysłać|wyslac|wysyłać|wysylac|spakować|spakowac)\b', normalized))
+    customer = bool(re.search(r'\b(?:do|dla)\s+[\wąćęłńóśźż]+', normalized))
+    mixed_quantities = bool(re.search(r'\bzam[oó]wieni\w*\b', normalized)
+                            and re.search(r'\b(?:dostępn\w*|dostepn\w*|stan\w*|iloś\w*|ilos\w*)\b', normalized))
+    return prospective and shipping and (customer or mixed_quantities)
 
 
 def _direct_physical_stock_query(value: str) -> str:
@@ -603,6 +615,7 @@ _INTENT_TOOL_NAMES = {
 # Specialist reads already define the source of truth. Keep their contracts
 # when high-level read models are enabled instead of exposing raw alternatives.
 _SPECIALIST_READ_TOOLS = {
+    'customer_partial_shipping': frozenset({'orders.customer_shipping_options'}),
     'dashboard_read': frozenset({'dashboard.read'}),
     'sales_analytics': frozenset({'business.sales.summary'}),
     'search_analytics': frozenset({'search.analytics.read'}),
@@ -857,7 +870,8 @@ Jeżeli historyczny odczyt nie jest dostępny albo narzędzie zwróci błąd, ni
 _MARKDOWN_RULE = re.compile(r'^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$',re.MULTILINE)
 _URL_RULE = re.compile(r'https?://\S+',re.IGNORECASE)
 _UUID_RULE = re.compile(r'\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b',re.IGNORECASE)
-_TECHNICAL_LINE_RULE = re.compile(r'(?im)^.*\b(?:approval_id|execution_id|correlation_id|product_id|count_session_id|expected_version)\b.*$')
+_TECHNICAL_LINE_RULE = re.compile(r'(?im)^.*(?:\b(?:approval_id|execution_id|correlation_id|product_id|product_ids|count_session_id|expected_version)\b|to=functions\.[\w.]+\s+code:).*$')
+_PSEUDO_TOOL_CALL_RULE = re.compile(r'(?im)^\s*to=functions\.[\w.]+\s+code:')
 _EXECUTION_TOKEN_RULE = re.compile(r'\b(?:SUCCESS|CONSUMED|PENDING_APPROVAL)\b')
 VOICE_RESPONSE_MODES = frozenset({
     'direct', 'detail_offer', 'summary', 'business_summary', 'full_detail',
@@ -898,6 +912,34 @@ def _plain_response_text(value, *, speech=False):
     else:
         text='\n'.join(line.rstrip() for line in text.splitlines() if line.strip())[:8000]
     return text.strip()
+
+
+def _customer_shipping_answer(data: dict[str, Any]) -> str:
+    if data.get('ambiguous'):
+        names = ', '.join(data.get('matches') or [])
+        return f'Znalazłem kilku pasujących odbiorców: {names}. Podaj pełną nazwę firmy.'
+    customer = str(data.get('customer') or '').strip()
+    if not customer:
+        return 'Nie znalazłem aktywnych zamówień tego klienta. Podaj pełną nazwę firmy.'
+    orders = data.get('orders') or []
+    if not orders:
+        return f'Nie ma otwartych pozycji zamówień dla {customer}.'
+    lines = [f'{customer} — wstępna możliwość pakowania według stanu fizycznego:']
+    for order in orders:
+        number = str(order.get('order_number') or 'Zamówienie')
+        for item in order.get('items') or []:
+            potential = int(item.get('potential_now_qty') or 0)
+            if potential <= 0:
+                continue
+            label = str(item.get('sku') or item.get('model') or 'Produkt')
+            required = int(item.get('remaining_qty') or 0)
+            lines.append(f'{number}: {label} — {potential} z {required} szt. obecnie na stanie.')
+    if len(lines) == 1:
+        lines.append('Dla żadnej otwartej pozycji nie ma teraz sztuk na stanie.')
+    if data.get('truncated'):
+        lines.append('Lista zamówień jest niepełna; zawęź pytanie do konkretnego zamówienia.')
+    lines.append('To odczyt stanu, nie rezerwacja. Przed nadaniem potwierdź pakowanie; inne zamówienia mogą korzystać z tych samych sztuk.')
+    return '\n'.join(lines)
 
 
 def _packing_history_answer(data: dict[str, Any]) -> str:
@@ -2548,6 +2590,7 @@ def run_agent_turn(human_actor: ActorContext, message: str, provider: AgentModel
         only_green_reads_so_far = True
         packing_history_result = None
         packing_history_error = ''
+        customer_shipping_result = None
         china_shortage_coverage_question = _is_china_shortage_coverage_question(turn_message)
         if packing_history_read and packing_history_direct_arguments:
             return direct_business_read(PACKING_HISTORY_OPERATION, packing_history_direct_arguments,
@@ -2589,6 +2632,14 @@ bez potwierdzonego wyniku narzędzia. Zachowaj wspólny limit operacji i pytaj t
 '''
             elif detected_intent in _SPECIALIST_READ_TOOLS:
                 model_instructions += _SPECIALIST_READ_INSTRUCTIONS
+                if detected_intent == 'customer_partial_shipping':
+                    model_instructions += '''
+Pytanie dotyczy częściowej wysyłki do klienta. Wywołaj orders.customer_shipping_options
+z nazwą firmy z bieżącego pytania albo z ostatniej jednoznacznej wiadomości użytkownika.
+Nie używaj samego readiness, nie zgaduj stanów po nazwie modelu i nie wpisuj
+wywołania narzędzia jako tekstu odpowiedzi. Jeśli nie da się wskazać klienta,
+poproś o pełną nazwę firmy.
+'''
                 if detected_intent == 'sales_analytics':
                     model_instructions += _intent_read_instructions(detected_intent)
             if shipment_read_requested:
@@ -2679,6 +2730,14 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
             usage['input_tokens'] += reply.input_tokens
             usage['output_tokens'] += reply.output_tokens
             if not reply.tool_calls:
+                if detected_intent == 'customer_partial_shipping' and not write_workflow_requested:
+                    return finish('SUCCESS',
+                        'Nie potwierdziłem ilości do częściowej wysyłki. Podaj pełną nazwę klienta i spróbuj ponownie.',
+                        voice_response_mode='direct')
+                if _PSEUDO_TOOL_CALL_RULE.search(reply.text or ''):
+                    return finish('FAILED',
+                        'Nie udało się potwierdzić danych. Spróbuj ponownie.',
+                        'UNEXECUTED_TOOL_CALL')
                 if shipment_read_requested:
                     return finish('SUCCESS', 'Wskaż datę wysyłki albo klienta, żebym mógł odczytać powiązaną fakturę.', voice_response_mode='direct')
                 if packing_history_read:
@@ -3078,6 +3137,8 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                             arguments=business_operations._safe_diagnostic_args(arguments))
                 if result.status == 'SUCCESS':
                     chat_503_diagnostics['tool_calls_ok'] += 1
+                    if call.name == 'orders.customer_shipping_options':
+                        customer_shipping_result = ('SUCCESS', dict(result.data or {}), '')
                     observe_shipping_state(call.name, result.data)
                     if call.name in {'inventory.count.session.start', 'inventory.count.get_expected',
                                      'inventory.count.record', 'inventory.count.complete',
@@ -3093,6 +3154,9 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                     chat_503_diagnostics['tool_calls_data_unavailable'] += 1
                     if generic_analytical_read and call.name == 'business.query':
                         generic_read_diagnostics['fallback_reason'] = 'query_unavailable'
+                if call.name == 'orders.customer_shipping_options' and result.status != 'SUCCESS':
+                    customer_shipping_result = (result.status, {},
+                        result.safe_error_message or 'Odczyt zamówień lub stanu jest chwilowo niedostępny.')
                 if call.name in {PACKING_HISTORY_OPERATION, shipment_read.OPERATION} and result.status != 'SUCCESS':
                     packing_history_error = (
                         result.safe_error_message
@@ -3203,6 +3267,12 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                 turn_outputs.append({'type':'function_call_output','call_id':call.call_id,'output':encoded})
             input_items.extend(outputs+turn_outputs)
             evidence.extend(outputs+turn_outputs)
+            if customer_shipping_result is not None:
+                customer_status, customer_data, customer_error = customer_shipping_result
+                if customer_status == 'SUCCESS':
+                    return finish('SUCCESS', _customer_shipping_answer(customer_data),
+                                  voice_response_mode='full_detail')
+                return finish('FAILED', customer_error, 'CUSTOMER_SHIPPING_READ_FAILED')
             if green_read_round:
                 read_planning_rounds += 1
                 high_level_read_diagnostics['read_rounds'] = read_planning_rounds

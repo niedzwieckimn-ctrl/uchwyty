@@ -133,6 +133,7 @@ PILOT_POLICIES = FULFILLMENT_POLICIES + (
     ("policy-orders-get", "orders.get", 1, "orders.read_full", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
     ("policy-orders-summary", "orders.summary", 1, "orders.read_full", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
     ("policy-orders-fulfillment-readiness", "orders.fulfillment.readiness", 1, "orders.read_full", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
+    ("policy-orders-customer-shipping-options", "orders.customer_shipping_options", 1, "orders.read_full", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
     ("policy-orders-packing-history-get", "orders.packing_history.get", 1, "packing.read", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
     ("policy-shipment-read", "shipment.read", 1, "orders.read_full", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
     ("policy-orders-packing-check", "orders.packing.check", 1, "packing.read", GREEN, 0, "approvals.decide", 3600, 1, None, 1),
