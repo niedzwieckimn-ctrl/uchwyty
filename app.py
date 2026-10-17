@@ -3263,6 +3263,7 @@ BUSINESS_FRESHNESS_OPERATION_GROUP = {
     "inventory.replenishment.ranking": "inventory",
     "orders.search": "orders", "orders.get": "orders", "orders.summary": "orders",
     "orders.fulfillment.readiness": "fulfillment",
+    "orders.customer_shipping_options": "fulfillment",
     "inventory.count.get_expected": "inventory", "inventory.count.summary": "inventory",
     "orders.packing.check": "fulfillment",
     "customers.search": "customers", "customers.get": "customers",

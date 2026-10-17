@@ -369,7 +369,7 @@ def _is_packing_history_document_followup(value: str) -> bool:
 def _detect_read_intent(value: str) -> str:
     """Choose one primary read intent without another model round-trip."""
     normalized = ' '.join(str(value or '').casefold().split()).strip(' ?!.')
-    if _is_customer_partial_shipping_question(normalized):
+    if _is_customer_partial_shipping_question(value):
         return 'customer_partial_shipping'
     if shipment_read.is_readiness_question(normalized):
         return 'order_readiness'
@@ -430,11 +430,15 @@ def _detect_read_intent(value: str) -> str:
 def _is_customer_partial_shipping_question(value: str) -> bool:
     normalized = ' '.join(str(value or '').casefold().split())
     prospective = bool(re.search(r'\b(?:mogę|moge|możemy|mozemy|można|mozna|do\s+wysyłki|do\s+wysylki)\b', normalized))
-    shipping = bool(re.search(r'\b(?:wysłać|wyslac|wysyłać|wysylac|spakować|spakowac)\b', normalized))
-    customer = bool(re.search(r'\b(?:do|dla)\s+[\wąćęłńóśźż]+', normalized))
+    shipping = bool(re.search(r'\b(?:wysłać|wyslac|wysyłać|wysylac|spakować|spakowac|nadać|nadac)\b', normalized))
+    customer = bool(re.search(r'\b(?:(?:do|dla|klientowi|klientce|firmie)\s+)[\wąćęłńóśźż]+', normalized))
+    named_customer = bool(re.search(
+        r'\b(?:wysłać|wyslac|wysyłać|wysylac|spakować|spakowac|nadać|nadac)\s+'
+        r'[A-ZĄĆĘŁŃÓŚŹŻ][\wąćęłńóśźż]+\s+[A-ZĄĆĘŁŃÓŚŹŻ][\wąćęłńóśźż]+',
+        str(value or '')))
     mixed_quantities = bool(re.search(r'\bzam[oó]wieni\w*\b', normalized)
                             and re.search(r'\b(?:dostępn\w*|dostepn\w*|stan\w*|iloś\w*|ilos\w*)\b', normalized))
-    return prospective and shipping and (customer or mixed_quantities)
+    return prospective and shipping and (customer or named_customer or mixed_quantities)
 
 
 def _direct_physical_stock_query(value: str) -> str:

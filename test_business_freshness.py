@@ -174,6 +174,7 @@ def test_new_read_only_operations_use_narrow_freshness_groups(freshness):
 
 
 @pytest.mark.parametrize(("operation", "group"), [
+    ("orders.customer_shipping_options", "fulfillment"),
     ("business.orders.state", "inventory"),
     ("business.inventory.state", "inventory"),
     ("business.finance.state", "sales"),
