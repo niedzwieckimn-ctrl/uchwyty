@@ -7,7 +7,7 @@ from flask import abort, redirect, render_template, request, url_for
 from werkzeug.exceptions import HTTPException
 
 SECTIONS = ('packing_lists', 'packing_batches', 'packing_allocations', 'packing_shipments',
-            'fulfillment_shipping_attempts')
+            'fulfillment_shipping_attempts', 'fulfillment_verifications')
 # Existing current document kinds: packing_list, invoice, label. Read only
 # their identities, including for legacy snapshots that still contain PDF bytes.
 DOC_FIELDS = ('kind', 'document_id')
@@ -55,6 +55,11 @@ def records(b):
 
 
 def cards_from_records(rows):
+    import shipment_amendments
+    # An explicit, validated amendment supersedes the earlier contents of one
+    # physical parcel. Equal tracking numbers alone never hide historical lists.
+    effective = {r['shipment_key']: r for r in
+                 shipment_amendments.effective_shipments_from_records(rows)}
     sources = {}
     current = set()
     for record in rows:
@@ -81,9 +86,14 @@ def cards_from_records(rows):
         if not batch or not items:
             continue
         finals = sorted((r for r in record.get('packing_shipments') or []
-                         if r['packing_list_id'] == key and r['final_batch_id'] == batch_id),
+                         if r['packing_list_id'] == key and r['final_batch_id'] == batch_id
+                         and r['shipment_key'] in effective),
                         key=lambda r: r['confirmed_at'])
         final = finals[-1] if finals else {}
+        had_final = any(r['packing_list_id'] == key and r['final_batch_id'] == batch_id
+                        for r in record.get('packing_shipments') or [])
+        if had_final and not final:
+            continue  # Superseded evidence remains in packing history, not a second parcel.
         if not final and (key, batch['created_at'], batch.get('selection_hash') or '') not in current:
             continue  # An old draft is not a new parcel after its pointer was replaced.
         receiver, booked_tracking, booked_carrier = {}, '', ''

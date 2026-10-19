@@ -2884,8 +2884,23 @@ def supabase_insert_row(table: str, row: dict):
 
 def supabase_update_rows(table: str, values: dict, filters: dict):
     guarded_inpost = table == 'orders' and isinstance(filters.get('inpost_shipment_id'), list)
-    params = {k: ('in.(' + ','.join(json.dumps(str(item)) for item in v) + ')'
-                  if guarded_inpost and isinstance(v, list) else f"eq.{v}") for k, v in filters.items()}
+    params, nullable_conditions = {}, []
+    for key, value in filters.items():
+        if guarded_inpost and value is None:
+            params[key] = 'is.null'
+        elif guarded_inpost and isinstance(value, list):
+            present = [item for item in value if item is not None]
+            allowed = 'in.(' + ','.join(json.dumps(str(item)) for item in present) + ')'
+            if None in value and present:
+                # Each nullable field is independently constrained. A single OR
+                # across fields would let one matching pointer bypass the rest.
+                nullable_conditions.append(f'or({key}.is.null,{key}.{allowed})')
+            else:
+                params[key] = 'is.null' if None in value else allowed
+        else:
+            params[key] = f'eq.{value}'
+    if nullable_conditions:
+        params['and'] = '(' + ','.join(nullable_conditions) + ')'
     result = supabase_request(
         f"/rest/v1/{table}",
         method="PATCH",
@@ -6842,9 +6857,10 @@ def apply_verified_inpost_status(order: dict, shipment: dict) -> dict:
         shipment_key = 'inpost:' + (shipment_id or remote_tracking)
         if not shipment_id and not remote_tracking:
             raise packing_versions.PackingConflict('Brak identyfikatora potwierdzonej przesyłki.')
-        prior = c.execute("SELECT * FROM packing_shipments WHERE shipment_key=?",
-                          (shipment_key,)).fetchone()
+        prior = inpost_tracking.final_for_shipment(c, shipment_id, remote_tracking)
         if prior:
+            # The carrier identity stays the authenticated ShipX ID. An explicit,
+            # immutable content correction selects the effective packing snapshot.
             shipment_key = prior['shipment_key']
             if remote_tracking and prior['tracking'] and re.sub(r'\s+', '', prior['tracking']) != remote_tracking:
                 raise packing_versions.PackingConflict('Numer śledzenia nie zgadza się z finalną listą tej przesyłki.')

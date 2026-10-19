@@ -231,18 +231,24 @@ def read(data, *, connection_factory, packing_allowed=True):
             return f' AND substr({column},1,10) BETWEEN ? AND ?', [
                 (requested_day-timedelta(days=1)).isoformat(),(requested_day+timedelta(days=1)).isoformat()]
         events, covered = [], set()
+        effective_finals, superseded_invoice_ids = [], set()
         tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if {'packing_shipments','packing_batches','packing_lists'} <= tables:
-            where, args = date_filter('ps.confirmed_at')
-            finals = db.execute('''SELECT ps.*,COALESCE(pb.invoice_id,pl.invoice_id) AS invoice_id
+            import shipment_amendments
+            finals = [dict(r) for r in db.execute('''SELECT ps.*,COALESCE(pb.invoice_id,pl.invoice_id) AS invoice_id
                 FROM packing_shipments ps JOIN packing_batches pb ON pb.id=ps.final_batch_id
-                LEFT JOIN packing_lists pl ON pl.packing_list_id=ps.packing_list_id WHERE 1=1'''+where, args).fetchall()
+                LEFT JOIN packing_lists pl ON pl.packing_list_id=ps.packing_list_id''')]
+            effective_finals = shipment_amendments.effective_shipments(db, finals)
+            by_key = {r['shipment_key']: r for r in finals}
+            superseded_invoice_ids = {by_key[key]['invoice_id'] for r in effective_finals
+                for key in r.get('superseded_shipment_keys', [])
+                if key in by_key and by_key[key].get('invoice_id')}
             members_by_batch = {}
             for row in db.execute('''SELECT DISTINCT pa.batch_id,o.* FROM packing_shipments ps
                 JOIN packing_allocations pa ON pa.batch_id=ps.final_batch_id
-                JOIN orders o ON o.id=pa.order_id WHERE 1=1'''+where,args):
+                JOIN orders o ON o.id=pa.order_id'''):
                 members_by_batch.setdefault(row['batch_id'],[]).append(dict(row))
-            for final in finals:
+            for final in effective_finals:
                 members = members_by_batch.get(final['final_batch_id'],[])
                 if not members or not any(matches_order(r) for r in members):
                     continue
@@ -295,14 +301,16 @@ def read(data, *, connection_factory, packing_allowed=True):
         chosen = events if mode == 'date' else events[:1]
         for event in chosen:
             candidates = set(_invoice_candidates(db, [r['id'] for r in event['members']]))
+            # A replaced invoice must not be reintroduced through shared order
+            # membership after an explicitly evidenced parcel amendment.
+            candidates -= superseded_invoice_ids - event['explicit_invoice_ids']
             # An immutable invoice attached to another confirmed physical parcel
             # cannot be inferred to belong to this parcel just from its order.
             if 'packing_shipments' in tables:
-                other = {r[0] for r in db.execute("""SELECT DISTINCT pb.invoice_id
-                    FROM packing_shipments ps JOIN packing_batches pb ON pb.id=ps.final_batch_id
-                    WHERE pb.invoice_id IS NOT NULL AND ps.shipment_key<>?
-                      AND NOT (ps.tracking<>'' AND ps.tracking=? AND ps.carrier=?)""",
-                    (event['shipment_id'],event['tracking'],event['carrier']))}
+                other = {r['invoice_id'] for r in effective_finals if r.get('invoice_id')
+                    and r['shipment_key'] != event['shipment_id']
+                    and not (r['tracking'] and r['tracking'] == event['tracking']
+                             and r['carrier'] == event['carrier'])}
                 candidates -= other - event['explicit_invoice_ids']
             event['invoice_candidates'] = sorted(candidates)
             event['invoice_id'] = next(iter(candidates)) if len(candidates) == 1 else None
