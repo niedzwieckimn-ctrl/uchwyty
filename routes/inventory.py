@@ -1,6 +1,8 @@
 """Mechanically extracted Flask routes; business logic is unchanged."""
 
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from internal_rbac import require_permission
+from stock_count_pdf import render_stock_count_pdf
 
 def register_routes(context):
     globals().update(context)
@@ -729,6 +731,44 @@ def register_routes(context):
             page_numbers=page_numbers, page_url=page_url,
         )
 
+
+
+    @app.get("/stock/count-sheet.pdf")
+    @require_permission("inventory.read")
+    def stock_count_sheet_pdf():
+        # Refresh only products + physical stock; never run the broad dashboard
+        # synchronization or the reservation/replenishment analysis for a PDF.
+        try:
+            freshness = ensure_business_operation_freshness("inventory.product.physical")
+            age = freshness.get("snapshot_age_seconds")
+            if supabase_enabled() and (age is None or age >= BUSINESS_FRESHNESS_TTL_SECONDS):
+                raise ValueError("Stock snapshot is not current")
+        except Exception:
+            app.logger.warning("STOCK_COUNT_PDF_REFRESH_FAILED", exc_info=True)
+            return render_template_string('''{% extends "base.html" %}{% block content %}
+              <div class="card"><h1>Nie udało się pobrać aktualnych stanów</h1>
+              <p>Połączenie z bazą jest chwilowo niedostępne. Spróbuj pobrać spis ponownie za chwilę.</p>
+              <a class="btn" href="{{ url_for('stock') }}">Wróć do magazynu</a></div>
+              {% endblock %}'''), 503, {"Cache-Control": "private, no-store"}
+        # Do not read between the product and stock writes of an overlapping sync.
+        with _supabase_full_io_lock:
+            c = conn()
+            try:
+                rows = [dict(row) for row in c.execute('''
+                    SELECT p.sku,p.model,p.name,p.ean,COALESCE(s.qty,0) AS stock_qty
+                    FROM products p LEFT JOIN stock s ON s.product_id=p.id
+                    WHERE COALESCE(p.archived,0)=0 ORDER BY p.sku COLLATE NOCASE,p.id
+                ''').fetchall()]
+                company_row = c.execute("SELECT * FROM company_profile WHERE id=1").fetchone()
+                company = dict(company_row) if company_row else {}
+            finally:
+                c.close()
+        generated_at = app_now()
+        stream = render_stock_count_pdf(rows, generated_at, get_pdf_font_names(), company)
+        response = send_file(stream, mimetype="application/pdf", as_attachment=True,
+                             download_name=f"spis-z-natury-{generated_at:%Y-%m-%d_%H-%M-%S}.pdf")
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
 
 
     @app.post("/api/stock_delta")
