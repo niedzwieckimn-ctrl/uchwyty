@@ -7,7 +7,7 @@
 .img-save-message{display:none;margin:12px 0;padding:12px 14px;border:1px solid #b9ebcb;border-radius:12px;background:#eaf9ef;color:#14753a;font-weight:700}.img-save-message.show{display:block}
 </style>
 
-<div class="inv-head"><div><h1>Stan magazynu</h1><div class="muted">Pełna kontrola stanów, rezerwacji i dostaw.</div></div><div class="flex"><button class="btn" onclick="openImages()">Zdjęcia produktów</button><button class="btn primary" onclick="openCorrection()">+ Korekta stanu</button></div></div>
+<div class="inv-head" style="flex-wrap:wrap"><div><h1>Stan magazynu</h1><div class="muted">Pełna kontrola stanów, rezerwacji i dostaw.</div></div><div class="flex" style="flex-wrap:wrap"><a class="btn" href="{{ url_for('stock_count_sheet_pdf') }}" title="Wszystkie aktywne SKU, stan systemowy i miejsce na wpisanie policzonych ilości">Spis z natury — PDF</a><button class="btn" onclick="openImages()">Zdjęcia produktów</button><button class="btn primary" onclick="openCorrection()">+ Korekta stanu</button></div></div>
 
 <div class="inv-kpis">
  {% for k in kpis %}<a class="inv-kpi" href="{{ k.url }}" style="text-decoration:none;color:inherit"><small>{{ k.label }}</small><b>{{ k.value }}</b><small>{{ k.note }}</small></a>{% endfor %}
