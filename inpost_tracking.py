@@ -570,6 +570,87 @@ def protected_order_ids(db):
         WHERE s.sync_state IN ('pending','conflict')''')}
 
 
+def final_for_shipment(db, shipment_id, tracking_no):
+    """Resolve ID/manual-number final identities only when the evidence agrees.
+
+    A manually attached parcel may have been finalized by its tracking number.
+    Neither that key nor an amendment key is ever used as a ShipX identifier.
+    """
+    import packing_versions
+    import shipment_amendments
+    sid = str(shipment_id or '').strip()
+    number = re.sub(r'\s+', '', str(tracking_no or ''))
+    keys = {'inpost:' + value for value in (sid, number) if value}
+    if not keys:
+        return None
+    rows = db.execute('SELECT * FROM packing_shipments WHERE shipment_key IN (' +
+                      ','.join('?' for _ in keys) + ')', tuple(sorted(keys))).fetchall()
+    resolved = {}
+    for row in rows:
+        saved_number = re.sub(r'\s+', '', str(row['tracking'] or ''))
+        if (str(row['carrier'] or '').strip().lower() != 'inpost'
+                or number and saved_number and saved_number != number
+                or row['shipment_key'] == 'inpost:' + number and saved_number != number):
+            raise packing_versions.PackingConflict('Numer śledzenia nie zgadza się z finalną listą tej przesyłki.')
+        effective = shipment_amendments.effective_shipment(db, dict(row))
+        resolved[effective['shipment_key']] = effective
+    if len(resolved) > 1:
+        raise packing_versions.PackingConflict('Identyfikator InPost i numer śledzenia wskazują różne listy pakowe.')
+    return next(iter(resolved.values()), None)
+
+
+def reconcile_amendment_notification(db, shipment_id, batch_id, orders):
+    """Update an unattempted notification's contents inside the correction write.
+
+    Never create a send obligation, reset a claim or touch a completed/uncertain
+    send. A later ordinary tracking run may send this already-pending message.
+    """
+    import inpost_reconciliation as work
+    import packing_versions
+    if not db.in_transaction:
+        raise packing_versions.PackingConflict('Korekta powiadomienia wymaga transakcji zapisu.')
+    sid = str(shipment_id or '').strip()
+    job = work.read(db, sid) if sid else None
+    if not job:
+        return False
+    notice = notification(db, sid)
+    if notice and (notice['state'] != 'pending' or notice.get('claim_token')
+                   or float(notice.get('lease_until') or 0) > 0):
+        return False
+    try:
+        previous = json.loads(job['notification_payload'])
+        if not previous:
+            return False
+        number = re.sub(r'\s+', '', str(previous['tracking_no'] or ''))
+        old_orders = previous['orders']
+        previous_ids = {int(row['id']) for row in old_orders}
+    except (KeyError, TypeError, ValueError):
+        raise packing_versions.PackingConflict('Nie można potwierdzić zapisanej zawartości powiadomienia.')
+    current = sorted((dict(row) for row in orders), key=lambda row: int(row['id']))
+    ids = [int(row['id']) for row in current]
+    final = final_for_shipment(db, sid, number)
+    packing = packing_versions.batch_result(db, int(batch_id), mode='final')
+    if (not number or not final or int(final['final_batch_id']) != int(batch_id)
+            or ids != packing['order_ids'] or not previous_ids.issubset(ids)
+            or any(str(row.get('inpost_shipment_id') or '') != sid
+                   or str(row.get('carrier') or '').lower() != 'inpost'
+                   or re.sub(r'\s+', '', str(row.get('tracking_no') or '')) != number
+                   for row in current)):
+        raise packing_versions.PackingConflict('Powiadomienie nie odpowiada poprawionej zawartości przesyłki.')
+    digest = hashlib.sha256(number.encode('utf-8')).hexdigest()[:16]
+    keys = [f'order_shipped:{oid}:inpost:{digest}' for oid in sorted(set(ids) | previous_ids)]
+    if db.execute('SELECT 1 FROM email_events WHERE event_key IN (' +
+                  ','.join('?' for _ in keys) + ') LIMIT 1', tuple(keys)).fetchone():
+        return False  # A legacy adapter receipt also proves an attempted send.
+    payload = work.encoded({'batch_id': int(batch_id), 'tracking_no': number, 'orders': current})
+    if payload == job['notification_payload']:
+        return False
+    changed = db.execute('UPDATE inpost_reconciliation SET notification_payload=? '
+                         'WHERE shipment_id=? AND notification_payload=?',
+                         (payload, sid, job['notification_payload']))
+    return changed.rowcount == 1
+
+
 def restore_packing_scope(b, order):
     """Hydrate missing shipment evidence before READ/apply; never infer allocations.
 
@@ -592,10 +673,10 @@ def restore_packing_scope(b, order):
             current_ids = {int(r[0]) for r in db.execute(
                 'SELECT id FROM orders WHERE inpost_shipment_id=?', (sid,))}
             ids = {int(order['id'])} | current_ids
-            final = db.execute('SELECT final_batch_id,tracking FROM packing_shipments WHERE shipment_key=?',
-                               ('inpost:' + sid,)).fetchone()
+            final = None
             try:
-                packing = (packing_versions.batch_result(db, final[0], mode='final') if final else
+                final = final_for_shipment(db, sid, order.get('tracking_no'))
+                packing = (packing_versions.batch_result(db, final['final_batch_id'], mode='final') if final else
                            packing_versions.current_for_order(db, int(order['id'])))
             except packing_versions.PackingConflict:
                 # A pointer/final marker may survive a partial cache reset.
@@ -658,8 +739,8 @@ def restore_packing_scope(b, order):
                         raise ValueError('Konflikt zapisanej historii przesyłki.')
                     db.execute('INSERT OR IGNORE INTO inpost_shipment_history VALUES(?,?,?,?)',
                         (row['order_id'],sid,row['snapshot_json'],row['created_at']))
-                    final = db.execute('SELECT tracking FROM packing_shipments WHERE shipment_key=?',('inpost:'+sid,)).fetchone()
-                    if not work.historical_member(db, int(row['order_id']), sid, re.sub(r'\s+', '', final[0])):
+                    final = final_for_shipment(db, sid, order.get('tracking_no'))
+                    if not final or not work.historical_member(db, int(row['order_id']), sid, re.sub(r'\s+', '', final['tracking'])):
                         raise ValueError('Niepotwierdzona tożsamość historycznego członka przesyłki.')
                 db.commit()
             finally:
@@ -682,9 +763,9 @@ def scope_diagnostic(db, order):
         'SELECT id,tracking_no,status FROM orders WHERE inpost_shipment_id=? ORDER BY id',
         (sid,))]
     ids = [int(row['id']) for row in linked]
-    final = db.execute('SELECT final_batch_id,tracking FROM packing_shipments WHERE shipment_key=?',
-                       ('inpost:' + sid,)).fetchone()
+    final = None
     try:
+        final = final_for_shipment(db, sid, order.get('tracking_no'))
         packing = (packing_versions.batch_result(db, final['final_batch_id'], mode='final')
                    if final else packing_versions.current_for_order(db, int(order['id'])))
         expected = sorted(int(i) for i in packing['order_ids']) if packing else []

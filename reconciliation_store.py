@@ -473,6 +473,19 @@ def stage(b, oid, connection=None, allow_replace=False):
         lists = [dict(r) for r in c.execute('''SELECT DISTINCT pl.* FROM packing_lists pl
             JOIN packing_batches pb ON pb.packing_list_id=pl.packing_list_id
             JOIN packing_allocations pa ON pa.batch_id=pb.id WHERE pa.order_id=? OR pl.root_order_id=?''', (oid, oid))]
+        # A newly added order must carry the predecessor of its explicit parcel
+        # correction too, so restoring that member alone preserves the proof.
+        import shipment_amendments
+        amendment_keys, amendment_proofs = shipment_amendments.amendment_evidence(c, oid)
+        proofs = {(r['order_id'], r['kind']): r for r in payload['fulfillment_verifications']}
+        proofs.update({(r['order_id'], r['kind']): r for r in amendment_proofs})
+        payload['fulfillment_verifications'] = list(proofs.values())
+        present = {row['packing_list_id'] for row in lists}
+        for key in sorted(amendment_keys - present):
+            previous = c.execute('SELECT * FROM packing_lists WHERE packing_list_id=?', (key,)).fetchone()
+            if not previous:
+                raise ValueError('Brak historii poprzedniej listy poprawianej przesyłki.')
+            lists.append(dict(previous))
         payload['packing_lists'] = lists
         keys = [r['packing_list_id'] for r in lists]
         if keys:
@@ -677,10 +690,19 @@ def restore(b, oid, *, allow_packing_extension=False):
         payload = _remap_packing_ids(c, record['payload'])
         for table in TABLES:
             entries = payload.get(table, [])
-            if table not in {'fulfillment_shipping_attempts', 'fulfillment_shipping_members'}:
+            if table == 'fulfillment_verifications':
+                # Parcel amendment receipts are append-only even when another
+                # member brings their dependencies into a cold local cache.
+                c.execute("DELETE FROM fulfillment_verifications WHERE order_id=? AND kind NOT LIKE 'shipment_amendment:%'", (oid,))
+            elif table not in {'fulfillment_shipping_attempts', 'fulfillment_shipping_members'}:
                 c.execute(f'DELETE FROM {table} WHERE order_id=?', (oid,))
             for source in entries:
                 source = dict(source)
+                if table == 'fulfillment_verifications' and str(source.get('kind') or '').startswith('shipment_amendment:'):
+                    existing = c.execute('SELECT payload FROM fulfillment_verifications WHERE order_id=? AND kind=?',
+                                         (source['order_id'], source['kind'])).fetchone()
+                    if existing and existing[0] != source['payload']:
+                        raise ValueError('Konflikt trwałego potwierdzenia korekty przesyłki.')
                 if table == 'fulfillment_documents':
                     encoded = source.pop('pdf_base64', None)
                     if not encoded:

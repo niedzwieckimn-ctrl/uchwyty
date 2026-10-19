@@ -1,4 +1,5 @@
 """Mechanically extracted Flask routes; business logic is unchanged."""
+import inpost_tracking
 
 def register_routes(context):
     globals().update(context)
@@ -534,20 +535,26 @@ def register_routes(context):
     @app.post("/orders/<int:order_id>/shipped")
     def order_mark_shipped(order_id):
         import packing_versions
+        from contextlib import ExitStack
         from fulfillment_operations import ui_write
         c = conn()
         try:
             package = packing_versions.current_for_order(c, order_id)
             root = c.execute('SELECT root_order_id FROM packing_batches WHERE id=?',
                 (package['batch_id'],)).fetchone() if package else None
+            locked_ids = set(package['order_ids'] if package else [order_id])
+            if root:
+                locked_ids.add(int(root[0]))
         finally:
             c.close()
-        with ui_write(root[0] if root else order_id):
-            return order_mark_shipped_service(order_id)
+        with ExitStack() as locks:
+            for oid in sorted(locked_ids):
+                locks.enter_context(ui_write(oid))
+            return order_mark_shipped_service(order_id, locked_ids=locked_ids)
 
 
-    def order_mark_shipped_service(order_id):
-        import packing_versions, sys
+    def order_mark_shipped_service(order_id, locked_ids=None):
+        import packing_versions, shipment_amendments, shipment_rebind, sys
         tracking_no = re.sub(r"\s+", "", norm(request.form.get("tracking_no")))
         carrier = norm(request.form.get("carrier")).lower()
         notify_customer = request.form.get("notify_customer") == "1"
@@ -575,17 +582,39 @@ def register_routes(context):
             backend = sys.modules.get('app') or sys.modules['__main__']
             c.execute('BEGIN IMMEDIATE')
             version_before = packing_versions.current_for_order(c, order_id)
+            if locked_ids is not None and version_before and not set(version_before['order_ids']).issubset(locked_ids):
+                raise packing_versions.PackingConflict('Zakres paczki zmienił się. Odśwież zamówienie przed zapisaniem numeru.')
             expected = packing_versions.shipment_form_version(c, version_before)
-            if not expected or request.form.get('shipment_form_version') != expected:
-                raise packing_versions.PackingConflict('Lista lub numer przesyłki zmieniły się. Odśwież zamówienie i wpisz numer dla aktualnej paczki.')
             # A manually entered number identifies THIS shipment. A stale
             # InPost ID on an older partial order must not select the old parcel.
             shipment_key = carrier + ':' + tracking_no
-            prior = c.execute('SELECT * FROM packing_shipments WHERE shipment_key=? OR (carrier=? AND tracking=?)',
-                              (shipment_key, carrier, tracking_no)).fetchone()
+            matches = [dict(r) for r in c.execute('SELECT * FROM packing_shipments WHERE shipment_key=? OR (carrier=? AND tracking=?)',
+                              (shipment_key, carrier, tracking_no))]
+            matches = shipment_amendments.effective_shipments(c, matches)
+            if len(matches) > 1:
+                raise packing_versions.PackingConflict('Numer wskazuje kilka różnych zapisów przesyłki. Sprawdź jej historię.')
+            prior = matches[0] if matches else None
+            amended = False
+            amended_sid = ''
+            # A repeated completed correction may carry the original form token.
+            # It can only revisit the same final list, never bind a different one.
+            completed_amendment = bool(shipment_rebind.is_replay(c, prior, request.form.get('shipment_form_version')) and version_before
+                and int(version_before['batch_id']) == int(prior['final_batch_id']))
+            if not expected or (request.form.get('shipment_form_version') != expected and not completed_amendment):
+                raise packing_versions.PackingConflict('Lista lub numer przesyłki zmieniły się. Odśwież zamówienie i wpisz numer dla aktualnej paczki.')
             if prior:
                 if version_before and int(version_before['batch_id']) != int(prior['final_batch_id']):
-                    raise packing_versions.PackingConflict('Ten numer należy do wcześniejszej paczki. Wpisz numer aktualnej przesyłki.')
+                    amended_sid = shipment_rebind.validate(c, prior, version_before)
+                    correction = shipment_amendments.amend(c, prior, version_before,
+                        actor=session.get('internal_actor_id') or 'admin',
+                        reason='Numer przesyłki przypisany z aktualnej listy po regeneracji faktury.',
+                        request_version=expected)
+                    prior = dict(c.execute('SELECT * FROM packing_shipments WHERE shipment_key=?',
+                                           (correction['final_key'],)).fetchone())
+                    amended = True
+                elif prior['shipment_key'].startswith('amend:'):
+                    amended = True
+                    amended_sid = shipment_rebind.validate(c, prior, version_before)
                 shipment_key = prior['shipment_key']
             packing = (packing_versions.batch_result(c, prior['final_batch_id'], mode='final') if prior else
                        packing_versions.ensure_current_for_shipment(backend, c, order_id))
@@ -595,17 +624,21 @@ def register_routes(context):
             package_orders = [dict(r) for r in c.execute(
                 'SELECT * FROM orders WHERE id IN (' + ','.join('?' for _ in package_order_ids) + ') ORDER BY id',
                 package_order_ids)]
+            shipping_before = {r['id']: dict(r) for r in package_orders}
             with open(packing['document_path'], 'rb') as packing_file:
                 packing_attachment = {'filename': 'lista_pakowa.pdf', 'content': packing_file.read()}
             placeholders = ",".join(["?"] * len(package_order_ids))
-            shipped_at = now_iso()
+            shipped_at = prior['confirmed_at'] if amended else now_iso()
+            if amended:
+                # Metadata reconciliation does not notify the customer again.
+                notify_customer = False
             packing_versions.confirm_shipment(c, batch_id=packing['batch_id'],
                 shipment_key=shipment_key, confirmed_at=shipped_at,
                 carrier=carrier, tracking=tracking_no, order_ids=package_order_ids)
             previous_shipping_ids = {}
             for member in package_orders:
                 old_id = str(member.get('inpost_shipment_id') or '')
-                if old_id and (carrier != 'inpost' or norm(member.get('tracking_no')) != tracking_no):
+                if not amended and old_id and (carrier != 'inpost' or norm(member.get('tracking_no')) != tracking_no):
                     # Keep a durable audit of the replaced pointer. This is NOT
                     # provider collection evidence and does not release API claims.
                     previous_shipping_ids[member['id']] = old_id
@@ -616,24 +649,29 @@ def register_routes(context):
                         (member['id'], 'external_shipment:' + shipment_key, json.dumps(proof)))
                     c.execute("UPDATE orders SET inpost_shipment_id='',inpost_label_format='' WHERE id=? AND inpost_shipment_id=?",
                               (member['id'], old_id))
-            packing_versions.stage_evidence(backend, c, package_order_ids,
-                allow_replace=not version_before and not prior)
+            if amended_sid:
+                c.execute('UPDATE orders SET inpost_shipment_id=?,inpost_label_format=\'pdf\' WHERE id IN ('
+                          + ','.join('?' for _ in package_order_ids) + ')', (amended_sid, *package_order_ids))
             # Status wysyłki nie zmienia magazynu. Stan schodzi dopiero podczas
             # pełnego zafakturowania zamówienia w finalize_fully_invoiced_orders().
             cur.execute(
                 f"""UPDATE orders
                     SET status=CASE
                           WHEN LOWER(COALESCE(status,'')) IN ('issued','completed') THEN status
-                          WHEN LOWER(COALESCE(status,''))='packed_partial' THEN 'partially_shipped'
+                          WHEN LOWER(COALESCE(status,'')) IN ('packed_partial','partially_shipped') THEN 'partially_shipped'
                           ELSE 'shipped'
                         END,
                         tracking_no=?, carrier=?, shipped_at=?
                     WHERE id IN ({placeholders})""",
                 (tracking_no, carrier, shipped_at, *package_order_ids),
             )
-            c.commit()
             cur.execute(f"SELECT * FROM orders WHERE id IN ({placeholders}) ORDER BY id", tuple(package_order_ids))
             package_orders = [dict(item) for item in cur.fetchall()]
+            if amended_sid:
+                inpost_tracking.reconcile_amendment_notification(c, amended_sid, packing['batch_id'], package_orders)
+            packing_versions.stage_evidence(backend, c, package_order_ids,
+                allow_replace=not version_before and not prior)
+            c.commit()
             order = next((item for item in package_orders if to_int(item.get("id"), 0) == order_id), package_orders[0])
         except (packing_versions.PackingConflict, OSError) as exc:
             c.rollback()
@@ -650,8 +688,19 @@ def register_routes(context):
                 for package_order in package_orders:
                     pointer_clear = ({'inpost_shipment_id': '', 'inpost_label_format': ''}
                                      if package_order['id'] in previous_shipping_ids else {})
+                    if amended_sid:
+                        pointer_clear = {'inpost_shipment_id': amended_sid, 'inpost_label_format': 'pdf'}
                     pointer_filter = ({'inpost_shipment_id': [previous_shipping_ids[package_order['id']], '']}
-                                      if pointer_clear else {})
+                                      if package_order['id'] in previous_shipping_ids else {})
+                    if amended:
+                        before = shipping_before[package_order['id']]
+                        pointer_filter = {
+                            'inpost_shipment_id': list(dict.fromkeys([before.get('inpost_shipment_id'), amended_sid])),
+                            'tracking_no': list(dict.fromkeys([before.get('tracking_no'), tracking_no])),
+                            'carrier': list(dict.fromkeys([before.get('carrier'), carrier])),
+                            'status': list(dict.fromkeys([before.get('status'), package_order.get('status')])),
+                            'warehouse_issued': before.get('warehouse_issued'),
+                        }
                     supabase_update_rows(
                         "orders",
                         {
@@ -672,7 +721,8 @@ def register_routes(context):
                 ))
 
         if not notify_customer:
-            return redirect(url_for('order_view', order_id=order_id, shipment_sent='1', notification_skipped='1'))
+            return redirect(url_for('order_view', order_id=order_id, shipment_sent='1', notification_skipped='1',
+                                    **({'shipment_rebound': '1'} if amended else {})))
         try:
             result = _send_orders_shipped_email(package_orders, tracking_no, carrier, packing_attachment)
         except Exception as exc:

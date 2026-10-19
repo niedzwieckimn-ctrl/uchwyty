@@ -1024,7 +1024,7 @@ def register_routes(context):
             </div>
             <form id="manual-shipment" method="post" action="{{ url_for('order_mark_shipped', order_id=o['id']) }}" class="flex" style="margin-top:14px;padding:14px;border:1px solid #dbe4f2;border-radius:16px;background:#f8fbff;">
               <input type="hidden" name="shipment_form_version" value="{{ shipment_form_version }}">
-              <div><b>{% if pending_package %}Numer nowej przesyłki{% else %}Numer ostatniej przesyłki{% endif %}</b><div class="muted">{% if current_package %}Lista z {{ current_package['created_at'] }} · {{ current_package['total_qty'] }} szt.{% else %}Najpierw zapisz listę pakową.{% endif %}</div>{% if pending_package and o['tracking_no'] %}<div class="muted">Poprzednia przesyłka: {{ o['tracking_no'] }}</div>{% endif %}</div>
+              <div><b>Numer przesyłki dla aktualnej listy</b><div class="muted">{% if current_package %}Lista z {{ current_package['created_at'] }} · {{ current_package['total_qty'] }} szt.{% else %}Najpierw zapisz listę pakową.{% endif %}</div>{% if pending_package and o['tracking_no'] %}<div class="muted">Poprzednia przesyłka: {{ o['tracking_no'] }}</div>{% endif %}</div>
               {% if o['inpost_shipment_id'] %}
                 <a class="btn primary" href="{{ url_for('order_inpost_label', order_id=o['id'], bundle='1') }}">Pobierz PDF A4 + A6</a>
               {% else %}
@@ -1037,11 +1037,13 @@ def register_routes(context):
                 {% endfor %}
               </select>
               <input name="tracking_no" value="{{ '' if pending_package else (o['tracking_no'] or '') }}" placeholder="Numer aktualnej przesyłki" required style="min-width:260px;">
+              <div class="muted" style="flex-basis:100%;">Po regeneracji faktury możesz wpisać numer tej samej paczki, jeśli zawiera pozycje aktualnej listy i jedzie do tego samego odbiorcy.</div>
               <label style="display:flex;align-items:center;gap:7px;"><input type="checkbox" name="notify_customer" value="1"> Wyślij e-mail klientowi</label>
               <button class="btn primary" type="submit" {% if not current_package %}disabled{% endif %}>Zapisz numer przesyłki</button>
               {% if o['tracking_no'] %}<a class="btn" target="_blank" href="{{ carrier_tracking_url(o['carrier'], o['tracking_no']) }}">Śledź</a>{% endif %}
             </form>
-            {% if request.args.get('shipment_sent') == '1' %}<div class="hint" style="margin-top:10px;">Status i numer przesyłki zapisane.{% if request.args.get('notification_skipped') == '1' %} Powiadomienie klienta zostało pominięte.{% else %} Klient otrzymał e-mail.{% endif %}</div>{% endif %}
+            {% if request.args.get('shipment_rebound') == '1' %}<div class="hint" style="margin-top:10px;">Numer przesyłki połączono z aktualną listą i fakturą. Poprzednia lista pozostała w historii. E-mail nie został wysłany ponownie.</div>
+            {% elif request.args.get('shipment_sent') == '1' %}<div class="hint" style="margin-top:10px;">Status i numer przesyłki zapisane.{% if request.args.get('notification_skipped') == '1' %} Powiadomienie klienta zostało pominięte.{% else %} Klient otrzymał e-mail.{% endif %}</div>{% endif %}
             {% if request.args.get('shipment_email_error') %}<div class="hint" style="margin-top:10px;">Status zapisany, ale e-mail nie został wysłany: {{ request.args.get('shipment_email_error') }}</div>{% endif %}
             {% if request.args.get('confirmation_sent') == '1' %}
               <div class="hint" style="margin-top:10px;">Potwierdzenie zamówienia zostało wysłane ponownie.</div>
