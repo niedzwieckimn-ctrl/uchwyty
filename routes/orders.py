@@ -1079,7 +1079,7 @@ def register_routes(context):
             <h2>Pozycje</h2>
             <table>
               <thead>
-                <tr><th>SKU</th><th>Model / Nazwa</th><th>IloĹ›Ä‡</th><th>Cena netto</th><th>Cena brutto</th><th>WartoĹ›Ä‡ netto</th><th>WartoĹ›Ä‡ brutto</th><th>Stan teraz</th><th>W dostawie (dostÄ™pne)</th><th>Realizacja</th><th>Akcje</th></tr>
+                <tr><th>SKU</th><th>Model / Nazwa</th><th>Zamówiono</th><th>Cena netto</th><th>Cena brutto</th><th>WartoĹ›Ä‡ netto</th><th>WartoĹ›Ä‡ brutto</th><th>Stan teraz</th><th>W dostawie (dostÄ™pne)</th><th>Realizacja</th><th>Akcje</th></tr>
               </thead>
               <tbody>
                 {% set ns = namespace(total_net=0, total_gross=0) %}
@@ -1102,6 +1102,10 @@ def register_routes(context):
                           <button class="btn" type="submit">ZmieĹ„</button>
                         </form>
                       {% endif %}
+                      <div class="small" style="margin-top:8px; line-height:1.6; white-space:nowrap;" title="Zrealizowano według zapisanych faktur">
+                        <div><span class="muted">Zrealizowano:</span> <b>{{ it['qty'] - it['remaining_qty'] }} szt.</b></div>
+                        <div><span class="muted">Pozostało:</span> <b>{{ it['remaining_qty'] }} szt.</b></div>
+                      </div>
                     </td>
                     <td><span class="badge">{{ "%.2f"|format(it['net_price']) }} {{ it['currency'] or o['currency'] or 'PLN' }}</span></td>
                     <td><span class="badge">{{ "%.2f"|format(it['gross_price']) }} {{ it['currency'] or o['currency'] or 'PLN' }}</span></td>
