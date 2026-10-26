@@ -907,7 +907,10 @@ def safe_create_shipment(oid, recipient, parcel, reference, service, options, *,
                     raise InPostError('Istnieje wcześniejsze nadanie z inną zawartością lub parametrami. Zweryfikuj przesyłkę przed kolejną paczką.')
                 return json.loads(old['provider_json'])
             raise InPostError('Wynik wcześniejszego nadania jest niepewny. Sprawdź przesyłkę; nie twórz kolejnej.')
-        stable = 'fulfillment-' + str(uuid.uuid4())
+        # ShipX prints reference on the label; retain the full unique suffix
+        # for recovery while making the leading text useful to the recipient.
+        label_reference = ' '.join(str(reference or '').split()) or 'Przesylka'
+        stable = label_reference[:63].rstrip() + ' / P-' + uuid.uuid4().hex
         c.execute('INSERT INTO fulfillment_shipping_attempts VALUES(?,?,?,?,?,?,?)',
             (oid, stable, json.dumps(payload), content, 'SENDING', None, b.now_iso()))
         c.executemany('INSERT INTO fulfillment_shipping_members VALUES(?,?)', [(member, oid) for member in package_ids])
