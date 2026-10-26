@@ -23,7 +23,7 @@ def flow(tmp_path, monkeypatch):
     monkeypatch.setattr(b, '_send_orders_packed_email', lambda *a, **kw: {'ok': True})
     monkeypatch.setattr(b, 'inpost_config_summary', lambda: {'configured': True, 'missing': []})
     pickup = []
-    monkeypatch.setattr(b, 'enqueue_automatic_inpost_pickup', lambda sid: pickup.append(sid))
+    monkeypatch.setattr(b, 'enqueue_automatic_inpost_pickup', lambda sid, **kwargs: pickup.append(sid))
     monkeypatch.setattr(b, 'inpost_pickup_status', lambda sid: {'state': 'queued', 'label': 'Oczekuje na podjazd'} if str(sid) in pickup else {})
     calls = []
     def create(receiver, parcel, reference, service, options):
