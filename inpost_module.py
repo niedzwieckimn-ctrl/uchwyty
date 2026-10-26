@@ -261,6 +261,13 @@ def create_dispatch_order(shipment_ids, pickup):
             "country_code": "PL",
         },
     }
+    # Organization discovery above may perform a slow GET. Recheck the deadline
+    # after that I/O, immediately before the dispatch POST for every caller.
+    from inpost_pickups import _creation_window_open, _local_now, _pickup_meta
+    now = _local_now()
+    day = str(_pickup_meta(pickup).get('scheduled_date') or now.date().isoformat())
+    if not _creation_window_open(day, now=now):
+        raise InPostError('Aktualny termin nie pozwala zamówić podjazdu. Nie wysłano zlecenia do InPost.')
     return _request(f"/organizations/{resolved_organization_id}/dispatch_orders", "POST", payload)
 
 

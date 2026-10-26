@@ -52,6 +52,28 @@ def _parse_clock(name, default):
 def cutoff_time():
     return _parse_clock('INPOST_DAILY_PICKUP_CUTOFF','12:20')
 
+def _creation_window_open(day,*,automatic=False,now=None):
+    now=now or _local_now();cutoff=cutoff_time()
+    return (now.weekday()<5 and now.date().isoformat()==day
+            and now.time()<=clock_time(cutoff.hour,cutoff.minute,59,999999)
+            and (not automatic or now.time()>=cutoff))
+
+
+def _automatic_window_open(day,now=None):
+    return _creation_window_open(day,automatic=True,now=now)
+
+
+def _worker_sleep_seconds(now=None):
+    now=now or _local_now();cutoff=cutoff_time()
+    boundary=now.replace(hour=cutoff.hour,minute=cutoff.minute,second=0,microsecond=0)
+    seconds=(boundary-now).total_seconds()
+    if now.weekday()<5:
+        # Wake at the boundary, with short checks only in the surrounding minute.
+        if 0<seconds<=60:return min(10.0,seconds)
+        if -60<seconds<=0:return min(10.0,60+seconds)
+    return 60.0
+
+
 def next_business_day(value):
     value=value+timedelta(days=1)
     while value.weekday()>=5:
@@ -173,7 +195,7 @@ class Store:
         finally:c.close()
     def update(self,job,release=True,**values):
         values['updated_at']=self.b.now_iso()
-        if release:values.update(claim_token=None,lease_until=0,next_check=time.time()+60)
+        if release:values.update(claim_token=None,lease_until=0,next_check=values.get('next_check',time.time()+60))
         if self.b.supabase_enabled():
             result=self.b.supabase_request('/rest/v1/rpc/update_inpost_pickup',method='POST',payload={'p_shipment':job['shipment_id'],'p_token':job['claim_token'],'p_values':values})
             if not result:raise RuntimeError('Utracono blokadę obsługi podjazdu')
@@ -189,7 +211,41 @@ class Store:
     def replace_payload(self,job,payload):
         claimed=self.claim(job['shipment_id'])
         if not claimed:return False
-        self.update(claimed,pickup_json=json.dumps(payload,ensure_ascii=False),state='pending',error='')
+        # Recheck under the lease: an uncertain or accepted request must never
+        # become a fresh request merely because its planned day has expired.
+        if int(claimed.get('attempted') or 0) or claimed.get('dispatch_id') or claimed.get('state')!='pending':
+            self.update(claimed)
+            return False
+        if _job_date(claimed)!=_job_date(job):
+            self.update(claimed)
+            return False
+        target_day=_pickup_meta(payload).get('scheduled_date')
+        payload=_job_payload(claimed)
+        meta=dict(_pickup_meta(payload));meta['scheduled_date']=target_day
+        payload[DAILY_META]=meta
+        encoded=json.dumps(payload,ensure_ascii=False)
+        previous=_job_date(claimed)
+        message=(f'Nie zlecono podjazdu w terminie dla {previous}. '
+                 f'Nowy plan: {_pickup_meta(payload).get("scheduled_date")}. '
+                 'Kurier nie jest jeszcze zamówiony.')
+        if self.b.supabase_enabled():
+            # Older installed RPC versions silently ignore pickup_json. Use a
+            # single conditional update and verify its returned representation.
+            result=self.b.supabase_request('/rest/v1/inpost_pickup_jobs',method='PATCH',
+                params={'shipment_id':'eq.'+str(claimed['shipment_id']),
+                        'claim_token':'eq.'+str(claimed['claim_token']),
+                        'attempted':'eq.0','dispatch_id':'is.null','state':'eq.pending',
+                        'select':'shipment_id,pickup_json'},
+                payload={'pickup_json':encoded,'error':message,
+                         'updated_at':self.b.now_iso(),'claim_token':None,
+                         'lease_until':0,'next_check':time.time()+60},
+                prefer='return=representation')
+            if (not isinstance(result,list) or len(result)!=1
+                    or str(result[0].get('shipment_id'))!=str(claimed['shipment_id'])
+                    or _job_payload(result[0])!=payload):
+                raise RuntimeError('Nie potwierdzono zapisu nowego terminu podjazdu. Sprawdź kolejkę.')
+            return True
+        self.update(claimed,pickup_json=encoded,state='pending',error=message)
         return True
 
 def _result_values(result):
@@ -208,7 +264,7 @@ def _update_group(store,rows,values,leader=None):
         if claimed:
             store.update(claimed,**values)
 
-def process_date(b,day):
+def process_date(b,day,*,automatic=False,allow_create=True):
     """Create one DispatchOrder for every parcel planned for one workday."""
     store=Store(b)
     rows=sorted((row for row in store.rows() if _job_date(row)==day),
@@ -227,6 +283,15 @@ def process_date(b,day):
                 store.update(leader,**values);_update_group(store,rows,values,leader)
                 return {'ok':False,'message':values['error']}
         else:
+            if not allow_create:
+                message='Podjazd nie został jeszcze zamówiony. Sprawdzono tylko wcześniejsze zlecenie.'
+                store.update(leader,state='pending',error=message)
+                return {'ok':False,'message':message}
+            if any(str(row['shipment_id'])!=str(leader['shipment_id']) and
+                   (int(row.get('attempted') or 0) or row.get('dispatch_id')) for row in rows):
+                message='Część tej grupy ma już próbę podjazdu. Sprawdź wcześniejsze zlecenie; nie zamówiono kolejnego kuriera.'
+                store.update(leader,state='pending',error=message)
+                return {'ok':False,'message':message}
             pickup=_job_payload(leader)
             try:validate(pickup)
             except ValueError as exc:
@@ -237,13 +302,24 @@ def process_date(b,day):
             for row in rows:
                 shipment=b.inpost_get_shipment(row['shipment_id'])
                 if str(shipment.get('status') or '').lower()!='confirmed':
-                    store.update(leader,state='pending',error='InPost przygotowuje jedną z przesyłek; podjazd zostanie zamówiony po jej potwierdzeniu.')
+                    retry={'next_check':time.time()+10} if automatic and _automatic_window_open(day) else {}
+                    store.update(leader,state='pending',error='InPost przygotowuje jedną z przesyłek; podjazd zostanie zamówiony po jej potwierdzeniu.',**retry)
                     return {'ok':False,'message':'Jedna z przesyłek nie jest jeszcze potwierdzona przez InPost.'}
                 shipment_ids.append(str(row['shipment_id']))
+            if not _creation_window_open(day,automatic=automatic):
+                message='Termin tej grupy nie pozwala teraz zamówić podjazdu. Nie wysłano zlecenia do InPost.'
+                store.update(leader,state='pending',error=message)
+                return {'ok':False,'message':message}
             # The leader is the durable at-most-once marker for the whole day.
             # After this write a timeout is reconciled by GET, never re-POSTed.
             store.update(leader,release=False,attempted=1,state='unknown')
             leader['attempted']=1
+            if not _creation_window_open(day,automatic=automatic):
+                # The durable intent may have taken the rest of the allowed minute.
+                # Preserve its marker; never start a late POST or reset uncertain work.
+                message='Minął termin podjazdu podczas zapisu próby. Nie wysłano zlecenia; sprawdź podjazd przed kolejną próbą.'
+                store.update(leader,state='unknown',error=message)
+                return {'ok':False,'message':message}
             result=b.inpost_create_dispatch_order(shipment_ids,pickup)
         values=_result_values(result)
         store.update(leader,**values)
@@ -256,14 +332,15 @@ def process_date(b,day):
             store.update(leader,**values);_update_group(store,rows,values,leader)
         else:
             state='unknown' if int(leader.get('attempted') or 0) or leader.get('dispatch_id') else 'pending'
-            store.update(leader,state=state,error=str(exc))
+            retry={'next_check':time.time()+10} if automatic and state=='pending' and _automatic_window_open(day) else {}
+            store.update(leader,state=state,error=str(exc),**retry)
         return {'ok':False,'message':str(exc)}
 
-def process_one(b,sid):
+def process_one(b,sid,*,allow_create=True):
     store=Store(b)
     current=next(iter(store.rows(sid)),None)
     if current and _job_date(current):
-        return process_date(b,_job_date(current))
+        return process_date(b,_job_date(current),allow_create=allow_create)
     job=store.claim(sid)
     if not job:return
     try:
@@ -281,6 +358,11 @@ def process_one(b,sid):
                 store.update(job,state='unknown',error='Nie potwierdzono wyniku poprzedniej próby. Nie ponowiono zamówienia kuriera. Sprawdź historię w InPost.')
                 return
         else:
+            if not allow_create:
+                message='Podjazd nie został jeszcze zamówiony. Sprawdzono tylko wcześniejsze zlecenie.'
+                store.update(job,state='pending',error=message)
+                return {'ok':False,'message':message}
+            day=_local_now().date().isoformat()
             pickup=json.loads(job['pickup_json'])
             try:validate(pickup)
             except ValueError as exc:
@@ -290,10 +372,18 @@ def process_one(b,sid):
             if status!='confirmed':
                 store.update(job,state='pending',error='InPost przygotowuje przesyłkę; podjazd zostanie zamówiony po jej potwierdzeniu.')
                 return
+            if not _creation_window_open(day):
+                message='Termin nie pozwala teraz zamówić podjazdu. Nie wysłano zlecenia do InPost.'
+                store.update(job,state='pending',error=message)
+                return {'ok':False,'message':message}
             # A restart after this commit is uncertain, even if POST never ran.
             # Such a job is reconciled with GET, never blindly resubmitted.
             store.update(job,release=False,attempted=1,state='unknown')
             job['attempted']=1
+            if not _creation_window_open(day):
+                message='Minął termin podjazdu podczas zapisu próby. Nie wysłano zlecenia; sprawdź podjazd przed kolejną próbą.'
+                store.update(job,state='unknown',error=message)
+                return {'ok':False,'message':message}
             result=b.inpost_create_dispatch_order([str(sid)],pickup)
         store.update(job,**_result_values(result))
     except Exception as exc:
@@ -331,9 +421,16 @@ def dashboard_state(b,now=None):
     def summary(day,items):
         attempted=any(int(row.get('attempted') or 0) or row.get('dispatch_id') for row in items)
         states={str(row.get('state') or '') for row in items}
+        missed=(not attempted and day<=today and
+                (day<today or now.time()>clock_time(cutoff_time().hour,cutoff_time().minute,59,999999)))
+        error=next((str(row.get('error')) for row in items if row.get('error')),'')
+        if missed:
+            error=f'Nie zlecono podjazdu do {cutoff_time().strftime("%H:%M")}. Kurier nie jest zamówiony.'
         return {'date':day,'parcel_count':sum(_parcel_count(row) for row in items),
                 'shipment_count':len(items),'ordered':attempted,
-                'state':('problem' if states & {'unknown','rejected','configuration_error'} else
+                'confirmed':all(row.get('dispatch_id') and row.get('state') in {'new','sent','collected'} for row in items),
+                'error':error,
+                'state':('problem' if missed or states & {'unknown','rejected','configuration_error'} else
                          'ordered' if attempted else 'planned'),
                 'label':next((LABELS.get(row.get('state'),row.get('state')) for row in items
                               if row.get('state')!='pending'),LABELS['pending'])}
@@ -358,11 +455,14 @@ def process_due(b):
     for job in rows:
         day=_job_date(job)
         if day:groups.setdefault(day,[]).append(job)
-    today=now.date().isoformat();cutoff=cutoff_time()
     for day,jobs in sorted(groups.items()):
+        # Legacy reconciliation and remote reads may cross the daily deadline.
+        # Do not decide using the timestamp captured before those operations.
+        now=_local_now();epoch=time.time()
+        today=now.date().isoformat();cutoff=cutoff_time()
         needs_reconciliation=any(job.get('state') in {'unknown','new'} for job in jobs)
         if needs_reconciliation and any(float(job.get('next_check') or 0)<=epoch for job in jobs):
-            try:process_date(b,day)
+            try:process_date(b,day,automatic=True)
             except Exception:b.app.logger.exception('Nie udało się uzgodnić dziennego podjazdu InPost')
             continue
         if day<today and not _closed(rows,day):
@@ -371,7 +471,7 @@ def process_due(b):
         due=now.time()>=cutoff
         still_open=now.time()<=clock_time(cutoff.hour,cutoff.minute,59,999999)
         if due and still_open and any(float(job.get('next_check') or 0)<=epoch for job in jobs):
-            try:process_date(b,day)
+            try:process_date(b,day,automatic=True)
             except Exception:b.app.logger.exception('Nie udało się zamówić dziennego podjazdu InPost')
         elif not still_open and not _closed(rows,day):
             _reschedule_expired(store,jobs,now)
@@ -388,5 +488,5 @@ def start_worker(b):
                 try:
                     with b.app.app_context():process_due(b)
                 except Exception:b.app.logger.exception('Kolejka podjazdów InPost wymaga sprawdzenia')
-                time.sleep(60)
+                time.sleep(_worker_sleep_seconds())
         _worker=threading.Thread(target=run,name='inpost-pickups',daemon=True);_worker.start()
