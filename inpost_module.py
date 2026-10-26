@@ -131,11 +131,14 @@ def organization_id():
     return resolved
 
 
-def split_street_building(value):
+def split_street_building(value, *, strict=False):
     text = (value or "").strip().rstrip(",")
-    match = re.match(r"^(.*?)[,\s]+(\d+[A-Za-z0-9/\-]*)$", text)
-    if match:
-        return match.group(1).strip(), match.group(2).strip()
+    match = re.fullmatch(r"(.*?)[,\s]+(\d+[A-Za-z0-9/.\-]*)", text)
+    street = match.group(1).strip().rstrip(",").strip() if match else ""
+    if street:
+        return street, match.group(2).strip()
+    if strict:
+        raise InPostError("Podaj ulicę i numer budynku/lokalu, np. Długa 10/2.")
     return text, "1"
 
 
