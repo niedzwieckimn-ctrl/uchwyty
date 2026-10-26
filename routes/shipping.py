@@ -226,13 +226,12 @@ def register_routes(context):
                                     raise InPostError('Uzupełnij dane odbiorcy: ' + labels[key] + '. W razie potrzeby wybierz innego odbiorcę.')
                             if not re.fullmatch(r'\d{2}-\d{3}', receiver['post_code']):
                                 raise InPostError('Kod pocztowy odbiorcy musi mieć format 00-000.')
-                            from inpost_module import normalize_polish_phone
+                            from inpost_module import normalize_polish_phone, split_street_building
                             if len(normalize_polish_phone(receiver['phone'])) != 9:
                                 raise InPostError('Podaj 9-cyfrowy telefon odbiorcy (może zawierać +48).')
                             if not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', receiver['email']):
                                 raise InPostError('Podaj poprawny e-mail odbiorcy.')
-                            if not re.search(r'[,\s]+\d+[A-Za-z0-9/\-]*$', receiver['street']):
-                                raise InPostError('Podaj ulicę i numer budynku/lokalu, np. Długa 10/2.')
+                            split_street_building(receiver['street'], strict=True)
                             recipient_selection = {'mode': recipient_mode, 'scope': recipient_context['scope']}
                     allowed_services = {
                         "inpost_courier_standard", "inpost_courier_express_1700",
