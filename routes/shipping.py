@@ -496,25 +496,50 @@ def register_routes(context):
         backend=sys.modules["app"] if "app" in sys.modules else sys.modules["__main__"]
         store=inpost_pickups.Store(backend)
         pickup=inpost_pickups.company_pickup(backend)
+        now=inpost_pickups._local_now()
+        cutoff=inpost_pickups.cutoff_time()
+        def can_create(job):
+            day=inpost_pickups._job_date(job)
+            return (now.weekday()<5 and (not day or day==now.date().isoformat())
+                    and now.time()<=cutoff.replace(second=59,microsecond=999999))
         message=""
         if request.method=="POST":
             sid=norm(request.form.get("shipment_id"))
-            if request.form.get("action")=="correct":
+            current=next(iter(store.rows(sid)),None) if sid else None
+            if not current:
+                return "Nie znaleziono przesyłki w kolejce podjazdów. Odśwież widok.",404
+            corrected=request.form.get("action")=="correct"
+            if corrected:
                 supplied={key:norm(request.form.get(key)) for key in pickup}
                 try:
                     if not store.correct_address(sid,supplied):
                         return "Nie można zmienić danych już wysłanego lub nierozstrzygniętego zlecenia.",409
                 except ValueError as exc:
                     return str(exc),400
-            inpost_pickups.process_one(backend,sid)
-            message="Sprawdzono kolejkę podjazdów. Aktualny wynik jest pokazany przy przesyłce."
+            current=next(iter(store.rows(sid)),None)
+            if not current:
+                return "Przesyłka zmieniła się. Odśwież widok podjazdów.",409
+            day=inpost_pickups._job_date(current)
+            group=[row for row in store.rows() if inpost_pickups._job_date(row)==day] if day else [current]
+            reconcile=any(int(row.get('attempted') or 0) or row.get('dispatch_id') for row in group)
+            allow_create=can_create(current)
+            if allow_create or reconcile:
+                result=inpost_pickups.process_one(backend,sid,allow_create=allow_create)
+                message=(result or {}).get('message') or "Sprawdzono wcześniejsze zlecenie. Aktualny wynik jest pokazany przy przesyłce."
+            else:
+                prefix="Dane odbioru zapisane. " if corrected else ""
+                if day and day>now.date().isoformat():
+                    message=prefix+f"Podjazd jest zaplanowany na {day}. Nie zamówiono kuriera wcześniej."
+                else:
+                    message=prefix+f"Nowy podjazd można zamówić w zaplanowanym dniu roboczym do {cutoff:%H:%M}. Nie wysłano zlecenia do InPost."
         jobs=store.rows()
         for job in jobs:
             job["label"]=inpost_pickups.LABELS.get(job["state"],job["state"])
             job["pickup"]=json.loads(job["pickup_json"])
+            job["can_create"]=can_create(job)
         return render_template_string("""{% extends 'base.html' %}{% block content %}
           <div class="card"><h1>Podjazdy kuriera InPost</h1>
-          <p>Po przygotowaniu etykiety aplikacja czeka na potwierdzenie przesyłki przez InPost i zleca podjazd.
+          <p>Paczki są łączone w dzienny podjazd. Nowe zlecenie można wysłać do {{ cutoff }} w zaplanowanym dniu odbioru.
           Utworzenie etykiety ani zlecenia podjazdu nie oznacza fizycznego wydania towaru.</p>
           <a class="btn" href="{{ url_for('orders') }}">Zamówienia</a>{% if message %}<p>{{ message }}</p>{% endif %}</div>
           {% for job in jobs %}<div class="card"><h2>Przesyłka {{ job.shipment_id }}</h2>
@@ -525,10 +550,10 @@ def register_routes(context):
           <form method="post"><input type="hidden" name="shipment_id" value="{{ job.shipment_id }}"><input type="hidden" name="action" value="correct">
           {% for key,label in [('name','Nazwa'),('street','Ulica i numer'),('post_code','Kod pocztowy'),('city','Miasto'),('phone','Telefon'),('email','E-mail'),('comment','Uwagi')] %}
           <label>{{ label }}<input name="{{ key }}" value="{{ job.pickup.get(key,'') }}" {% if key not in ['email','comment'] %}required{% endif %}></label>{% endfor %}
-          <button class="btn" type="submit">Zapisz dane i zleć podjazd</button></form>
+          <button class="btn" type="submit">{{ 'Zapisz dane i zamów kuriera' if job.can_create else 'Zapisz dane odbioru' }}</button></form>
           {% elif job.state not in ['rejected','collected'] %}<form method="post"><input type="hidden" name="shipment_id" value="{{ job.shipment_id }}"><button class="btn" type="submit">Sprawdź wcześniejsze zlecenie</button></form>{% endif %}
           </div>{% endfor %}{% if not jobs %}<div class="card">Brak przesyłek w kolejce automatycznych podjazdów.</div>{% endif %}
-        {% endblock %}""",title="Podjazdy InPost",jobs=jobs,message=message)
+        {% endblock %}""",title="Podjazdy InPost",jobs=jobs,message=message,cutoff=cutoff.strftime('%H:%M'))
 
 
     @app.post("/orders/<int:order_id>/shipped")
