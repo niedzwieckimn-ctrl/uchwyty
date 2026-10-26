@@ -13,6 +13,8 @@ import uuid
 from datetime import datetime, time as clock_time, timedelta
 from zoneinfo import ZoneInfo
 
+from inpost_tracking import COLLECTED
+
 WARSAW = ZoneInfo('Europe/Warsaw')
 DAILY_META = '_daily_pickup'
 
@@ -98,7 +100,7 @@ def _parcel_count(job):
 def _closed(rows,scheduled_date):
     return any(_job_date(row)==scheduled_date and
                (int(row.get('attempted') or 0) or row.get('dispatch_id') or
-                row.get('state') in {'new','sent','unknown','collected'}) for row in rows)
+                row.get('state') in {'new','sent','unknown'}) for row in rows)
 
 def scheduled_date(rows=None,now=None):
     now=now or _local_now();today=now.date()
@@ -267,9 +269,35 @@ def _update_group(store,rows,values,leader=None):
 def process_date(b,day,*,automatic=False,allow_create=True):
     """Create one DispatchOrder for every parcel planned for one workday."""
     store=Store(b)
-    rows=sorted((row for row in store.rows() if _job_date(row)==day),
+    rows=sorted((row for row in store.rows() if _job_date(row)==day and row.get('state')!='collected'),
                 key=lambda row:(row.get('created_at') or '',str(row['shipment_id'])))
     if not rows:return {'ok':False,'message':'Brak przesyłek zaplanowanych na ten podjazd.'}
+    observations={}
+    # Retire only unattempted parcels. Never discard a durable uncertain POST
+    # marker or change the membership of a dispatch already being reconciled.
+    if allow_create and not any(int(r.get('attempted') or 0) or r.get('dispatch_id') for r in rows):
+        for row in rows:
+            try:
+                shipment=b.inpost_get_shipment(row['shipment_id'])
+                observations[str(row['shipment_id'])]=shipment
+                if str(shipment.get('status') or '').lower() not in COLLECTED:continue
+                claimed=store.claim(row['shipment_id'])
+                if not claimed:
+                    return {'ok':False,'message':'Trwa sprawdzanie odbioru przesyłki. Spróbuj za chwilę.'}
+                if int(claimed.get('attempted') or 0) or claimed.get('dispatch_id'):
+                    store.update(claimed)
+                    return {'ok':False,'message':'Podjazd został już rozpoczęty. Sprawdź wcześniejsze zlecenie.'}
+                store.update(claimed,state='collected',error='')
+            except Exception as exc:
+                claimed=store.claim(row['shipment_id'])
+                if claimed:
+                    retry={'next_check':time.time()+10} if automatic and _automatic_window_open(day) else {}
+                    store.update(claimed,error=str(exc),**retry)
+                return {'ok':False,'message':str(exc)}
+        rows=[r for r in store.rows() if _job_date(r)==day and r.get('state')!='collected']
+        rows.sort(key=lambda r:(r.get('created_at') or '',str(r['shipment_id'])))
+        if not rows:
+            return {'ok':True,'message':'InPost potwierdził odbiór wszystkich paczek. Nie zamówiono kolejnego podjazdu.'}
     leader=store.claim(rows[0]['shipment_id'])
     if not leader:
         return {'ok':False,'message':'Podjazd jest już sprawdzany. Odśwież widok za chwilę.'}
@@ -300,7 +328,7 @@ def process_date(b,day,*,automatic=False,allow_create=True):
                 return {'ok':False,'message':str(exc)}
             shipment_ids=[]
             for row in rows:
-                shipment=b.inpost_get_shipment(row['shipment_id'])
+                shipment=observations.get(str(row['shipment_id'])) or b.inpost_get_shipment(row['shipment_id'])
                 if str(shipment.get('status') or '').lower()!='confirmed':
                     retry={'next_check':time.time()+10} if automatic and _automatic_window_open(day) else {}
                     store.update(leader,state='pending',error='InPost przygotowuje jedną z przesyłek; podjazd zostanie zamówiony po jej potwierdzeniu.',**retry)
@@ -369,6 +397,9 @@ def process_one(b,sid,*,allow_create=True):
                 store.update(job,state='configuration_error',error=str(exc));return
             shipment=b.inpost_get_shipment(sid)
             status=str(shipment.get('status') or '').lower()
+            if status in COLLECTED:
+                store.update(job,state='collected',error='')
+                return {'ok':True,'message':'InPost potwierdził odbiór. Nie zamówiono podjazdu.'}
             if status!='confirmed':
                 store.update(job,state='pending',error='InPost przygotowuje przesyłkę; podjazd zostanie zamówiony po jej potwierdzeniu.')
                 return
@@ -416,7 +447,7 @@ def dashboard_state(b,now=None):
     groups={}
     for row in rows:
         day=_job_date(row)
-        if not day:continue
+        if not day or row.get('state')=='collected':continue
         group=groups.setdefault(day,[]);group.append(row)
     def summary(day,items):
         attempted=any(int(row.get('attempted') or 0) or row.get('dispatch_id') for row in items)
@@ -454,7 +485,7 @@ def process_due(b):
     groups={}
     for job in rows:
         day=_job_date(job)
-        if day:groups.setdefault(day,[]).append(job)
+        if day and job.get('state')!='collected':groups.setdefault(day,[]).append(job)
     for day,jobs in sorted(groups.items()):
         # Legacy reconciliation and remote reads may cross the daily deadline.
         # Do not decide using the timestamp captured before those operations.

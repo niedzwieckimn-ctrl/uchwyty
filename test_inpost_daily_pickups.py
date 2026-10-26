@@ -337,3 +337,52 @@ def test_legacy_slow_operation_does_not_create_late_pickup(monkeypatch,tmp_path,
     assert result['ok'] is False and backend.created==[]
     assert row['attempted']==int(slow_phase=='intent')
     assert row['state']==('unknown' if slow_phase=='intent' else 'pending')
+
+@pytest.mark.parametrize('collected_sid',['11','12'])
+@pytest.mark.parametrize('status',['collected_from_sender','delivered','adopted_at_sorting_center'])
+def test_collected_parcel_does_not_block_remaining(tmp_path,monkeypatch,collected_sid,status):
+    backend,store=setup_backend(tmp_path,monkeypatch,at(10,0))
+    store.enqueue('11',pickup_data());store.enqueue('12',pickup_data())
+    monkeypatch.setattr(backend,'inpost_get_shipment',lambda sid:{'status':status if sid==collected_sid else 'confirmed'})
+    assert pickups.order_today(backend)['ok']
+    assert backend.created==[[sid for sid in ['11','12'] if sid!=collected_sid]]
+    assert store.rows(collected_sid)[0]['state']=='collected'
+    assert store.rows(collected_sid)[0]['attempted']==0
+    assert pickups.dashboard_state(backend)['today']['parcel_count']==1
+
+
+def test_after_cutoff_parcel_collected_before_tomorrow_never_orders(tmp_path,monkeypatch):
+    backend,store=setup_backend(tmp_path,monkeypatch,at(13,0))
+    now=clock(monkeypatch,at(13,0))
+    store.enqueue('11',pickup_data())
+    monkeypatch.setattr(backend,'inpost_get_shipment',lambda sid:{'status':'taken_by_courier'})
+    now[0]=at(12,20,12)
+    pickups.process_due(backend)
+    assert backend.created==[]
+    assert store.rows('11')[0]['state']=='collected'
+    assert pickups.dashboard_state(backend)['today'] is None
+    now[0]=at(12,20,13)
+    pickups.process_due(backend)
+    assert backend.created==[]
+    store.enqueue('12',pickup_data())
+    assert pickups._job_date(store.rows('12')[0])=='2026-10-13'
+
+
+def test_unknown_status_or_read_failure_never_becomes_collected(tmp_path,monkeypatch):
+    backend,store=setup_backend(tmp_path,monkeypatch,at(10,0))
+    store.enqueue('11',pickup_data())
+    monkeypatch.setattr(backend,'inpost_get_shipment',lambda sid:{'status':'mystery'})
+    assert not pickups.order_today(backend)['ok']
+    assert store.rows('11')[0]['state']=='pending'
+    assert backend.created==[]
+
+
+def test_collection_does_not_erase_uncertain_dispatch(tmp_path,monkeypatch):
+    backend,store=setup_backend(tmp_path,monkeypatch,at(10,0))
+    store.enqueue('11',pickup_data())
+    job=store.claim('11');store.update(job,state='unknown',attempted=1,next_check=0)
+    monkeypatch.setattr(backend,'inpost_get_shipment',lambda sid:{'status':'delivered'})
+    assert not pickups.order_today(backend)['ok']
+    assert store.rows('11')[0]['attempted']==1
+    assert store.rows('11')[0]['state']=='unknown'
+    assert backend.created==[]
