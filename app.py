@@ -5803,14 +5803,56 @@ def prepare_invoice_edit_items(edit_items: list[dict], form, invoice_type="domes
 
 CLIENT_API_PATHS = {
     "/api/client_stock_catalog", "/api/client_search_log", "/api/client/orders",
+    "/api/client/architect-code/quote", "/api/client/architect-sales",
     "/api/order_lookup", "/api/client_invoices", "/api/client_order_email",
     "/api/client/profile", "/api/client/search-aliases",
+}
+ARCHITECT_ALLOWED_ORIGINS = {
+    value.strip().rstrip("/")
+    for value in os.environ.get("ARCHITECT_ALLOWED_ORIGINS", "").split(",")
+    if value.strip()
 }
 _rate_lock = threading.Lock()
 _rate_hits = {}
 _client_auth_cache_lock = threading.Lock()
 _client_auth_cache = {}
 CLIENT_AUTH_CACHE_TTL_SEC = 60
+
+
+def _active_client_membership(auth_user_id: str) -> dict | None:
+    """Resolve B2B access from the existing server-owned client_accounts table.
+
+    A valid Supabase session by itself must not grant access to stock, orders,
+    invoices, or product images. This mapping already exists in production.
+    """
+    if not auth_user_id or not supabase_enabled():
+        return None
+    rows = supabase_request(
+        "/rest/v1/client_accounts",
+        method="GET",
+        params={
+            "select": "customer_id,is_active",
+            "user_id": f"eq.{auth_user_id}",
+            "is_active": "eq.true",
+            "limit": 1,
+        },
+        timeout=10,
+    ) or []
+    if not isinstance(rows, list) or not rows:
+        return None
+    customer_id = to_int(rows[0].get("customer_id"), 0)
+    return {"customer_id": customer_id} if customer_id > 0 else None
+
+
+def architect_order_redemption(order_id: int) -> dict | None:
+    """Durable promotion link; absence is meaningful only after a successful read."""
+    if not supabase_enabled():
+        return None
+    rows = supabase_request("/rest/v1/architect_code_redemptions", params={
+        "select": "id,code_id,distributor_id,program_version,created_at",
+        "order_id": f"eq.{int(order_id)}", "limit": 1,
+    }, timeout=10) or []
+    return rows[0] if rows else None
 
 
 def _rate_limit(bucket: str, limit: int, window_seconds: int):
@@ -5887,10 +5929,20 @@ def security_gate():
         or path.startswith("/api/client/orders/")
         or path.startswith("/api/client/product-images/")
     )
+    if path.startswith("/api/architect/"):
+        if request.method == "OPTIONS":
+            return None
+        if not _rate_limit("architect_api", 120, 60):
+            return jsonify(ok=False, error="Zbyt wiele żądań"), 429
+        user = _authenticated_client_user()
+        if not user:
+            return jsonify(ok=False, error="Brak autoryzacji"), 401
+        g.architect_user = user
+        return None
     if is_client_api:
         if request.method == "OPTIONS":
             return None
-        if path == "/api/client/orders" and not _rate_limit("client_orders", 12, 10 * 60):
+        if path == "/api/client/orders" and request.method == "POST" and not _rate_limit("client_orders", 12, 10 * 60):
             return jsonify(ok=False, error="Zbyt wiele prób złożenia zamówienia"), 429
         if not _rate_limit("client_api", 180, 60):
             return jsonify(ok=False, error="Zbyt wiele żądań"), 429
@@ -5907,7 +5959,15 @@ def security_gate():
                 )
                 return redirect(panel_url, code=302)
             return jsonify(ok=False, error="Brak autoryzacji"), 401
+        try:
+            membership = _active_client_membership(user["id"])
+        except Exception:
+            app.logger.exception("Nie udało się sprawdzić członkostwa dystrybutora")
+            return jsonify(ok=False, error="Weryfikacja uprawnień jest niedostępna"), 503
+        if not membership:
+            return jsonify(ok=False, error="Brak aktywnego dostępu dystrybutora"), 403
         g.client_user = user
+        g.client_customer_id = membership["customer_id"]
         return None
 
     if path == "/logout":
@@ -6016,6 +6076,7 @@ BASE = r"""
           <a href="{{ url_for('products') }}">Produkty</a>
           <a href="{{ url_for('customers') }}">Klienci</a>
           <a href="{{ url_for('pricing') }}">Cennik</a>
+          <a href="{{ url_for('architects_admin') }}">Architekci</a>
           <a href="{{ url_for('company') }}">Dane mojej firmy</a>
           <a href="{{ url_for('cash_flow') }}">Cash flow</a>
           <a href="{{ url_for('orderchamp_sync_v2.page') }}">Orderchamp</a>
@@ -6546,7 +6607,14 @@ def auto_sync_after_write(response):
             or request.path.startswith("/api/invoices/")
             or request.path.startswith("/api/client/orders/")
         )
-        if is_client_api:
+        if request.path.startswith("/api/architect/"):
+            origin = norm(request.headers.get("Origin")).rstrip("/")
+            if origin and origin in ARCHITECT_ALLOWED_ORIGINS:
+                response.headers["Access-Control-Allow-Origin"] = origin
+                response.headers["Vary"] = "Origin"
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        elif is_client_api:
             origin = norm(request.headers.get("Origin")).rstrip("/")
             if origin and origin in CLIENT_ALLOWED_ORIGINS:
                 response.headers["Access-Control-Allow-Origin"] = origin
@@ -6560,12 +6628,16 @@ def auto_sync_after_write(response):
 
         no_auto_sync_paths = {
             "/api/client_search_log", "/api/client_order_email", "/api/client/profile", "/searches/action",
+            "/api/client/architect-code/quote", "/api/client/architect-sales", "/architects",
             # Authentication and audio processing do not modify business rows.
             # Their successful POST responses must not publish the entire DB.
             "/login", "/api/internal/ai/voice/transcribe", "/api/internal/ai/voice/synthesize",
         }
         if (response.status_code < 400 and request.method in ("POST", "PUT", "PATCH", "DELETE")
                 and request.path not in no_auto_sync_paths
+                and not request.path.startswith("/api/architect/")
+                and not request.path.startswith("/api/admin/architects")
+                and not getattr(g, "architect_program_write", False)
                 and not request.path.startswith("/api/admin/orderchamp/")
                 and request.path not in {"/api/internal/orderchamp/tick", "/webhooks/orderchamp"}):
             trigger_background_supabase_sync(reason=f"{request.method} {request.path}")
@@ -7928,6 +8000,8 @@ def _authenticated_client_user() -> dict | None:
                 "id": str(payload.get("id")),
                 "email": email,
                 "name": norm(metadata.get("full_name") or metadata.get("name")) or email.split("@")[0],
+                "email_confirmed": bool(payload.get("email_confirmed_at") or payload.get("confirmed_at")),
+                "metadata": metadata,
             }
             if len(_client_auth_cache) >= 500:
                 _client_auth_cache.clear()
@@ -7941,8 +8015,14 @@ def _authenticated_client_user() -> dict | None:
             return None
 
 
-def _client_profile_for_email(email: str) -> dict:
+def _client_profile_for_email(email: str, customer_id=None) -> dict:
     email = _email_key(email)
+    bound_customer_id = (
+        to_int(customer_id, 0) or (
+            to_int(getattr(g, "client_customer_id", 0), 0)
+            if has_request_context() else 0
+        )
+    )
     fallback = {
         "id": None,
         "name": email.split("@")[0] if email else "",
@@ -7959,10 +8039,13 @@ def _client_profile_for_email(email: str) -> dict:
 
     params = {
         "select": "id,name,address,phone,email,nip,language,price_list",
-        "email": f"ilike.{email}",
-        "order": "id.desc",
         "limit": 1,
     }
+    if bound_customer_id:
+        params["id"] = f"eq.{bound_customer_id}"
+    else:
+        params["email"] = f"ilike.{email}"
+        params["order"] = "id.desc"
     try:
         rows = supabase_request("/rest/v1/customers", params=params, timeout=20) or []
     except urllib.error.HTTPError as exc:
@@ -7974,6 +8057,8 @@ def _client_profile_for_email(email: str) -> dict:
         rows = supabase_request("/rest/v1/customers", params=fallback_params, timeout=20) or []
 
     if not isinstance(rows, list) or not rows:
+        if bound_customer_id:
+            raise RuntimeError("Powiązany dystrybutor nie istnieje")
         return fallback
     row = dict(rows[0])
     language = normalize_client_language(row.get("language"))
@@ -8010,7 +8095,7 @@ def _order_by_idempotency_key(idempotency_key: str) -> dict | None:
     c = conn()
     try:
         cur = c.cursor()
-        cur.execute("SELECT id, order_no, customer_email FROM orders WHERE idempotency_key=? LIMIT 1", (idempotency_key,))
+        cur.execute("SELECT id, order_no, customer_email, customer_id FROM orders WHERE idempotency_key=? LIMIT 1", (idempotency_key,))
         row = cur.fetchone()
         if row:
             return dict(row)
@@ -8020,7 +8105,7 @@ def _order_by_idempotency_key(idempotency_key: str) -> dict | None:
         return None
     rows = supabase_request(
         "/rest/v1/orders",
-        params={"select": "id,order_no,customer_email", "idempotency_key": f"eq.{idempotency_key}", "limit": 1},
+        params={"select": "id,order_no,customer_email,customer_id", "idempotency_key": f"eq.{idempotency_key}", "limit": 1},
     )
     return dict(rows[0]) if isinstance(rows, list) and rows else None
 
@@ -8145,7 +8230,7 @@ def _api_order_lookup_impl():
         c.close()
         return jsonify(ok=False, error="Nie znaleziono zamĂłwienia"), 404
     order = dict(o)
-    if _email_key(order.get("customer_email")) != _email_key(g.client_user["email"]):
+    if to_int(order.get("customer_id"), 0) != to_int(g.client_customer_id, 0):
         c.close()
         return jsonify(ok=False, error="Brak dostępu"), 403
 
@@ -8244,8 +8329,13 @@ def _api_order_lookup_impl():
         else:
             it["realization_label"] = "0 szt."
 
+    promo_order = bool(architect_order_redemption(order_id))
+    if promo_order:
+        for it in items:
+            it["line_value_gross"] = money_float(gross_from_net_23(it["line_value_net"]))
     total_net = round(sum(float(it.get("line_value_net") or 0) for it in items), 2)
-    total_gross = round(sum(float(it.get("line_value_gross") or 0) for it in items), 2)
+    total_gross = money_float(gross_from_net_23(total_net)) if promo_order else round(
+        sum(float(it.get("line_value_gross") or 0) for it in items), 2)
     total_retail = round(sum(float(it.get("line_value_retail") or 0) for it in items), 2)
     order_currency = normalize_order_currency(order.get("currency"))
     order_price_list = normalize_client_price_list(order.get("price_list"))
@@ -8289,7 +8379,7 @@ def _api_client_order_pdf_impl(order_id: int, retail_prices: bool = False):
         if not row:
             return jsonify(ok=False, error="Nie znaleziono zamówienia"), 404
         order = dict(row)
-        if _email_key(order.get("customer_email")) != email:
+        if to_int(order.get("customer_id"), 0) != to_int(g.client_customer_id, 0):
             return jsonify(ok=False, error="Brak dostępu"), 403
 
         items = _client_order_items_local(c, order)
@@ -9146,12 +9236,12 @@ configure_order_status(lambda db, order_id, status: local_order_transition(
 _startup_step("routes_import_begin")
 from routes import admin as routes_admin, china as routes_china, customers as routes_customers
 from routes import inventory as routes_inventory, invoices as routes_invoices
-from routes import orders as routes_orders, shipping as routes_shipping
+from routes import orders as routes_orders, shipping as routes_shipping, architects as routes_architects
 # Legacy code replaces the original /searches handler with client_searches_v2.
 # Temporarily release the endpoint so its URL rule can be registered in the
 # customer module, then restore the same v2 handler as before the extraction.
 app.view_functions.pop("client_searches", None)
-for _routes_module in (routes_admin, routes_customers, routes_orders, routes_inventory, routes_shipping, routes_invoices, routes_china):
+for _routes_module in (routes_admin, routes_customers, routes_orders, routes_inventory, routes_shipping, routes_invoices, routes_china, routes_architects):
     globals().update(_routes_module.register_routes(globals()))
 if "client_searches_v2" in globals():
     app.view_functions["client_searches"] = client_searches_v2
