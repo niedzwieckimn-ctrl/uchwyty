@@ -53,26 +53,23 @@ def test_catalog_uses_approved_retail_price_for_architect_quotes(monkeypatch):
     assert rows[0]["retail_price"] == 178.34
 
 
-def test_architect_order_uses_scoped_snapshot_without_waiting_for_full_sync(client, monkeypatch):
-    snapshots = []
-    def scoped_pull(**kwargs):
-        snapshots.append(tuple(kwargs["tables"]))
-        return {"ok": True}
+def test_architect_order_commits_without_local_snapshot(client, monkeypatch):
+    saved = []
     def remote(path, **kwargs):
         if path == "/rest/v1/rpc/architect_create_discounted_order":
+            saved.append({"id": 812, "order_no": "STAGING-812", "customer_id": 77})
             return 812
         if path == "/rest/v1/orders":
-            return [{"order_no": "STAGING-812"}]
+            return saved
         raise AssertionError(path)
-    monkeypatch.setattr(backend, "pull_shared_tables_from_supabase", scoped_pull)
+    monkeypatch.setattr(backend, "pull_shared_tables_from_supabase", lambda **kwargs: (_ for _ in ()).throw(AssertionError("scoped sync")))
     monkeypatch.setattr(backend, "maybe_pull_shared_from_supabase", lambda **kwargs: (_ for _ in ()).throw(AssertionError("full sync")))
+    monkeypatch.setattr(backend, "_client_stock_catalog_rows", lambda profile: (_ for _ in ()).throw(AssertionError("local catalog")))
     monkeypatch.setattr(backend, "supabase_request", remote)
-    monkeypatch.setattr(backend, "_safe_saved_order_confirmation", lambda order_id: {"ok": True})
     response = client.post("/api/client/orders", json={**payload(), "architect_code": "ARCHITEKT-6207"}, headers=headers())
     assert response.status_code == 200
     assert response.get_json()["order"] == {"id": 812, "order_no": "STAGING-812"}
-    assert snapshots == [(("customers", "id"), ("products", "id")),
-                         (("orders", "id"), ("order_items", "id"))]
+    assert response.get_json()["email"]["pending_retry"] is True
 
 
 def test_inpost_accepts_full_and_partial_packing_statuses():
