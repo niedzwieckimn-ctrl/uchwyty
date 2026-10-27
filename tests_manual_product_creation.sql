@@ -19,6 +19,10 @@ begin
   if again->>'error' is null then raise exception 'Duplicate SKU accepted'; end if;
   again := public.create_catalog_product_v1(request_key,data||'{"net_price":"200.00"}'::jsonb);
   if again->>'error' is null then raise exception 'Changed retry accepted'; end if;
+  again := public.create_catalog_product_v1(gen_random_uuid(), data||'{"sku":"TEST-CATALOG-ROLLBACK-VARIANT"}'::jsonb);
+  if again->>'error' is not null then raise exception 'Shared price creation failed'; end if;
+  if (select count(*) from public.products p join public.pricing pr on pr.model=p.model or pr.model=p.sku
+      where p.id=(again->>'product_id')::bigint)<>1 then raise exception 'Shared price duplicates product'; end if;
   begin
     perform public.create_catalog_product_v1(gen_random_uuid(),data||'{"sku":"TEST-CATALOG-ROLLBACK-FAIL","model":"TEST-CATALOG-ROLLBACK-FAIL","image":{"stored_path":""}}'::jsonb);
     raise exception 'Expected image failure' using errcode='ZX001';

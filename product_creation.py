@@ -59,8 +59,9 @@ def local_create(db, request_id, data, stamp):
     pid = db.execute('INSERT INTO products(sku,model,ean,name,archived,created_at) VALUES(?,?,?,?,0,?)',
                      (data['sku'], data['model'], data['ean'], data['name'], stamp)).lastrowid
     db.execute('INSERT INTO stock(product_id,qty) VALUES(?,0)', (pid,))
-    db.execute('INSERT INTO pricing(model,net_price,gross_price,created_at) VALUES(?,?,?,?)',
-               (data['sku'], data['net_price'], data['gross_price'], stamp))
+    if not model_price:
+        db.execute('INSERT INTO pricing(model,net_price,gross_price,created_at) VALUES(?,?,?,?)',
+                   (data['sku'], data['net_price'], data['gross_price'], stamp))
     db.execute('INSERT INTO pricing_eur(sku,ean,price_eur,uvp_eur,created_at,updated_at) VALUES(?,?,?,?,?,?)',
                (data['sku'], data['ean'], data['price_eur'], data['uvp_eur'], stamp, stamp))
     if data.get('image'):

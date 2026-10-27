@@ -138,3 +138,15 @@ def test_decimal_rounding_and_override():
     data=creation.validate({'sku':'X','model':'X','net_price':'0,23','gross_price':'0,29','uvp_eur':'1,25'})
     assert data['price_eur']=='0.08'
     assert data['uvp_eur']=='1.25'
+
+
+def test_matching_shared_model_reuses_one_price(client):
+    data=form(client)
+    db=backend.conn();db.execute("INSERT INTO pricing(model,net_price,gross_price,created_at) VALUES('New model',100,123,'test')");db.commit();db.close()
+    assert client.post('/products/new',data=data).status_code == 302
+    assert len(rows('pricing')) == 1
+    db=backend.conn()
+    try:
+        assert len(db.execute('SELECT p.id FROM products p JOIN pricing pr ON pr.model=p.model OR pr.model=p.sku').fetchall()) == 1
+    finally:
+        db.close()
