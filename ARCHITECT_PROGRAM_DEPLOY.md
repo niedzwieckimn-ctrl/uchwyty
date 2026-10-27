@@ -1,6 +1,6 @@
 # Program „Niedźwieccy dla Architektów” — wdrożenie
 
-Ten pakiet powstał na podstawie `uchwyty-main (51).zip`. Kod źródłowy działającego IKUGO nie został porównany z repozytorium produkcyjnym. Przed scaleniem porównaj `app.py`, `routes/orders.py`, `routes/invoices.py` i schemat bazy z aktualnym branchem wdrożeniowym. Nie zastępuj nowszego kodu pełnym ZIP-em.
+Zmiany powstały na podstawie `uchwyty-main (51).zip`, a następnie zostały przeniesione na aktualny `main` repozytorium `niedzwieckimn-ctrl/uchwyty` (commit `af18f92051715a1e374103ec66b18a4b7e2ef47d`), połączonego z usługą Render `uchwyty`. Porównano pliki `app.py`, `routes/orders.py` i `routes/invoices.py`; ich treść z ZIP51 była taka sama po normalizacji końców linii. Nowsze pliki produkcyjnego repozytorium pozostały zachowane. Przed scaleniem ponownie sprawdź aktualny `main` i schemat bazy. Nie zastępuj nowszego kodu pełnym ZIP-em.
 
 ## Kolejność
 
