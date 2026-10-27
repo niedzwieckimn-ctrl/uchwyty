@@ -5,6 +5,7 @@ import json
 import csv
 import io
 import unicodedata
+import urllib.error
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -390,6 +391,19 @@ def register_routes(context):
             lines = supabase_request('/rest/v1/architect_sale_lines',params={
                 'select':'id,order_item_id,product_id,qty,retail_gross_before,retail_gross_after,vat_rate',
                 'redemption_id':f"eq.{redemptions[0]['id']}",'order':'id.asc'},timeout=15) or []
+            line_ids = [to_int(line.get('id'), 0) for line in lines]
+            if line_ids:
+                ledger = supabase_request('/rest/v1/architect_commission_ledger', params={
+                    'select':'sale_line_id,sold_qty',
+                    'sale_line_id': 'in.(' + ','.join(map(str, line_ids)) + ')',
+                    'entry_type':'eq.accrual', 'limit':1000,
+                }, timeout=15) or []
+                sold_by_line = {}
+                for entry in ledger:
+                    line_id = to_int(entry.get('sale_line_id'), 0)
+                    sold_by_line[line_id] = sold_by_line.get(line_id, 0) + to_int(entry.get('sold_qty'), 0)
+                for line in lines:
+                    line['sold_qty'] = sold_by_line.get(to_int(line['id'], 0), 0)
             invoices = supabase_request('/rest/v1/invoices',params={
                 'select':'id,invoice_no','order_id':f'eq.{order_id}',
                 'publication_state':'eq.complete','order':'id.desc'},timeout=15) or []
@@ -415,12 +429,31 @@ def register_routes(context):
         context=client_sale_context(sale_line_id)
         if not context:
             return jsonify(ok=False,error='Pozycja nie należy do Twojego sklepu'),403
-        result=supabase_request('/rest/v1/rpc/architect_record_verified_sale',method='POST',payload={
-            'p_sale_line_id':sale_line_id,'p_invoice_id':invoice_id,
-            'p_distributor_id':g.client_customer_id,'p_sold_qty':qty,
-            'p_sale_date':sale_date,'p_sale_reference':reference,
-            'p_retail_gross_before':str(before),'p_retail_gross_after':str(after),
-            'p_actor':g.client_user['id']},timeout=20)
+        try:
+            result=supabase_request('/rest/v1/rpc/architect_record_verified_sale',method='POST',payload={
+                'p_sale_line_id':sale_line_id,'p_invoice_id':invoice_id,
+                'p_distributor_id':g.client_customer_id,'p_sold_qty':qty,
+                'p_sale_date':sale_date,'p_sale_reference':reference,
+                'p_retail_gross_before':str(before),'p_retail_gross_after':str(after),
+                'p_actor':g.client_user['id']},timeout=20)
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (400, 409):
+                raise
+            try:
+                detail = str(json.loads(exc.read().decode('utf-8')).get('message') or '')
+            except (ValueError, UnicodeError, AttributeError):
+                detail = ''
+            if 'Sold units exceed invoiced units' in detail:
+                error = 'Sprzedana ilość przekracza liczbę sztuk objętych fakturą.'
+            elif 'duplicate key value' in detail:
+                error = 'Ten dokument sprzedaży został już użyty.'
+            elif 'Retail sale evidence required' in detail:
+                error = 'Sprawdź datę i numer dokumentu sprzedaży.'
+            elif 'Retail receipt totals differ' in detail:
+                error = 'Kwoty nie zgadzają się z ceną zapisaną przy kodzie.'
+            else:
+                error = 'Nie można potwierdzić sprzedaży. Sprawdź fakturę, ilość i dokument.'
+            return jsonify(ok=False,error=error),409
         return jsonify(ok=True,ledger_id=result),201
 
     @app.get("/api/admin/architects")
