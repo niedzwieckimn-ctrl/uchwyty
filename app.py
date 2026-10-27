@@ -8230,10 +8230,84 @@ def _client_order_items_local(c, order: dict) -> list[dict]:
     return items
 
 def _api_order_lookup_impl():
-    maybe_pull_shared_from_supabase(force=True)
     token = norm(request.args.get("token"))
     if not token:
         return jsonify(ok=False, error="Brak tokenu"), 400
+
+    # Architect orders are committed directly in Supabase. Reading their
+    # immutable price snapshots must not wait for a full warehouse cache pull.
+    if supabase_enabled():
+        remote_orders = supabase_request("/rest/v1/orders", params={
+            "select": "*", "order_no": f"eq.{token}", "limit": 1,
+        }, timeout=15) or []
+        if remote_orders:
+            remote_order = remote_orders[0]
+            if to_int(remote_order.get("customer_id"), 0) != to_int(g.client_customer_id, 0):
+                return jsonify(ok=False, error="Brak dostępu"), 403
+            redemption = supabase_request("/rest/v1/architect_code_redemptions", params={
+                "select": "id", "order_id": f"eq.{remote_order['id']}", "limit": 1,
+            }, timeout=15) or []
+            if redemption:
+                remote_items = supabase_request("/rest/v1/order_items", params={
+                    "select": "*", "order_id": f"eq.{remote_order['id']}", "order": "id.asc",
+                }, timeout=15) or []
+                product_ids = sorted({to_int(row.get("product_id"), 0) for row in remote_items
+                                      if to_int(row.get("product_id"), 0) > 0})
+                products = {}
+                stock = {}
+                if product_ids:
+                    product_filter = f"in.({','.join(str(value) for value in product_ids)})"
+                    product_rows = supabase_request("/rest/v1/products", params={
+                        "select": "id,sku,model,name", "id": product_filter,
+                    }, timeout=15) or []
+                    products = {to_int(row.get("id"), 0): row for row in product_rows}
+                    catalog_rows = supabase_request("/rest/v1/client_stock_catalog_v", params={
+                        "select": "product_id,qty_on_stock", "product_id": product_filter,
+                    }, timeout=15) or []
+                    stock = {to_int(row.get("product_id"), 0): to_int(row.get("qty_on_stock"), 0)
+                             for row in catalog_rows}
+                allocations = supabase_request("/rest/v1/invoice_allocations", params={
+                    "select": "order_item_id,qty", "order_id": f"eq.{remote_order['id']}",
+                }, timeout=15) or []
+                invoiced = {}
+                for row in allocations:
+                    item_id = to_int(row.get("order_item_id"), 0)
+                    invoiced[item_id] = invoiced.get(item_id, 0) + to_int(row.get("qty"), 0)
+                items = []
+                for row in remote_items:
+                    item = dict(row)
+                    product_id = to_int(item.get("product_id"), 0)
+                    product = products.get(product_id, {})
+                    qty = to_int(item.get("qty"), 0)
+                    item_id = to_int(item.get("id"), 0)
+                    net = money_float(item.get("unit_net_price"))
+                    gross = money_float(item.get("unit_gross_price"))
+                    retail = money_float(item.get("unit_retail_price"))
+                    invoiced_qty = invoiced.get(item_id, 0)
+                    stock_qty = stock.get(product_id, 0)
+                    item.update(model=norm(product.get("model")), name=norm(product.get("name")),
+                                sku=norm(item.get("sku") or product.get("sku")),
+                                net_price=net, gross_price=gross, retail_price=retail,
+                                stock_qty=stock_qty, qty_physical=stock_qty,
+                                available_qty=stock_qty, ordered_qty=qty,
+                                invoiced_qty=invoiced_qty, remaining_qty=max(0, qty - invoiced_qty),
+                                availability_label="dostępne" if stock_qty >= qty else "10/20 dni",
+                                realization_label=("w całości" if invoiced_qty >= qty and qty > 0
+                                                   else f"częściowo: {invoiced_qty}/{qty} szt." if invoiced_qty
+                                                   else "0 szt."),
+                                line_value_net=money_float(Decimal(str(net)) * qty),
+                                line_value_retail=money_float(Decimal(str(retail)) * qty))
+                    item["line_value_gross"] = money_float(gross_from_net_23(item["line_value_net"]))
+                    items.append(item)
+                total_net = money_float(sum(Decimal(str(x["line_value_net"])) for x in items))
+                total_retail = money_float(sum(Decimal(str(x["line_value_retail"])) for x in items))
+                remote_order = dict(remote_order)
+                remote_order.update(total_net=total_net,
+                                    total_gross=money_float(gross_from_net_23(total_net)),
+                                    total_retail=total_retail)
+                return jsonify(ok=True, order=remote_order, items=items)
+
+    maybe_pull_shared_from_supabase(force=True)
 
     c = conn()
     cur = c.cursor()
@@ -8388,6 +8462,50 @@ def _api_order_lookup_impl():
     )
 
 def _api_client_order_pdf_impl(order_id: int, retail_prices: bool = False):
+    if supabase_enabled():
+        remote_orders = supabase_request("/rest/v1/orders", params={
+            "select": "*", "id": f"eq.{order_id}", "limit": 1,
+        }, timeout=15) or []
+        if remote_orders:
+            remote_order = remote_orders[0]
+            if to_int(remote_order.get("customer_id"), 0) != to_int(g.client_customer_id, 0):
+                return jsonify(ok=False, error="Brak dostępu"), 403
+            redemption = supabase_request("/rest/v1/architect_code_redemptions", params={
+                "select": "id", "order_id": f"eq.{order_id}", "limit": 1,
+            }, timeout=15) or []
+            if redemption:
+                remote_items = supabase_request("/rest/v1/order_items", params={
+                    "select": "*", "order_id": f"eq.{order_id}", "order": "id.asc",
+                }, timeout=15) or []
+                product_ids = sorted({to_int(row.get("product_id"), 0) for row in remote_items
+                                      if to_int(row.get("product_id"), 0) > 0})
+                products = {}
+                if product_ids:
+                    product_rows = supabase_request("/rest/v1/products", params={
+                        "select": "id,model,name",
+                        "id": f"in.({','.join(str(value) for value in product_ids)})",
+                    }, timeout=15) or []
+                    products = {to_int(row.get("id"), 0): row for row in product_rows}
+                items = []
+                for row in remote_items:
+                    item = dict(row)
+                    product = products.get(to_int(item.get("product_id"), 0), {})
+                    item.update(model=norm(product.get("model")), name=norm(product.get("name")),
+                                net_price=money_float(item.get("unit_net_price")),
+                                gross_price=money_float(item.get("unit_gross_price")),
+                                retail_price=money_float(item.get("unit_retail_price")))
+                    items.append(item)
+                customers = supabase_request("/rest/v1/customers", params={
+                    "select": "language", "id": f"eq.{g.client_customer_id}", "limit": 1,
+                }, timeout=15) or []
+                language = normalize_client_language(customers[0].get("language") if customers else "pl")
+                pdf_buffer, filename = generate_client_order_pdf(
+                    dict(remote_order), items, language, retail_prices=retail_prices)
+                response = send_file(pdf_buffer, mimetype="application/pdf",
+                                     as_attachment=True, download_name=filename, max_age=0)
+                response.headers["Cache-Control"] = "no-store"
+                return response
+
     maybe_pull_shared_from_supabase(force=True)
     email = _email_key(g.client_user.get("email"))
 
