@@ -386,3 +386,56 @@ def test_collection_does_not_erase_uncertain_dispatch(tmp_path,monkeypatch):
     assert store.rows('11')[0]['attempted']==1
     assert store.rows('11')[0]['state']=='unknown'
     assert backend.created==[]
+
+
+def tracking_receipt(backend,sid,status='collected_from_sender',verified='2026-10-26T15:00:00+01:00'):
+    db=backend.conn()
+    db.execute("CREATE TABLE IF NOT EXISTS inpost_tracking_state(shipment_id TEXT PRIMARY KEY,status_code TEXT,verified_at TEXT)")
+    db.execute('INSERT OR REPLACE INTO inpost_tracking_state VALUES(?,?,?)',(sid,status,verified))
+    db.commit();db.close()
+
+
+def test_verified_collection_removes_future_plan_without_carrier_poll(tmp_path,monkeypatch):
+    backend,store=setup_backend(tmp_path,monkeypatch,at(13,0))
+    store.enqueue('11',pickup_data())
+    tracking_receipt(backend,'11')
+    def no_http(*args):raise AssertionError('No additional InPost request allowed')
+    monkeypatch.setattr(backend,'inpost_get_shipment',no_http)
+    assert pickups.dashboard_state(backend)['next'] is None
+    pickups.process_due(backend)
+    assert store.rows('11')[0]['state']=='collected'
+    assert store.rows('11')[0]['attempted']==0
+    assert backend.created==[]
+
+
+def test_collected_receipt_does_not_hide_other_parcels(tmp_path,monkeypatch):
+    backend,store=setup_backend(tmp_path,monkeypatch,at(9,0))
+    store.enqueue('11',pickup_data());store.enqueue('12',pickup_data())
+    tracking_receipt(backend,'11','delivered')
+    pickups.process_due(backend)
+    state=pickups.dashboard_state(backend)
+    assert state['today']['parcel_count']==1 and state['can_order']
+    assert store.rows('11')[0]['state']=='collected'
+    assert store.rows('12')[0]['state']=='pending'
+    assert backend.created==[]
+
+
+@pytest.mark.parametrize('status,verified',[('confirmed','yes'),('mystery','yes'),('delivered','')])
+def test_only_verified_collection_is_removed(tmp_path,monkeypatch,status,verified):
+    backend,store=setup_backend(tmp_path,monkeypatch,at(9,0))
+    store.enqueue('11',pickup_data())
+    tracking_receipt(backend,'11',status,verified)
+    pickups.process_due(backend)
+    assert store.rows('11')[0]['state']=='pending'
+    assert pickups.dashboard_state(backend)['today']['parcel_count']==1
+
+
+def test_verified_collection_preserves_uncertain_group_marker(tmp_path,monkeypatch):
+    backend,store=setup_backend(tmp_path,monkeypatch,at(9,0))
+    store.enqueue('11',pickup_data());store.enqueue('12',pickup_data())
+    claimed=store.claim('11');store.update(claimed,attempted=1,state='unknown',next_check=0)
+    tracking_receipt(backend,'11')
+    pickups.process_due(backend)
+    assert store.rows('11')[0]['attempted']==1
+    assert store.rows('11')[0]['state']=='unknown'
+    assert backend.created==[]

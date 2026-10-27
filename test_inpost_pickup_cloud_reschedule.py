@@ -1,5 +1,6 @@
 import copy
 import json
+import sqlite3
 
 import pytest
 
@@ -18,6 +19,9 @@ class OldRpcBackend:
         self.calls = []
         self.lose_lease = False
         self.wrong_receipt = False
+
+    def conn(self):
+        return sqlite3.connect(':memory:')
 
     def supabase_enabled(self):
         return True
