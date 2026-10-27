@@ -510,7 +510,8 @@ create or replace function public.architect_record_verified_sale(
   p_sold_qty integer, p_sale_date date, p_sale_reference text,
   p_retail_gross_before numeric, p_retail_gross_after numeric, p_actor text
 ) returns uuid language plpgsql security definer
-set search_path = public, pg_temp as $$
+set search_path = public, pg_temp
+set timezone = 'Europe/Warsaw' as $$
 declare
   v_line public.architect_sale_lines%rowtype;
   v_architect_id uuid;
