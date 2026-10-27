@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block content %}
-<style>#new-product .grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}#new-product label{display:block}#new-product label input{margin-top:6px}@media(max-width:760px){#new-product .grid2{grid-template-columns:1fr}}</style>
+<style>#new-product .grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}#new-product label{display:block}#new-product label input{margin-top:6px}@media(max-width:760px){ #new-product .grid2{grid-template-columns:1fr}}</style>
 <div class="card"><div class="flex"><h1>Dodaj produkt</h1><a class="btn right" href="{{ url_for('products') }}">← Produkty</a></div>
 <p class="muted">Dane produktu, ceny i zdjęcie w jednym miejscu.</p></div>
 {% if error %}<div class="card" role="alert" style="border-color:#e05263;color:#a51932">{{ error }}</div>{% endif %}
