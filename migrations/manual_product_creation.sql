@@ -26,6 +26,7 @@ declare
   uvp numeric := (p_data->>'uvp_eur')::numeric;
   stamp text := now()::text;
   receipt jsonb;
+  price_key text;
 begin
   if p_request_id is null or v_sku is null or v_sku !~ '^[A-Za-z0-9][A-Za-z0-9._/-]{0,79}$'
      or coalesce(length(model_name),0) not between 1 and 120
@@ -65,7 +66,11 @@ begin
   insert into public.products(id,sku,model,ean,name,created_at,archived)
     values(pid,v_sku,model_name,ean_value,p_data->>'name',stamp,false);
   insert into public.stock(product_id,qty) values(pid,0);
-  insert into public.pricing(model,net_price,gross_price,created_at) values(v_sku,net,gross,stamp);
+  select model into price_key from public.pricing where lower(btrim(model))=lower(model_name) limit 1;
+  if not found then
+    price_key := v_sku;
+    insert into public.pricing(model,net_price,gross_price,created_at) values(price_key,net,gross,stamp);
+  end if;
   insert into public.pricing_eur(sku,ean,price_eur,uvp_eur) values(v_sku,ean_value,eur,uvp);
   if p_data->'image' is not null then
     if coalesce(p_data->'image'->>'stored_path','')='' then
@@ -82,7 +87,7 @@ begin
   receipt := jsonb_build_object('product_id',pid,'sku',v_sku,
     'products',(select to_jsonb(p) from public.products p where id=pid),
     'stock',(select to_jsonb(s) from public.stock s where product_id=pid),
-    'pricing',(select to_jsonb(pr) from public.pricing pr where model=v_sku),
+    'pricing',(select to_jsonb(pr) from public.pricing pr where model=price_key),
     'pricing_eur',(select to_jsonb(pe) from public.pricing_eur pe where pe.sku=v_sku),
     'product_images',(select to_jsonb(i) from public.product_images i where id=iid),
     'product_image_assignments',(select to_jsonb(a) from public.product_image_assignments a where product_id=pid));
