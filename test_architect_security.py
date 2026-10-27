@@ -1,6 +1,7 @@
 """Focused regression checks for the architect/B2B role boundary."""
 
 import os
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -84,3 +85,29 @@ def test_admin_architect_list_links_to_profile_and_shows_stats():
     assert response.status_code == 200
     assert f'/architects/{architect_id}'.encode() in response.data
     assert 'Studio K'.encode() in response.data
+
+
+def test_parallel_architect_registration_returns_existing_profile_after_conflict():
+    architect_id = '0b000000-0000-0000-0000-000000000004'
+    user = {
+        'id': architect_id, 'email': 'architect@example.com', 'email_confirmed': True,
+        'metadata': {'first_name': 'Test', 'last_name': 'Architekt',
+                     'studio_name': 'Pracownia testowa', 'phone': '000000000',
+                     'instagram': '@test', 'shipping_address': 'Testowa 1, Warszawa'},
+    }
+    saved = {'id': architect_id, 'status': 'pending_verification'}
+    reads = []
+
+    def remote(path, **kwargs):
+        assert path == '/rest/v1/architect_profiles'
+        if kwargs.get('method') == 'POST':
+            raise urllib.error.HTTPError('https://example.invalid', 409, 'Conflict', {}, None)
+        reads.append(True)
+        return [] if len(reads) == 1 else [saved]
+
+    with patch.object(backend, '_authenticated_client_user', return_value=user), \
+         patch.object(architect_routes, 'supabase_request', side_effect=remote):
+        response = backend.app.test_client().post('/api/architect/me', json={})
+    assert response.status_code == 200
+    assert response.get_json()['profile'] == saved
+    assert len(reads) == 2

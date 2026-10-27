@@ -1,5 +1,12 @@
 # Scenariusze staging
 
+Przed testami wykonaj kolejno migracje `architect_program_001.sql`,
+`architect_security_002.sql`, `architect_commission_rounding_003.sql` i
+`architect_service_role_grants_004.sql`. Ostatnia migracja nadaje istniejącej
+roli serwerowej dostęp do nowych tabel programu. Odosobniona, syntetyczna
+baza staging wymaga dodatkowo grantów do bazowych tabel IKUGO; w produkcji
+te uprawnienia są zarządzane niezależnie.
+
 Wyniki tych testów nie są jeszcze potwierdzone na staging. Przed uruchomieniem publicznym wykonaj je na odrębnej gałęzi/projekcie i zachowaj identyfikatory rekordów oraz zrzuty wyników.
 
 1. Zarejestruj architekta, potwierdź e-mail, odrzuć próbę wygenerowania kodu przy statusie `pending_verification`, następnie zatwierdź profil w IKUGO.
