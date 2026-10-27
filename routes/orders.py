@@ -1765,6 +1765,69 @@ def register_routes(context):
                     and replay[0].get("redeemed_by_user_id") == client_user["id"]
                     and to_int(replay[0].get("distributor_id"), 0) == to_int(g.client_customer_id, 0))
 
+        if architect_code:
+            # The PostgreSQL function validates the distributor, code, products,
+            # prices and idempotency in one transaction. The staging warehouse's
+            # SQLite cache can be unavailable while a full IKUGO pull is running;
+            # it must not prevent this remote-first order from being committed.
+            raw_items = data.get("items")
+            if not isinstance(raw_items, list) or not 1 <= len(raw_items) <= 100:
+                return jsonify(ok=False, error="Zamówienie musi zawierać od 1 do 100 pozycji"), 400
+            items_for_rpc = []
+            for item in raw_items:
+                if (not isinstance(item, dict) or isinstance(item.get("product_id"), bool)
+                        or not isinstance(item.get("product_id"), int) or item["product_id"] <= 0
+                        or isinstance(item.get("qty"), bool)
+                        or not isinstance(item.get("qty"), int) or item["qty"] <= 0):
+                    return jsonify(ok=False, error="Nieprawidłowa pozycja zamówienia"), 400
+                items_for_rpc.append({"product_id": item["product_id"], "qty": item["qty"]})
+            customer_id = to_int(g.client_customer_id, 0)
+            if customer_id <= 0:
+                return jsonify(ok=False, error="Brak powiązanego dystrybutora"), 403
+
+            def saved_architect_order():
+                rows = supabase_request("/rest/v1/orders", params={
+                    "select": "id,order_no,customer_id",
+                    "idempotency_key": f"eq.{idempotency_key}", "limit": 1,
+                }, timeout=10) or []
+                return rows[0] if rows else None
+
+            try:
+                existing = saved_architect_order()
+                if existing:
+                    if (to_int(existing.get("customer_id"), 0) != customer_id
+                            or not architect_replay_matches(existing["id"])):
+                        return jsonify(ok=False, error="Konflikt Idempotency-Key"), 409
+                    return jsonify(ok=True, duplicate=True,
+                                   order={"id": existing["id"], "order_no": existing["order_no"]},
+                                   email={"ok": False, "pending_retry": True})
+                order_id = to_int(supabase_request(
+                    "/rest/v1/rpc/architect_create_discounted_order", method="POST",
+                    payload={"p_auth_user_id": client_user["id"],
+                             "p_customer_id": customer_id, "p_code": architect_code,
+                             "p_idempotency_key": idempotency_key,
+                             "p_items": items_for_rpc, "p_note": note}, timeout=30), 0)
+                if order_id <= 0:
+                    raise RuntimeError("Nie otrzymano numeru zamówienia")
+                saved = saved_architect_order()
+                order_no = saved["order_no"] if saved else make_order_no(order_id, now_iso())
+                return jsonify(ok=True, order={"id": order_id, "order_no": order_no},
+                               email={"ok": False, "pending_retry": True})
+            except Exception:
+                # A lost HTTP response can follow a committed SQL transaction.
+                # Reconcile by the same key before reporting an error.
+                try:
+                    saved = saved_architect_order()
+                    if saved and to_int(saved.get("customer_id"), 0) == customer_id \
+                            and architect_replay_matches(saved["id"]):
+                        return jsonify(ok=True, duplicate=True, recovered=True,
+                                       order={"id": saved["id"], "order_no": saved["order_no"]},
+                                       email={"ok": False, "pending_retry": True})
+                except Exception:
+                    pass
+                app.logger.exception("Błąd transakcyjnego zamówienia architekta user_id=%s", client_user["id"])
+                return jsonify(ok=False, error="Nie udało się zapisać zamówienia z kodem"), 500
+
         try:
             if architect_code:
                 # The code RPC checks prices, distributor and stock atomically.
