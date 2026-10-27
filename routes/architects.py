@@ -46,8 +46,9 @@ def register_routes(context):
             return jsonify(ok=False, error="Niedozwolone źródło żądania"), 403
         if not g.architect_user.get("email_confirmed"):
             return jsonify(ok=False, error="Potwierdź adres e-mail przed utworzeniem profilu"), 403
-        if profile():
-            return jsonify(ok=False, error="Profil już istnieje"), 409
+        existing = profile()
+        if existing:
+            return jsonify(ok=True, profile=existing)
         metadata = g.architect_user.get("metadata") or {}
         values = {key: norm(metadata.get(key)) for key in (
             "first_name", "last_name", "studio_name", "phone", "instagram",
@@ -59,9 +60,18 @@ def register_routes(context):
             return jsonify(ok=False, error="Uzupełnij wymagane dane rejestracji"), 400
         if any(len(value) > 250 for value in values.values()):
             return jsonify(ok=False, error="Dane rejestracji są zbyt długie"), 400
-        created = supabase_request("/rest/v1/architect_profiles", method="POST", payload={
-            "id": g.architect_user["id"], "email": g.architect_user["email"], **values,
-        }, prefer="return=representation", timeout=15) or []
+        try:
+            created = supabase_request("/rest/v1/architect_profiles", method="POST", payload={
+                "id": g.architect_user["id"], "email": g.architect_user["email"], **values,
+            }, prefer="return=representation", timeout=15) or []
+        except urllib.error.HTTPError as exc:
+            # getSession and onAuthStateChange can start registration together.
+            # A second request must receive the profile created by the first.
+            if exc.code == 409:
+                existing = profile()
+                if existing:
+                    return jsonify(ok=True, profile=existing)
+            raise
         audit(g.architect_user["id"], "registered", "architect_profile", g.architect_user["id"])
         return jsonify(ok=True, profile=created[0] if created else profile()), 201
 
