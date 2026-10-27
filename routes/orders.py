@@ -1766,7 +1766,18 @@ def register_routes(context):
                     and to_int(replay[0].get("distributor_id"), 0) == to_int(g.client_customer_id, 0))
 
         try:
-            maybe_pull_shared_from_supabase(force=True)
+            if architect_code:
+                # The code RPC checks prices, distributor and stock atomically.
+                # Only the local product lookup below needs a current snapshot;
+                # avoid blocking on unrelated IKUGO tables in an isolated stage.
+                snapshot = pull_shared_tables_from_supabase(
+                    force=True, delete_missing=False,
+                    tables=(("customers", "id"), ("products", "id")),
+                )
+                if not snapshot.get("ok"):
+                    raise RuntimeError("Niepełny odczyt klientów lub produktów")
+            else:
+                maybe_pull_shared_from_supabase(force=True)
         except Exception as exc:
             app.logger.error("Nie udało się odświeżyć danych Supabase przed zamówieniem: %s", exc)
             return jsonify(ok=False, error="Nie udało się odświeżyć danych produktów"), 503
@@ -1850,7 +1861,12 @@ def register_routes(context):
                 # A local cache refresh or email failure must not turn a saved
                 # order into a failed response or trigger a second redemption.
                 try:
-                    maybe_pull_shared_from_supabase(force=True)
+                    snapshot = pull_shared_tables_from_supabase(
+                        force=True, delete_missing=False,
+                        tables=(("orders", "id"), ("order_items", "id")),
+                    )
+                    if not snapshot.get("ok"):
+                        raise RuntimeError("Niepełny odczyt zapisanego zamówienia")
                     email_result = _safe_saved_order_confirmation(order_id)
                 except Exception:
                     app.logger.exception("Zamówienie architekta zapisane, ale lokalna synchronizacja nie powiodła się")
@@ -1883,10 +1899,11 @@ def register_routes(context):
             # następnie utracić połączenie podczas lokalnego odświeżenia. Pobieramy
             # stan ponownie i rozpoznajemy zamówienie po niezmiennym kluczu, zamiast
             # zwracać klientowi fałszywy błąd 500.
-            try:
-                maybe_pull_shared_from_supabase(force=True)
-            except Exception:
-                pass
+            if not architect_code:
+                try:
+                    maybe_pull_shared_from_supabase(force=True)
+                except Exception:
+                    pass
             existing = _order_by_idempotency_key(idempotency_key)
             if existing:
                 if (to_int(existing.get("customer_id"), 0) != to_int(g.client_customer_id, 0)
