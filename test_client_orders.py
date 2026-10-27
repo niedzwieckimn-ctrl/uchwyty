@@ -131,6 +131,17 @@ def test_architect_order_pdf_uses_remote_snapshot(client, monkeypatch):
     assert response.data.startswith(b"%PDF")
 
 
+def test_architect_pdf_generator_does_not_read_local_company_profile(monkeypatch):
+    monkeypatch.setattr(backend, "conn", lambda: (_ for _ in ()).throw(AssertionError("local SQLite")))
+    buffer, _ = backend.generate_client_order_pdf(
+        {"id": 812, "order_no": "STAGING-812", "currency": "PLN",
+         "created_at": "2026-10-28 00:06:00", "customer_name": "Test"},
+        [{"sku": "TEST-001", "model": "TEST", "name": "Produkt testowy",
+          "qty": 1, "net_price": 92.75, "retail_price": 160.51}],
+        "pl", retail_prices=True, company_override={"company_name": "Niedźwieccy"})
+    assert buffer.getvalue().startswith(b"%PDF")
+
+
 def test_inpost_accepts_full_and_partial_packing_statuses():
     assert backend.inpost_label_allowed_for_status("packed") is True
     assert backend.inpost_label_allowed_for_status("packed_partial") is True

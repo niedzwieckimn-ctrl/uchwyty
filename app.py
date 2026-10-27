@@ -4307,6 +4307,7 @@ def generate_client_order_pdf(
     items: list[dict],
     language: str,
     retail_prices: bool = False,
+    company_override: dict | None = None,
 ) -> tuple[io.BytesIO, str]:
     """Create one localized order PDF without persisting a second document copy."""
     language = normalize_client_language(language)
@@ -4323,12 +4324,15 @@ def generate_client_order_pdf(
     pale_gray = (0.91, 0.91, 0.91)
     rule_gray = (0.38, 0.38, 0.38)
 
-    c = conn()
-    try:
-        company_row = c.execute("SELECT * FROM company_profile WHERE id=1").fetchone()
-        company = dict(company_row) if company_row else {}
-    finally:
-        c.close()
+    if company_override is not None:
+        company = company_override
+    else:
+        c = conn()
+        try:
+            company_row = c.execute("SELECT * FROM company_profile WHERE id=1").fetchone()
+            company = dict(company_row) if company_row else {}
+        finally:
+            c.close()
 
     def txt(value) -> str:
         return fix_polish_mojibake(norm(value))
@@ -8500,7 +8504,8 @@ def _api_client_order_pdf_impl(order_id: int, retail_prices: bool = False):
                 }, timeout=15) or []
                 language = normalize_client_language(customers[0].get("language") if customers else "pl")
                 pdf_buffer, filename = generate_client_order_pdf(
-                    dict(remote_order), items, language, retail_prices=retail_prices)
+                    dict(remote_order), items, language, retail_prices=retail_prices,
+                    company_override={"company_name": "Niedźwieccy"})
                 response = send_file(pdf_buffer, mimetype="application/pdf",
                                      as_attachment=True, download_name=filename, max_age=0)
                 response.headers["Cache-Control"] = "no-store"
