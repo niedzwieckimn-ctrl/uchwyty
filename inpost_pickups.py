@@ -442,10 +442,47 @@ def order_today(b,now=None):
         return {'ok':False,'message':'Dzisiejszy termin 12:20 minął. Nowe przesyłki są zaplanowane na następny dzień roboczy.'}
     return process_date(b,now.date().isoformat())
 
+def _verified_collected_ids(b, rows):
+    """Reuse authenticated tracking receipts; never infer collection from order status."""
+    ids=[str(r['shipment_id']) for r in rows if r.get('state')!='collected'
+         and not int(r.get('attempted') or 0) and not r.get('dispatch_id')]
+    if not ids:return set()
+    db=b.conn()
+    try:
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='inpost_tracking_state'").fetchone():
+            return set()
+        collected=set()
+        for start in range(0,len(ids),200):
+            batch=ids[start:start+200]
+            for row in db.execute(
+                "SELECT shipment_id,status_code FROM inpost_tracking_state WHERE verified_at<>'' AND shipment_id IN ("+
+                ','.join('?' for _ in batch)+')',batch):
+                if str(row['status_code']).lower() in COLLECTED:collected.add(str(row['shipment_id']))
+        return collected
+    finally:db.close()
+
+
+def _retire_verified_collections(b, store, rows):
+    changed=False
+    for sid in _verified_collected_ids(b,rows):
+        job=store.claim(sid)
+        if not job:continue
+        # A concurrent dispatch may have started since the receipt was read.
+        # Its intent must remain available to the whole group's reconciliation.
+        if int(job.get('attempted') or 0) or job.get('dispatch_id'):
+            store.update(job)
+            continue
+        store.update(job,state='collected',error='')
+        changed=True
+    return changed
+
+
 def dashboard_state(b,now=None):
     now=now or _local_now();rows=Store(b).rows();today=now.date().isoformat()
+    collected=_verified_collected_ids(b,rows)
     groups={}
     for row in rows:
+        if str(row['shipment_id']) in collected:continue
         day=_job_date(row)
         if not day or row.get('state')=='collected':continue
         group=groups.setdefault(day,[]);group.append(row)
@@ -476,6 +513,7 @@ def dashboard_state(b,now=None):
 def process_due(b):
     if not enabled():return
     epoch=time.time();now=_local_now();store=Store(b);rows=store.rows()
+    if _retire_verified_collections(b,store,rows):rows=store.rows()
     # Legacy rows keep their original immediate/reconciliation path.
     for job in rows:
         if _job_date(job):continue
