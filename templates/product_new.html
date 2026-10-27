@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block content %}
+<style>#new-product .grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}#new-product label{display:block}#new-product label input{margin-top:6px}@media(max-width:760px){ #new-product .grid2{grid-template-columns:1fr}}</style>
+<div class="card"><div class="flex"><h1>Dodaj produkt</h1><a class="btn right" href="{{ url_for('products') }}">← Produkty</a></div>
+<p class="muted">Dane produktu, ceny i zdjęcie w jednym miejscu.</p></div>
+{% if error %}<div class="card" role="alert" style="border-color:#e05263;color:#a51932">{{ error }}</div>{% endif %}
+<form method="post" enctype="multipart/form-data" id="new-product">
+<input type="hidden" name="request_id" value="{{ request_id }}">
+<div class="card"><h2>Produkt</h2><div class="grid2">
+{% for key,label,required,limit in [('sku','SKU',true,80),('ean','EAN / GTIN',false,14),('model','Model',true,120),('name','Nazwa / opis wariantu',false,300)] %}
+<label>{{ label }}{% if required %} *{% endif %}<input name="{{ key }}" value="{{ values.get(key,'') }}" maxlength="{{ limit }}" {% if required %}required{% endif %} {% if key=='ean' %}inputmode="numeric"{% endif %}></label>
+{% endfor %}</div><p class="muted small">W nazwie możesz dopisać kolor, rozstaw i wymiary. Stan początkowy: 0 szt. Towar przyjmiesz osobno w magazynie.</p></div>
+<div class="card"><h2>Ceny</h2><div class="grid2">
+<label>Cena netto PLN *<input name="net_price" id="net-price" value="{{ values.get('net_price','') }}" inputmode="decimal" required></label>
+<label>Cena brutto PLN<input name="gross_price" id="gross-price" value="{{ values.get('gross_price','') }}" inputmode="decimal" placeholder="Netto × 1,23"></label>
+<div><b>Cena netto EUR</b><p><output id="eur-price">—</output> EUR</p><span class="muted small">Netto PLN ÷ 4,30 × 1,45. Obliczana automatycznie przy zapisie.</span></div>
+<label>Sugerowana cena UVP EUR (opcjonalnie)<input name="uvp_eur" id="uvp-price" value="{{ values.get('uvp_eur','') }}" inputmode="decimal" placeholder="Domyślnie netto EUR × 1,45"><span class="muted small">Osobna cena sugerowana; nie jest ceną netto EUR.</span></label>
+</div></div>
+<div class="card"><h2>Zdjęcie główne</h2><label>Wybierz zdjęcie<input type="file" name="image" id="product-image" accept="image/png,image/jpeg,.svg"></label>
+<p class="muted small">JPG, PNG lub SVG, maksymalnie 5 MB. To zdjęcie będzie widoczne przy produkcie. Po błędzie wybierz plik ponownie.</p>
+<img id="image-preview" alt="Podgląd zdjęcia produktu" hidden style="max-width:240px;max-height:240px;object-fit:contain">
+</div><div class="card flex"><button class="btn primary" type="submit" id="save-product">Zapisz produkt</button><a class="btn" href="{{ url_for('products') }}">Anuluj</a></div>
+</form>
+<script>
+(() => {
+ const net=document.getElementById('net-price'), eur=document.getElementById('eur-price');
+ const gross=document.getElementById('gross-price'),uvp=document.getElementById('uvp-price');
+ function preview(){const n=Number(net.value.trim().replace(',','.'));const valid=net.value.trim()!==''&&Number.isFinite(n)&&n>=0;
+   eur.textContent=valid?(n/4.30*1.45).toFixed(2).replace('.',','):'—';
+   gross.placeholder=valid?(n*1.23).toFixed(2):'Netto × 1,23';
+   uvp.placeholder=valid?(Math.round(n/4.30*1.45*100)/100*1.45).toFixed(2):'Domyślnie netto EUR × 1,45';}
+ net.addEventListener('input',preview);preview();
+ let url;document.getElementById('product-image').addEventListener('change',e=>{if(url)URL.revokeObjectURL(url);const file=e.target.files[0],img=document.getElementById('image-preview');img.hidden=!file;if(file){url=URL.createObjectURL(file);img.src=url;}});
+ document.getElementById('new-product').addEventListener('submit',()=>{const b=document.getElementById('save-product');b.disabled=true;b.textContent='Zapisywanie…';});
+ window.addEventListener('pageshow',()=>{const b=document.getElementById('save-product');b.disabled=false;b.textContent='Zapisz produkt';});
+})();
+</script>
+{% endblock %}

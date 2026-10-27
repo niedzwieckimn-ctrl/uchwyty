@@ -3,6 +3,8 @@
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from internal_rbac import require_permission
 from stock_count_pdf import render_stock_count_pdf
+import product_creation
+import uuid
 
 def register_routes(context):
     globals().update(context)
@@ -376,6 +378,81 @@ def register_routes(context):
 
 
 
+    @app.route("/products/new", methods=["GET", "POST"])
+    @require_permission("inventory.catalog_manage")
+    def product_new():
+        # Initial catalogue creation only; existing prices cannot be overwritten.
+        # Changes to an existing price remain in the separate pricing workflow.
+        from flask import session
+        from werkzeug.exceptions import HTTPException
+        values, error, status = {}, "", 200
+        if request.method == "GET":
+            request_id = str(uuid.uuid4())
+            session["product_create_tokens"] = (session.get("product_create_tokens", []) + [request_id])[-10:]
+        else:
+            values = request.form.to_dict()
+            request_id = values.get("request_id", "")
+            if request_id not in session.get("product_create_tokens", []):
+                return "Formularz wygasł. Otwórz ponownie Dodaj produkt.", 400
+            try:
+                data = product_creation.validate(values)
+                upload = request.files.get("image")
+                if upload and norm(upload.filename):
+                    from internal_rbac import current_actor_context, ALLOW
+                    if current_actor_context().permission_decision("inventory.assets_manage") != ALLOW:
+                        abort(403)
+                    cleaned, extension = _prepare_product_image(upload)
+                    stored_name = hashlib.sha256(cleaned).hexdigest() + extension
+                    directory = os.path.join(os.path.dirname(DB_PATH), "product_images")
+                    os.makedirs(directory, exist_ok=True)
+                    stored_path = os.path.join(directory, stored_name)
+                    with open(stored_path, "wb") as handle:
+                        handle.write(cleaned)
+                    if supabase_enabled():
+                        stored_path = supabase_storage_upload_file(stored_path, "product-images/" + stored_name,
+                            content_type={".svg":"image/svg+xml", ".png":"image/png", ".jpg":"image/jpeg"}[extension])
+                    data["image"] = {"stored_path": stored_path, "filename": os.path.basename(norm(upload.filename))}
+                if supabase_enabled():
+                    result = supabase_request("/rest/v1/rpc/create_catalog_product_v1", method="POST",
+                        payload={"p_request_id": request_id, "p_data": data}, timeout=25)
+                    if isinstance(result, dict) and result.get("error"):
+                        raise ValueError(result["error"])
+                    if not isinstance(result, dict) or not result.get("product_id"):
+                        raise RuntimeError("Missing durable product receipt")
+                    c = conn()
+                    try:
+                        from contextlib import ExitStack
+                        with ExitStack() as guards:
+                            for table, key in (("products","id"), ("stock","product_id"), ("pricing","model"),
+                                               ("pricing_eur","sku"), ("product_images","id"), ("product_image_assignments","product_id")):
+                                if result.get(table):
+                                    guards.enter_context(_scoped_write_guard(table, key, [result[table][key]]))
+                            product_creation.cache_receipt(c, result)
+                    finally:
+                        c.close()
+                else:
+                    c = conn()
+                    try:
+                        result = product_creation.local_create(c, request_id, data, now_iso())
+                    finally:
+                        c.close()
+                from internal_audit import SUCCESS, try_record_audit_event
+                from internal_rbac import current_actor_context
+                try_record_audit_event("inventory.product.create", result=SUCCESS,
+                    actor_context=current_actor_context(), entity_type="product",
+                    entity_id=str(result["product_id"]), after_state={"sku":data["sku"], "net_price":data["net_price"], "price_eur":data["price_eur"]})
+                return redirect(url_for("products", q=data["sku"], product_created=data["sku"]))
+            except ValueError as exc:
+                error, status = str(exc), 400
+            except HTTPException:
+                raise
+            except Exception:
+                app.logger.exception("Manual product creation failed; retain request identity for reconciliation")
+                error, status = "Nie udało się potwierdzić pełnego zapisu. Zachowaj ten formularz i ponów zapis z tymi samymi danymi i zdjęciem — nie utworzy to drugiego produktu.", 503
+        return render_template("product_new.html", title="Dodaj produkt", values=values,
+                               request_id=request_id, error=error), status
+
+
     @app.get("/products")
     def products():
         maybe_pull_shared_from_supabase()
@@ -411,8 +488,9 @@ def register_routes(context):
           <div class="card">
             <div class="flex">
               <h1 style="margin:0;">Produkty</h1>
-              <div class="right"></div>
+              <a class="btn primary right" href="{{ url_for('product_new') }}">Dodaj produkt</a>
             </div>
+            {% if request.args.get('product_created') %}<p role="status" style="color:#067a2d">Dodano produkt {{ request.args.get('product_created') }} wraz z cennikiem.</p>{% endif %}
             {% if request.args.get('product_deleted') %}<div class="notice" style="margin-top:10px;color:#067a2d;">Usunięto produkt {{ request.args.get('product_deleted') }}.</div>{% endif %}
             {% if request.args.get('product_error') %}<div class="notice" style="margin-top:10px;color:#b00020;">{{ request.args.get('product_error') }}</div>{% endif %}
             <form method="get" class="grid3" style="margin-top:10px;">
