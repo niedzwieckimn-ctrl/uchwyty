@@ -23,6 +23,13 @@ class ArchitectPricingTests(unittest.TestCase):
         self.assertEqual(line.wholesale_net_after, Decimal('3120.27'))
         self.assertEqual(line.commission_estimate, Decimal('307.32'))
 
+    def test_fractional_commission_rounds_on_the_full_line(self):
+        line = price_line(wholesale_unit_net='100', retail_unit_gross='178.34',
+                          vat_rate='0.23', qty=2, rules=RULES)
+        self.assertEqual(line.retail_unit_gross_after, Decimal('160.51'))
+        self.assertEqual(line.retail_unit_net_after, Decimal('130.50'))
+        self.assertEqual(line.commission_estimate, Decimal('18.27'))
+
     def test_negative_wholesale_is_rejected(self):
         with self.assertRaisesRegex(ValueError, 'manual review'):
             price_line(wholesale_unit_net='1', retail_unit_gross='2000',

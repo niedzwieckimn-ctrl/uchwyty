@@ -5,7 +5,7 @@ Zmiany powstały na podstawie `uchwyty-main (51).zip`, a następnie zostały prz
 ## Kolejność
 
 1. Zrób kopię bazy i sprawdź ją na izolowanym środowisku. Potwierdź kolumny `client_accounts(user_id,customer_id,is_active)`, `orders.idempotency_key`, `order_items.unit_net_price`, `invoice_allocations.order_item_id`, `invoices.publication_state`, `stock.qty`.
-2. Na staging uruchom `migrations/architect_program_001.sql`. Jest to migracja jednorazowa. Zawiera nowe tabele, ograniczenia, RLS i funkcje transakcyjne; nie aktualizuje istniejących zamówień.
+2. Na staging uruchom `migrations/architect_program_001.sql`, a następnie `migrations/architect_commission_rounding_003.sql`. Pierwsza migracja jest jednorazowa i zawiera nowe tabele, ograniczenia, RLS i funkcje transakcyjne; nie aktualizuje istniejących zamówień. Migracja 003 aktualizuje funkcję naliczania prowizji również w bazach, które wcześniej uruchomiły 001.
 3. Wdróż ten backend z obecnymi sekretami Supabase tylko w konfiguracji serwera. Dodaj `ARCHITECT_ALLOWED_ORIGINS=https://<testowy-adres-netlify>`. Sprawdź, że nowe konto Auth bez aktywnego `client_accounts` dostaje 403 od każdego endpointu `/api/client/*`.
 4. Wdróż zmieniony Panel Klienta B2B na testowym adresie i Panel Architekta na testowym Netlify. Dodaj adres testowy do przekierowań Supabase Auth. Wypełnij publiczne zmienne Vite zgodnie z `.env.example` panelu.
 5. Uruchom scenariusze w `TESTY-WDROZENIOWE.md`, łącznie z dwoma kontami dystrybutorów, kontem architekta, częściową fakturą, dwukrotnym zamówieniem, zwrotem po wypłacie i odczytami RLS. Testy muszą działać na staging z kopiami danych testowych.
@@ -20,10 +20,12 @@ Kod można wykorzystać raz i tylko u wybranego, aktywnego dystrybutora. Zamówi
 
 Prowizja powstaje dopiero po potwierdzeniu faktycznej sprzedaży i wystawieniu kompletnej faktury B2B. Administrator zatwierdza ją i zapisuje zewnętrzny numer wypłaty; system nie wykonuje przelewów. Opóźnione zatwierdzenie tworzy dodatkową partię rozliczenia dla miesiąca pierwotnej sprzedaży. Zwrot tworzy odrębny ujemny zapis, także po wypłacie.
 
+Przy częściowych fakturach prowizja jest zaokrąglana narastająco od całej potwierdzonej ilości. Zapis dla kolejnej faktury stanowi różnicę względem już naliczonych prowizji; suma zapisów równa się prowizji dla jednej faktury obejmującej tę samą ilość.
+
 ## Ograniczenia przed produkcją
 
 - Zamówienia programu są obecnie dopuszczone tylko przy VAT 23%, ponieważ istniejący generator faktur krajowych narzuca tę stawkę. Katalog umie pokazać inną stawkę; użycie kodu na taki wariant kończy się 409 do czasu przebudowy fakturowania i testu podatkowego.
-- Skuteczność funkcji SQL została sprawdzona składniowo, nie transakcyjnie na PostgreSQL. Nie uruchamiaj migracji na `main` przed testem staging.
+- Funkcje SQL przeszły transakcyjny test na osobnej, pustej bazie Supabase staging: dwa częściowe dokumenty, idempotencja, przypisanie dystrybutora, rozliczenie, wypłata i zwrot. Test zakończył się `ROLLBACK`, więc nie pozostawił zamówień ani kont testowych. Nadal wymagany jest test pełnej ścieżki HTTP/Auth/Netlify/Render na staging przed wdrożeniem produkcyjnym.
 - Weryfikacja Instagrama jest manualną decyzją administratora. Kwestie regulaminu i tekstu informacji o danych osobowych wymagają zatwierdzonej treści przed publiczną rejestracją.
 - Eksporty i lista administratora mają limit 5000 rekordów na odczyt. Przed większą skalą dodaj paginację.
 
