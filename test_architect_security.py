@@ -55,6 +55,67 @@ def test_distributor_orders_are_scoped_by_membership_not_email():
     assert len(calls) == 2
 
 
+def test_distributor_sale_form_reports_already_sold_units():
+    user = {'id':'0b000000-0000-0000-0000-000000000002',
+            'email':'employee@example.com','name':'Employee'}
+
+    def remote(path, **kwargs):
+        if path == '/rest/v1/client_accounts':
+            return [{'customer_id':17,'is_active':True}]
+        if path == '/rest/v1/architect_code_redemptions':
+            assert kwargs['params']['distributor_id'] == 'eq.17'
+            return [{'id':'0b000000-0000-0000-0000-000000000003',
+                     'order_id':51,'distributor_id':17}]
+        if path == '/rest/v1/architect_sale_lines':
+            return [{'id':7,'qty':2,'order_item_id':6,'product_id':3,
+                     'retail_gross_before':200,'retail_gross_after':180,'vat_rate':0.23}]
+        if path == '/rest/v1/architect_commission_ledger':
+            assert kwargs['params']['entry_type'] == 'eq.accrual'
+            return [{'sale_line_id':7,'sold_qty':1}]
+        if path == '/rest/v1/invoices':
+            return [{'id':5,'invoice_no':'TEST-5'}]
+        raise AssertionError(f'Unexpected read: {path}')
+
+    with patch.object(backend, '_authenticated_client_user', return_value=user), \
+         patch.object(backend, 'supabase_enabled', return_value=True), \
+         patch.object(backend, 'supabase_request', side_effect=remote), \
+         patch.object(architect_routes, 'supabase_request', side_effect=remote):
+        response = backend.app.test_client().get('/api/client/architect-sales?order_id=51')
+    assert response.status_code == 200
+    assert response.get_json()['lines'][0]['sold_qty'] == 1
+
+
+def test_duplicate_distributor_sale_returns_business_conflict():
+    from io import BytesIO
+    user = {'id':'0b000000-0000-0000-0000-000000000002',
+            'email':'employee@example.com','name':'Employee'}
+
+    def remote(path, **kwargs):
+        if path == '/rest/v1/client_accounts':
+            return [{'customer_id':17,'is_active':True}]
+        if path == '/rest/v1/architect_sale_lines':
+            return [{'id':7,'redemption_id':'0b000000-0000-0000-0000-000000000003'}]
+        if path == '/rest/v1/architect_code_redemptions':
+            return [{'distributor_id':17}]
+        if path == '/rest/v1/rpc/architect_record_verified_sale':
+            raise urllib.error.HTTPError('https://example.invalid',400,'Bad Request',{},
+                BytesIO(b'{"message":"Sold units exceed invoiced units"}'))
+        raise AssertionError(f'Unexpected read: {path}')
+
+    with patch.object(backend, '_authenticated_client_user', return_value=user), \
+         patch.object(backend, 'supabase_enabled', return_value=True), \
+         patch.object(backend, 'supabase_request', side_effect=remote), \
+         patch.object(architect_routes, 'supabase_request', side_effect=remote), \
+         patch.object(architect_routes, '_rate_limit', return_value=True), \
+         patch.object(architect_routes, '_client_order_origin_allowed', return_value=True):
+        response = backend.app.test_client().post('/api/client/architect-sales', json={
+            'sale_line_id':7,'invoice_id':5,'sold_qty':1,
+            'sale_reference':'TEST-001','sale_date':'2026-10-28',
+            'retail_gross_before':'200.00','retail_gross_after':'180.00'})
+    assert response.status_code == 409
+    assert 'przekracza'.encode() in response.data
+
+
 def test_admin_architect_page_renders_without_program_data():
     with patch.dict(backend.app.config,{'SECRET_KEY':'test-only-session-key'}):
         client=backend.app.test_client()
