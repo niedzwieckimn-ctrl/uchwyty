@@ -7261,6 +7261,24 @@ def _client_stock_catalog_rows(profile: dict) -> list[dict]:
             raise RuntimeError("Nieprawidłowa odpowiedź cennika EUR")
         eur_by_sku = {norm(row.get("sku")).lower(): row for row in eur_rows}
 
+    approved_retail_by_product = {}
+    if price_list != "eu_eur":
+        try:
+            retail_rows = supabase_request(
+                "/rest/v1/architect_product_details",
+                method="GET",
+                params={"select": "product_id,retail_gross_override", "retail_gross_override": "not.is.null", "limit": 5000},
+                timeout=20,
+            ) or []
+            approved_retail_by_product = {
+                to_int(item.get("product_id"), 0): money_float(item.get("retail_gross_override"))
+                for item in retail_rows if isinstance(item, dict)
+            }
+        except Exception:
+            # The catalog also serves installations where the architect program
+            # has not been migrated yet. Keep the existing B2B price fallback.
+            app.logger.warning("Nie udało się odczytać zatwierdzonych cen detalicznych", exc_info=True)
+
     catalog = []
     for raw in rows:
         row = dict(raw)
@@ -7284,7 +7302,9 @@ def _client_stock_catalog_rows(profile: dict) -> list[dict]:
         else:
             net_price = money_float(row.get("net_price"))
             gross_price = money_float(row.get("gross_price"))
-            retail_price = money_float(money_dec(net_price) * Decimal("1.45") * Decimal("1.23"))
+            retail_price = approved_retail_by_product.get(product_id) or money_float(
+                money_dec(net_price) * Decimal("1.45") * Decimal("1.23")
+            )
         row.update({
             "net_price": net_price,
             "gross_price": gross_price,

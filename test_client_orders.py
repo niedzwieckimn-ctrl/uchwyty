@@ -20,6 +20,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(backend, "supabase_enabled", lambda: True)
     monkeypatch.setattr(backend, "maybe_pull_shared_from_supabase", lambda **kwargs: None)
     monkeypatch.setattr(backend, "_authenticated_client_user", lambda: {"id": "user-1", "email": "test@example.com", "name": "Test"})
+    monkeypatch.setattr(backend, "_active_client_membership", lambda user_id: {"customer_id": 77})
     monkeypatch.setattr(backend, "_order_by_idempotency_key", lambda key: None)
     monkeypatch.setattr(backend, "_client_profile_for_email", lambda email: {
         "id": 77, "name": "Test", "email": email, "language": "pl",
@@ -34,6 +35,22 @@ def client(tmp_path, monkeypatch):
 
 def headers():
     return {"Authorization": "Bearer test", "Idempotency-Key": str(uuid.uuid4())}
+
+
+def test_catalog_uses_approved_retail_price_for_architect_quotes(monkeypatch):
+    responses = {
+        "/rest/v1/client_stock_catalog_v": [{
+            "product_id": 501, "sku": "STAGING-MOS-001", "model": "STAGING-MOS",
+            "name": "Testowy uchwyt", "qty_physical": 20, "qty_reserved": 0,
+            "qty_on_stock": 20, "net_price": 100, "gross_price": 123,
+        }],
+        "/rest/v1/architect_product_details": [{
+            "product_id": 501, "retail_gross_override": 178.34,
+        }],
+    }
+    monkeypatch.setattr(backend, "supabase_request", lambda path, **kwargs: responses.get(path, []))
+    rows = backend._client_stock_catalog_rows({"price_list": "pln"})
+    assert rows[0]["retail_price"] == 178.34
 
 
 def test_inpost_accepts_full_and_partial_packing_statuses():
@@ -99,7 +116,8 @@ def test_email_failure_keeps_created_order(client, monkeypatch):
 
 
 def test_same_idempotency_key_returns_existing_order(client, monkeypatch):
-    monkeypatch.setattr(backend, "_order_by_idempotency_key", lambda key: {"id": 125, "order_no": "ZAM-TEST", "customer_email": "test@example.com"})
+    monkeypatch.setattr(backend, "_order_by_idempotency_key", lambda key: {"id": 125, "order_no": "ZAM-TEST", "customer_id": 77, "customer_email": "test@example.com"})
+    monkeypatch.setattr(backend, "supabase_request", lambda path, **kwargs: [])
     create = Mock(side_effect=AssertionError("must not create"))
     monkeypatch.setattr(backend, "remote_first_create_order", create)
     monkeypatch.setattr(backend, "_send_saved_order_confirmation", lambda order_id: {"ok": True, "duplicate": True})
@@ -166,8 +184,8 @@ def test_order_pdf_is_owned_and_uses_profile_language(client, monkeypatch):
         ("TEST", 10, 12.3, backend.now_iso()),
     )
     c.execute(
-        "INSERT INTO orders(id, order_no, customer_name, customer_email, status, created_at) VALUES(?,?,?,?,?,?)",
-        (901, "ZAM-PDF-901", "Test", "test@example.com", "confirmed", backend.now_iso()),
+        "INSERT INTO orders(id, order_no, customer_id, customer_name, customer_email, status, created_at) VALUES(?,?,?,?,?,?,?)",
+        (901, "ZAM-PDF-901", 77, "Test", "test@example.com", "confirmed", backend.now_iso()),
     )
     c.execute(
         "INSERT INTO order_items(order_id, product_id, sku, qty, created_at) VALUES(?,?,?,?,?)",
