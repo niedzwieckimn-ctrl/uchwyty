@@ -818,6 +818,13 @@ def register_routes(context):
         items = [dict(r) for r in cur.fetchall()]
 
         for it in items:
+            # Match the invoice engine: VAT is rounded on the complete net line.
+            # Multiplying a rounded unit gross can differ by a cent for qty > 1.
+            line_net = money_dec(it.get("line_value_net"))
+            it["line_value_gross"] = money_float(
+                line_net if (it.get("currency") or o["currency"] or "PLN") == "EUR"
+                else line_net + vat23_from_net(line_net)
+            )
             it["in_delivery_available"] = int(it.get("in_delivery", 0))
             it["delivery_used"] = 0
             it["line_shortage"] = 0
