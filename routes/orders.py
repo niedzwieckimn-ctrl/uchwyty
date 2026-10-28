@@ -1,5 +1,7 @@
 """Mechanically extracted Flask routes; business logic is unchanged."""
 
+import architect_order_email
+
 def register_routes(context):
     globals().update(context)
 
@@ -1800,7 +1802,7 @@ def register_routes(context):
                         return jsonify(ok=False, error="Konflikt Idempotency-Key"), 409
                     return jsonify(ok=True, duplicate=True,
                                    order={"id": existing["id"], "order_no": existing["order_no"]},
-                                   email={"ok": False, "pending_retry": True})
+                                   email=architect_order_email.order_status(supabase_request, existing["id"]))
                 order_id = to_int(supabase_request(
                     "/rest/v1/rpc/architect_create_discounted_order", method="POST",
                     payload={"p_auth_user_id": client_user["id"],
@@ -1812,7 +1814,7 @@ def register_routes(context):
                 saved = saved_architect_order()
                 order_no = saved["order_no"] if saved else make_order_no(order_id, now_iso())
                 return jsonify(ok=True, order={"id": order_id, "order_no": order_no},
-                               email={"ok": False, "pending_retry": True})
+                               email=architect_order_email.order_status(supabase_request, order_id))
             except Exception:
                 # A lost HTTP response can follow a committed SQL transaction.
                 # Reconcile by the same key before reporting an error.
@@ -1822,7 +1824,7 @@ def register_routes(context):
                             and architect_replay_matches(saved["id"]):
                         return jsonify(ok=True, duplicate=True, recovered=True,
                                        order={"id": saved["id"], "order_no": saved["order_no"]},
-                                       email={"ok": False, "pending_retry": True})
+                                       email=architect_order_email.order_status(supabase_request, saved["id"]))
                 except Exception:
                     pass
                 app.logger.exception("Błąd transakcyjnego zamówienia architekta user_id=%s", client_user["id"])
