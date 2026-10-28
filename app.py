@@ -28,6 +28,7 @@ from contextlib import contextmanager
 from functools import wraps
 
 _STARTUP_STARTED = time.monotonic()
+_APP_IMPORT_PID = os.getpid()
 _startup_logger = logging.getLogger("app.startup")
 _ai_chat_logger = logging.getLogger("app.ai_chat")
 
@@ -9475,11 +9476,13 @@ def _refresh_domain_route_context():
 # protects the same shipment across processes; the thread lock is only local.
 import inpost_pickups as _inpost_pickups
 import sys as _pickup_sys
-_inpost_pickups.start_worker(_pickup_sys.modules[__name__])
+if not os.environ.get("RENDER"):
+    _inpost_pickups.start_worker(_pickup_sys.modules[__name__])
 _startup_step("inpost_worker_init")
 
 import inpost_tracking as _inpost_tracking
-_inpost_tracking.start_worker(_pickup_sys.modules[__name__])
+if not os.environ.get("RENDER"):
+    _inpost_tracking.start_worker(_pickup_sys.modules[__name__])
 _startup_step("inpost_tracking_worker_init")
 
 # The scheduler runs in a daemon thread, while the durable claim coordinates
@@ -9487,7 +9490,8 @@ _startup_step("inpost_tracking_worker_init")
 import ksef_scheduler as _ksef_scheduler
 import ksef_automation as _ksef_automation
 _ksef_automation.register_routes(_pickup_sys.modules[__name__])
-_ksef_scheduler.start_worker(_pickup_sys.modules[__name__])
+if not os.environ.get("RENDER"):
+    _ksef_scheduler.start_worker(_pickup_sys.modules[__name__])
 _startup_step("ksef_scheduler_worker_init")
 
 
@@ -9506,7 +9510,8 @@ def _send_audit_to_supabase(payload):
 
 if supabase_enabled():
     configure_audit_remote_sender(_send_audit_to_supabase)
-    start_audit_outbox_worker()
+    if not os.environ.get("RENDER"):
+        start_audit_outbox_worker()
 _startup_step("audit_worker_init")
 _startup_step("app_ready")
 
