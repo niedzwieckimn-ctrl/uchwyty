@@ -14,6 +14,8 @@ def program_admin(admin_client, monkeypatch):
     calls=[]
     def remote(path,**kwargs):
         calls.append((path,kwargs))
+        if path == '/rest/v1/customers':
+            return [dict(id=101,name='Salon A',address='Testowa 1',email='test@example.invalid',phone='',nip='',language='pl',price_list='pln')]
         return [] if 'memberships' in path else {'ok':True}
     monkeypatch.setattr(b,'supabase_enabled',lambda:True)
     monkeypatch.setattr(b,'supabase_request',remote)
@@ -37,6 +39,12 @@ def test_customer_toggle_requires_csrf(program_admin):
     client,token,calls=program_admin
     result=client.post('/customers/101/architect-program',data={'active':'1'})
     assert result.status_code==403 and calls==[]
+
+def test_remote_customer_profile_survives_empty_local_cache(program_admin):
+    client,token,calls=program_admin
+    db=b.conn(); db.execute('DELETE FROM customers WHERE id=101'); db.commit(); db.close()
+    result=client.get('/customers/101/edit')
+    assert result.status_code==200 and 'Salon A' in result.get_data(as_text=True)
 
 def test_warehouse_role_cannot_change_membership(program_admin):
     client,token,calls=program_admin
