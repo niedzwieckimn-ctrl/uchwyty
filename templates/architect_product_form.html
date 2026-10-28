@@ -1,0 +1,20 @@
+<div class="card">
+  <h2>Treść katalogu architekta</h2>
+  <p>Nazwy, symbole i zdjęcia pochodzą ze wspólnego katalogu IKUGO. Tutaj uzupełnisz opis wariantu, wymiary, wykończenie, dane techniczne i zatwierdzoną cenę detaliczną.</p>
+  <form method="post" action="{{ url_for('architects_admin') }}" style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">
+    <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}"><input type="hidden" name="action" value="product_details">
+    <label>ID wariantu<input name="product_id" type="number" min="1" list="architect-product-ids" required></label>
+    <datalist id="architect-product-ids">{% for p in products %}<option value="{{ p.product_id }}">{{ p.sku }} · {{ p.model }} · {{ p.name }}</option>{% endfor %}</datalist>
+    <label>Materiał<input name="material" value="Lity mosiądz" required></label>
+    <label>Rozstaw montażowy<input name="mounting_spacing" placeholder="np. 160 mm"></label>
+    <label>Wymiary i długości<input name="dimensions"></label>
+    <label>Wykończenie<input name="finish"></label>
+    <label>VAT<input name="vat_rate" type="number" min="0" max="1" step="0.01" value="0.23" required></label>
+    <label>Zatwierdzona cena detaliczna brutto PLN<input name="retail_gross_override" type="number" min="0.01" step="0.01" placeholder="Puste = B2B × 1,45 × VAT"></label>
+    <label>Link HTTPS do modelu 3D<input name="model_3d_url" type="url" placeholder="https://…"></label>
+    <label style="grid-column:1/-1">Opis<textarea name="description"></textarea></label>
+    <label style="grid-column:1/-1">Dane techniczne JSON<textarea name="technical_data">{}</textarea></label>
+    <button class="btn primary">Zapisz dane produktu</button>
+  </form>
+  <div style="overflow:auto;margin-top:15px"><table><thead><tr><th>ID</th><th>Materiał</th><th>Rozstaw</th><th>Wymiary</th><th>Wykończenie</th><th>VAT</th><th>Cena brutto</th></tr></thead><tbody>{% for p in product_details %}<tr><td>{{ p.product_id }}</td><td>{{ p.material }}</td><td>{{ p.mounting_spacing or '' }}</td><td>{{ p.dimensions or '' }}</td><td>{{ p.finish or '' }}</td><td>{{ p.vat_rate }}</td><td>{{ p.retail_gross_override or 'z cennika' }}</td></tr>{% else %}<tr><td colspan="7">Brak uzupełnionych wariantów.</td></tr>{% endfor %}</tbody></table></div>
+</div>

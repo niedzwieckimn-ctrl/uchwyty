@@ -3191,7 +3191,7 @@ Poproś krótko o wskazanie jednego obszaru albo obiektu, który użytkownik chc
                             if int(source.get('entity_id') or 0) == int(arguments['invoice_id']):
                                 invoice_record = {**(source.get('trusted_result_subset') or {}), **invoice_record}
                                 break
-                        approval['invoice_number'] = str(invoice_record.get('invoice_number') or '')
+                        approval['invoice_number'] = str(approval.get('invoice_number') or invoice_record.get('invoice_number') or '')
                         approval['buyer_name'] = str(invoice_record.get('buyer_name') or '')
                     if call.name == 'invoices.payment.set_status':
                         approval['paid'] = bool(arguments.get('paid'))

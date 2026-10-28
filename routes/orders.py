@@ -716,6 +716,33 @@ def register_routes(context):
         # Rebuild only the cache before diagnostics. This does not poll InPost,
         # finalize a shipment or send mail on an ordinary page view.
         c.close()
+
+        architect_promo = None
+        if supabase_enabled():
+            try:
+                redemption = architect_order_redemption(order_id)
+                if redemption:
+                    codes = supabase_request('/rest/v1/architect_codes',params={
+                        'select':'code,architect_id,status',
+                        'id':f"eq.{redemption['code_id']}",'limit':1},timeout=10) or []
+                    architect = supabase_request('/rest/v1/architect_profiles',params={
+                        'select':'first_name,last_name,studio_name',
+                        'id':f"eq.{codes[0]['architect_id']}",'limit':1},timeout=10) or [] if codes else []
+                    lines = supabase_request('/rest/v1/architect_sale_lines',params={
+                        'select':'wholesale_net_before,manufacturer_discount_net,wholesale_net_after',
+                        'redemption_id':f"eq.{redemption['id']}",'limit':100},timeout=10) or []
+                    architect_promo = {
+                        'code':codes[0]['code'] if codes else '',
+                        'code_status':codes[0]['status'] if codes else '',
+                        'architect_name':(' '.join(filter(None,[architect[0].get('first_name'),architect[0].get('last_name')])) if architect else ''),
+                        'studio_name':architect[0].get('studio_name') if architect else '',
+                        'distributor_id':redemption['distributor_id'],
+                        'standard_net':sum(Decimal(str(x['wholesale_net_before'])) for x in lines),
+                        'discount_net':sum(Decimal(str(x['manufacturer_discount_net'])) for x in lines),
+                        'final_net':sum(Decimal(str(x['wholesale_net_after'])) for x in lines),
+                    }
+            except Exception:
+                app.logger.exception('Nie udało się pobrać danych rabatu architekta dla zamówienia %s',order_id)
         try:
             inpost_tracking.restore_packing_scope(sys.modules[app.import_name], dict(o))
             if not norm(o['inpost_shipment_id']):
@@ -924,6 +951,14 @@ def register_routes(context):
               </div>
             </div>
           </div>
+
+          {% if architect_promo %}<div class="card" style="border-color:#c9b78f;background:#fbf8f1">
+            <h2>Rabat architekta</h2>
+            <div class="grid3"><div><small>Kod</small><br><b>{{ architect_promo.code }}</b><br><small>Status: {{ architect_promo.code_status }}</small></div>
+              <div><small>Architekt</small><br><b>{{ architect_promo.architect_name }}</b><br>{{ architect_promo.studio_name }}</div>
+              <div><small>Dystrybutor ID</small><br><b>{{ architect_promo.distributor_id }}</b></div></div>
+            <p>Wartość standardowa netto: <b>{{ '%.2f'|format(architect_promo.standard_net) }} PLN</b> · rabat Niedźwieccy: <b>{{ '%.2f'|format(architect_promo.discount_net) }} PLN</b> · wartość po rabacie: <b>{{ '%.2f'|format(architect_promo.final_net) }} PLN</b></p>
+          </div>{% endif %}
 
           <div class="card order-progress">
             <div class="progress-step {% if not initial %}done{% else %}active{% endif %}"><span class="progress-dot">{% if not initial %}✓{% else %}1{% endif %}</span><span class="progress-label">Niepotwierdzone</span>{% if initial %}<span class="progress-current">Aktualny status</span>{% endif %}</div>
@@ -1153,7 +1188,7 @@ def register_routes(context):
           </div>
         {% endblock %}
         """
-        return render_template_string(tpl, title=canonical_order_no(o["id"], o["created_at"], o["order_no"]), base_url=BASE_URL, db_path=DB_PATH, o=o, items=items, saved_packing_documents=saved_packing_documents, current_document=current_document, packing_history_documents=packing_history_documents, can_edit_packing=can_edit_packing, current_package=current_package, shipment_form_version=shipment_form_version, open_selection=open_selection, pending_package=pending_package, resume_url=resume_url, invoice=dict(invoice_row) if invoice_row else None, shipment_status=shipment_status, shipment_status_error=shipment_status_error, shipment_state=shipment_state, shipment_work=shipment_work, refresh_result=refresh_result, notice=notice, notice_state=notice_state, shipment_scope=shipment_scope, inpost_status_label=inpost_tracking.status_label, inpost_result_label=inpost_tracking.result_label, inpost_notification_label=inpost_tracking.notification_label, order_url=order_url, products=products_rows, locked=(int(o["warehouse_issued"] or 0)==1), order_status_label=order_status_label, order_status_css=order_status_css, canonical_order_no=canonical_order_no)
+        return render_template_string(tpl, title=canonical_order_no(o["id"], o["created_at"], o["order_no"]), base_url=BASE_URL, db_path=DB_PATH, o=o, items=items, architect_promo=architect_promo, saved_packing_documents=saved_packing_documents, current_document=current_document, packing_history_documents=packing_history_documents, can_edit_packing=can_edit_packing, current_package=current_package, shipment_form_version=shipment_form_version, open_selection=open_selection, pending_package=pending_package, resume_url=resume_url, invoice=dict(invoice_row) if invoice_row else None, shipment_status=shipment_status, shipment_status_error=shipment_status_error, shipment_state=shipment_state, shipment_work=shipment_work, refresh_result=refresh_result, notice=notice, notice_state=notice_state, shipment_scope=shipment_scope, inpost_status_label=inpost_tracking.status_label, inpost_result_label=inpost_tracking.result_label, inpost_notification_label=inpost_tracking.notification_label, order_url=order_url, products=products_rows, locked=(int(o["warehouse_issued"] or 0)==1 or bool(architect_promo)), order_status_label=order_status_label, order_status_css=order_status_css, canonical_order_no=canonical_order_no)
 
 
 
@@ -1172,6 +1207,8 @@ def register_routes(context):
 
 
     def order_item_add_service(order_id, *, request, session=None, structured=False):
+        if architect_order_redemption(order_id):
+            return 'Zamówienie z kodem architekta wymaga korekty z zachowaniem historii', 409
         product_id = to_int(request.form.get("product_id"), 0)
         qty = to_int(request.form.get("qty"), 0)
         if product_id <= 0 or qty <= 0:
@@ -1256,6 +1293,8 @@ def register_routes(context):
 
 
     def order_item_update_service(order_id, item_id, *, request, session=None, structured=False):
+        if architect_order_redemption(order_id):
+            return 'Zamówienie z kodem architekta wymaga korekty z zachowaniem historii', 409
         qty = to_int(request.form.get("qty"), 0)
         if qty <= 0:
             return "IloĹ›Ä‡ musi byÄ‡ > 0", 400
@@ -1295,6 +1334,8 @@ def register_routes(context):
 
 
     def order_item_delete_service(order_id, item_id, *, request, session=None, structured=False):
+        if architect_order_redemption(order_id):
+            return 'Zamówienie z kodem architekta wymaga korekty z zachowaniem historii', 409
         c = conn()
         cur = c.cursor()
         cur.execute("SELECT status, warehouse_issued FROM orders WHERE id=?", (order_id,))
@@ -1332,6 +1373,8 @@ def register_routes(context):
 
     @app.post("/orders/<int:order_id>/delete")
     def order_delete(order_id):
+        if architect_order_redemption(order_id):
+            return 'Zamówienia z wykorzystanym kodem nie można usunąć; użyj korekty z historią', 409
         c = conn()
         cur = c.cursor()
         cur.execute("SELECT id, warehouse_issued FROM orders WHERE id=?", (order_id,))
@@ -1662,13 +1705,22 @@ def register_routes(context):
 
 
 
-    @app.route("/api/client/orders", methods=["POST", "OPTIONS"])
+    @app.route("/api/client/orders", methods=["GET", "POST", "OPTIONS"])
     def api_client_orders_create():
         """Create the complete order and send its email in one backend request."""
         if not _client_order_origin_allowed():
             return jsonify(ok=False, error="Niedozwolone źródło żądania"), 403
         if request.method == "OPTIONS":
             return ("", 204)
+
+        if request.method == "GET":
+            if not supabase_enabled():
+                return jsonify(ok=False, error="Brak połączenia z zamówieniami"), 503
+            rows = supabase_request('/rest/v1/orders', params={
+                'select':'id,order_no,qr_data_url,status,created_at,customer_name,customer_email,note,currency,price_list,tracking_no,carrier,packed_at,shipped_at',
+                'customer_id':f'eq.{g.client_customer_id}',
+                'order':'id.desc','limit':200}, timeout=20) or []
+            return jsonify(ok=True, orders=rows)
 
         if not supabase_enabled():
             app.logger.error("Odrzucono zamówienie klienta: brak konfiguracji Supabase")
@@ -1683,21 +1735,122 @@ def register_routes(context):
         customer_email = client_user["email"]
         customer_name = client_user["name"]
         note = norm(data.get("note"))
+        architect_code = norm(data.get("architect_code")).upper()
+        if architect_code:
+            g.architect_program_write = True
         idempotency_key = norm(request.headers.get("Idempotency-Key"))
         try:
             uuid.UUID(idempotency_key)
         except Exception:
             return jsonify(ok=False, error="Brak lub niepoprawny Idempotency-Key"), 400
 
+        def architect_replay_matches(saved_order_id):
+            replay = supabase_request("/rest/v1/architect_code_redemptions", params={
+                "select": "code_id,distributor_id,redeemed_by_user_id,request_items",
+                "order_id": f"eq.{saved_order_id}", "limit": 1,
+            }, timeout=10) or []
+            if not replay:
+                return not architect_code
+            if not architect_code or not isinstance(data.get("items"), list):
+                return False
+            replay_code = supabase_request("/rest/v1/architect_codes", params={
+                "select": "code", "id": f"eq.{replay[0]['code_id']}", "limit": 1,
+            }, timeout=10) or []
+            raw = data["items"]
+            expected = [{"product_id": x.get("product_id"), "qty": x.get("qty")}
+                        for x in raw if isinstance(x, dict)]
+            return (len(expected) == len(raw) and bool(replay_code)
+                    and replay_code[0].get("code") == architect_code
+                    and replay[0].get("request_items") == expected
+                    and replay[0].get("redeemed_by_user_id") == client_user["id"]
+                    and to_int(replay[0].get("distributor_id"), 0) == to_int(g.client_customer_id, 0))
+
+        if architect_code:
+            # The PostgreSQL function validates the distributor, code, products,
+            # prices and idempotency in one transaction. The staging warehouse's
+            # SQLite cache can be unavailable while a full IKUGO pull is running;
+            # it must not prevent this remote-first order from being committed.
+            raw_items = data.get("items")
+            if not isinstance(raw_items, list) or not 1 <= len(raw_items) <= 100:
+                return jsonify(ok=False, error="Zamówienie musi zawierać od 1 do 100 pozycji"), 400
+            items_for_rpc = []
+            for item in raw_items:
+                if (not isinstance(item, dict) or isinstance(item.get("product_id"), bool)
+                        or not isinstance(item.get("product_id"), int) or item["product_id"] <= 0
+                        or isinstance(item.get("qty"), bool)
+                        or not isinstance(item.get("qty"), int) or item["qty"] <= 0):
+                    return jsonify(ok=False, error="Nieprawidłowa pozycja zamówienia"), 400
+                items_for_rpc.append({"product_id": item["product_id"], "qty": item["qty"]})
+            customer_id = to_int(g.client_customer_id, 0)
+            if customer_id <= 0:
+                return jsonify(ok=False, error="Brak powiązanego dystrybutora"), 403
+
+            def saved_architect_order():
+                rows = supabase_request("/rest/v1/orders", params={
+                    "select": "id,order_no,customer_id",
+                    "idempotency_key": f"eq.{idempotency_key}", "limit": 1,
+                }, timeout=10) or []
+                return rows[0] if rows else None
+
+            try:
+                existing = saved_architect_order()
+                if existing:
+                    if (to_int(existing.get("customer_id"), 0) != customer_id
+                            or not architect_replay_matches(existing["id"])):
+                        return jsonify(ok=False, error="Konflikt Idempotency-Key"), 409
+                    return jsonify(ok=True, duplicate=True,
+                                   order={"id": existing["id"], "order_no": existing["order_no"]},
+                                   email={"ok": False, "pending_retry": True})
+                order_id = to_int(supabase_request(
+                    "/rest/v1/rpc/architect_create_discounted_order", method="POST",
+                    payload={"p_auth_user_id": client_user["id"],
+                             "p_customer_id": customer_id, "p_code": architect_code,
+                             "p_idempotency_key": idempotency_key,
+                             "p_items": items_for_rpc, "p_note": note}, timeout=30), 0)
+                if order_id <= 0:
+                    raise RuntimeError("Nie otrzymano numeru zamówienia")
+                saved = saved_architect_order()
+                order_no = saved["order_no"] if saved else make_order_no(order_id, now_iso())
+                return jsonify(ok=True, order={"id": order_id, "order_no": order_no},
+                               email={"ok": False, "pending_retry": True})
+            except Exception:
+                # A lost HTTP response can follow a committed SQL transaction.
+                # Reconcile by the same key before reporting an error.
+                try:
+                    saved = saved_architect_order()
+                    if saved and to_int(saved.get("customer_id"), 0) == customer_id \
+                            and architect_replay_matches(saved["id"]):
+                        return jsonify(ok=True, duplicate=True, recovered=True,
+                                       order={"id": saved["id"], "order_no": saved["order_no"]},
+                                       email={"ok": False, "pending_retry": True})
+                except Exception:
+                    pass
+                app.logger.exception("Błąd transakcyjnego zamówienia architekta user_id=%s", client_user["id"])
+                return jsonify(ok=False, error="Nie udało się zapisać zamówienia z kodem"), 500
+
         try:
-            maybe_pull_shared_from_supabase(force=True)
+            if architect_code:
+                # The code RPC checks prices, distributor and stock atomically.
+                # Only the local product lookup below needs a current snapshot;
+                # avoid blocking on unrelated IKUGO tables in an isolated stage.
+                snapshot = pull_shared_tables_from_supabase(
+                    force=True, delete_missing=False,
+                    tables=(("customers", "id"), ("products", "id")),
+                )
+                if not snapshot.get("ok"):
+                    raise RuntimeError("Niepełny odczyt klientów lub produktów")
+            else:
+                maybe_pull_shared_from_supabase(force=True)
         except Exception as exc:
             app.logger.error("Nie udało się odświeżyć danych Supabase przed zamówieniem: %s", exc)
             return jsonify(ok=False, error="Nie udało się odświeżyć danych produktów"), 503
 
         existing = _order_by_idempotency_key(idempotency_key)
         if existing:
-            if norm(existing.get("customer_email")).lower() != customer_email:
+            if (to_int(existing.get("customer_id"), 0) != to_int(g.client_customer_id, 0)
+                    or (not architect_code and norm(existing.get("customer_email")).lower() != customer_email)):
+                return jsonify(ok=False, error="Konflikt Idempotency-Key"), 409
+            if not architect_replay_matches(existing["id"]):
                 return jsonify(ok=False, error="Konflikt Idempotency-Key"), 409
             app.logger.info("Ponowiono request user_id=%s order_id=%s idempotency_key=%s", client_user["id"], existing["id"], idempotency_key)
             return jsonify(ok=True, duplicate=True, order={"id": existing["id"], "order_no": existing["order_no"]}, email=_safe_saved_order_confirmation(int(existing["id"])))
@@ -1753,14 +1906,42 @@ def register_routes(context):
             c.close()
 
         try:
+            if architect_code:
+                if profile.get("price_list") != "pln":
+                    return jsonify(ok=False, error="Kod działa tylko dla cennika PLN"), 400
+                order_id = to_int(supabase_request(
+                    "/rest/v1/rpc/architect_create_discounted_order", method="POST",
+                    payload={
+                        "p_auth_user_id": client_user["id"],
+                        "p_customer_id": profile["id"], "p_code": architect_code,
+                        "p_idempotency_key": idempotency_key,
+                        "p_items": [{"product_id": x["product_id"], "qty": x["qty"]} for x in items],
+                        "p_note": note,
+                    }, timeout=30), 0)
+                if order_id <= 0:
+                    raise RuntimeError("Nie otrzymano numeru zamówienia")
+                # The remote PostgreSQL transaction is committed at this point.
+                # A local cache refresh or email failure must not turn a saved
+                # order into a failed response or trigger a second redemption.
+                try:
+                    snapshot = pull_shared_tables_from_supabase(
+                        force=True, delete_missing=False,
+                        tables=(("orders", "id"), ("order_items", "id")),
+                    )
+                    if not snapshot.get("ok"):
+                        raise RuntimeError("Niepełny odczyt zapisanego zamówienia")
+                    email_result = _safe_saved_order_confirmation(order_id)
+                except Exception:
+                    app.logger.exception("Zamówienie architekta zapisane, ale lokalna synchronizacja nie powiodła się")
+                    email_result = {"ok": False, "pending_retry": True}
+                order_rows = supabase_request("/rest/v1/orders", params={
+                    "select": "order_no", "id": f"eq.{order_id}", "limit": 1,
+                }, timeout=10) or []
+                order_no = order_rows[0]["order_no"] if order_rows else make_order_no(order_id, now_iso())
+                return jsonify(ok=True, order={"id": order_id, "order_no": order_no}, email=email_result)
             order_id = remote_first_create_order(
-                profile.get("id"),
-                customer_name,
-                norm(profile.get("address")),
-                norm(profile.get("phone")),
-                customer_email,
-                note,
-                items,
+                profile.get("id"), customer_name, norm(profile.get("address")),
+                norm(profile.get("phone")), customer_email, note, items,
                 idempotency_key=idempotency_key,
                 price_list=profile.get("price_list", "pln"),
                 currency=profile.get("currency", "PLN"),
@@ -1781,18 +1962,22 @@ def register_routes(context):
             # następnie utracić połączenie podczas lokalnego odświeżenia. Pobieramy
             # stan ponownie i rozpoznajemy zamówienie po niezmiennym kluczu, zamiast
             # zwracać klientowi fałszywy błąd 500.
-            try:
-                maybe_pull_shared_from_supabase(force=True)
-            except Exception:
-                pass
+            if not architect_code:
+                try:
+                    maybe_pull_shared_from_supabase(force=True)
+                except Exception:
+                    pass
             existing = _order_by_idempotency_key(idempotency_key)
             if existing:
-                if norm(existing.get("customer_email")).lower() != customer_email:
+                if (to_int(existing.get("customer_id"), 0) != to_int(g.client_customer_id, 0)
+                        or (not architect_code and norm(existing.get("customer_email")).lower() != customer_email)):
+                    return jsonify(ok=False, error="Konflikt Idempotency-Key"), 409
+                if not architect_replay_matches(existing["id"]):
                     return jsonify(ok=False, error="Konflikt Idempotency-Key"), 409
                 app.logger.info("Konflikt idempotencji user_id=%s order_id=%s", client_user["id"], existing["id"])
                 return jsonify(ok=True, duplicate=True, recovered=True, order={"id": existing["id"], "order_no": existing["order_no"]}, email=_safe_saved_order_confirmation(int(existing["id"])))
             app.logger.exception("Błąd tworzenia zamówienia user_id=%s items=%s", client_user["id"], len(items))
-            return jsonify(ok=False, error=str(exc)), 500
+            return jsonify(ok=False, error=("Nie udało się zapisać zamówienia z kodem" if architect_code else str(exc))), 500
 
 
 

@@ -84,6 +84,9 @@ OPERATION_DEFINITIONS: dict[str, OperationDefinition] = {
     'orders.packing.shortage.report': OperationDefinition('orders.packing.shortage.report', 1, 'packing.prepare', GREEN, WRITE),
     'orders.packing.confirm': OperationDefinition('orders.packing.confirm', 1, 'packing.confirm', YELLOW, WRITE),
     "security.login": OperationDefinition("security.login", 1, None, GREEN, SECURITY),
+    "staging.distributor_password": OperationDefinition(
+        "staging.distributor_password", 1, "system.users_manage", YELLOW, SECURITY
+    ),
     "security.permission.denied": OperationDefinition(
         "security.permission.denied", 1, None, YELLOW, SECURITY
     ),

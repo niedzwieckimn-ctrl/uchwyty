@@ -14,6 +14,7 @@ import internal_approval as approval
 
 @pytest.fixture
 def amendment(tmp_path, monkeypatch):
+    monkeypatch.setitem(b.app.config, 'SECRET_KEY', 'test-only-invoice-amendment-session')
     monkeypatch.setattr(b, 'DB_PATH', str(tmp_path / 'amendment.db'))
     monkeypatch.setattr(b, 'supabase_enabled', lambda: False)
     monkeypatch.setattr(b, 'maybe_pull_shared_from_supabase', lambda **kw: None)

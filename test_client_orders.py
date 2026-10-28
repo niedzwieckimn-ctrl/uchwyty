@@ -18,8 +18,10 @@ def client(tmp_path, monkeypatch):
     c.commit()
     c.close()
     monkeypatch.setattr(backend, "supabase_enabled", lambda: True)
+    monkeypatch.setattr(backend, "supabase_request", lambda path, **kwargs: [])
     monkeypatch.setattr(backend, "maybe_pull_shared_from_supabase", lambda **kwargs: None)
     monkeypatch.setattr(backend, "_authenticated_client_user", lambda: {"id": "user-1", "email": "test@example.com", "name": "Test"})
+    monkeypatch.setattr(backend, "_active_client_membership", lambda user_id: {"customer_id": 77})
     monkeypatch.setattr(backend, "_order_by_idempotency_key", lambda key: None)
     monkeypatch.setattr(backend, "_client_profile_for_email", lambda email: {
         "id": 77, "name": "Test", "email": email, "language": "pl",
@@ -34,6 +36,112 @@ def client(tmp_path, monkeypatch):
 
 def headers():
     return {"Authorization": "Bearer test", "Idempotency-Key": str(uuid.uuid4())}
+
+
+def test_catalog_uses_approved_retail_price_for_architect_quotes(monkeypatch):
+    responses = {
+        "/rest/v1/client_stock_catalog_v": [{
+            "product_id": 501, "sku": "STAGING-MOS-001", "model": "STAGING-MOS",
+            "name": "Testowy uchwyt", "qty_physical": 20, "qty_reserved": 0,
+            "qty_on_stock": 20, "net_price": 100, "gross_price": 123,
+        }],
+        "/rest/v1/architect_product_details": [{
+            "product_id": 501, "retail_gross_override": 178.34,
+        }],
+    }
+    monkeypatch.setattr(backend, "supabase_request", lambda path, **kwargs: responses.get(path, []))
+    rows = backend._client_stock_catalog_rows({"price_list": "pln"})
+    assert rows[0]["retail_price"] == 178.34
+
+
+def test_architect_order_commits_without_local_snapshot(client, monkeypatch):
+    saved = []
+    def remote(path, **kwargs):
+        if path == "/rest/v1/rpc/architect_create_discounted_order":
+            saved.append({"id": 812, "order_no": "STAGING-812", "customer_id": 77})
+            return 812
+        if path == "/rest/v1/orders":
+            return saved
+        if path == "/rest/v1/architect_order_email_outbox":
+            return [{"status": "PENDING", "last_error_code": None}]
+        raise AssertionError(path)
+    monkeypatch.setattr(backend, "pull_shared_tables_from_supabase", lambda **kwargs: (_ for _ in ()).throw(AssertionError("scoped sync")))
+    monkeypatch.setattr(backend, "maybe_pull_shared_from_supabase", lambda **kwargs: (_ for _ in ()).throw(AssertionError("full sync")))
+    monkeypatch.setattr(backend, "_client_stock_catalog_rows", lambda profile: (_ for _ in ()).throw(AssertionError("local catalog")))
+    monkeypatch.setattr(backend, "supabase_request", remote)
+    response = client.post("/api/client/orders", json={**payload(), "architect_code": "ARCHITEKT-6207"}, headers=headers())
+    assert response.status_code == 200
+    assert response.get_json()["order"] == {"id": 812, "order_no": "STAGING-812"}
+    assert response.get_json()["email"]["pending_retry"] is True
+
+
+def test_architect_order_lookup_uses_saved_remote_prices(client, monkeypatch):
+    responses = {
+        "/rest/v1/orders": [{"id": 812, "order_no": "STAGING-812", "customer_id": 77,
+                             "status": "new", "currency": "PLN"}],
+        "/rest/v1/architect_code_redemptions": [{"id": "redemption-1"}],
+        "/rest/v1/order_items": [{"id": 901, "order_id": 812, "product_id": 990001,
+                                  "sku": "TEST-001", "qty": 2, "unit_net_price": 92.75,
+                                  "unit_gross_price": 114.08, "unit_retail_price": 160.51}],
+        "/rest/v1/products": [{"id": 990001, "sku": "TEST-001", "model": "TEST",
+                               "name": "Produkt testowy"}],
+        "/rest/v1/client_stock_catalog_v": [{"product_id": 990001, "qty_on_stock": 20}],
+        "/rest/v1/invoice_allocations": [],
+    }
+    monkeypatch.setattr(backend, "supabase_request", lambda path, **kwargs: responses[path])
+    monkeypatch.setattr(backend, "maybe_pull_shared_from_supabase", lambda **kwargs: (_ for _ in ()).throw(AssertionError("full sync")))
+    response = client.get("/api/order_lookup?token=STAGING-812", headers={"Authorization": "Bearer test"})
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["order"]["total_net"] == 185.5
+    assert body["order"]["total_gross"] == 228.17
+    assert body["order"]["total_retail"] == 321.02
+    assert body["items"][0]["net_price"] == 92.75
+    assert body["items"][0]["retail_price"] == 160.51
+
+
+def test_architect_order_lookup_rejects_other_distributor_before_items(client, monkeypatch):
+    seen = []
+    def remote(path, **kwargs):
+        seen.append(path)
+        if path == "/rest/v1/orders":
+            return [{"id": 812, "order_no": "STAGING-812", "customer_id": 88}]
+        raise AssertionError("Private order details must not be fetched")
+    monkeypatch.setattr(backend, "supabase_request", remote)
+    response = client.get("/api/order_lookup?token=STAGING-812", headers={"Authorization": "Bearer test"})
+    assert response.status_code == 403
+    assert seen == ["/rest/v1/orders"]
+
+
+def test_architect_order_pdf_uses_remote_snapshot(client, monkeypatch):
+    responses = {
+        "/rest/v1/orders": [{"id": 812, "order_no": "STAGING-812", "customer_id": 77,
+                             "status": "new", "currency": "PLN", "created_at": "2026-10-28 00:06:00",
+                             "customer_name": "Test", "customer_email": "test@example.com"}],
+        "/rest/v1/architect_code_redemptions": [{"id": "redemption-1"}],
+        "/rest/v1/order_items": [{"id": 901, "order_id": 812, "product_id": 990001,
+                                  "sku": "TEST-001", "qty": 1, "unit_net_price": 92.75,
+                                  "unit_gross_price": 114.08, "unit_retail_price": 160.51}],
+        "/rest/v1/products": [{"id": 990001, "model": "TEST", "name": "Produkt testowy"}],
+        "/rest/v1/customers": [{"language": "pl"}],
+    }
+    monkeypatch.setattr(backend, "supabase_request", lambda path, **kwargs: responses[path])
+    monkeypatch.setattr(backend, "maybe_pull_shared_from_supabase", lambda **kwargs: (_ for _ in ()).throw(AssertionError("full sync")))
+    response = client.get("/api/client/orders/812/pdf-retail", headers={"Authorization": "Bearer test"})
+    assert response.status_code == 200
+    assert response.mimetype == "application/pdf"
+    assert response.data.startswith(b"%PDF")
+
+
+def test_architect_pdf_generator_does_not_read_local_company_profile(monkeypatch):
+    monkeypatch.setattr(backend, "conn", lambda: (_ for _ in ()).throw(AssertionError("local SQLite")))
+    buffer, _ = backend.generate_client_order_pdf(
+        {"id": 812, "order_no": "STAGING-812", "currency": "PLN",
+         "created_at": "2026-10-28 00:06:00", "customer_name": "Test"},
+        [{"sku": "TEST-001", "model": "TEST", "name": "Produkt testowy",
+          "qty": 1, "net_price": 92.75, "retail_price": 160.51}],
+        "pl", retail_prices=True, company_override={"company_name": "Niedźwieccy"})
+    assert buffer.getvalue().startswith(b"%PDF")
 
 
 def test_inpost_accepts_full_and_partial_packing_statuses():
@@ -99,7 +207,8 @@ def test_email_failure_keeps_created_order(client, monkeypatch):
 
 
 def test_same_idempotency_key_returns_existing_order(client, monkeypatch):
-    monkeypatch.setattr(backend, "_order_by_idempotency_key", lambda key: {"id": 125, "order_no": "ZAM-TEST", "customer_email": "test@example.com"})
+    monkeypatch.setattr(backend, "_order_by_idempotency_key", lambda key: {"id": 125, "order_no": "ZAM-TEST", "customer_id": 77, "customer_email": "test@example.com"})
+    monkeypatch.setattr(backend, "supabase_request", lambda path, **kwargs: [])
     create = Mock(side_effect=AssertionError("must not create"))
     monkeypatch.setattr(backend, "remote_first_create_order", create)
     monkeypatch.setattr(backend, "_send_saved_order_confirmation", lambda order_id: {"ok": True, "duplicate": True})
@@ -166,8 +275,8 @@ def test_order_pdf_is_owned_and_uses_profile_language(client, monkeypatch):
         ("TEST", 10, 12.3, backend.now_iso()),
     )
     c.execute(
-        "INSERT INTO orders(id, order_no, customer_name, customer_email, status, created_at) VALUES(?,?,?,?,?,?)",
-        (901, "ZAM-PDF-901", "Test", "test@example.com", "confirmed", backend.now_iso()),
+        "INSERT INTO orders(id, order_no, customer_id, customer_name, customer_email, status, created_at) VALUES(?,?,?,?,?,?,?)",
+        (901, "ZAM-PDF-901", 77, "Test", "test@example.com", "confirmed", backend.now_iso()),
     )
     c.execute(
         "INSERT INTO order_items(order_id, product_id, sku, qty, created_at) VALUES(?,?,?,?,?)",
