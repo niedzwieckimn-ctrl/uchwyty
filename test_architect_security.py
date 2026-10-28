@@ -72,7 +72,12 @@ def test_distributor_sale_form_reports_already_sold_units():
         if path == '/rest/v1/architect_commission_ledger':
             assert kwargs['params']['entry_type'] == 'eq.accrual'
             return [{'sale_line_id':7,'sold_qty':1}]
+        if path == '/rest/v1/invoice_allocations':
+            assert kwargs['params']['order_id'] == 'eq.51'
+            return [{'invoice_id':5}]
         if path == '/rest/v1/invoices':
+            assert kwargs['params']['id'] == 'in.(5)'
+            assert 'order_id' not in kwargs['params']
             return [{'id':5,'invoice_no':'TEST-5'}]
         raise AssertionError(f'Unexpected read: {path}')
 

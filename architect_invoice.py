@@ -5,6 +5,15 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 CENT = Decimal("0.01")
 
 
+def require_no_second_discount(value):
+    try:
+        discount = Decimal(str(value or 0))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError("Nieprawidłowa wartość rabatu") from exc
+    if not discount.is_finite() or discount != 0:
+        raise ValueError("Rabat architekta jest już zapisany w cenach pozycji zamówienia. Usuń drugi rabat z formularza.")
+
+
 def amount(value):
     try:
         result = Decimal(str(value)).quantize(CENT, rounding=ROUND_HALF_UP)
@@ -22,7 +31,8 @@ def expected_promo_invoice_totals(items, snapshots, order_id, *, invoice_type,
     `snapshots` are the immutable architect_sale_lines fetched from Supabase.
     The input rows come from the current IKUGO order and invoice selection.
     """
-    if invoice_type != "domestic" or currency != "PLN" or amount(discount_percent or 0) != 0:
+    require_no_second_discount(discount_percent)
+    if invoice_type != "domestic" or currency != "PLN":
         raise ValueError("Faktura programu wymaga PLN, VAT krajowego i bez drugiego rabatu")
     if not items or not snapshots:
         raise ValueError("Brak pozycji programu do faktury")
@@ -55,3 +65,23 @@ def expected_promo_invoice_totals(items, snapshots, order_id, *, invoice_type,
         total_net += selected_net
     total_net = amount(total_net)
     return total_net, amount(total_net + amount(total_net * Decimal("0.23")))
+
+
+def expected_combined_invoice_totals(items, snapshots_by_order, *, invoice_type,
+                                     currency, discount_percent):
+    """Reconcile each promoted order, then round VAT on the combined document.
+
+    Ordinary lines keep the existing saved prices. Allocations, rather than
+    the invoice's root order, identify which order each invoice line covers.
+    """
+    require_no_second_discount(discount_percent)
+    if not items or not snapshots_by_order:
+        raise ValueError("Brak pozycji programu do faktury")
+    for order_id, snapshots in snapshots_by_order.items():
+        selected = [item for item in items if
+                    int(item.get('source_order_id') or item.get('order_id') or 0) == order_id]
+        expected_promo_invoice_totals(selected, snapshots, order_id,
+                                     invoice_type=invoice_type, currency=currency,
+                                     discount_percent=discount_percent)
+    total = amount(sum((amount(item['line_value_net']) for item in items), Decimal(0)))
+    return total, amount(total + amount(total * Decimal('0.23')))
