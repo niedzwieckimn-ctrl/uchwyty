@@ -408,6 +408,18 @@ def register_routes(context):
         if not row:
             return "Nie znaleziono klienta", 404
 
+        actor = current_actor_context()
+        can_manage_program = bool(actor and actor.permission_decision('system.users_manage') == 'ALLOW')
+        membership, program_error = {}, ''
+        if can_manage_program and supabase_enabled():
+            try:
+                records = supabase_request('/rest/v1/distributor_program_memberships', params={
+                    'select':'customer_id,active,store_name,city,store_address,contact',
+                    'customer_id':f'eq.{customer_id}','limit':1}, timeout=12) or []
+                membership = records[0] if records else {}
+            except Exception:
+                program_error = 'Nie udało się odczytać ustawienia programu. Odśwież stronę.'
+
         tpl = r"""
         {% extends "base.html" %}
         {% block content %}
@@ -461,7 +473,52 @@ def register_routes(context):
           </div>
         {% endblock %}
         """
-        return render_template_string(tpl, title="Edycja klienta", base_url=BASE_URL, db_path=DB_PATH, row=row)
+        program_form = r"""
+          {% if can_manage_program %}
+          <div class="card">
+            <h2>Program Architektów: {{ 'WŁĄCZONY' if membership.get('active') else 'WYŁĄCZONY' }}</h2>
+            {% if program_error %}<p role="alert">{{ program_error }}</p>{% else %}
+            <form method="post" action="{{ url_for('customer_architect_program',customer_id=row['id']) }}" class="row">
+              <div><label>Uczestnictwo<select name="active"><option value="0" {% if not membership.get('active') %}selected{% endif %}>WYŁĄCZONY</option><option value="1" {% if membership.get('active') %}selected{% endif %}>WŁĄCZONY</option></select></label></div>
+              <div><label>Nazwa sklepu<input name="store_name" value="{{ membership.get('store_name') or row['name'] }}" maxlength="200"></label></div>
+              <div><label>Miasto<input name="city" value="{{ membership.get('city') or '' }}" maxlength="120"></label></div>
+              <div><label>Adres sklepu<input name="store_address" value="{{ membership.get('store_address') or row['address'] or '' }}" maxlength="500"></label></div>
+              <div><label>Kontakt<input name="contact" value="{{ membership.get('contact') or row['phone'] or '' }}" maxlength="250"></label></div>
+              <div><button class="btn primary" type="submit">Zapisz ustawienie programu</button></div>
+            </form>
+            <p class="muted">Wyłączenie blokuje nowe kody i zamówienia z kodem. Zachowuje dotychczasowe zamówienia i rozliczenia.</p>
+            {% endif %}
+          </div>
+          {% endif %}
+        """
+        tpl = tpl.replace('{% endblock %}', program_form + '{% endblock %}')
+        return render_template_string(tpl, title="Edycja klienta", base_url=BASE_URL, db_path=DB_PATH, row=row,
+            membership=membership, can_manage_program=can_manage_program, program_error=program_error)
+
+    @app.post('/customers/<int:customer_id>/architect-program')
+    @require_permission('system.users_manage', operation='architect.program_admin')
+    def customer_architect_program(customer_id):
+        if not supabase_enabled():
+            return 'Brak połączenia z bazą programu', 503
+        value = request.form.get('active')
+        if value not in {'0','1'}:
+            return 'Nieprawidłowe ustawienie programu', 400
+        try:
+            # Missing membership is OFF; repeated disabling is a harmless no-op.
+            records = supabase_request('/rest/v1/distributor_program_memberships', params={
+                'select':'active','customer_id':f'eq.{customer_id}','limit':1}, timeout=12) or []
+            if value == '1' or (records and records[0].get('active')):
+                supabase_request('/rest/v1/rpc/architect_set_distributor', method='POST', payload={
+                    'p_customer_id':customer_id,'p_active':value == '1',
+                    'p_store_name':norm(request.form.get('store_name')),
+                    'p_city':norm(request.form.get('city')),
+                    'p_store_address':norm(request.form.get('store_address')),
+                    'p_contact':norm(request.form.get('contact')),
+                    'p_actor':str(session.get('admin_username') or 'admin')}, timeout=15)
+        except Exception:
+            app.logger.exception('Customer program membership update failed: customer=%s',customer_id)
+            return 'Nie zapisano ustawienia. Sprawdź cennik PLN, nazwę sklepu i miasto, następnie odśwież profil.', 400
+        return redirect(url_for('customers_edit',customer_id=customer_id))
 
 
 
