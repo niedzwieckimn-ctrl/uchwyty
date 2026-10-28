@@ -2316,7 +2316,7 @@ CLIENT_PANEL_URL = (
 ADMIN_ACTION_TOKEN = os.environ.get("ADMIN_ACTION_TOKEN", "").strip()
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin").strip()
 ADMIN_PASSWORD_HASH = os.environ.get("ADMIN_PASSWORD_HASH", "").strip()
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "").strip()
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 if not SUPABASE_SERVICE_ROLE_KEY:
     app.logger.error("Brak SUPABASE_SERVICE_ROLE_KEY; funkcje synchronizacji i zamówień klienta będą niedostępne.")
 app.logger.warning(
@@ -5819,6 +5819,13 @@ ARCHITECT_ALLOWED_ORIGINS = {
 _rate_lock = threading.Lock()
 _rate_hits = {}
 _client_auth_cache_lock = threading.Lock()
+_client_auth_inflight = {}
+
+
+class ClientAuthUnavailable(RuntimeError):
+    """An Auth outage must not invalidate a browser session."""
+
+
 _client_auth_cache = {}
 CLIENT_AUTH_CACHE_TTL_SEC = 60
 
@@ -5877,7 +5884,7 @@ def _admin_password_ok(candidate: str) -> bool:
             return check_password_hash(ADMIN_PASSWORD_HASH, candidate)
         except Exception:
             return False
-    return bool(ADMIN_PASSWORD) and hmac.compare_digest(ADMIN_PASSWORD, candidate)
+    return bool(ADMIN_PASSWORD) and hmac.compare_digest(ADMIN_PASSWORD.encode("utf-8"), candidate.encode("utf-8"))
 
 
 @app.before_request
@@ -5938,7 +5945,10 @@ def security_gate():
             return None
         if not _rate_limit("architect_api", 120, 60):
             return jsonify(ok=False, error="Zbyt wiele żądań"), 429
-        user = _authenticated_client_user()
+        try:
+            user = _authenticated_client_user()
+        except ClientAuthUnavailable:
+            return jsonify(ok=False, error="Weryfikacja sesji jest chwilowo niedostępna. Spróbuj ponownie."), 503
         if not user:
             return jsonify(ok=False, error="Brak autoryzacji"), 401
         g.architect_user = user
@@ -5950,7 +5960,10 @@ def security_gate():
             return jsonify(ok=False, error="Zbyt wiele prób złożenia zamówienia"), 429
         if not _rate_limit("client_api", 180, 60):
             return jsonify(ok=False, error="Zbyt wiele żądań"), 429
-        user = _authenticated_client_user()
+        try:
+            user = _authenticated_client_user()
+        except ClientAuthUnavailable:
+            return jsonify(ok=False, error="Weryfikacja sesji jest chwilowo niedostępna. Spróbuj ponownie."), 503
         if not user:
             # Stare e-maile wskazuja endpoint PDF bez naglowka Authorization.
             # Przekierowujemy do panelu; dokument nadal wymaga tokenu po loginie.
@@ -7998,45 +8011,67 @@ def _authenticated_client_user() -> dict | None:
     if not token:
         return None
     cache_key = hashlib.sha256(token.encode("utf-8")).hexdigest()
-    now_monotonic = time.monotonic()
-    # Miniatury są pobierane równolegle. Blokada sprawia, że tylko pierwsze
-    # żądanie weryfikuje token w Supabase Auth, a pozostałe korzystają przez
-    # minutę z wyniku tej samej, już potwierdzonej sesji.
+    # Share verification for the same session; unrelated users never wait on
+    # a network call while holding the global cache lock.
     with _client_auth_cache_lock:
         cached = _client_auth_cache.get(cache_key)
-        if cached and cached[0] > now_monotonic:
+        if cached and cached[0] > time.monotonic():
             return dict(cached[1])
-        req = urllib.request.Request(f"{SUPABASE_URL}/auth/v1/user", method="GET")
+        flight = _client_auth_inflight.get(cache_key)
+        owner = flight is None
+        if owner:
+            flight = {"done": threading.Event(), "user": None, "unavailable": False}
+            _client_auth_inflight[cache_key] = flight
+    if not owner:
+        if not flight["done"].wait(22) or flight["unavailable"]:
+            raise ClientAuthUnavailable()
+        return dict(flight["user"]) if flight["user"] else None
+    user = None
+    try:
         api_key = SUPABASE_ANON_KEY or SUPABASE_SERVICE_ROLE_KEY
         if not api_key:
             app.logger.error("Weryfikacja klienta niemożliwa: brak SUPABASE_ANON_KEY")
-            return None
+            raise ClientAuthUnavailable()
+        req = urllib.request.Request(f"{SUPABASE_URL}/auth/v1/user", method="GET")
         req.add_header("apikey", api_key)
         req.add_header("Authorization", f"Bearer {token}")
-        try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-            email = norm(payload.get("email")).lower()
-            if not payload.get("id") or not email:
-                return None
-            metadata = payload.get("user_metadata") if isinstance(payload.get("user_metadata"), dict) else {}
-            user = {
-                "id": str(payload.get("id")),
-                "email": email,
-                "name": norm(metadata.get("full_name") or metadata.get("name")) or email.split("@")[0],
-                "email_confirmed": bool(payload.get("email_confirmed_at") or payload.get("confirmed_at")),
-                "metadata": metadata,
-            }
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        email = norm(payload.get("email")).lower()
+        if not payload.get("id") or not email:
+            raise ClientAuthUnavailable()
+        metadata = payload.get("user_metadata") if isinstance(payload.get("user_metadata"), dict) else {}
+        user = {
+            "id": str(payload.get("id")), "email": email,
+            "name": norm(metadata.get("full_name") or metadata.get("name")) or email.split("@")[0],
+            "email_confirmed": bool(payload.get("email_confirmed_at") or payload.get("confirmed_at")),
+            "metadata": metadata,
+        }
+        with _client_auth_cache_lock:
             if len(_client_auth_cache) >= 500:
-                _client_auth_cache.clear()
+                expired = [key for key, value in _client_auth_cache.items() if value[0] <= time.monotonic()]
+                for key in expired:
+                    _client_auth_cache.pop(key, None)
+                if len(_client_auth_cache) >= 500:
+                    _client_auth_cache.pop(next(iter(_client_auth_cache)))
             _client_auth_cache[cache_key] = (time.monotonic() + CLIENT_AUTH_CACHE_TTL_SEC, user)
-            return dict(user)
-        except urllib.error.HTTPError as exc:
+        return dict(user)
+    except urllib.error.HTTPError as exc:
+        if exc.code in {401, 403}:
             app.logger.warning("Supabase odrzucił token klienta: HTTP %s", exc.code)
             return None
-        except Exception as exc:
-            app.logger.warning("Nie udało się zweryfikować tokenu klienta: %s", type(exc).__name__)
-            return None
+        flight["unavailable"] = True
+        app.logger.warning("Supabase Auth jest niedostępne: HTTP %s", exc.code)
+        raise ClientAuthUnavailable() from exc
+    except Exception as exc:
+        flight["unavailable"] = True
+        app.logger.warning("Nie udało się zweryfikować sesji klienta: %s", type(exc).__name__)
+        raise ClientAuthUnavailable() from exc
+    finally:
+        flight["user"] = user
+        with _client_auth_cache_lock:
+            _client_auth_inflight.pop(cache_key, None)
+            flight["done"].set()
 
 
 def _client_profile_for_email(email: str, customer_id=None) -> dict:
