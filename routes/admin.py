@@ -34,9 +34,25 @@ def register_routes(context):
                     session["csrf_token"] = secrets.token_urlsafe(32)
                     session.permanent = True
                     app.logger.info("ADMIN_LOGIN audit_begin")
-                    audit_id = try_record_audit_event(
-                        "security.login", result="SUCCESS", entity_type="internal_actor",
-                        entity_id=session.get("internal_actor_id"))
+                    login_thread_id = threading.get_ident()
+                    def report_stalled_login():
+                        # Function names and line numbers only: never frame
+                        # locals, form fields, credentials or source lines.
+                        frame = sys._current_frames().get(login_thread_id)
+                        stack = []
+                        while frame is not None:
+                            stack.append("%s:%s:%s" % (os.path.basename(frame.f_code.co_filename), frame.f_code.co_name, frame.f_lineno))
+                            frame = frame.f_back
+                        app.logger.error("ADMIN_LOGIN stalled stack=%s", " <- ".join(stack))
+                    watchdog = threading.Timer(3.0, report_stalled_login)
+                    watchdog.daemon = True
+                    watchdog.start()
+                    try:
+                        audit_id = try_record_audit_event(
+                            "security.login", result="SUCCESS", entity_type="internal_actor",
+                            entity_id=session.get("internal_actor_id"))
+                    finally:
+                        watchdog.cancel()
                     if not audit_id:
                         session.clear()
                         app.logger.error("ADMIN_LOGIN audit_unavailable")
