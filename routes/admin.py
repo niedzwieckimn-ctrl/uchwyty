@@ -12,6 +12,7 @@ def register_routes(context):
         error = ""
         response_status = 200
         if request.method == "POST":
+            app.logger.info("ADMIN_LOGIN received pid=%s", os.getpid())
             username_ok = hmac.compare_digest(norm(request.form.get("username")).encode("utf-8"), ADMIN_USERNAME.encode("utf-8"))
             configured = bool(app.secret_key and (ADMIN_PASSWORD_HASH or ADMIN_PASSWORD))
             if not configured:
@@ -19,6 +20,7 @@ def register_routes(context):
                 error = "Brak konfiguracji logowania administratora na serwerze."
                 response_status = 503
             elif username_ok and _admin_password_ok(request.form.get("password") or ""):
+                app.logger.info("ADMIN_LOGIN credentials_verified")
                 session.clear()
                 try:
                     bind_bootstrap_owner_session(session)
@@ -31,9 +33,14 @@ def register_routes(context):
                     session["admin_authenticated"] = True
                     session["csrf_token"] = secrets.token_urlsafe(32)
                     session.permanent = True
-                    try_record_audit_event(
+                    app.logger.info("ADMIN_LOGIN audit_begin")
+                    audit_id = try_record_audit_event(
                         "security.login", result="SUCCESS", entity_type="internal_actor",
                         entity_id=session.get("internal_actor_id"))
+                    if not audit_id:
+                        session.clear()
+                        app.logger.error("ADMIN_LOGIN audit_unavailable")
+                        return "Nie można teraz zapisać sesji. Spróbuj ponownie za chwilę.", 503
                     app.logger.info("ADMIN_LOGIN success")
                     target = norm(request.args.get("next"))
                     return redirect(target if target.startswith("/") and not target.startswith("//") else url_for("home"))
