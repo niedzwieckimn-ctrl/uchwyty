@@ -46,6 +46,66 @@ def register_routes(context):
 
 
 
+    @app.route("/admin/staging/distributor-password", methods=["GET", "POST"])
+    @require_permission("system.users_manage", operation="staging.distributor_password")
+    def staging_distributor_password():
+        # Temporary recovery for the one existing QA account. Never production.
+        if SUPABASE_URL != "https://irhrzdsjnwjyqfvhiclk.supabase.co":
+            return "Not found", 404
+        target_id = "0062dcbf-717e-40a7-a820-3f79aefaa33f"
+        target_email = "dystrybutor.staging@example.com"
+        error, success, status = "", False, 200
+        if request.method == "POST":
+            if request.is_json:
+                return "Użyj formularza zmiany hasła.", 415
+            password = request.form.get("password") or ""
+            confirmation = request.form.get("confirmation") or ""
+            if len(password) < 12 or len(password.encode("utf-8")) > 72:
+                error, status = "Hasło musi mieć co najmniej 12 znaków i maksymalnie 72 bajty UTF-8.", 400
+            elif not hmac.compare_digest(password.encode("utf-8"), confirmation.encode("utf-8")):
+                error, status = "Wpisane hasła różnią się.", 400
+            else:
+                try:
+                    path = "/auth/v1/admin/users/" + target_id
+                    user = supabase_request(path, timeout=10)
+                    if not isinstance(user, dict) or user.get("id") != target_id or user.get("email") != target_email:
+                        error, status = "Nie potwierdzono właściwego konta testowego. Hasło nie zostało zmienione.", 409
+                    else:
+                        # No logging or echo of request/response bodies for credentials.
+                        changed = supabase_request(path, method="PUT", payload={"password": password}, timeout=10)
+                        if not isinstance(changed, dict) or changed.get("id") != target_id:
+                            error, status = "Brak potwierdzenia zmiany. Sprawdź logowanie przed ponowną próbą.", 502
+                        else:
+                            success = True
+                            try_record_audit_event("staging.distributor_password", result="SUCCESS",
+                                                   entity_type="auth_user", entity_id=target_id)
+                except Exception:
+                    # Do not include exception details: providers may echo submitted data.
+                    app.logger.warning("STAGING_DISTRIBUTOR_PASSWORD provider_failure")
+                    error, status = "Usługa nie potwierdziła zmiany. Sprawdź logowanie przed ponowną próbą.", 503
+        html = render_template_string(r'''<!doctype html><html lang="pl"><head>
+          <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>Hasło dystrybutora — staging</title><style>
+          body{font-family:Segoe UI,sans-serif;background:#f5f6fa;color:#17233c;margin:0;padding:32px}
+          main{max-width:520px;margin:auto;background:white;padding:28px;border-radius:20px}
+          label{display:block;margin:16px 0 6px}input,button{box-sizing:border-box;width:100%;padding:12px;font:inherit}
+          button{margin-top:20px;background:#5577ee;color:white;border:0;border-radius:10px}
+          .error{color:#b9384c}.success{color:#16734b}small{color:#596779}</style></head><body><main>
+          <h1>Hasło dystrybutora testowego</h1><p>{{ email }}</p>
+          <small>Istniejące konto w Niedźwieccy Staging. Dane konta i uprawnienia pozostają zachowane.</small>
+          {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+          {% if success %}<p class="success" role="status">Hasło zostało zmienione. Możesz zalogować się do Panelu B2B.</p>
+          <a href="https://niedzwieccy-b2b-architekci-staging.netlify.app/">Otwórz Panel B2B</a>
+          {% else %}<form method="post" autocomplete="off">
+          <label for="password">Nowe hasło</label><input id="password" name="password" type="password" minlength="12" autocomplete="new-password" required>
+          <label for="confirmation">Powtórz nowe hasło</label><input id="confirmation" name="confirmation" type="password" minlength="12" autocomplete="new-password" required>
+          <button type="submit">Zapisz hasło dystrybutora</button></form>{% endif %}
+          </main></body></html>''', email=target_email, error=error, success=success)
+        response = app.make_response((html, status))
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+
     @app.get("/logout")
     def logout():
         session.clear()
