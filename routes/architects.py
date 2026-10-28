@@ -13,6 +13,20 @@ from decimal import Decimal
 from architect_pricing import ProgramRules, money, price_line
 
 
+def payout_timestamp(value, now):
+    """A date selected today must not become an arbitrary future noon UTC."""
+    try:
+        day = datetime.strptime(value, '%Y-%m-%d').date()
+    except (TypeError, ValueError):
+        raise ValueError('Podaj poprawną datę wypłaty') from None
+    if day > now.date():
+        raise ValueError('Data wypłaty nie może być w przyszłości')
+    paid_at = now if day == now.date() else now.replace(
+        year=day.year, month=day.month, day=day.day,
+        hour=12, minute=0, second=0, microsecond=0)
+    return paid_at.isoformat()
+
+
 def register_routes(context):
     globals().update(context)
 
@@ -585,6 +599,7 @@ def register_routes(context):
             ledger=ledger,settlements=settlements,audits=audits)
 
     @app.route('/architects', methods=['GET', 'POST'])
+    @require_permission('system.users_manage', operation='architect.program_admin')
     def architects_admin():
         actor = str(session.get('admin_username') or 'admin')
         if request.method == 'POST':
@@ -680,7 +695,7 @@ def register_routes(context):
                     supabase_request('/rest/v1/rpc/architect_record_payout',method='POST',
                         payload={'p_settlement_id':settlement_id,
                                  'p_reference':norm(request.form.get('payment_reference')),
-                                 'p_paid_at':norm(request.form.get('paid_at'))+'T12:00:00Z',
+                                 'p_paid_at':payout_timestamp(norm(request.form.get('paid_at')), app_now()),
                                  'p_actor':actor},timeout=20)
                 elif action == 'product_details':
                     product_id = to_int(request.form.get('product_id'),0)
