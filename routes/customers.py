@@ -400,11 +400,20 @@ def register_routes(context):
 
     @app.get("/customers/<int:customer_id>/edit")
     def customers_edit(customer_id):
-        c = conn()
-        cur = c.cursor()
-        cur.execute("SELECT * FROM customers WHERE id=?", (customer_id,))
-        row = cur.fetchone()
-        c.close()
+        if supabase_enabled():
+            try:
+                records = supabase_request('/rest/v1/customers', params={
+                    'select':'id,name,address,phone,email,nip,language,price_list',
+                    'id':f'eq.{customer_id}','limit':1}, timeout=12) or []
+                row = records[0] if records else None
+            except Exception:
+                return 'Nie udało się odczytać klienta. Odśwież stronę.', 503
+        else:
+            c = conn()
+            cur = c.cursor()
+            cur.execute("SELECT * FROM customers WHERE id=?", (customer_id,))
+            row = cur.fetchone()
+            c.close()
         if not row:
             return "Nie znaleziono klienta", 404
 
