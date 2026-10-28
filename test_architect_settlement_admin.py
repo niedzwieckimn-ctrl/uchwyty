@@ -54,3 +54,24 @@ def test_external_role_cannot_manage_architect_program():
     response=b.app.test_client().get('/architects',headers={'Authorization':'Bearer architect-or-distributor'})
     assert response.status_code==302
     assert '/login' in response.headers['Location']
+
+
+def test_admin_renders_existing_sample_items_without_dict_method_collision(admin_client, monkeypatch):
+    monkeypatch.setattr(b, '_rate_hits', {})
+    admin_client.post('/login', data={'username': 'admin', 'password': 'correct-test-only'})
+    sample_id = '11111111-1111-4111-8111-111111111111'
+    def read(path, **kwargs):
+        if path.endswith('/architect_sample_orders'):
+            return [{'id': sample_id, 'architect_id': 'test-architect',
+                     'shipping_address': 'STAGING', 'status': 'requested',
+                     'tracking_no': '', 'created_at': '2026-10-28'}]
+        if path.endswith('/architect_sample_items'):
+            return [{'sample_order_id': sample_id, 'product_id': 503, 'qty': 1}]
+        if path.endswith('/client_stock_catalog_v'):
+            return [{'product_id': 503, 'sku': 'STAGING-MOS-003', 'model': 'TEST', 'name': 'Uchwyt'}]
+        return []
+    monkeypatch.setattr(a, 'supabase_request', read)
+    response = admin_client.get('/architects')
+    assert response.status_code == 200
+    assert 'Warianty: STAGING-MOS-003' in response.get_data(as_text=True)
+    assert 'Rozliczenia miesięczne' in response.get_data(as_text=True)
