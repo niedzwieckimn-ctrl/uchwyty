@@ -334,6 +334,19 @@ def _new_sqlite_write_lock():
 
 
 _sqlite_write_lock = _new_sqlite_write_lock()
+_sqlite_write_lock_pid = os.getpid()
+_sqlite_write_lock_timeout = 5.0
+
+
+def _process_sqlite_write_lock():
+    # A lock held by a background thread at fork has no surviving owner in
+    # the child. SQLite still provides cross-process transaction locking.
+    global _sqlite_write_lock, _sqlite_write_lock_pid
+    if _sqlite_write_lock_pid != os.getpid():
+        _sqlite_write_lock = _new_sqlite_write_lock()
+        _sqlite_write_lock_pid = os.getpid()
+    return _sqlite_write_lock
+
 _SQLITE_WRITE_PREFIXES = frozenset({
     "ALTER", "ANALYZE", "ATTACH", "BEGIN", "CREATE", "DELETE", "DETACH",
     "DROP", "INSERT", "REINDEX", "REPLACE", "UPDATE", "VACUUM",
@@ -389,19 +402,23 @@ class _SerializedWriteConnection(sqlite3.Connection):
     def _before_sql(self, sql):
         if _sqlite_statement_writes(sql) and not self._write_lock_held:
             started = time.perf_counter()
-            _sqlite_write_lock.acquire()
+            write_lock = _process_sqlite_write_lock()
+            if not write_lock.acquire(timeout=_sqlite_write_lock_timeout):
+                app.logger.error("SQLITE_WRITE_LOCK_TIMEOUT pid=%s thread=%s", os.getpid(), threading.get_ident())
+                raise sqlite3.OperationalError("Local database write queue is busy")
+            self._held_write_lock = write_lock
             self._write_lock_held = True
             _perf_add("sqlite_write_lock_wait", time.perf_counter() - started)
 
     def _release_write_lock_if_idle(self):
         if self._write_lock_held and not self.in_transaction:
             self._write_lock_held = False
-            _sqlite_write_lock.release()
+            self._held_write_lock.release()
 
     def _release_write_lock(self):
         if self._write_lock_held:
             self._write_lock_held = False
-            _sqlite_write_lock.release()
+            self._held_write_lock.release()
 
     def cursor(self, factory=None):
         return super().cursor(factory or _SerializedWriteCursor)

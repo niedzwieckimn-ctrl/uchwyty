@@ -144,3 +144,59 @@ def test_admin_rejection_logs_only_diagnostic_flags(admin_client, caplog):
     assert 'wrong-test-only' not in caplog.text
     assert 'correct-test-only' not in caplog.text
     assert admin_client.get('/api/internal/external-executions/health').status_code == 401
+
+
+def test_busy_audit_returns_without_hanging_or_unaudited_session(admin_client, monkeypatch, caplog):
+    import time
+    monkeypatch.setattr(b, '_sqlite_write_lock', threading.RLock())
+    monkeypatch.setattr(b, '_sqlite_write_lock_timeout', 0.1)
+    held, release = threading.Event(), threading.Event()
+    def writer():
+        with b._sqlite_write_lock:
+            held.set()
+            release.wait(5)
+    worker = threading.Thread(target=writer)
+    worker.start()
+    assert held.wait(1)
+    try:
+        started = time.monotonic()
+        result = admin_client.post('/login', data={'username':'admin','password':'correct-test-only'})
+        assert time.monotonic() - started < 1
+        assert result.status_code == 503
+        assert 'SQLITE_WRITE_LOCK_TIMEOUT' in caplog.text
+        assert 'audit_unavailable' in caplog.text
+        assert 'correct-test-only' not in caplog.text
+        with admin_client.session_transaction() as state:
+            assert not state.get('admin_authenticated')
+    finally:
+        release.set()
+        worker.join(2)
+    result = admin_client.post('/login', data={'username':'admin','password':'correct-test-only'})
+    assert result.status_code == 302
+    db = b.conn()
+    try:
+        assert db.execute("SELECT COUNT(*) FROM internal_audit_log WHERE operation='security.login'").fetchone()[0] == 1
+    finally:
+        db.close()
+
+
+def test_inherited_thread_lock_is_replaced_in_child_process(admin_client, monkeypatch):
+    inherited = threading.RLock()
+    monkeypatch.setattr(b, '_sqlite_write_lock', inherited)
+    monkeypatch.setattr(b, '_sqlite_write_lock_pid', -1)
+    held, release = threading.Event(), threading.Event()
+    def owner():
+        with inherited:
+            held.set()
+            release.wait(5)
+    worker = threading.Thread(target=owner)
+    worker.start()
+    assert held.wait(1)
+    try:
+        assert b._process_sqlite_write_lock() is not inherited
+        result = admin_client.post('/login', data={'username':'admin','password':'correct-test-only'})
+        assert result.status_code == 302
+        assert admin_client.get('/api/internal/external-executions/health').status_code == 200
+    finally:
+        release.set()
+        worker.join(2)
