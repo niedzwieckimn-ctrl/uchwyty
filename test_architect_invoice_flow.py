@@ -195,3 +195,16 @@ def test_unsent_invoice_removal_restores_stock_and_releases_allocation(program_f
     assert rows('SELECT qty FROM invoice_allocations') == []
     assert rows('SELECT qty FROM stock') == [{'qty':20}]
     assert rows('SELECT unit_net_price FROM order_items WHERE id=1') == [{'unit_net_price':92.75}]
+
+
+def test_order_view_gross_matches_invoice_rounding(program_flow, monkeypatch):
+    client, _ = program_flow
+    monkeypatch.setattr(backend, 'architect_order_redemption', lambda oid: None)
+    db = backend.conn()
+    db.execute('UPDATE order_items SET qty=2,unit_net_price=46.37,unit_gross_price=57.04 WHERE id=2')
+    db.commit(); db.close()
+    response=client.get('/orders/2')
+    assert response.status_code == 200
+    html=response.get_data(as_text=True)
+    assert '114.07 PLN' in html
+    assert '114.08 PLN' not in html

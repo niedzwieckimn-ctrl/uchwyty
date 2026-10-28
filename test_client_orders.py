@@ -307,3 +307,23 @@ def test_order_pdf_rejects_other_customer(client):
     c.close()
     response = client.get("/api/client/orders/902/pdf", headers={"Authorization": "Bearer test"})
     assert response.status_code == 403
+
+
+@pytest.mark.parametrize("retail,net,gross,retail_snapshot,qty,expected", [
+    (True, 1040.09, 1279.31, 1800, 1, "1 800,00 PLN"),
+    (False, 46.37, 57.04, 80.25, 2, "114,07 PLN"),
+])
+def test_order_pdf_preserves_snapshot_and_invoice_line_rounding(monkeypatch, retail, net, gross, retail_snapshot, qty, expected):
+    drawn = []
+    original = backend.canvas.Canvas.drawRightString
+    def capture(self, x, y, text, *args, **kwargs):
+        drawn.append(str(text))
+        return original(self, x, y, text, *args, **kwargs)
+    monkeypatch.setattr(backend.canvas.Canvas, 'drawRightString', capture)
+    result, _ = backend.generate_client_order_pdf(
+        {'id':812,'order_no':'TEST-SNAPSHOT','currency':'PLN','customer_name':'Test'},
+        [{'sku':'TEST','qty':qty,'net_price':net,'gross_price':gross,'retail_price':retail_snapshot}],
+        'pl', retail_prices=retail, company_override={'company_name':'TEST'})
+    assert result.getvalue().startswith(b'%PDF')
+    normalized = [text.replace('\u00a0',' ') for text in drawn]
+    assert any(text.endswith(expected) for text in normalized), normalized

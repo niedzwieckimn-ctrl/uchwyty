@@ -4,7 +4,7 @@
 -- Run migrations and this suite in the SAME transaction; fixtures 101/102/501.
 do $$
 declare a uuid=current_setting('portal_test.architect_id')::uuid; d uuid=current_setting('portal_test.distributor_id')::uuid;
-  r jsonb; r2 jsonb; c text; k uuid=gen_random_uuid(); oid bigint; n integer; before_stock integer;
+  action text; r jsonb; r2 jsonb; c text; k uuid=gen_random_uuid(); oid bigint; n integer; before_stock integer;
 begin
   assert not has_function_privilege('anon','public.portal_request(text,jsonb)','execute'),'anon RPC blocked';
   assert not has_function_privilege('authenticated','architect_portal.create_order(uuid,bigint,jsonb)','execute'),'private create blocked';
@@ -14,6 +14,9 @@ begin
   r:=public.portal_request('architect.catalog');
   assert r->>'ok'='true' and jsonb_array_length(r->'products')>0,'architect catalog';
   assert not exists(select 1 from jsonb_array_elements(r->'products') p where p ?| array['net_price','qty_physical','qty_reserved','qty_on_stock','wholesale_net_before']),'architect field isolation';
+  foreach action in array array['architect.me','architect.codes','architect.distributors','architect.samples','architect.earnings','architect.dashboard'] loop
+    r:=public.portal_request(action); assert r->>'ok'='true','architect read endpoint '||action;
+  end loop;
   r:=public.portal_request('b2b.profile'); assert r->>'status'='403','architect cannot access B2B';
   r:=public.portal_request('architect.create_code','{"distributor_id":101}'); assert r->>'ok'='false','disabled issuance rejected';
   perform public.architect_set_distributor(101,true,'STAGING Salon A','Warszawa',null,null,'test:rollback');
@@ -27,11 +30,18 @@ begin
   select qty into before_stock from public.stock where product_id=501;
   r:=public.portal_request('b2b.quote',jsonb_build_object('code',c,'items','[{"product_id":501,"qty":2}]'::jsonb));
   assert r->>'ok'='true','quote';
+  r2:=public.portal_request('b2b.quote',jsonb_build_object('code',c,'items','[{"product_id":501,"qty":2},{"product_id":503,"qty":1}]'::jsonb));
+  assert r2->>'ok'='true' and (r2->>'total_gross')::numeric=285.21,'quote sums rounded line VAT';
   r:=public.portal_request('b2b.create_order',jsonb_build_object('idempotency_key',k,'architect_code',c,'note','ROLLBACK-ONLY',
     'customer_id',102,'program_active',false,'items','[{"product_id":501,"qty":2,"unit_net_price":0.01}]'::jsonb));
   assert r->>'ok'='true','atomic discounted order'; oid:=(r#>>'{order,id}')::bigint;
   assert (select customer_id from public.orders where id=oid)=101,'ignore forged customer';
   assert (select unit_net_price from public.order_items where order_id=oid)=92.75,'ignore forged price and correct discount';
+  r2:=public.portal_request('b2b.order',jsonb_build_object('token',r#>>'{order,order_no}'));
+  assert r2->>'ok'='true' and (r2#>>'{items,0,line_value_gross}')::numeric=round(92.75*2*1.23,2),'line VAT from full line net, not rounded unit gross';
+  foreach action in array array['b2b.profile','b2b.catalog','b2b.orders','b2b.invoices','b2b.aliases'] loop
+    r2:=public.portal_request(action); assert r2->>'ok'='true','B2B read endpoint '||action;
+  end loop;
   assert (select qty from public.stock where product_id=501)=before_stock,'order does not issue stock';
   assert (select count(*) from public.architect_commission_ledger where sale_line_id in (select id from public.architect_sale_lines where order_item_id in(select id from public.order_items where order_id=oid)))=0,'no wholesale commission';
   r2:=public.portal_request('b2b.create_order',jsonb_build_object('idempotency_key',k,'architect_code',c,'note','ROLLBACK-ONLY','items','[{"product_id":501,"qty":2}]'::jsonb));
@@ -55,6 +65,12 @@ begin
   select count(*) into n from public.orders;
   r2:=public.portal_request('b2b.create_order',jsonb_build_object('idempotency_key',gen_random_uuid(),'items','[{"product_id":501,"qty":1},{"product_id":99999999,"qty":1}]'::jsonb));
   assert r2->>'ok'='false' and (select count(*) from public.orders)=n,'invalid second line leaves no partial order';
+  -- Two ordinary lines whose VAT differs if rounded only once at header level.
+  update public.staging_product_prices set net_price=case when product_id=501 then 92.75 else 46.37 end where product_id in(501,503);
+  r2:=public.portal_request('b2b.create_order',jsonb_build_object('idempotency_key',gen_random_uuid(),'items','[{"product_id":501,"qty":2},{"product_id":503,"qty":1}]'::jsonb));
+  assert r2->>'ok'='true','ordinary multi-line rounding fixture';
+  r2:=public.portal_request('b2b.order',jsonb_build_object('token',r2#>>'{order,order_no}'));
+  assert (r2#>>'{order,total_gross}')::numeric=285.21,'history sums rounded line VAT';
   -- Financial example is temporary and all catalog changes are rolled back.
   update public.staging_product_prices set net_price=1121.39 where product_id=501;
   insert into public.architect_product_details(product_id,retail_gross_override) values(501,2000)

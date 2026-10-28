@@ -4485,14 +4485,20 @@ def generate_client_order_pdf(
         unit_net = money_dec(item.get("net_price"))
         unit_gross = money_dec(item.get("gross_price"))
         if retail_prices:
-            # Cennik detaliczny jest zawsze wyliczany od ceny netto B2B.
-            # Brutto liczymy od wartości źródłowej, a kwoty zaokrąglamy dopiero
-            # na wyjściu — dokładnie tak samo jak ceny detaliczne w panelu.
-            retail_net = unit_net * Decimal("1.45")
-            unit_net = retail_net.quantize(MONEY_Q, rounding=ROUND_HALF_UP)
-            unit_gross = (retail_net * Decimal("1.23")).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
-        line_net = (unit_net * qty).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
-        line_gross = (unit_gross * qty).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
+            # Preserve the accepted retail snapshot, including architect discount.
+            saved_retail = item.get("retail_price")
+            if saved_retail is None:
+                saved_retail = item.get("unit_retail_price")
+            if saved_retail is not None:
+                unit_gross = money_dec(saved_retail)
+                unit_net = unit_gross if currency == "EUR" else money_dec(unit_gross / Decimal("1.23"))
+            else:
+                retail_net = unit_net * Decimal("1.45")
+                unit_net = money_dec(retail_net)
+                unit_gross = money_dec(retail_net if currency == "EUR" else retail_net * Decimal("1.23"))
+        line_net = money_dec(unit_net * qty)
+        line_gross = (money_dec(unit_gross * qty) if retail_prices else
+                      line_net if currency == "EUR" else line_net + vat23_from_net(line_net))
         total_net += line_net
         total_gross += line_gross
         if y < 31 * mm:
