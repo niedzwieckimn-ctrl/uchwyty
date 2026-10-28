@@ -10,26 +10,38 @@ def register_routes(context):
     @app.route("/login", methods=["GET", "POST"])
     def login():
         error = ""
+        response_status = 200
         if request.method == "POST":
-            if not app.secret_key or not (ADMIN_PASSWORD_HASH or ADMIN_PASSWORD):
+            username_ok = hmac.compare_digest(norm(request.form.get("username")).encode("utf-8"), ADMIN_USERNAME.encode("utf-8"))
+            configured = bool(app.secret_key and (ADMIN_PASSWORD_HASH or ADMIN_PASSWORD))
+            if not configured:
+                app.logger.error("ADMIN_LOGIN configuration_missing")
                 error = "Brak konfiguracji logowania administratora na serwerze."
-            elif hmac.compare_digest(norm(request.form.get("username")), ADMIN_USERNAME) and _admin_password_ok(request.form.get("password") or ""):
+                response_status = 503
+            elif username_ok and _admin_password_ok(request.form.get("password") or ""):
                 session.clear()
-                session["admin_authenticated"] = True
-                session["csrf_token"] = secrets.token_urlsafe(32)
-                session.permanent = True
-                bind_bootstrap_owner_session(session)
-                try_record_audit_event(
-                    "security.login",
-                    result="SUCCESS",
-                    entity_type="internal_actor",
-                    entity_id=session.get("internal_actor_id"),
-                )
-                target = norm(request.args.get("next"))
-                return redirect(target if target.startswith("/") and not target.startswith("//") else url_for("home"))
+                try:
+                    bind_bootstrap_owner_session(session)
+                except Exception:
+                    session.clear()
+                    app.logger.exception("ADMIN_LOGIN session_binding_failed")
+                    error = "Nie udało się otworzyć sesji. Spróbuj ponownie za chwilę."
+                    response_status = 503
+                else:
+                    session["admin_authenticated"] = True
+                    session["csrf_token"] = secrets.token_urlsafe(32)
+                    session.permanent = True
+                    try_record_audit_event(
+                        "security.login", result="SUCCESS", entity_type="internal_actor",
+                        entity_id=session.get("internal_actor_id"))
+                    app.logger.info("ADMIN_LOGIN success")
+                    target = norm(request.args.get("next"))
+                    return redirect(target if target.startswith("/") and not target.startswith("//") else url_for("home"))
             else:
+                session.clear()
+                app.logger.warning("ADMIN_LOGIN credentials_rejected username_match=%s mode=%s", username_ok, "hash" if ADMIN_PASSWORD_HASH else "plain")
                 error = "Nieprawidłowy login lub hasło."
-        return render_template_string(r'''<!doctype html><html lang="pl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Logowanie — Niedźwieccy</title><style>body{margin:0;font-family:Inter,Segoe UI,sans-serif;background:#f5f6fa;color:#17233c;display:grid;place-items:center;min-height:100vh}.box{width:min(420px,calc(100% - 28px));background:#fff;padding:30px;border-radius:24px;box-shadow:0 18px 55px rgba(20,35,65,.13)}h1{margin:0 0 5px}.muted{color:#718096;font-size:13px;margin-bottom:22px}label{display:block;font-size:12px;font-weight:700;margin:12px 0 6px}input{width:100%;box-sizing:border-box;padding:12px;border:1px solid #dfe3ec;border-radius:13px;font:inherit}button{width:100%;margin-top:18px;padding:12px;border:0;border-radius:13px;background:#5577ee;color:#fff;font-weight:700}.error{background:#fff1f2;color:#b9384c;padding:10px;border-radius:12px;font-size:12px}</style></head><body><form class="box" method="post"><h1>Panel magazynu</h1><div class="muted">Zaloguj się jako administrator.</div>{% if error %}<div class="error">{{ error }}</div>{% endif %}<label>Login</label><input name="username" autocomplete="username" required><label>Hasło</label><input name="password" type="password" autocomplete="current-password" required><button type="submit">Zaloguj</button></form></body></html>''', error=error)
+        return render_template_string(r'''<!doctype html><html lang="pl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Logowanie — Niedźwieccy</title><style>body{margin:0;font-family:Inter,Segoe UI,sans-serif;background:#f5f6fa;color:#17233c;display:grid;place-items:center;min-height:100vh}.box{width:min(420px,calc(100% - 28px));background:#fff;padding:30px;border-radius:24px;box-shadow:0 18px 55px rgba(20,35,65,.13)}h1{margin:0 0 5px}.muted{color:#718096;font-size:13px;margin-bottom:22px}label{display:block;font-size:12px;font-weight:700;margin:12px 0 6px}input{width:100%;box-sizing:border-box;padding:12px;border:1px solid #dfe3ec;border-radius:13px;font:inherit}button{width:100%;margin-top:18px;padding:12px;border:0;border-radius:13px;background:#5577ee;color:#fff;font-weight:700}.error{background:#fff1f2;color:#b9384c;padding:10px;border-radius:12px;font-size:12px}</style></head><body><form class="box" method="post"><h1>Panel magazynu</h1><div class="muted">Zaloguj się jako administrator.</div>{% if error %}<div class="error">{{ error }}</div>{% endif %}<label>Login</label><input name="username" autocomplete="username" required><label>Hasło</label><input name="password" type="password" autocomplete="current-password" required><button type="submit">Zaloguj</button></form></body></html>''', error=error), response_status
 
 
 
