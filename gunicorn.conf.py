@@ -20,12 +20,15 @@ def post_worker_init(worker):
     import inpost_pickups
     import inpost_tracking
     import ksef_scheduler
+    import architect_order_email
     inpost_pickups.start_worker(backend)
     inpost_tracking.start_worker(backend)
     thread = ksef_scheduler.start_worker(backend)
     audit_started = backend.start_audit_outbox_worker() if backend.supabase_enabled() else False
+    email_started = architect_order_email.start_worker(backend)
     worker.log.info('BACKGROUND_WORKERS_READY import_pid=%s serving_pid=%s preload=%s audit_started=%s',
                     backend._APP_IMPORT_PID, worker.pid, worker.cfg.preload_app,
                     audit_started)
+    worker.log.info('ARCHITECT_EMAIL_WORKER_READY started=%s', email_started)
     worker.log.info('KSEF_WORKER_READY pid=%s alive=%s', worker.pid,
                     bool(thread and thread.is_alive()))

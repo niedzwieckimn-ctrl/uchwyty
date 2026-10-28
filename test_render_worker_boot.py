@@ -12,10 +12,10 @@ def test_render_import_does_not_start_sqlite_background_threads(tmp_path):
                SUPABASE_SERVICE_ROLE_KEY='test-only-not-a-credential',
                SUPABASE_ANON_KEY='', SUPABASE_AUTO_SYNC_ON_WRITE='0')
     script = '''
-import inpost_pickups, inpost_tracking, ksef_scheduler, internal_audit_outbox
+import inpost_pickups, inpost_tracking, ksef_scheduler, internal_audit_outbox, architect_order_email
 def premature(*args, **kwargs):
     raise AssertionError('Background worker started during pre-fork import')
-for module in (inpost_pickups, inpost_tracking, ksef_scheduler, internal_audit_outbox):
+for module in (inpost_pickups, inpost_tracking, ksef_scheduler, internal_audit_outbox, architect_order_email):
     module.start_worker = premature
 import app
 assert app.supabase_enabled()
@@ -35,10 +35,10 @@ def test_gunicorn_hook_accepts_audit_worker_boolean_contract(monkeypatch, starte
     import runpy
     from types import SimpleNamespace
     import app
-    import inpost_pickups, inpost_tracking, ksef_scheduler
+    import inpost_pickups, inpost_tracking, ksef_scheduler, architect_order_email
     monkeypatch.setattr(app, 'supabase_enabled', lambda: True)
     monkeypatch.setattr(app, 'start_audit_outbox_worker', lambda: started)
-    for module in (inpost_pickups, inpost_tracking, ksef_scheduler):
+    for module in (inpost_pickups, inpost_tracking, ksef_scheduler, architect_order_email):
         monkeypatch.setattr(module, 'start_worker', lambda backend: None)
     hook = runpy.run_path(str(Path(__file__).with_name('gunicorn.conf.py')))['post_worker_init']
     hook(SimpleNamespace(pid=os.getpid(), cfg=SimpleNamespace(preload_app=False),

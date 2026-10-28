@@ -62,6 +62,8 @@ def test_architect_order_commits_without_local_snapshot(client, monkeypatch):
             return 812
         if path == "/rest/v1/orders":
             return saved
+        if path == "/rest/v1/architect_order_email_outbox":
+            return [{"status": "PENDING", "last_error_code": None}]
         raise AssertionError(path)
     monkeypatch.setattr(backend, "pull_shared_tables_from_supabase", lambda **kwargs: (_ for _ in ()).throw(AssertionError("scoped sync")))
     monkeypatch.setattr(backend, "maybe_pull_shared_from_supabase", lambda **kwargs: (_ for _ in ()).throw(AssertionError("full sync")))

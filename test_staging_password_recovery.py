@@ -1,6 +1,8 @@
 """Recovery is limited to one existing staging account and a CSRF-protected owner."""
+import json
 import pytest
 import app as b
+from internal_audit_outbox import remote_payload
 from test_auth_resilience import admin_client
 from test_internal_rbac import _create_actor
 
@@ -41,6 +43,35 @@ def test_recovery_updates_only_fixed_existing_account(recovery, caplog):
     assert calls == [('/auth/v1/admin/users/'+UID, {'timeout':10}),
                      ('/auth/v1/admin/users/'+UID, {'method':'PUT','payload':{'password':'isolated-test-password'},'timeout':10})]
     assert 'isolated-test-password' not in result.get_data(as_text=True) + caplog.text
+
+
+def test_recovery_persists_secret_free_audit_and_delivery_job(recovery):
+    # Exercise the real audit registry and SQLite store; only Supabase is faked.
+    assert post(recovery).status_code == 200
+    db = b.conn()
+    try:
+        rows = db.execute(
+            "SELECT * FROM internal_audit_log WHERE operation='staging.distributor_password'"
+        ).fetchall()
+        assert len(rows) == 1
+        event = dict(rows[0])
+        assert event['result'] == 'SUCCESS'
+        assert event['permission'] == 'system.users_manage'
+        assert event['audit_policy'] == 'SECURITY'
+        assert event['entity_type'] == 'auth_user'
+        assert event['entity_id'] == UID
+        assert event['actor_type'] == 'HUMAN'
+        assert 'OWNER' in json.loads(event['roles_json'])
+        job = db.execute(
+            "SELECT status FROM internal_audit_outbox WHERE audit_id=?", (event['audit_id'],)
+        ).fetchone()
+        assert job is not None and job[0] == 'PENDING'
+        payload = remote_payload(event)
+        assert 'isolated-test-password' not in json.dumps(event) + json.dumps(payload)
+        assert event['before_state'] is None and event['after_state'] is None
+        assert payload['before_state'] is None and payload['after_state'] is None
+    finally:
+        db.close()
 
 
 @pytest.mark.parametrize('values', [dict(csrf_token='invalid'), dict(password='short'), dict(confirmation='different')])
