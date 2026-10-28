@@ -4,7 +4,7 @@ create or replace function architect_portal.dispatch(p_action text,p_data jsonb)
 returns jsonb language plpgsql security definer set search_path='' as $$
 declare uid uuid=auth.uid(); cid bigint; profile public.architect_profiles%rowtype;
   customer public.customers%rowtype; account auth.users%rowtype; data jsonb; extra jsonb;
-  result jsonb; items jsonb; o public.orders%rowtype; code public.architect_codes%rowtype;
+  result jsonb; items jsonb; o public.orders%rowtype; issued_code public.architect_codes%rowtype;
   prefix text; candidate text; attempt integer; product_ids bigint[]; sid uuid;
   oid bigint; iid bigint; plist text; program_active boolean; net numeric; gross numeric; retail numeric;
 begin
@@ -63,8 +63,8 @@ begin
         for attempt in 1..30 loop
           candidate:=prefix||'-'||lpad(((('x'||substr(replace(gen_random_uuid()::text,'-',''),1,8))::bit(32)::bigint)%10000)::text,4,'0');
           begin
-            code:=public.architect_issue_code(uid,cid,candidate);
-            return jsonb_build_object('ok',true,'code',jsonb_build_object('id',code.id,'code',code.code,'distributor_id',cid,'status',code.status,'expires_at',code.expires_at));
+            issued_code:=public.architect_issue_code(uid,cid,candidate);
+            return jsonb_build_object('ok',true,'code',jsonb_build_object('id',issued_code.id,'code',issued_code.code,'distributor_id',cid,'status',issued_code.status,'expires_at',issued_code.expires_at));
           exception when unique_violation then null;
           end;
         end loop;
@@ -112,7 +112,7 @@ begin
           coalesce(oi.unit_gross_price,(c->>'gross_price')::numeric) gross_price,
           coalesce(oi.unit_retail_price,(c->>'retail_price')::numeric) retail_price,
           round(coalesce(oi.unit_net_price,(c->>'net_price')::numeric)*oi.qty,2) line_value_net,
-          round(coalesce(oi.unit_gross_price,(c->>'gross_price')::numeric)*oi.qty,2) line_value_gross,
+          round(coalesce(oi.unit_net_price,(c->>'net_price')::numeric)*oi.qty*(case when o.currency='EUR' then 1 else 1.23 end),2) line_value_gross,
           round(coalesce(oi.unit_retail_price,(c->>'retail_price')::numeric)*oi.qty,2) line_value_retail,
           coalesce(a.qty,0) invoiced_qty,greatest(0,oi.qty-coalesce(a.qty,0)) remaining_qty,
           coalesce((c->>'qty_physical')::integer,0) stock_qty,
