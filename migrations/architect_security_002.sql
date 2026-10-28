@@ -16,6 +16,16 @@ revoke insert, update, delete on public.orders, public.order_items from anon, au
 revoke select on public.orders, public.order_items from anon;
 grant select on public.orders, public.order_items to authenticated;
 
+-- The order policies below look up the authenticated user's B2B membership.
+-- Without this grant and own-row policy, PostgreSQL rejects the policy's
+-- subquery even for a valid distributor.
+alter table public.client_accounts enable row level security;
+revoke select on public.client_accounts from anon;
+grant select on public.client_accounts to authenticated;
+drop policy if exists client_accounts_select_own on public.client_accounts;
+create policy client_accounts_select_own on public.client_accounts
+  for select to authenticated using (user_id = (select auth.uid()));
+
 -- Email equality alone is not a distributor authorization. Preserve B2B
 -- read access through the existing active user-to-customer mapping.
 drop policy if exists orders_select_own on public.orders;
