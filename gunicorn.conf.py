@@ -23,9 +23,9 @@ def post_worker_init(worker):
     inpost_pickups.start_worker(backend)
     inpost_tracking.start_worker(backend)
     thread = ksef_scheduler.start_worker(backend)
-    audit_thread = backend.start_audit_outbox_worker() if backend.supabase_enabled() else None
-    worker.log.info('BACKGROUND_WORKERS_READY import_pid=%s serving_pid=%s preload=%s audit_alive=%s',
+    audit_started = backend.start_audit_outbox_worker() if backend.supabase_enabled() else False
+    worker.log.info('BACKGROUND_WORKERS_READY import_pid=%s serving_pid=%s preload=%s audit_started=%s',
                     backend._APP_IMPORT_PID, worker.pid, worker.cfg.preload_app,
-                    bool(audit_thread and audit_thread.is_alive()))
+                    audit_started)
     worker.log.info('KSEF_WORKER_READY pid=%s alive=%s', worker.pid,
                     bool(thread and thread.is_alive()))
