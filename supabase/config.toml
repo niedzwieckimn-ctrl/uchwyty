@@ -1,0 +1,2 @@
+[functions.portal-email]
+verify_jwt = true
