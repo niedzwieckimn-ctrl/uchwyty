@@ -314,8 +314,12 @@ def register_routes(context):
                 "buyer_name", "buyer_tax_no", "buyer_address", "buyer_country",
                 "buyer_email", "buyer_phone", "discount_percent", "invoice_type", "currency"
             ]}
-            if architect_order_redemption(order_id) and Decimal(data.get("discount_percent") or "0") != 0:
-                return "Rabat architekta jest już zapisany w cenach pozycji zamówienia. Usuń drugi rabat z formularza.", 409
+            if architect_order_redemption(order_id):
+                from architect_invoice import require_no_second_discount
+                try:
+                    require_no_second_discount(data.get("discount_percent"))
+                except ValueError as exc:
+                    return str(exc), 409
             suggested_invoice_no = norm(request.form.get("suggested_invoice_no"))
             manual_marker = norm(request.form.get("invoice_no_manual"))
             if manual_marker in {"0", "1"}:
@@ -452,8 +456,8 @@ def register_routes(context):
                     return redirect(url_for("order_invoice", order_id=order_id, from_packing="1"))
             promo_expected = None
             if norm(request.form.get("submit_action")) != "packing" and invoice_items and not msg:
-                # A program invoice is tied to one durable order and its price
-                # snapshots. A failed database read must block issuance.
+                # Reconcile immutable prices per source order. The existing
+                # invoice allocations preserve membership on combined invoices.
                 selected_order_ids = {
                     int(it.get("source_order_id") or it.get("order_id") or order_id)
                     for it in invoice_items
@@ -464,18 +468,23 @@ def register_routes(context):
                 }
                 promoted = [selected_id for selected_id, link in promo_links.items() if link]
                 if promoted:
-                    if len(selected_order_ids) != 1:
-                        return "Zamówienie z kodem architekta wymaga osobnej faktury.", 409
-                    program_order_id = promoted[0]
-                    sale_snapshots = supabase_request('/rest/v1/architect_sale_lines', params={
-                        'select': 'order_item_id,qty,vat_rate,wholesale_net_after',
-                        'redemption_id': f"eq.{promo_links[program_order_id]['id']}",
-                        'limit': 1000,
-                    }, timeout=15) or []
-                    from architect_invoice import expected_promo_invoice_totals
+                    customer_id = to_int(o['customer_id'], 0)
+                    if customer_id <= 0 or any(
+                        to_int(related_order_by_id.get(selected_id, {}).get('customer_id'), 0) != customer_id
+                        for selected_id in selected_order_ids
+                    ):
+                        return "Faktura programu może łączyć tylko zamówienia tego samego dystrybutora.", 409
+                    snapshots_by_order = {}
+                    for program_order_id in promoted:
+                        snapshots_by_order[program_order_id] = supabase_request('/rest/v1/architect_sale_lines', params={
+                            'select': 'order_item_id,qty,vat_rate,wholesale_net_after',
+                            'redemption_id': f"eq.{promo_links[program_order_id]['id']}",
+                            'limit': 1000,
+                        }, timeout=15) or []
+                    from architect_invoice import expected_combined_invoice_totals
                     try:
-                        promo_expected = expected_promo_invoice_totals(
-                            invoice_items, sale_snapshots, program_order_id,
+                        promo_expected = expected_combined_invoice_totals(
+                            invoice_items, snapshots_by_order,
                             invoice_type=data['invoice_type'], currency=data['currency'],
                             discount_percent=data.get('discount_percent'),
                         )

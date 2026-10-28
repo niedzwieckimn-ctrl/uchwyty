@@ -404,9 +404,15 @@ def register_routes(context):
                     sold_by_line[line_id] = sold_by_line.get(line_id, 0) + to_int(entry.get('sold_qty'), 0)
                 for line in lines:
                     line['sold_qty'] = sold_by_line.get(to_int(line['id'], 0), 0)
-            invoices = supabase_request('/rest/v1/invoices',params={
-                'select':'id,invoice_no','order_id':f'eq.{order_id}',
-                'publication_state':'eq.complete','order':'id.desc'},timeout=15) or []
+            allocations = supabase_request('/rest/v1/invoice_allocations', params={
+                'select':'invoice_id', 'order_id':f'eq.{order_id}', 'qty':'gt.0',
+            }, timeout=15) or []
+            invoice_ids = sorted({to_int(row.get('invoice_id'), 0) for row in allocations} - {0})
+            invoices = []
+            if invoice_ids:
+                invoices = supabase_request('/rest/v1/invoices',params={
+                    'select':'id,invoice_no','id':'in.(' + ','.join(map(str, invoice_ids)) + ')',
+                    'publication_state':'eq.complete','order':'id.desc'},timeout=15) or []
             return jsonify(ok=True,lines=lines,invoices=invoices)
         if not _client_order_origin_allowed() or not _rate_limit('architect_sale',8,3600):
             return jsonify(ok=False,error='Nie można teraz potwierdzić sprzedaży'),429
