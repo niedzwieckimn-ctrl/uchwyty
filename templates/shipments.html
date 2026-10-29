@@ -35,8 +35,10 @@
   {% if c.receiver %}<p class="small"><b>Odbiorca:</b> {{ c.receiver.name }}<br>{{ c.receiver.street }} · {{ c.receiver.post_code }} {{ c.receiver.city }}</p>{% endif %}
   {% if c.tracking %}<p><b>{{ c.carrier|upper }}</b> · {{ c.tracking }}</p>{% else %}<p class="muted">Numer przesyłki pojawi się po nadaniu.</p>{% endif %}
   <div class="flex">
-    <a class="btn" href="{{ url_for('shipment_packing_pdf',key=c.key) }}">Lista pakowa PDF</a>
-    {% if c.invoice and c.invoice.publication_state == 'complete' %}<a class="btn" href="/invoices/{{ c.invoice.id }}/download">{{ c.invoice.invoice_no }}</a>{% endif %}
+    {% for document in c.documents|default([c]) %}
+    <a class="btn" href="{{ url_for('shipment_packing_pdf',key=document.key) }}">Lista pakowa{% if c.documents|default([])|length > 1 %} {{ loop.index }}{% endif %} PDF</a>
+    {% if document.invoice and document.invoice.publication_state == 'complete' %}<a class="btn" href="/invoices/{{ document.invoice.id }}/download">{{ document.invoice.invoice_no }}</a>{% endif %}
+    {% endfor %}
   </div>
   <div class="flex">
     {% if c.tracking_url %}<a class="btn primary" href="{{ c.tracking_url }}" target="_blank" rel="noopener">Śledź przesyłkę</a>

@@ -578,7 +578,7 @@ def register_routes(context):
 
 
     def order_mark_shipped_service(order_id, locked_ids=None):
-        import packing_versions, shipment_amendments, shipment_rebind, sys
+        import packing_versions, shipment_amendments, shipment_rebind, shipment_join, sys
         tracking_no = re.sub(r"\s+", "", norm(request.form.get("tracking_no")))
         carrier = norm(request.form.get("carrier")).lower()
         notify_customer = request.form.get("notify_customer") == "1"
@@ -615,31 +615,51 @@ def register_routes(context):
             matches = [dict(r) for r in c.execute('SELECT * FROM packing_shipments WHERE shipment_key=? OR (carrier=? AND tracking=?)',
                               (shipment_key, carrier, tracking_no))]
             matches = shipment_amendments.effective_shipments(c, matches)
-            if len(matches) > 1:
-                raise packing_versions.PackingConflict('Numer wskazuje kilka różnych zapisów przesyłki. Sprawdź jej historię.')
-            prior = matches[0] if matches else None
+            same_list = [r for r in matches if version_before and int(r['final_batch_id']) == int(version_before['batch_id'])]
+            prior = same_list[0] if same_list else (matches[0] if matches else None)
             amended = False
             amended_sid = ''
             # A repeated completed correction may carry the original form token.
             # It can only revisit the same final list, never bind a different one.
-            completed_amendment = bool(shipment_rebind.is_replay(c, prior, request.form.get('shipment_form_version')) and version_before
+            completed_amendment = bool((shipment_rebind.is_replay(c, prior, request.form.get('shipment_form_version'))
+                or shipment_join.replay(c, prior, request.form.get('shipment_form_version'))) and version_before
                 and int(version_before['batch_id']) == int(prior['final_batch_id']))
             if not expected or (request.form.get('shipment_form_version') != expected and not completed_amendment):
                 raise packing_versions.PackingConflict('Lista lub numer przesyłki zmieniły się. Odśwież zamówienie i wpisz numer dla aktualnej paczki.')
             if prior:
                 if version_before and int(version_before['batch_id']) != int(prior['final_batch_id']):
-                    amended_sid = shipment_rebind.validate(c, prior, version_before)
-                    correction = shipment_amendments.amend(c, prior, version_before,
-                        actor=session.get('internal_actor_id') or 'admin',
-                        reason='Numer przesyłki przypisany z aktualnej listy po regeneracji faktury.',
-                        request_version=expected)
-                    prior = dict(c.execute('SELECT * FROM packing_shipments WHERE shipment_key=?',
-                                           (correction['final_key'],)).fetchone())
-                    amended = True
+                    old_invoice = c.execute('SELECT invoice_id FROM packing_batches WHERE id=?',
+                                            (prior['final_batch_id'],)).fetchone()
+                    separate_invoice = bool(old_invoice and old_invoice[0] != version_before.get('invoice_id')
+                        and c.execute('SELECT 1 FROM invoices WHERE id=?', (old_invoice[0],)).fetchone())
+                    if separate_invoice or len(matches) > 1:
+                        summary = shipment_join.validate(c, matches, version_before)
+                        if request.form.get('join_existing') != summary['token']:
+                            c.rollback()
+                            return render_template('shipment_join.html', summary=summary, carrier=carrier,
+                                tracking=tracking_no, order_id=order_id, form_version=expected,
+                                title='Dołącz listę do paczki', base_url=BASE_URL, db_path=DB_PATH), 409
+                        shipment_key = shipment_join.key(version_before, carrier, tracking_no)
+                        shipment_join.record(c, version_before, shipment_key, matches, expected,
+                                             session.get('internal_actor_id') or 'admin')
+                        prior = None
+                        notify_customer = False
+                    else:
+                        amended_sid = shipment_rebind.validate(c, prior, version_before)
+                        correction = shipment_amendments.amend(c, prior, version_before,
+                            actor=session.get('internal_actor_id') or 'admin',
+                            reason='Numer przesyłki przypisany z aktualnej listy po regeneracji faktury.',
+                            request_version=expected)
+                        prior = dict(c.execute('SELECT * FROM packing_shipments WHERE shipment_key=?',
+                                               (correction['final_key'],)).fetchone())
+                        amended = True
                 elif prior['shipment_key'].startswith('amend:'):
                     amended = True
                     amended_sid = shipment_rebind.validate(c, prior, version_before)
-                shipment_key = prior['shipment_key']
+                if prior:
+                    shipment_key = prior['shipment_key']
+                    if shipment_key.startswith('join:'):
+                        notify_customer = False
             packing = (packing_versions.batch_result(c, prior['final_batch_id'], mode='final') if prior else
                        packing_versions.ensure_current_for_shipment(backend, c, order_id))
             package_order_ids = packing['order_ids']

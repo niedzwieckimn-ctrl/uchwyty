@@ -191,6 +191,10 @@ def cloud(tracked, monkeypatch, fail_at=0):
                          'payload': payload['p_payload']}
         return {'saved': True, 'revision': metadata[oid]['revision']}
     monkeypatch.setattr(b, 'supabase_request', metadata_request)
+    def sync_parcel(backend, members, *, expand_members=True):
+        assert set(members) == set(ORDER_IDS)
+        assert expand_members is False
+    monkeypatch.setattr(packing_versions, 'sync_evidence', sync_parcel)
     def update(table, values, filters):
         calls.append(filters['id'])
         if len(calls) == fail_at:
