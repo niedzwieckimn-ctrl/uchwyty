@@ -112,7 +112,7 @@ def cards_from_records(rows):
         tracking = final.get('tracking') or booked_tracking
         carrier = final.get('carrier') or booked_carrier
         invoice_id = batch.get('invoice_id') or packing.get('invoice_id')
-        cards.append(dict(key=key, root=int(packing['root_order_id']), batch=batch,
+        cards.append(dict(key=key, shipment_key=final.get('shipment_key'), root=int(packing['root_order_id']), batch=batch,
             created=batch['created_at'], sent=bool(final), tracking=tracking, carrier=carrier,
             receiver=receiver, invoice_id=invoice_id, invoice=None,
             customer=items[0].get('customer_name_snapshot') or 'Klient',
@@ -123,6 +123,41 @@ def cards_from_records(rows):
             tracking_url=('https://inpost.pl/sledzenie-przesylek?number=' + quote(tracking, safe=''))
                 if carrier.lower() == 'inpost' and tracking else ''))
     return sorted(cards, key=lambda card: card['created'], reverse=True)
+
+
+def group_joined_cards(cards, rows):
+    """Group only explicitly joined lists; equal numbers alone are not proof."""
+    groups = {c.get('shipment_key'): {c.get('shipment_key')} for c in cards if c.get('shipment_key')}
+    by_key = {c.get('shipment_key'): c for c in cards if c.get('shipment_key')}
+    for row in rows:
+        for proof in row.get('fulfillment_verifications') or []:
+            kind = proof.get('kind') or ''
+            if not kind.startswith('join:') or kind not in by_key:
+                continue
+            try:
+                data = json.loads(proof['payload'])
+                if data.get('packing_list') != by_key[kind]['key']:
+                    continue
+                parents = [p for p in data.get('parents', []) if p in by_key
+                    and by_key[p]['carrier'] == by_key[kind]['carrier']
+                    and by_key[p]['tracking'] == by_key[kind]['tracking']]
+                merged = set().union(groups[kind], *(groups[p] for p in parents))
+                for member in merged:
+                    groups[member] = merged
+            except (ValueError, TypeError, KeyError):
+                continue
+    result, seen = [], set()
+    for card in cards:
+        sk = card.get('shipment_key')
+        if sk and sk in seen:
+            continue
+        members = groups.get(sk, set())
+        documents = [c for c in cards if c.get('shipment_key') in members] if members else [card]
+        seen.update(members)
+        merged = dict(card, documents=documents, total=sum(c['total'] for c in documents),
+            orders=sorted({o for c in documents for o in c['orders']}))
+        result.append(merged)
+    return result
 
 
 def invoice_labels(b, cards):
@@ -191,6 +226,7 @@ def register_routes(app, b):
             rows, limited = records(b)
             cards = cards_from_records(rows)
             invoice_labels(b, cards)
+            cards = group_joined_cards(cards, rows)
         except Exception:
             app.logger.exception('SHIPMENTS_READ_FAILED')
             cards = []
