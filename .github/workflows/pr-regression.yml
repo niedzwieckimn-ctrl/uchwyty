@@ -1,0 +1,30 @@
+name: PR regression
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: python -m pip install -r requirements-dev.txt
+      - name: Packing, shipment and architect program regressions
+        run: >-
+          python -m pytest -q
+          test_inpost_completion.py
+          test_inpost_tracking47.py
+          test_packing_ui_reconciliation.py
+          test_customer_architect_program.py
+          test_architect_settlement_admin.py
+          test_architect_security.py
+          test_architect_pricing.py
+          test_architect_order_email.py
+          test_architect_invoice_flow.py
+          test_architect_invoice.py
