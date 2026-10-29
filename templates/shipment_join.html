@@ -1,0 +1,15 @@
+{% extends 'base.html' %}{% block content %}
+<div class="card"><h1>Dołącz listę do istniejącej paczki</h1>
+<p>{{ summary.customer }} · <b>{{ carrier|upper }} {{ tracking }}</b></p>
+<p>W paczce są już dokumenty: <b>{{ summary.invoices|join(', ') }}</b>.</p>
+<p>Dołączasz <b>{{ summary.total }} szt.</b> z faktury <b>{{ summary.invoice }}</b>.</p>
+<p>Potwierdź, że te produkty jadą w tej samej fizycznej paczce do tego samego odbiorcy. Poprzednie listy i faktury zostaną zachowane. Nie powstanie nowa etykieta ani podjazd.</p>
+<form method="post" action="{{ url_for('order_mark_shipped', order_id=order_id) }}">
+<input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
+<input type="hidden" name="tracking_no" value="{{ tracking }}">
+<input type="hidden" name="carrier" value="{{ carrier }}">
+<input type="hidden" name="shipment_form_version" value="{{ form_version }}">
+<input type="hidden" name="join_existing" value="{{ summary.token }}">
+<button class="btn primary" type="submit">Tak, dołącz do tej paczki</button>
+<a class="btn" href="{{ url_for('order_view', order_id=order_id) }}">Wróć do zamówienia</a>
+</form></div>{% endblock %}

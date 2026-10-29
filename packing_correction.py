@@ -129,14 +129,27 @@ def send(b, order_id, file_hash):
 
 
 def form_version(db, order_id):
-    """Stable browser revision includes other lists and billing for this customer."""
-    rows = db.execute('''SELECT o.id,o.status,d.file_hash,d.document_id,
-        (SELECT GROUP_CONCAT(ia.id || ':' || ia.qty) FROM invoice_allocations ia WHERE ia.order_id=o.id)
+    """Compare business content, never cache-local document/allocation IDs.
+
+    Reconciliation can remap batch IDs and rebuild invoice allocations without
+    changing a single quantity. Those storage IDs must not invalidate a form.
+    """
+    rows = db.execute('''SELECT o.id,o.status,d.file_hash
         FROM orders o LEFT JOIN fulfillment_documents d ON d.order_id=o.id AND d.kind='packing_list'
         WHERE o.id=? OR (TRIM(COALESCE(o.customer_email,''))<>'' AND
           LOWER(TRIM(o.customer_email))=(SELECT LOWER(TRIM(customer_email)) FROM orders WHERE id=?))
         ORDER BY o.id''', (order_id, order_id)).fetchall()
-    return hashlib.sha256(json.dumps([list(r) for r in rows]).encode()).hexdigest()
+    content = []
+    for row in rows:
+        oid = row[0]
+        allocations = db.execute('''SELECT invoice_id,order_item_id,product_id,sku,SUM(qty)
+            FROM invoice_allocations WHERE order_id=?
+            GROUP BY invoice_id,order_item_id,product_id,sku
+            ORDER BY invoice_id,order_item_id,product_id,sku''', (oid,)).fetchall()
+        items = db.execute('''SELECT id,product_id,qty FROM order_items
+            WHERE order_id=? ORDER BY id''', (oid,)).fetchall()
+        content.append([list(row), [list(r) for r in allocations], [list(r) for r in items]])
+    return hashlib.sha256(json.dumps(content).encode()).hexdigest()
 
 
 def _assert_no_current_shipping(db, package):
