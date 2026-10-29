@@ -22,10 +22,13 @@ Deno.serve(async(req:Request)=>{
     return fetch(`https://api.resend.com${path}`,{...init,headers:{Authorization:`Bearer ${provider}`,'Content-Type':'application/json',...init.headers},signal:AbortSignal.timeout(10000)});
   };
   try {
+    // Resolve receipts that arrived before the sender persisted its provider ID.
+    await rpc('portal_email_sync_events',{});
     const summary=await runBatch({rpc,sender,testRecipient:mode==='staging'?recipient:'',
       send:async(body:unknown,key:string)=>{const r=await providerFetch('/emails',{method:'POST',headers:{'Idempotency-Key':key},body:JSON.stringify(body)});return {status:r.status,body:await r.json().catch(()=>({}))};},
       getReceipt:async(id:string)=>{const r=await providerFetch(`/emails/${encodeURIComponent(id)}`);if(!r.ok)throw new Error('RECEIPT_UNAVAILABLE');return r.json();}
     });
+    await rpc('portal_email_sync_events',{});
     return Response.json(summary);
   }catch{ return Response.json({status:'worker_error'},{status:503}); }
 });
