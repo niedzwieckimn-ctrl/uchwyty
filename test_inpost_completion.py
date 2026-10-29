@@ -170,7 +170,10 @@ def cloud(tracked, monkeypatch, fail_at=0):
     remote = {oid: _order(oid) for oid in ORDER_IDS}
     calls = []
     monkeypatch.setattr(b, 'supabase_enabled', lambda: True)
-    monkeypatch.setattr(packing_versions, 'sync_evidence', lambda *args: None)
+    def sync_parcel(backend, members, *, expand_members=True):
+        assert set(members) == set(ORDER_IDS)
+        assert expand_members is False
+    monkeypatch.setattr(packing_versions, 'sync_evidence', sync_parcel)
     def update(table, values, filters):
         calls.append(filters['id'])
         if len(calls) == fail_at:

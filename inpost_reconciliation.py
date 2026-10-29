@@ -161,7 +161,10 @@ def publish(b, claim):
     finally:
         db.close()
     # Publish the evidence already staged with the business write first.
-    packing_versions.sync_evidence(b, payload['member_ids'])
+    # The durable intent already records the full parcel membership. Expanding
+    # through every historical list of a member crosses into later parcels and
+    # lets an unrelated pending write block this parcel's delivery receipt.
+    packing_versions.sync_evidence(b, payload['member_ids'], expand_members=False)
     for item in payload['orders']:
         db = b.conn()
         try:

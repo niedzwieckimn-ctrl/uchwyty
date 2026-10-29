@@ -261,13 +261,14 @@ def evidence_members(db, order_ids):
     return sorted(members)
 
 
-def sync_evidence(b, order_ids):
+def sync_evidence(b, order_ids, *, expand_members=True):
     if not b.supabase_enabled():
         return
     import reconciliation_store
     db = b.conn()
     try:
-        order_ids = evidence_members(db, order_ids)
+        order_ids = (evidence_members(db, order_ids) if expand_members
+                     else sorted(set(int(oid) for oid in order_ids)))
     finally:
         db.close()
     for oid in order_ids:
