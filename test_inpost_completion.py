@@ -167,10 +167,30 @@ def test_real_adapter_receipts_and_no_second_attempt(tracked, monkeypatch, respo
 
 
 def cloud(tracked, monkeypatch, fail_at=0):
+    from test_inpost_tracking47 import hydrated_cloud_fixture
+    import reconciliation_store
+    hydrated_cloud_fixture()
     remote = {oid: _order(oid) for oid in ORDER_IDS}
     calls = []
     monkeypatch.setattr(b, 'supabase_enabled', lambda: True)
-    monkeypatch.setattr(packing_versions, 'sync_evidence', lambda *args: None)
+    metadata = {}
+    for oid in ORDER_IDS:
+        revision, payload = reconciliation_store.stage(b, oid)
+        metadata[oid] = {'revision': revision, 'payload': payload}
+    db = b.conn()
+    db.execute('DELETE FROM fulfillment_reconciliation_pending')
+    db.commit()
+    db.close()
+    def metadata_request(path, method='GET', params=None, payload=None, **kwargs):
+        if path == '/rest/v1/fulfillment_reconciliation' and method == 'GET':
+            return [metadata[int(params['order_id'].removeprefix('eq.'))]]
+        assert path == '/rest/v1/rpc/save_fulfillment_reconciliation' and method == 'POST'
+        oid = payload['p_order_id']
+        assert metadata[oid]['revision'] == payload['p_expected_revision']
+        metadata[oid] = {'revision': payload['p_expected_revision'] + 1,
+                         'payload': payload['p_payload']}
+        return {'saved': True, 'revision': metadata[oid]['revision']}
+    monkeypatch.setattr(b, 'supabase_request', metadata_request)
     def update(table, values, filters):
         calls.append(filters['id'])
         if len(calls) == fail_at:
@@ -194,8 +214,11 @@ def test_partial_cloud_failure_restart_snapshot_retry_no_duplicate(tracked, monk
     assert all(remote[i]['status'] == 'partially_shipped' for i in ORDER_IDS)
     assert state()[1]['sync_payload'] == payload
     assert state()[0]['sync_state'] == 'synced'
-    assert len(tracked['mail']) == 1 and not tracked['pickup'] and not tracked['calls']
+    assert not tracked['mail'] and not tracked['pickup'] and not tracked['calls']
     assert tracking.process(b, _order(708), source='webhook')['ok']
+    assert len(tracked['mail']) == 1
+    tracking.process(b, _order(702), source='webhook')
+    assert len(tracked['mail']) == 1
     assert len(calls) == 7  # Three initial attempts plus four idempotent retries.
 
 

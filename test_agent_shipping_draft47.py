@@ -301,7 +301,16 @@ def test_structured_shipping_blocks_unfinished_invoice_of_current_parcel(parcel)
     assert parcel['calls'] == [] and parcel['pickup'] == []
 
 
-def test_full_parcel_dialogue_from_discovery_through_shipment_and_single_pickup(parcel):
+def test_full_parcel_dialogue_from_discovery_through_shipment_and_single_pickup(parcel, monkeypatch):
+    import inpost_pickups
+    pickup_requests = []
+    def confirmed_pickup(backend):
+        assert parcel['pickup'] == ['123456']
+        pickup_requests.append('123456')
+        return {'ok': True, 'dispatch_order_id': 'synthetic-dispatch'}
+    # The dialogue fixture fakes enqueueing; do not invoke a real daily queue.
+    # Its scheduling, cutoff and provider receipts have separate integration tests.
+    monkeypatch.setattr(inpost_pickups, 'order_today', confirmed_pickup)
     discovered, _ = _turn('Czy mam jakąś spakowaną paczkę, ale niewysłaną?', [
         _tool('orders.fulfillment.state', {'order_id':702}),
         runtime.ProviderResponse(text='Potwierdzona paczka obejmuje cztery zamówienia i 14 spakowanych sztuk.')])
@@ -341,3 +350,4 @@ def test_full_parcel_dialogue_from_discovery_through_shipment_and_single_pickup(
     assert repeated['status'] == 'SUCCESS' and provider.calls == [], repeated
     assert repeated['pending_approvals'] == [] and len(parcel['calls']) == 1
     assert parcel['pickup'] == ['123456'] and 'kolejce' in repeated['message']
+    assert pickup_requests == ['123456']

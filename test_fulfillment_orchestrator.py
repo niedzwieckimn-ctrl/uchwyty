@@ -310,7 +310,8 @@ def test_partial_invoice_failure_preserves_packing_and_resumes(flow, monkeypatch
     c = b.conn(); assert c.execute('SELECT COUNT(*) FROM invoices').fetchone()[0] == 1; c.close()
 
 
-def test_post_invoice_amendment_preserves_shipment_and_stales_docs(flow):
+@pytest.mark.parametrize('removal_verified', [True, False])
+def test_post_invoice_amendment_preserves_shipment_and_stales_docs(flow, removal_verified):
     c = b.conn()
     c.execute("INSERT INTO products(id,sku,model,name,created_at) VALUES(704,'LEO-N29-BB','Leo','Leo N29 BB',?)", (b.now_iso(),))
     c.execute('INSERT INTO stock(product_id,qty) VALUES(704,50)')
@@ -332,6 +333,18 @@ def test_post_invoice_amendment_preserves_shipment_and_stales_docs(flow):
     s = state()
     assert not s['packing_list']['current'] and not s['invoice']['current']
     assert s['shipment']['exists'] and s['shipment']['parameters_need_review']
+    if not removal_verified:
+        c = b.conn()
+        c.execute("UPDATE internal_invoice_removal_claims SET state='RUNNING' WHERE invoice_id=?", (iid,))
+        c.commit(); c.close()
+        success('orders.packing_list.generate')
+        blocked = run('orders.invoice.create')
+        assert blocked.status == 'CONFLICT'
+        assert blocked.error_code == 'INVOICE_ATTEMPT_CONFLICT'
+        c = b.conn()
+        assert c.execute('SELECT COUNT(*) FROM invoices').fetchone()[0] == 0
+        c.close()
+        return
     docs()
     success('shipping.shipment.confirm_parameters', human_confirmed=True)
     success('shipping.shipment.refresh')

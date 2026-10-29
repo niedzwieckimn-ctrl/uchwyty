@@ -3,12 +3,13 @@ from pathlib import Path
 
 import pytest
 import requests
+from flask import Flask
 
 import app as backend
 import internal_rbac as rbac
 import orderchamp_http as http
 from orderchamp_client import OrderchampClient, OrderchampError
-from test_internal_rbac import isolated, _create_actor, _legacy_admin_session
+from test_internal_rbac import isolated as database_isolated, _create_actor, _legacy_admin_session
 from test_orderchamp_stock import client_for, connected, found, missing, Response, TOKEN
 
 CONNECTION = '/api/admin/orderchamp/test-connection'
@@ -18,6 +19,25 @@ LOCAL_CATALOG = '/api/admin/orderchamp/local-catalog'
 PUSH = '/api/admin/orderchamp/push-one'
 SEED = '/api/admin/orderchamp/seed-one'
 HEADERS = {'X-CSRF-Token': 'test'}
+
+
+@pytest.fixture
+def isolated(database_isolated):
+    """Exercise the retained legacy adapter without re-enabling it in the app.
+
+    Production now registers orderchamp_sync_v2. Its routing/authorization has
+    its own test_orderchamp_sync_v2 suite; these tests cover the older module.
+    """
+    legacy = Flask(__name__, template_folder=backend.app.template_folder)
+    legacy.config.update(backend.app.config)
+    http.register_routes(legacy, lambda: backend.DB_PATH, refresh_stock=lambda: None)
+    return legacy.test_client()
+
+
+def test_legacy_adapter_is_not_registered_in_application():
+    endpoints = {str(rule) for rule in backend.app.url_map.iter_rules()}
+    assert CONNECTION not in endpoints
+    assert DRY_RUN not in endpoints
 
 
 @pytest.fixture
