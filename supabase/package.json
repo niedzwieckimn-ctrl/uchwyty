@@ -1,0 +1,1 @@
+{"name":"portal-email-verification-tests","private":true,"scripts":{"test":"node --test ../test_portal_email_edge.mjs ../test_portal_email_webhook.mjs"},"devDependencies":{"svix":"1.76.1"}}
