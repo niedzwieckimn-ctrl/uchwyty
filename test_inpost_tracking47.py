@@ -214,7 +214,7 @@ def test_supabase_failure_does_not_roll_back_local_status(tracked, monkeypatch):
     import packing_versions
     hydrated_cloud_fixture()
     monkeypatch.setattr(b, 'supabase_enabled', lambda: True)
-    monkeypatch.setattr(packing_versions, 'sync_evidence', lambda *args: None)
+    monkeypatch.setattr(packing_versions, 'sync_evidence', lambda *args, **kwargs: None)
     def failed(*args):
         raise ConnectionError('synthetic cloud failure')
     monkeypatch.setattr(b, 'supabase_update_rows', failed)

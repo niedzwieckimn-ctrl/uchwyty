@@ -218,8 +218,11 @@ def test_partial_cloud_failure_restart_snapshot_retry_no_duplicate(tracked, monk
     assert all(remote[i]['status'] == 'partially_shipped' for i in ORDER_IDS)
     assert state()[1]['sync_payload'] == payload
     assert state()[0]['sync_state'] == 'synced'
+    # The cloud patch is durable, but the email waits for a fresh event with
+    # final reconciliation evidence. Keep that ordering from this branch.
     assert not tracked['mail'] and not tracked['pickup'] and not tracked['calls']
-    assert tracking.process(b, _order(708), source='webhook')['ok']
+    next_result = tracking.process(b, _order(708), source='webhook')
+    assert next_result['orders_applied'] and next_result['result'] == 'unchanged'
     assert len(tracked['mail']) == 1
     tracking.process(b, _order(702), source='webhook')
     assert len(tracked['mail']) == 1
