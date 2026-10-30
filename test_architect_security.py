@@ -153,6 +153,30 @@ def test_admin_architect_list_links_to_profile_and_shows_stats():
     assert 'Studio K'.encode() in response.data
 
 
+def test_pending_notifications_survive_overview_filters():
+    pending_id = '0b000000-0000-0000-0000-000000000004'
+    def remote(path, **_kwargs):
+        if path == '/rest/v1/architect_profiles':
+            return [{'id':pending_id,'first_name':'Nowa','last_name':'Osoba',
+                     'studio_name':'Pracownia do weryfikacji','email':'pending@example.invalid',
+                     'instagram':'@test','status':'pending_verification',
+                     'sample_entitlements':1,'created_at':'2026-10-30'}]
+        return []
+    with patch.dict(backend.app.config, {'SECRET_KEY':'test-only-session-key'}):
+        client = backend.app.test_client()
+        with client.session_transaction() as session:
+            session['admin_authenticated'] = True
+            session['csrf_token'] = 'test-only-token'
+        for query in ['?status=approved','?q=brak-dopasowania','?city=Poznan']:
+            with patch.object(architect_routes,'supabase_request',side_effect=remote):
+                response = client.get('/architects'+query)
+            page = response.get_data(as_text=True)
+            assert response.status_code == 200
+            assert 'Nowi architekci do zatwierdzenia: 1' in page
+            assert f'/architects/{pending_id}' in page
+            assert 'Wszystkie zgłoszenia zostały obsłużone.' not in page
+
+
 def test_admin_overview_uses_actual_codes_and_opens_separate_profile():
     architect_id = '0b000000-0000-0000-0000-000000000003'
     def remote(path, **_kwargs):
