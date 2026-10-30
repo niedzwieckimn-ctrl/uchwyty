@@ -1,4 +1,5 @@
 import {runBatch} from './core.mjs';
+import {prepareWelcomeEmail,DEFAULT_PANEL_URL} from './welcome-render.mjs';
 const env=(key:string)=>Deno.env.get(key)||'';
 Deno.serve(async(req:Request)=>{
   // Supabase may inject an sb_secret_ key into the legacy-named runtime variable.
@@ -25,6 +26,7 @@ Deno.serve(async(req:Request)=>{
     // Resolve receipts that arrived before the sender persisted its provider ID.
     await rpc('portal_email_sync_events',{});
     const summary=await runBatch({rpc,sender,testRecipient:mode==='staging'?recipient:'',
+      prepare:prepareWelcomeEmail(rpc,env('ARCHITECT_PANEL_URL')||DEFAULT_PANEL_URL),
       send:async(body:unknown,key:string)=>{const r=await providerFetch('/emails',{method:'POST',headers:{'Idempotency-Key':key},body:JSON.stringify(body)});return {status:r.status,body:await r.json().catch(()=>({}))};},
       getReceipt:async(id:string)=>{const r=await providerFetch(`/emails/${encodeURIComponent(id)}`);if(!r.ok)throw new Error('RECEIPT_UNAVAILABLE');return r.json();}
     });

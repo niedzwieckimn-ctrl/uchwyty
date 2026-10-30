@@ -39,6 +39,13 @@
   <h1>Program Architektów</h1>
   <p class="intro">Architekci, kody i potwierdzona sprzedaż w jednym miejscu. Dane pochodzą z bieżącej bazy IKUGO.</p>
   {% if request.args.get('result') == 'saved' %}<p role="status">Zapisano operację.</p>{% endif %}
+  <section class="tile" aria-label="Nowe akcje" style="margin-bottom:18px;border-color:#B39461">
+    <h2>Nowi architekci do zatwierdzenia: {{ pending_architects|length }}</h2>
+    <p>Zgłoszenia pozostają tutaj do podjęcia decyzji, niezależnie od filtrów poniżej.</p>
+    <ul class="rank">{% for a in pending_architects %}<li><span><b>{{ a.first_name }} {{ a.last_name }} · {{ a.studio_name }}</b><small>{{ a.email }} · {{ a.created_at }}</small></span><a class="btn" href="{{ url_for('architect_admin_profile',architect_id=a.id) }}">Sprawdź zgłoszenie</a></li>{% else %}<li>Wszystkie zgłoszenia zostały obsłużone.</li>{% endfor %}</ul>
+    <p><a href="{{ url_for('architects_admin',view='settings') }}">Nowe zamówienia próbek: {{ new_samples_count }} →</a></p>
+    <a class="btn" href="{{ url_for('architects_admin') }}">Odśwież nowe akcje</a>
+  </section>
   <div class="summary">
     <div class="tile"><small>Zarejestrowani architekci</small><strong>{{ total_architects }}</strong><small>Wszystkie zgłoszenia, również oczekujące.</small></div>
     <div class="tile"><small>Wygenerowane kody</small><strong>{{ total_codes }}</strong><small>Kody utworzone przez architektów.</small></div>

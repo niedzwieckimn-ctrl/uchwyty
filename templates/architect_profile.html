@@ -15,6 +15,21 @@
   </form>
 </section>
 {% endif %}
+{% if profile.status == 'approved' %}
+<section class="card" aria-label="Wiadomość o aktywacji konta">
+  <h2>Wiadomość o aktywacji konta</h2>
+  <p>Wyślij ponownie wiadomość „Twoje konto zostało zatwierdzone i jest już aktywne” na {{ profile.email }}.</p>
+  {% if welcome_job %}<p>Ostatnia wysyłka: <strong>{{ {'PENDING':'W kolejce','DELIVERING':'Wysyłanie','RETRY':'Ponowienie po błędzie','DELIVERED':'Przyjęta przez operatora poczty','UNKNOWN':'Wymaga sprawdzenia przed ponowieniem','BLOCKED':'Wysyłka zablokowana'}.get(welcome_job.status,'Wymaga sprawdzenia') }}</strong>{% if welcome_job.provider_status %} · Doręczenie: {{ {'delivered':'Doręczono','bounced':'Odbito — sprawdź adres','complained':'Zgłoszono jako spam','sent':'Wysłano','delivery_delayed':'Opóźnione','failed':'Błąd doręczenia'}.get(welcome_job.provider_status,'Oczekuje na potwierdzenie') }}{% endif %}</p>{% else %}<p>Brak zapisanej wysyłki wiadomości o aktywacji.</p>{% endif %}
+  {% if request.args.get('result') == 'welcome_queued' %}<p role="status">Wiadomość jest w kolejce wysyłki. To nie jest jeszcze potwierdzenie doręczenia.</p>{% endif %}
+  <form method="post" action="{{ url_for('architects_admin') }}">
+    <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
+    <input type="hidden" name="action" value="resend_welcome">
+    <input type="hidden" name="architect_id" value="{{ profile.id }}">
+    <input type="hidden" name="request_id" value="{{ welcome_request_id }}">
+    <button class="btn" type="submit">Wyślij ponownie wiadomość o aktywacji konta</button>
+  </form>
+</section>
+{% endif %}
 <div class="card" id="architect-tabs" role="tablist" aria-label="Profil architekta" style="display:flex;gap:8px;flex-wrap:wrap">
 {% for id,label in [('data','Dane'),('samples','Próbki'),('codes','Kody'),('orders','Zamówienia'),('ledger','Prowizje'),('settlements','Rozliczenia miesięczne'),('audit','Historia')] %}<button class="btn" type="button" role="tab" data-tab="{{ id }}" aria-selected="{{ 'true' if loop.first else 'false' }}">{{ label }}</button>{% endfor %}
 </div>

@@ -3,13 +3,16 @@ export function classifyResponse(status, body) {
   if (status === 429 || status >= 500 || status === 408 || (status === 409 && body?.name === 'concurrent_idempotent_requests')) return {status:'RETRY',code:status===429?'PROVIDER_RATE_LIMITED':'PROVIDER_TRANSIENT',id:''};
   return {status:'BLOCKED',code:'PROVIDER_REJECTED',id:''};
 }
-export async function runBatch({rpc,send,getReceipt,sender,testRecipient='',limit=2}) {
+export async function runBatch({rpc,send,getReceipt,sender,testRecipient='',limit=2,prepare}) {
   const summary={claimed:0,accepted:0,retried:0,receipts:0};
   for(let i=0;i<Math.min(2,Math.max(0,limit));i++) {
     const owner=crypto.randomUUID();
     const job=await rpc('portal_email_claim',{p_owner:owner,p_sender:sender,p_test_recipient:testRecipient});
     if(!job) break;
     summary.claimed++;
+    // Persist rendered account mail before contacting the provider. Retries use
+    // that exact snapshot even after template or environment changes.
+    if(prepare)job.request=await prepare(job,owner);
     let result;
     try { const response=await send(job.request,job.idempotency_key); result=classifyResponse(response.status,response.body); }
     catch { result={status:'RETRY',code:'PROVIDER_OUTCOME_UNKNOWN_RETRY_SAME_KEY',id:''}; }
