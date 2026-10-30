@@ -43,6 +43,8 @@ def register_routes(context):
         return rows[0] if rows else None
 
     def approved():
+        if not g.architect_user.get('email_confirmed'):
+            return None
         row = profile()
         return row if row and row.get("status") == "approved" else None
 
@@ -532,6 +534,10 @@ def register_routes(context):
             'select':'*','id':f'eq.{architect_id}','limit':1},timeout=15) or []
         if not profile_rows: return 'Nie znaleziono architekta',404
         owner=profile_rows[0]
+        welcome_jobs=supabase_request('/rest/v1/architect_order_email_outbox',params={
+            'select':'status,provider_status,created_at', 'architect_id':f'eq.{architect_id}',
+            'notification_type':'in.(architect_approved,architect_welcome_resend)',
+            'order':'created_at.desc','limit':1},timeout=15) or []
         codes=supabase_request('/rest/v1/architect_codes',params={
             'select':'id,code,distributor_id,status,created_at,expires_at',
             'architect_id':f'eq.{architect_id}','order':'created_at.desc','limit':1000},timeout=20) or []
@@ -598,7 +604,9 @@ def register_routes(context):
             row['payout']=payout_by_settlement.get(row['id'])
         return render_template('architect_profile.html',title='Profil architekta',
             profile=owner,samples=samples,codes=codes,redemptions=redemptions,
-            ledger=ledger,settlements=settlements,audits=audits)
+            ledger=ledger,settlements=settlements,audits=audits,
+            welcome_request_id=str(uuid.uuid4()),
+            welcome_job=welcome_jobs[0] if welcome_jobs else None)
 
     @app.route('/architects', methods=['GET', 'POST'])
     @require_permission('system.users_manage', operation='architect.program_admin')
@@ -615,6 +623,14 @@ def register_routes(context):
                     supabase_request('/rest/v1/rpc/architect_review_profile',method='POST',
                         payload={'p_architect_id':architect_id,'p_status':status,
                                  'p_actor':actor},timeout=15)
+                elif action == 'resend_welcome':
+                    architect_id = str(uuid.UUID(norm(request.form.get('architect_id'))))
+                    request_id = str(uuid.UUID(norm(request.form.get('request_id'))))
+                    supabase_request('/rest/v1/rpc/architect_resend_welcome', method='POST',
+                        payload={'p_architect_id':architect_id,'p_request_id':request_id,
+                                 'p_actor':actor}, timeout=15)
+                    return redirect(url_for('architect_admin_profile',architect_id=architect_id,
+                                            result='welcome_queued'))
                 elif action == 'sample_status':
                     sample_id = str(uuid.UUID(norm(request.form.get('sample_id'))))
                     status = norm(request.form.get('status'))
@@ -862,6 +878,8 @@ def register_routes(context):
             search=search,status_filter=status_filter,city_filter=city_filter,cities=cities,
             sort=sort,page=page,page_count=page_count,filtered_count=filtered_count,
             total_architects=total_architects,total_codes=total_codes,
-            redeemed_codes=redeemed_codes,top_architects=top_architects,pln=pln)
+            redeemed_codes=redeemed_codes,top_architects=top_architects,pln=pln,
+            pending_architects=[a for a in architects if a.get('status') == 'pending_verification'],
+            new_samples_count=sum(1 for s in samples if s.get('status') == 'requested'))
 
     return {}
