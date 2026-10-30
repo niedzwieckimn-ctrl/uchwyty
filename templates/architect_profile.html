@@ -1,6 +1,20 @@
 {% extends "base.html" %}
 {% block content %}
 <div class="card"><a href="{{ url_for('architects_admin') }}">← Architekci</a><h1>{{ profile.first_name }} {{ profile.last_name }}</h1><p>{{ profile.studio_name }} · {{ profile.status }}</p></div>
+{% if profile.status == 'pending_verification' %}
+<section class="card" aria-label="Weryfikacja zgłoszenia">
+  <h2>Weryfikacja zgłoszenia</h2>
+  <p>Sprawdź dane pracowni i profil Instagram, a następnie podejmij decyzję.</p>
+  <form method="post" action="{{ url_for('architects_admin') }}" style="display:flex;gap:8px;flex-wrap:wrap">
+    <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
+    <input type="hidden" name="action" value="review">
+    <input type="hidden" name="architect_id" value="{{ profile.id }}">
+    <input type="hidden" name="return_view" value="settings">
+    <button class="btn primary" name="status" value="approved">Zatwierdź konto</button>
+    <button class="btn" name="status" value="rejected">Odrzuć zgłoszenie</button>
+  </form>
+</section>
+{% endif %}
 <div class="card" id="architect-tabs" role="tablist" aria-label="Profil architekta" style="display:flex;gap:8px;flex-wrap:wrap">
 {% for id,label in [('data','Dane'),('samples','Próbki'),('codes','Kody'),('orders','Zamówienia'),('ledger','Prowizje'),('settlements','Rozliczenia miesięczne'),('audit','Historia')] %}<button class="btn" type="button" role="tab" data-tab="{{ id }}" aria-selected="{{ 'true' if loop.first else 'false' }}">{{ label }}</button>{% endfor %}
 </div>
