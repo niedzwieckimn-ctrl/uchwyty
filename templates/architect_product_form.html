@@ -2,7 +2,7 @@
   <h2>Treść katalogu architekta</h2>
   <p>Nazwy, symbole i zdjęcia pochodzą ze wspólnego katalogu IKUGO. Tutaj uzupełnisz opis wariantu, wymiary, wykończenie, dane techniczne i zatwierdzoną cenę detaliczną.</p>
   <form method="post" action="{{ url_for('architects_admin') }}" style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">
-    <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}"><input type="hidden" name="action" value="product_details">
+    <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}"><input type="hidden" name="action" value="product_details"><input type="hidden" name="return_view" value="catalog">
     <label>ID wariantu<input name="product_id" type="number" min="1" list="architect-product-ids" required></label>
     <datalist id="architect-product-ids">{% for p in products %}<option value="{{ p.product_id }}">{{ p.sku }} · {{ p.model }} · {{ p.name }}</option>{% endfor %}</datalist>
     <label>Materiał<input name="material" value="Lity mosiądz" required></label>

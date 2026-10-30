@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <a href="{{ url_for('architects_admin') }}">← Program Architektów</a>
+  <h1>Katalog architekta</h1>
+  <p>Produkty i symbole pochodzą ze wspólnego katalogu IKUGO w Supabase. Dane techniczne są uzupełnieniem tych samych wariantów, przypisanym przez ID produktu. Zdjęcia pozostają w istniejącym Storage.</p>
+</div>
+{% include "architect_product_form.html" %}
+<div class="card"><h2>Warianty we wspólnym katalogu</h2><div style="overflow:auto"><table><thead><tr><th>ID</th><th>SKU</th><th>Model</th><th>Nazwa</th></tr></thead><tbody>
+{% for p in products %}<tr><td>{{ p.product_id }}</td><td>{{ p.sku }}</td><td>{{ p.model or '—' }}</td><td>{{ p.name }}</td></tr>{% else %}<tr><td colspan="4">Brak opublikowanych produktów.</td></tr>{% endfor %}
+</tbody></table></div></div>
+{% endblock %}

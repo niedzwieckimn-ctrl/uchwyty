@@ -48,6 +48,7 @@ def test_warehouse_actor_cannot_manage_architect_program(admin_client,monkeypatc
     with admin_client.session_transaction() as state:
         state['internal_actor_id']=actor
     assert admin_client.get('/architects').status_code==403
+    assert admin_client.get('/architects/11111111-1111-4111-8111-111111111111').status_code==403
 
 
 def test_external_role_cannot_manage_architect_program():
@@ -71,7 +72,8 @@ def test_admin_renders_existing_sample_items_without_dict_method_collision(admin
             return [{'product_id': 503, 'sku': 'STAGING-MOS-003', 'model': 'TEST', 'name': 'Uchwyt'}]
         return []
     monkeypatch.setattr(a, 'supabase_request', read)
-    response = admin_client.get('/architects')
+    response = admin_client.get('/architects?view=settings')
     assert response.status_code == 200
     assert 'Warianty: STAGING-MOS-003' in response.get_data(as_text=True)
     assert 'Rozliczenia miesięczne' in response.get_data(as_text=True)
+    assert 'name="view" value="settings"' in response.get_data(as_text=True)
