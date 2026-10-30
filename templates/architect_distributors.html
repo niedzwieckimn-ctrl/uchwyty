@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <a href="{{ url_for('architects_admin') }}">← Program Architektów</a>
+  <h1>Dystrybutorzy programu</h1>
+  <p>Wybierz partnera z istniejącej kartoteki IKUGO. Nazwa, adres i kontakt są pobierane z jego aktualnego rekordu klienta. Udział w programie nie wpływa na zwykłe zamówienia B2B.</p>
+  {% if request.args.get('result') == 'saved' %}<p role="status">Zapisano zmianę.</p>{% endif %}
+  {% if error %}<p role="alert">{{ error }}</p>{% endif %}
+  <form method="post" action="{{ url_for('architects_admin') }}" style="display:flex;gap:10px;flex-wrap:wrap;align-items:end">
+    <input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
+    <input type="hidden" name="action" value="distributor_add">
+    <input type="hidden" name="return_view" value="distributors">
+    <label>Klient IKUGO
+      <input id="customer-search" type="search" placeholder="Szukaj nazwy lub ID klienta" aria-label="Szukaj klienta IKUGO">
+      <select name="customer_id" required style="min-width:280px">
+        <option value="">Wybierz istniejącego klienta PLN</option>
+        {% for c in customers if (c.price_list or 'pln')|lower == 'pln' %}
+        <option value="{{ c.id }}">{{ c.name }} · ID {{ c.id }} · {{ c.address or 'bez adresu' }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Miasto, jeśli nie wynika z adresu<input name="city" placeholder="Opcjonalnie"></label>
+    <button class="btn primary" type="submit">Włącz w programie</button>
+  </form>
+</div>
+<div class="card"><h2>Obecni uczestnicy programu</h2>
+  <div style="overflow:auto"><table><thead><tr><th>Dystrybutor IKUGO</th><th>Adres i kontakt z kartoteki</th><th>Architekci</th><th>Kody / realizacje</th><th>Status</th><th>Operacja</th></tr></thead><tbody>
+  {% for d in distributors %}<tr>
+    <td>{{ d.store_name }}<br><small>ID klienta: {{ d.customer_id }}</small></td>
+    <td>{{ d.address or '—' }}<br><small>{{ d.contact or '—' }}</small></td>
+    <td>{{ d.architects|join(', ') or '—' }}</td>
+    <td>{{ d.codes_count }} / {{ d.redemptions_count }}</td>
+    <td>{{ 'Aktywny' if d.active else 'Wyłączony' }}</td>
+    <td>{% if d.active %}<form method="post" action="{{ url_for('architects_admin') }}"><input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}"><input type="hidden" name="action" value="distributor_disable"><input type="hidden" name="return_view" value="distributors"><input type="hidden" name="customer_id" value="{{ d.customer_id }}"><button class="btn" type="submit">Wyłącz udział</button></form>{% else %}Zwykłe B2B nadal działa{% endif %}</td>
+  </tr>{% else %}<tr><td colspan="6">Program jest wyłączony dla wszystkich dystrybutorów.</td></tr>{% endfor %}
+  </tbody></table></div>
+</div>
+<script>
+document.getElementById('customer-search').addEventListener('input', function () {
+  const query = this.value.toLocaleLowerCase('pl').trim();
+  const select = document.querySelector('select[name="customer_id"]');
+  for (const option of select.options) {
+    option.hidden = Boolean(option.value) && !option.text.toLocaleLowerCase('pl').includes(query);
+  }
+});
+</script>
+{% endblock %}
