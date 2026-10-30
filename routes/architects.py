@@ -4,6 +4,7 @@ import secrets
 import json
 import csv
 import io
+import re
 import unicodedata
 import urllib.error
 import uuid
@@ -525,6 +526,7 @@ def register_routes(context):
                          download_name=f'architekci-{kind}.csv',max_age=0)
 
     @app.get('/architects/<uuid:architect_id>')
+    @require_permission('system.users_manage', operation='architect.program_admin')
     def architect_admin_profile(architect_id):
         profile_rows=supabase_request('/rest/v1/architect_profiles',params={
             'select':'*','id':f'eq.{architect_id}','limit':1},timeout=15) or []
@@ -632,17 +634,22 @@ def register_routes(context):
                 elif action == 'distributor_add':
                     customer_id = to_int(request.form.get('customer_id'),0)
                     rows = supabase_request('/rest/v1/customers',params={
-                        'select':'id,price_list','id':f'eq.{customer_id}','limit':1},timeout=15) or []
+                        'select':'id,name,address,phone,email,price_list',
+                        'id':f'eq.{customer_id}','limit':1},timeout=15) or []
                     if not rows or norm(rows[0].get('price_list') or 'pln').lower() != 'pln':
                         raise ValueError('Wybierz istniejącego dystrybutora z cennikiem PLN')
-                    store_name = norm(request.form.get('store_name'))
-                    city = norm(request.form.get('city'))
-                    if not store_name or not city: raise ValueError('Podaj sklep i miasto')
+                    customer = rows[0]
+                    store_name = norm(customer.get('name'))
+                    address = norm(customer.get('address'))
+                    city_match = re.search(r'\b\d{2}-\d{3}\s+([^,\n]+)', address)
+                    city = city_match.group(1).strip() if city_match else norm(request.form.get('city'))
+                    if not store_name or not city: raise ValueError('Uzupełnij miasto w kartotece klienta lub w formularzu')
                     supabase_request('/rest/v1/rpc/architect_set_distributor',method='POST',payload={
                         'p_customer_id':customer_id,'p_active':True,
                         'p_store_name':store_name,'p_city':city,
-                        'p_store_address':norm(request.form.get('store_address')),
-                        'p_contact':norm(request.form.get('contact')),'p_actor':actor},timeout=15)
+                        'p_store_address':address,
+                        'p_contact':norm(customer.get('phone') or customer.get('email')),
+                        'p_actor':actor},timeout=15)
                 elif action == 'distributor_disable':
                     customer_id = to_int(request.form.get('customer_id'),0)
                     supabase_request('/rest/v1/rpc/architect_set_distributor',method='POST',payload={
@@ -717,13 +724,16 @@ def register_routes(context):
                                  'p_actor':actor},timeout=20)
                 else:
                     raise ValueError('Nieznana operacja')
-                return redirect(url_for('architects_admin', result='saved'))
+                return_view = norm(request.form.get('return_view'))
+                if return_view not in {'distributors', 'catalog', 'settings'}:
+                    return_view = 'settings'
+                return redirect(url_for('architects_admin', view=return_view, result='saved'))
             except Exception as exc:
                 app.logger.exception('Architect admin action failed: %s', action)
                 return render_template('architect_admin.html',title='Architekci',error=str(exc),
                     architects=[],samples=[],distributors=[],sale_lines=[],ledger=[],settlements=[],products=[],product_details=[]),400
         architects = supabase_request('/rest/v1/architect_profiles',params={
-            'select':'id,first_name,last_name,studio_name,email,instagram,status,sample_entitlements,created_at',
+            'select':'id,first_name,last_name,studio_name,email,instagram,shipping_address,status,sample_entitlements,created_at',
             'order':'created_at.desc','limit':5000},timeout=20) or []
         samples = supabase_request('/rest/v1/architect_sample_orders',params={
             'select':'id,architect_id,shipping_address,status,tracking_no,created_at',
@@ -737,6 +747,14 @@ def register_routes(context):
                 row['items']=[x for x in sample_items if x['sample_order_id']==row['id']]
         distributors = supabase_request('/rest/v1/distributor_program_memberships',params={
             'select':'customer_id,store_name,city,active','order':'store_name.asc','limit':500},timeout=20) or []
+        customers = supabase_request('/rest/v1/customers',params={
+            'select':'id,name,address,phone,email,price_list','order':'name.asc','limit':5000},timeout=20) or []
+        customer_by_id = {to_int(c.get('id'),0): c for c in customers}
+        for distributor in distributors:
+            customer = customer_by_id.get(to_int(distributor.get('customer_id'),0), {})
+            distributor['store_name'] = customer.get('name') or distributor.get('store_name')
+            distributor['address'] = customer.get('address') or ''
+            distributor['contact'] = customer.get('phone') or customer.get('email') or ''
         sale_lines = supabase_request('/rest/v1/architect_sale_lines',params={
             'select':'id,order_item_id,product_id,qty,retail_gross_after,commission_estimate',
             'order':'id.desc','limit':200},timeout=20) or []
@@ -756,7 +774,9 @@ def register_routes(context):
             'select':'product_id,material,mounting_spacing,dimensions,finish,vat_rate,retail_gross_override,updated_at',
             'order':'product_id.asc','limit':5000},timeout=20) or []
         stats_codes = supabase_request('/rest/v1/architect_codes',params={
-            'select':'id,architect_id,status','limit':5000},timeout=20) or []
+            'select':'id,architect_id,distributor_id,status','limit':5000},timeout=20) or []
+        stats_redemptions = supabase_request('/rest/v1/architect_code_redemptions',params={
+            'select':'id,distributor_id','limit':5000},timeout=20) or []
         stats_samples = supabase_request('/rest/v1/architect_sample_orders',params={
             'select':'architect_id,status','limit':5000},timeout=20) or []
         stats_lines = supabase_request('/rest/v1/architect_sale_lines',params={
@@ -783,17 +803,65 @@ def register_routes(context):
         for row in architects:
             row['stats'] = metrics[row['id']]
             row['stats']['referrals'] = len(row['stats']['referrals'])
+            address = norm(row.get('shipping_address'))
+            match = re.search(r'\b\d{2}-\d{3}\s+([^,\n]+)', address)
+            row['city'] = match.group(1).strip() if match else ''
+        architect_by_id = {row['id']: row for row in architects}
+        for distributor in distributors:
+            customer_id = to_int(distributor.get('customer_id'), 0)
+            related_codes = [code for code in stats_codes if to_int(code.get('distributor_id'), 0) == customer_id]
+            distributor['architects'] = sorted({
+                ' '.join(filter(None, [architect_by_id[code['architect_id']].get('first_name'),
+                                        architect_by_id[code['architect_id']].get('last_name')]))
+                for code in related_codes if code.get('architect_id') in architect_by_id})
+            distributor['codes_count'] = len(related_codes)
+            distributor['redemptions_count'] = sum(
+                to_int(redemption.get('distributor_id'), 0) == customer_id
+                for redemption in stats_redemptions)
+        total_architects = len(architects)
+        total_codes = len(stats_codes)
+        redeemed_codes = sum(code.get('status') == 'redeemed' for code in stats_codes)
+        top_architects = sorted(
+            (row for row in architects if row['stats']['referrals'] > 0),
+            key=lambda row: (row['stats']['sales'],row['stats']['referrals']),reverse=True)[:3]
         search = norm(request.args.get('q')).casefold()
         status_filter = norm(request.args.get('status'))
+        city_filter = norm(request.args.get('city'))
+        cities = sorted({row['city'] for row in architects if row['city']})
         if search:
             architects = [row for row in architects if search in ' '.join(str(row.get(k) or '')
                 for k in ('studio_name','first_name','last_name','email','instagram')).casefold()]
         if status_filter:
             architects = [row for row in architects if row.get('status') == status_filter]
-        return render_template('architect_admin.html',title='Architekci',error='',
-            architects=architects,samples=samples,distributors=distributors,
+        if city_filter:
+            architects = [row for row in architects if row['city'] == city_filter]
+        sort = norm(request.args.get('sort'))
+        if sort not in {'name','sales','orders','earnings','newest'}: sort = 'newest'
+        if sort == 'name': architects.sort(key=lambda row: (row['studio_name'] or '').casefold())
+        elif sort == 'sales': architects.sort(key=lambda row: row['stats']['sales'],reverse=True)
+        elif sort == 'orders': architects.sort(key=lambda row: row['stats']['referrals'],reverse=True)
+        elif sort == 'earnings': architects.sort(key=lambda row: row['stats']['earnings'],reverse=True)
+        else: architects.sort(key=lambda row: row.get('created_at') or '',reverse=True)
+        filtered_count = len(architects)
+        filtered_architects = architects
+        page_size = 20
+        page_count = max(1,(filtered_count + page_size - 1)//page_size)
+        page = min(max(to_int(request.args.get('page'),1),1),page_count)
+        page_architects = architects[(page-1)*page_size:page*page_size]
+        view = norm(request.args.get('view'))
+        template = {'distributors':'architect_distributors.html',
+                    'catalog':'architect_catalog_admin.html',
+                    'settings':'architect_admin.html'}.get(view,'architect_admin_overview.html')
+        def pln(value):
+            return f"{Decimal(str(value or 0)):,.2f}".replace(',',' ').replace('.',',') + ' zł'
+        return render_template(template,title='Program Architektów',error='',
+            architects=page_architects if template == 'architect_admin_overview.html' else filtered_architects,
+            samples=samples,distributors=distributors,customers=customers,
             sale_lines=sale_lines,ledger=ledger,settlements=settlements,
             products=products,product_details=product_details,
-            search=search,status_filter=status_filter)
+            search=search,status_filter=status_filter,city_filter=city_filter,cities=cities,
+            sort=sort,page=page,page_count=page_count,filtered_count=filtered_count,
+            total_architects=total_architects,total_codes=total_codes,
+            redeemed_codes=redeemed_codes,top_architects=top_architects,pln=pln)
 
     return {}
