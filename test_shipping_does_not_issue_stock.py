@@ -1,7 +1,13 @@
 import app as backend
+import pytest
 
 
-def test_marking_order_shipped_does_not_change_stock(tmp_path, monkeypatch):
+@pytest.mark.parametrize('ordered_qty,start_status,expected_status', [
+    (2, 'packed', 'shipped'),
+    (3, 'packed', 'partially_shipped'),
+    (2, 'packed_partial', 'shipped'),
+])
+def test_marking_order_shipped_does_not_change_stock(tmp_path, monkeypatch, ordered_qty, start_status, expected_status):
     monkeypatch.setattr(backend, "DB_PATH", str(tmp_path / "shipping.db"))
     monkeypatch.setattr(backend, "DATA_DIR", str(tmp_path))
     backend.init_db()
@@ -16,11 +22,11 @@ def test_marking_order_shipped_does_not_change_stock(tmp_path, monkeypatch):
         """INSERT INTO orders(id, order_no, customer_name, customer_email, status, packed_at,
                               warehouse_issued, created_at)
            VALUES(?,?,?,?,?,?,?,?)""",
-        (880101, "ZAM-TEST", "Klient", "klient@example.com", "packed", backend.now_iso(), 0, backend.now_iso()),
+        (880101, "ZAM-TEST", "Klient", "klient@example.com", start_status, backend.now_iso(), 0, backend.now_iso()),
     )
     cur.execute(
         "INSERT INTO order_items(order_id, product_id, sku, qty, created_at) VALUES(?,?,?,?,?)",
-        (880101, 880001, "SHIP-001", 2, backend.now_iso()),
+        (880101, 880001, "SHIP-001", ordered_qty, backend.now_iso()),
     )
     c.commit()
     c.close()
@@ -64,5 +70,5 @@ def test_marking_order_shipped_does_not_change_stock(tmp_path, monkeypatch):
     assert c.execute('SELECT COUNT(*) FROM packing_shipments').fetchone()[0] == 1
     c.close()
     assert stock["qty"] == 10
-    assert order["status"] == "shipped"
+    assert order["status"] == expected_status
     assert order["warehouse_issued"] == 0

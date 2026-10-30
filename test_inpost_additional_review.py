@@ -12,7 +12,7 @@ import packing_versions
 import inpost_history
 from test_fulfillment_orchestrator import flow
 from test_agent_shipping_draft47 import parcel, ORDER_IDS
-from test_inpost_tracking47 import tracked, _order
+from test_inpost_tracking47 import tracked, _order, hydrated_cloud_fixture
 
 _REAL_SHIPPED_EMAIL = b._send_orders_shipped_email
 
@@ -40,6 +40,7 @@ def test_real_mail_adapter_timeout_remains_unknown(tracked, monkeypatch):
 
 
 def test_sync_conflict_is_not_overwritten_by_next_refresh(tracked, monkeypatch):
+    hydrated_cloud_fixture()
     monkeypatch.setattr(b,'supabase_enabled',lambda:True)
     monkeypatch.setattr(packing_versions,'sync_evidence',lambda *args:None)
     def cloud_down(*args,**kwargs): raise ConnectionError('review cloud unavailable')
@@ -56,14 +57,13 @@ def test_sync_conflict_is_not_overwritten_by_next_refresh(tracked, monkeypatch):
 
 
 def test_crash_after_local_commit_preserves_durable_sync_intent(tracked, monkeypatch):
+    hydrated_cloud_fixture()
     monkeypatch.setattr(b,'supabase_enabled',lambda:True)
     class SimulatedProcessDeath(BaseException): pass
-    original=tracking.mark_result
-    def die_before_pending(backend,sid,result,error='',sync_state=None):
-        if result=='applied' and sync_state=='pending':
-            raise SimulatedProcessDeath('after commit, before sync marker')
-        return original(backend,sid,result,error,sync_state)
-    monkeypatch.setattr(tracking,'mark_result',die_before_pending)
+    import inpost_reconciliation
+    def die_before_sync(*args, **kwargs):
+        raise SimulatedProcessDeath('after local commit, before remote synchronization')
+    monkeypatch.setattr(inpost_reconciliation,'flush',die_before_sync)
     with pytest.raises(SimulatedProcessDeath):
         tracking.process(b,_order(702),source='webhook')
     assert _order(702)['status']=='partially_shipped'

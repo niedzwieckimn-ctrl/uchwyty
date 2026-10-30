@@ -1095,6 +1095,29 @@ def perform(name, data, actor, *, correlation_id='', approval_id='', before_stat
             if s['intents']:
                 matching = [intent for intent in s['intents'] if intent['kind'] == 'invoice' and intent['content_hash'] == s['content_hash']]
                 prior_completed = any(d['kind'] == 'invoice' for d in s['documents'])
+                if not prior_completed:
+                    # Approved removal detaches the current invoice pointer.
+                    # Its immutable history and verified removal still prove
+                    # that this old intent completed, rather than timed out.
+                    c = b.conn()
+                    try:
+                        prior_completed = bool(c.execute('''
+                            SELECT 1 FROM fulfillment_verifications v
+                            JOIN internal_invoice_removal_claims r
+                              ON v.kind='invoice_removed:' || r.invoice_id
+                             AND json_extract(v.payload,'$.invoice_id')=r.invoice_id
+                             AND r.state='SUCCESS'
+                            JOIN json_each(v.payload,'$.packing_batches') batch
+                            JOIN fulfillment_document_history h
+                              ON h.order_id=v.order_id AND h.kind='packing_list'
+                             AND h.document_id=json_extract(batch.value,'$.id')
+                            JOIN fulfillment_document_intents i
+                              ON i.order_id=h.order_id AND i.kind='invoice'
+                             AND i.content_hash=h.content_hash
+                            WHERE h.order_id=? LIMIT 1
+                        ''', (oid,)).fetchone())
+                    finally:
+                        c.close()
                 if not matching and not prior_completed:
                     raise error('INVOICE_ATTEMPT_CONFLICT', 'Rozpoczęta próba dotyczy innej wersji zamówienia. Najpierw uzgodnij jej wynik.', 'CONFLICT')
                 if not matching and prior_completed:

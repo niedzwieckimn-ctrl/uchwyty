@@ -1,0 +1,7 @@
+[functions.portal-email]
+verify_jwt = true
+
+# Separate endpoint authenticated by the provider's Svix signature and timestamp.
+# The existing sending worker above still requires its JWT.
+[functions.portal-email-webhook]
+verify_jwt = false

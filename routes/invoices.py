@@ -250,7 +250,7 @@ def register_routes(context):
         # rekord albo starsze zamówienie mogą nie zawierać adresu, mimo że klient
         # uzupełnił go później w swoim profilu.
         try:
-            client_profile = _client_profile_for_email(o["customer_email"])
+            client_profile = _client_profile_for_email(o["customer_email"], customer_id=o["customer_id"])
         except Exception as exc:
             app.logger.warning("Nie udało się pobrać profilu do faktury order_id=%s: %s", order_id, exc)
             client_profile = {}
@@ -314,6 +314,12 @@ def register_routes(context):
                 "buyer_name", "buyer_tax_no", "buyer_address", "buyer_country",
                 "buyer_email", "buyer_phone", "discount_percent", "invoice_type", "currency"
             ]}
+            if architect_order_redemption(order_id):
+                from architect_invoice import require_no_second_discount
+                try:
+                    require_no_second_discount(data.get("discount_percent"))
+                except ValueError as exc:
+                    return str(exc), 409
             suggested_invoice_no = norm(request.form.get("suggested_invoice_no"))
             manual_marker = norm(request.form.get("invoice_no_manual"))
             if manual_marker in {"0", "1"}:
@@ -448,6 +454,42 @@ def register_routes(context):
                     })
                     session["latest_packing_selection"] = load_open_packing_selection(order_id)
                     return redirect(url_for("order_invoice", order_id=order_id, from_packing="1"))
+            promo_expected = None
+            if norm(request.form.get("submit_action")) != "packing" and invoice_items and not msg:
+                # Reconcile immutable prices per source order. The existing
+                # invoice allocations preserve membership on combined invoices.
+                selected_order_ids = {
+                    int(it.get("source_order_id") or it.get("order_id") or order_id)
+                    for it in invoice_items
+                }
+                promo_links = {
+                    selected_id: architect_order_redemption(selected_id)
+                    for selected_id in selected_order_ids
+                }
+                promoted = [selected_id for selected_id, link in promo_links.items() if link]
+                if promoted:
+                    customer_id = to_int(o['customer_id'], 0)
+                    if customer_id <= 0 or any(
+                        to_int(related_order_by_id.get(selected_id, {}).get('customer_id'), 0) != customer_id
+                        for selected_id in selected_order_ids
+                    ):
+                        return "Faktura programu może łączyć tylko zamówienia tego samego dystrybutora.", 409
+                    snapshots_by_order = {}
+                    for program_order_id in promoted:
+                        snapshots_by_order[program_order_id] = supabase_request('/rest/v1/architect_sale_lines', params={
+                            'select': 'order_item_id,qty,vat_rate,wholesale_net_after',
+                            'redemption_id': f"eq.{promo_links[program_order_id]['id']}",
+                            'limit': 1000,
+                        }, timeout=15) or []
+                    from architect_invoice import expected_combined_invoice_totals
+                    try:
+                        promo_expected = expected_combined_invoice_totals(
+                            invoice_items, snapshots_by_order,
+                            invoice_type=data['invoice_type'], currency=data['currency'],
+                            discount_percent=data.get('discount_percent'),
+                        )
+                    except (TypeError, ValueError, KeyError) as exc:
+                        return f"Faktura zablokowana: {exc}", 409
             # Allocate only on an actual valid issue request, not on GET.
             if invoice_items and not msg:
                 import invoice_numbering, sys
@@ -465,6 +507,11 @@ def register_routes(context):
                 msg = "Faktura musi zawieraÄ‡ co najmniej jednÄ… pozycjÄ™."
             elif invoice_items and not msg:
                 pdf_path, total_net, total_gross = generate_order_invoice_pdf(o, invoice_items, data)
+                if promo_expected and (
+                    Decimal(str(total_net)).quantize(Decimal('0.01')) != promo_expected[0]
+                    or Decimal(str(total_gross)).quantize(Decimal('0.01')) != promo_expected[1]
+                ):
+                    return "Faktura zablokowana: suma dokumentu różni się od zamówienia z kodem architekta.", 409
                 packing_pdf_path = generate_invoice_packing_list_pdf(o, invoice_items, data, pdf_path)
                 c = conn()
                 cur = c.cursor()
@@ -787,16 +834,13 @@ def register_routes(context):
           LEFT JOIN invoice_meta m ON m.invoice_id = i.id
           LEFT JOIN ksef_documents k ON k.invoice_id = i.id
           LEFT JOIN orders o ON o.id = i.order_id
-          WHERE i.publication_state='complete' AND (
-              LOWER(COALESCE(i.buyer_email,'')) = ?
-              OR LOWER(COALESCE(o.customer_email,'')) = ?
-            )
+          WHERE i.publication_state='complete' AND o.customer_id = ?
             AND (
               COALESCE(m.sent_to_client,0)=1
               OR m.invoice_id IS NULL
             )
           ORDER BY i.order_id DESC, i.id DESC
-        """, (email, email))
+        """, (g.client_customer_id,))
         rows = []
         for r in cur.fetchall():
             d = dict(r)
@@ -1446,6 +1490,7 @@ def register_routes(context):
             m.invoice_id AS meta_invoice_id,
             i.buyer_email,
             o.customer_email AS order_customer_email,
+            o.customer_id AS order_customer_id,
             COALESCE(m.pdf_path,'') AS pdf_path,
             COALESCE(m.sent_to_client,0) AS sent_to_client,
             i.invoice_no
@@ -1460,12 +1505,10 @@ def register_routes(context):
         if not row:
             return jsonify(ok=False, error="Nie znaleziono faktury"), 404
 
-        if email:
-            buyer_ok = _email_key(row["buyer_email"]) == email
-            order_ok = _email_key(row["order_customer_email"]) == email
-            has_meta = row["meta_invoice_id"] is not None
-            if (has_meta and int(row["sent_to_client"] or 0) != 1) or not (buyer_ok or order_ok):
-                return jsonify(ok=False, error="Brak dostÄ™pu"), 403
+        has_meta = row["meta_invoice_id"] is not None
+        if ((has_meta and int(row["sent_to_client"] or 0) != 1)
+                or to_int(row["order_customer_id"], 0) != to_int(g.client_customer_id, 0)):
+            return jsonify(ok=False, error="Brak dostępu"), 403
 
         meta = load_invoice_meta(invoice_id) or {}
         ts = now_iso()
@@ -1501,7 +1544,8 @@ def register_routes(context):
             m.invoice_id AS meta_invoice_id,
             COALESCE(m.pdf_path,'') AS pdf_path,
             COALESCE(m.sent_to_client,0) AS sent_to_client,
-            o.customer_email AS order_customer_email
+            o.customer_email AS order_customer_email,
+            o.customer_id AS order_customer_id
           FROM invoices i
           LEFT JOIN invoice_meta m ON m.invoice_id = i.id
           LEFT JOIN orders o ON o.id = i.order_id
@@ -1513,12 +1557,10 @@ def register_routes(context):
         if not row:
             return "Nie znaleziono faktury", 404
 
-        if email:
-            buyer_ok = _email_key(row["buyer_email"]) == email
-            order_ok = _email_key(row["order_customer_email"]) == email
-            has_meta = row["meta_invoice_id"] is not None
-            if (has_meta and int(row["sent_to_client"] or 0) != 1) or not (buyer_ok or order_ok):
-                return "Brak dostÄ™pu", 403
+        has_meta = row["meta_invoice_id"] is not None
+        if ((has_meta and int(row["sent_to_client"] or 0) != 1)
+                or to_int(row["order_customer_id"], 0) != to_int(g.client_customer_id, 0)):
+            return "Brak dostępu", 403
 
         def mark_downloaded_by_client():
             if not email:

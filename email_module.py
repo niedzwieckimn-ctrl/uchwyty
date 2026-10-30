@@ -263,7 +263,8 @@ def _items_table(items, copy: dict, currency: str) -> tuple[str, Decimal]:
     return table, total
 
 
-def send_order_confirmation(order: dict, items: list[dict], admin_email: str = "") -> dict:
+def send_order_confirmation(order: dict, items: list[dict], admin_email: str = "", *,
+                            idempotency_key: str = "", recipients_override=None) -> dict:
     order_no = order.get("order_no") or f"ZAM-{order.get('id') or ''}"
     customer_name = order.get("customer_name") or order.get("name") or order.get("customer_email") or "Klient"
     customer_email = order.get("customer_email") or order.get("email") or ""
@@ -271,7 +272,8 @@ def send_order_confirmation(order: dict, items: list[dict], admin_email: str = "
     language = str(order.get("language") or "pl").lower()
     copy = ORDER_COPY.get(language, ORDER_COPY["pl"])
     currency = str(order.get("currency") or "PLN").upper()
-    recipients = _uniq_emails([customer_email, admin_email or email_config_summary().get("admin_email")])
+    recipients = _uniq_emails(recipients_override if recipients_override is not None else
+                             [customer_email, admin_email or email_config_summary().get("admin_email")])
     subject = copy["subject"].format(order_no=order_no)
     items_table, total = _items_table(items, copy, currency)
     details = _email_info_box(
@@ -294,7 +296,7 @@ def send_order_confirmation(order: dict, items: list[dict], admin_email: str = "
         f"{copy['total']}: {_money(total, currency)}\n\n"
         f"{copy['reply']}\n{copy['regards']}, Niedźwieccy"
     )
-    return send_email(recipients, subject, html_body, text_body)
+    return send_email(recipients, subject, html_body, text_body, idempotency_key=idempotency_key)
 
 
 INVOICE_COPY = {

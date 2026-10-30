@@ -28,6 +28,7 @@ from contextlib import contextmanager
 from functools import wraps
 
 _STARTUP_STARTED = time.monotonic()
+_APP_IMPORT_PID = os.getpid()
 _startup_logger = logging.getLogger("app.startup")
 _ai_chat_logger = logging.getLogger("app.ai_chat")
 
@@ -334,6 +335,19 @@ def _new_sqlite_write_lock():
 
 
 _sqlite_write_lock = _new_sqlite_write_lock()
+_sqlite_write_lock_pid = os.getpid()
+_sqlite_write_lock_timeout = 5.0
+
+
+def _process_sqlite_write_lock():
+    # A lock held by a background thread at fork has no surviving owner in
+    # the child. SQLite still provides cross-process transaction locking.
+    global _sqlite_write_lock, _sqlite_write_lock_pid
+    if _sqlite_write_lock_pid != os.getpid():
+        _sqlite_write_lock = _new_sqlite_write_lock()
+        _sqlite_write_lock_pid = os.getpid()
+    return _sqlite_write_lock
+
 _SQLITE_WRITE_PREFIXES = frozenset({
     "ALTER", "ANALYZE", "ATTACH", "BEGIN", "CREATE", "DELETE", "DETACH",
     "DROP", "INSERT", "REINDEX", "REPLACE", "UPDATE", "VACUUM",
@@ -389,19 +403,23 @@ class _SerializedWriteConnection(sqlite3.Connection):
     def _before_sql(self, sql):
         if _sqlite_statement_writes(sql) and not self._write_lock_held:
             started = time.perf_counter()
-            _sqlite_write_lock.acquire()
+            write_lock = _process_sqlite_write_lock()
+            if not write_lock.acquire(timeout=_sqlite_write_lock_timeout):
+                app.logger.error("SQLITE_WRITE_LOCK_TIMEOUT pid=%s thread=%s", os.getpid(), threading.get_ident())
+                raise sqlite3.OperationalError("Local database write queue is busy")
+            self._held_write_lock = write_lock
             self._write_lock_held = True
             _perf_add("sqlite_write_lock_wait", time.perf_counter() - started)
 
     def _release_write_lock_if_idle(self):
         if self._write_lock_held and not self.in_transaction:
             self._write_lock_held = False
-            _sqlite_write_lock.release()
+            self._held_write_lock.release()
 
     def _release_write_lock(self):
         if self._write_lock_held:
             self._write_lock_held = False
-            _sqlite_write_lock.release()
+            self._held_write_lock.release()
 
     def cursor(self, factory=None):
         return super().cursor(factory or _SerializedWriteCursor)
@@ -2316,7 +2334,7 @@ CLIENT_PANEL_URL = (
 ADMIN_ACTION_TOKEN = os.environ.get("ADMIN_ACTION_TOKEN", "").strip()
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin").strip()
 ADMIN_PASSWORD_HASH = os.environ.get("ADMIN_PASSWORD_HASH", "").strip()
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "").strip()
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 if not SUPABASE_SERVICE_ROLE_KEY:
     app.logger.error("Brak SUPABASE_SERVICE_ROLE_KEY; funkcje synchronizacji i zamówień klienta będą niedostępne.")
 app.logger.warning(
@@ -4307,6 +4325,7 @@ def generate_client_order_pdf(
     items: list[dict],
     language: str,
     retail_prices: bool = False,
+    company_override: dict | None = None,
 ) -> tuple[io.BytesIO, str]:
     """Create one localized order PDF without persisting a second document copy."""
     language = normalize_client_language(language)
@@ -4323,12 +4342,15 @@ def generate_client_order_pdf(
     pale_gray = (0.91, 0.91, 0.91)
     rule_gray = (0.38, 0.38, 0.38)
 
-    c = conn()
-    try:
-        company_row = c.execute("SELECT * FROM company_profile WHERE id=1").fetchone()
-        company = dict(company_row) if company_row else {}
-    finally:
-        c.close()
+    if company_override is not None:
+        company = company_override
+    else:
+        c = conn()
+        try:
+            company_row = c.execute("SELECT * FROM company_profile WHERE id=1").fetchone()
+            company = dict(company_row) if company_row else {}
+        finally:
+            c.close()
 
     def txt(value) -> str:
         return fix_polish_mojibake(norm(value))
@@ -4463,14 +4485,20 @@ def generate_client_order_pdf(
         unit_net = money_dec(item.get("net_price"))
         unit_gross = money_dec(item.get("gross_price"))
         if retail_prices:
-            # Cennik detaliczny jest zawsze wyliczany od ceny netto B2B.
-            # Brutto liczymy od wartości źródłowej, a kwoty zaokrąglamy dopiero
-            # na wyjściu — dokładnie tak samo jak ceny detaliczne w panelu.
-            retail_net = unit_net * Decimal("1.45")
-            unit_net = retail_net.quantize(MONEY_Q, rounding=ROUND_HALF_UP)
-            unit_gross = (retail_net * Decimal("1.23")).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
-        line_net = (unit_net * qty).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
-        line_gross = (unit_gross * qty).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
+            # Preserve the accepted retail snapshot, including architect discount.
+            saved_retail = item.get("retail_price")
+            if saved_retail is None:
+                saved_retail = item.get("unit_retail_price")
+            if saved_retail is not None:
+                unit_gross = money_dec(saved_retail)
+                unit_net = unit_gross if currency == "EUR" else money_dec(unit_gross / Decimal("1.23"))
+            else:
+                retail_net = unit_net * Decimal("1.45")
+                unit_net = money_dec(retail_net)
+                unit_gross = money_dec(retail_net if currency == "EUR" else retail_net * Decimal("1.23"))
+        line_net = money_dec(unit_net * qty)
+        line_gross = (money_dec(unit_gross * qty) if retail_prices else
+                      line_net if currency == "EUR" else line_net + vat23_from_net(line_net))
         total_net += line_net
         total_gross += line_gross
         if y < 31 * mm:
@@ -5803,14 +5831,63 @@ def prepare_invoice_edit_items(edit_items: list[dict], form, invoice_type="domes
 
 CLIENT_API_PATHS = {
     "/api/client_stock_catalog", "/api/client_search_log", "/api/client/orders",
+    "/api/client/architect-code/quote", "/api/client/architect-sales",
     "/api/order_lookup", "/api/client_invoices", "/api/client_order_email",
     "/api/client/profile", "/api/client/search-aliases",
+}
+ARCHITECT_ALLOWED_ORIGINS = {
+    value.strip().rstrip("/")
+    for value in os.environ.get("ARCHITECT_ALLOWED_ORIGINS", "").split(",")
+    if value.strip()
 }
 _rate_lock = threading.Lock()
 _rate_hits = {}
 _client_auth_cache_lock = threading.Lock()
+_client_auth_inflight = {}
+
+
+class ClientAuthUnavailable(RuntimeError):
+    """An Auth outage must not invalidate a browser session."""
+
+
 _client_auth_cache = {}
 CLIENT_AUTH_CACHE_TTL_SEC = 60
+
+
+def _active_client_membership(auth_user_id: str) -> dict | None:
+    """Resolve B2B access from the existing server-owned client_accounts table.
+
+    A valid Supabase session by itself must not grant access to stock, orders,
+    invoices, or product images. This mapping already exists in production.
+    """
+    if not auth_user_id or not supabase_enabled():
+        return None
+    rows = supabase_request(
+        "/rest/v1/client_accounts",
+        method="GET",
+        params={
+            "select": "customer_id,is_active",
+            "user_id": f"eq.{auth_user_id}",
+            "is_active": "eq.true",
+            "limit": 1,
+        },
+        timeout=10,
+    ) or []
+    if not isinstance(rows, list) or not rows:
+        return None
+    customer_id = to_int(rows[0].get("customer_id"), 0)
+    return {"customer_id": customer_id} if customer_id > 0 else None
+
+
+def architect_order_redemption(order_id: int) -> dict | None:
+    """Durable promotion link; absence is meaningful only after a successful read."""
+    if not supabase_enabled():
+        return None
+    rows = supabase_request("/rest/v1/architect_code_redemptions", params={
+        "select": "id,code_id,distributor_id,program_version,created_at",
+        "order_id": f"eq.{int(order_id)}", "limit": 1,
+    }, timeout=10) or []
+    return rows[0] if rows else None
 
 
 def _rate_limit(bucket: str, limit: int, window_seconds: int):
@@ -5831,7 +5908,7 @@ def _admin_password_ok(candidate: str) -> bool:
             return check_password_hash(ADMIN_PASSWORD_HASH, candidate)
         except Exception:
             return False
-    return bool(ADMIN_PASSWORD) and hmac.compare_digest(ADMIN_PASSWORD, candidate)
+    return bool(ADMIN_PASSWORD) and hmac.compare_digest(ADMIN_PASSWORD.encode("utf-8"), candidate.encode("utf-8"))
 
 
 @app.before_request
@@ -5887,14 +5964,30 @@ def security_gate():
         or path.startswith("/api/client/orders/")
         or path.startswith("/api/client/product-images/")
     )
+    if path.startswith("/api/architect/"):
+        if request.method == "OPTIONS":
+            return None
+        if not _rate_limit("architect_api", 120, 60):
+            return jsonify(ok=False, error="Zbyt wiele żądań"), 429
+        try:
+            user = _authenticated_client_user()
+        except ClientAuthUnavailable:
+            return jsonify(ok=False, error="Weryfikacja sesji jest chwilowo niedostępna. Spróbuj ponownie."), 503
+        if not user:
+            return jsonify(ok=False, error="Brak autoryzacji"), 401
+        g.architect_user = user
+        return None
     if is_client_api:
         if request.method == "OPTIONS":
             return None
-        if path == "/api/client/orders" and not _rate_limit("client_orders", 12, 10 * 60):
+        if path == "/api/client/orders" and request.method == "POST" and not _rate_limit("client_orders", 12, 10 * 60):
             return jsonify(ok=False, error="Zbyt wiele prób złożenia zamówienia"), 429
         if not _rate_limit("client_api", 180, 60):
             return jsonify(ok=False, error="Zbyt wiele żądań"), 429
-        user = _authenticated_client_user()
+        try:
+            user = _authenticated_client_user()
+        except ClientAuthUnavailable:
+            return jsonify(ok=False, error="Weryfikacja sesji jest chwilowo niedostępna. Spróbuj ponownie."), 503
         if not user:
             # Stare e-maile wskazuja endpoint PDF bez naglowka Authorization.
             # Przekierowujemy do panelu; dokument nadal wymaga tokenu po loginie.
@@ -5907,7 +6000,15 @@ def security_gate():
                 )
                 return redirect(panel_url, code=302)
             return jsonify(ok=False, error="Brak autoryzacji"), 401
+        try:
+            membership = _active_client_membership(user["id"])
+        except Exception:
+            app.logger.exception("Nie udało się sprawdzić członkostwa dystrybutora")
+            return jsonify(ok=False, error="Weryfikacja uprawnień jest niedostępna"), 503
+        if not membership:
+            return jsonify(ok=False, error="Brak aktywnego dostępu dystrybutora"), 403
         g.client_user = user
+        g.client_customer_id = membership["customer_id"]
         return None
 
     if path == "/logout":
@@ -6016,6 +6117,7 @@ BASE = r"""
           <a href="{{ url_for('products') }}">Produkty</a>
           <a href="{{ url_for('customers') }}">Klienci</a>
           <a href="{{ url_for('pricing') }}">Cennik</a>
+          <a href="{{ url_for('architects_admin') }}">Architekci</a>
           <a href="{{ url_for('company') }}">Dane mojej firmy</a>
           <a href="{{ url_for('cash_flow') }}">Cash flow</a>
           <a href="{{ url_for('orderchamp_sync_v2.page') }}">Orderchamp</a>
@@ -6546,7 +6648,14 @@ def auto_sync_after_write(response):
             or request.path.startswith("/api/invoices/")
             or request.path.startswith("/api/client/orders/")
         )
-        if is_client_api:
+        if request.path.startswith("/api/architect/"):
+            origin = norm(request.headers.get("Origin")).rstrip("/")
+            if origin and origin in ARCHITECT_ALLOWED_ORIGINS:
+                response.headers["Access-Control-Allow-Origin"] = origin
+                response.headers["Vary"] = "Origin"
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        elif is_client_api:
             origin = norm(request.headers.get("Origin")).rstrip("/")
             if origin and origin in CLIENT_ALLOWED_ORIGINS:
                 response.headers["Access-Control-Allow-Origin"] = origin
@@ -6560,12 +6669,16 @@ def auto_sync_after_write(response):
 
         no_auto_sync_paths = {
             "/api/client_search_log", "/api/client_order_email", "/api/client/profile", "/searches/action",
+            "/api/client/architect-code/quote", "/api/client/architect-sales", "/architects",
             # Authentication and audio processing do not modify business rows.
             # Their successful POST responses must not publish the entire DB.
             "/login", "/api/internal/ai/voice/transcribe", "/api/internal/ai/voice/synthesize",
         }
         if (response.status_code < 400 and request.method in ("POST", "PUT", "PATCH", "DELETE")
                 and request.path not in no_auto_sync_paths
+                and not request.path.startswith("/api/architect/")
+                and not request.path.startswith("/api/admin/architects")
+                and not getattr(g, "architect_program_write", False)
                 and not request.path.startswith("/api/admin/orderchamp/")
                 and request.path not in {"/api/internal/orderchamp/tick", "/webhooks/orderchamp"}):
             trigger_background_supabase_sync(reason=f"{request.method} {request.path}")
@@ -7189,6 +7302,24 @@ def _client_stock_catalog_rows(profile: dict) -> list[dict]:
             raise RuntimeError("Nieprawidłowa odpowiedź cennika EUR")
         eur_by_sku = {norm(row.get("sku")).lower(): row for row in eur_rows}
 
+    approved_retail_by_product = {}
+    if price_list != "eu_eur":
+        try:
+            retail_rows = supabase_request(
+                "/rest/v1/architect_product_details",
+                method="GET",
+                params={"select": "product_id,retail_gross_override", "retail_gross_override": "not.is.null", "limit": 5000},
+                timeout=20,
+            ) or []
+            approved_retail_by_product = {
+                to_int(item.get("product_id"), 0): money_float(item.get("retail_gross_override"))
+                for item in retail_rows if isinstance(item, dict)
+            }
+        except Exception:
+            # The catalog also serves installations where the architect program
+            # has not been migrated yet. Keep the existing B2B price fallback.
+            app.logger.warning("Nie udało się odczytać zatwierdzonych cen detalicznych", exc_info=True)
+
     catalog = []
     for raw in rows:
         row = dict(raw)
@@ -7212,7 +7343,9 @@ def _client_stock_catalog_rows(profile: dict) -> list[dict]:
         else:
             net_price = money_float(row.get("net_price"))
             gross_price = money_float(row.get("gross_price"))
-            retail_price = money_float(money_dec(net_price) * Decimal("1.45") * Decimal("1.23"))
+            retail_price = approved_retail_by_product.get(product_id) or money_float(
+                money_dec(net_price) * Decimal("1.45") * Decimal("1.23")
+            )
         row.update({
             "net_price": net_price,
             "gross_price": gross_price,
@@ -7902,47 +8035,77 @@ def _authenticated_client_user() -> dict | None:
     if not token:
         return None
     cache_key = hashlib.sha256(token.encode("utf-8")).hexdigest()
-    now_monotonic = time.monotonic()
-    # Miniatury są pobierane równolegle. Blokada sprawia, że tylko pierwsze
-    # żądanie weryfikuje token w Supabase Auth, a pozostałe korzystają przez
-    # minutę z wyniku tej samej, już potwierdzonej sesji.
+    # Share verification for the same session; unrelated users never wait on
+    # a network call while holding the global cache lock.
     with _client_auth_cache_lock:
         cached = _client_auth_cache.get(cache_key)
-        if cached and cached[0] > now_monotonic:
+        if cached and cached[0] > time.monotonic():
             return dict(cached[1])
-        req = urllib.request.Request(f"{SUPABASE_URL}/auth/v1/user", method="GET")
+        flight = _client_auth_inflight.get(cache_key)
+        owner = flight is None
+        if owner:
+            flight = {"done": threading.Event(), "user": None, "unavailable": False}
+            _client_auth_inflight[cache_key] = flight
+    if not owner:
+        if not flight["done"].wait(22) or flight["unavailable"]:
+            raise ClientAuthUnavailable()
+        return dict(flight["user"]) if flight["user"] else None
+    user = None
+    try:
         api_key = SUPABASE_ANON_KEY or SUPABASE_SERVICE_ROLE_KEY
         if not api_key:
             app.logger.error("Weryfikacja klienta niemożliwa: brak SUPABASE_ANON_KEY")
-            return None
+            raise ClientAuthUnavailable()
+        req = urllib.request.Request(f"{SUPABASE_URL}/auth/v1/user", method="GET")
         req.add_header("apikey", api_key)
         req.add_header("Authorization", f"Bearer {token}")
-        try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-            email = norm(payload.get("email")).lower()
-            if not payload.get("id") or not email:
-                return None
-            metadata = payload.get("user_metadata") if isinstance(payload.get("user_metadata"), dict) else {}
-            user = {
-                "id": str(payload.get("id")),
-                "email": email,
-                "name": norm(metadata.get("full_name") or metadata.get("name")) or email.split("@")[0],
-            }
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        email = norm(payload.get("email")).lower()
+        if not payload.get("id") or not email:
+            raise ClientAuthUnavailable()
+        metadata = payload.get("user_metadata") if isinstance(payload.get("user_metadata"), dict) else {}
+        user = {
+            "id": str(payload.get("id")), "email": email,
+            "name": norm(metadata.get("full_name") or metadata.get("name")) or email.split("@")[0],
+            "email_confirmed": bool(payload.get("email_confirmed_at") or payload.get("confirmed_at")),
+            "metadata": metadata,
+        }
+        with _client_auth_cache_lock:
             if len(_client_auth_cache) >= 500:
-                _client_auth_cache.clear()
+                expired = [key for key, value in _client_auth_cache.items() if value[0] <= time.monotonic()]
+                for key in expired:
+                    _client_auth_cache.pop(key, None)
+                if len(_client_auth_cache) >= 500:
+                    _client_auth_cache.pop(next(iter(_client_auth_cache)))
             _client_auth_cache[cache_key] = (time.monotonic() + CLIENT_AUTH_CACHE_TTL_SEC, user)
-            return dict(user)
-        except urllib.error.HTTPError as exc:
+        return dict(user)
+    except urllib.error.HTTPError as exc:
+        if exc.code in {401, 403}:
             app.logger.warning("Supabase odrzucił token klienta: HTTP %s", exc.code)
             return None
-        except Exception as exc:
-            app.logger.warning("Nie udało się zweryfikować tokenu klienta: %s", type(exc).__name__)
-            return None
+        flight["unavailable"] = True
+        app.logger.warning("Supabase Auth jest niedostępne: HTTP %s", exc.code)
+        raise ClientAuthUnavailable() from exc
+    except Exception as exc:
+        flight["unavailable"] = True
+        app.logger.warning("Nie udało się zweryfikować sesji klienta: %s", type(exc).__name__)
+        raise ClientAuthUnavailable() from exc
+    finally:
+        flight["user"] = user
+        with _client_auth_cache_lock:
+            _client_auth_inflight.pop(cache_key, None)
+            flight["done"].set()
 
 
-def _client_profile_for_email(email: str) -> dict:
+def _client_profile_for_email(email: str, customer_id=None) -> dict:
     email = _email_key(email)
+    bound_customer_id = (
+        to_int(customer_id, 0) or (
+            to_int(getattr(g, "client_customer_id", 0), 0)
+            if has_request_context() else 0
+        )
+    )
     fallback = {
         "id": None,
         "name": email.split("@")[0] if email else "",
@@ -7959,10 +8122,13 @@ def _client_profile_for_email(email: str) -> dict:
 
     params = {
         "select": "id,name,address,phone,email,nip,language,price_list",
-        "email": f"ilike.{email}",
-        "order": "id.desc",
         "limit": 1,
     }
+    if bound_customer_id:
+        params["id"] = f"eq.{bound_customer_id}"
+    else:
+        params["email"] = f"ilike.{email}"
+        params["order"] = "id.desc"
     try:
         rows = supabase_request("/rest/v1/customers", params=params, timeout=20) or []
     except urllib.error.HTTPError as exc:
@@ -7974,6 +8140,8 @@ def _client_profile_for_email(email: str) -> dict:
         rows = supabase_request("/rest/v1/customers", params=fallback_params, timeout=20) or []
 
     if not isinstance(rows, list) or not rows:
+        if bound_customer_id:
+            raise RuntimeError("Powiązany dystrybutor nie istnieje")
         return fallback
     row = dict(rows[0])
     language = normalize_client_language(row.get("language"))
@@ -8010,7 +8178,7 @@ def _order_by_idempotency_key(idempotency_key: str) -> dict | None:
     c = conn()
     try:
         cur = c.cursor()
-        cur.execute("SELECT id, order_no, customer_email FROM orders WHERE idempotency_key=? LIMIT 1", (idempotency_key,))
+        cur.execute("SELECT id, order_no, customer_email, customer_id FROM orders WHERE idempotency_key=? LIMIT 1", (idempotency_key,))
         row = cur.fetchone()
         if row:
             return dict(row)
@@ -8020,7 +8188,7 @@ def _order_by_idempotency_key(idempotency_key: str) -> dict | None:
         return None
     rows = supabase_request(
         "/rest/v1/orders",
-        params={"select": "id,order_no,customer_email", "idempotency_key": f"eq.{idempotency_key}", "limit": 1},
+        params={"select": "id,order_no,customer_email,customer_id", "idempotency_key": f"eq.{idempotency_key}", "limit": 1},
     )
     return dict(rows[0]) if isinstance(rows, list) and rows else None
 
@@ -8125,10 +8293,84 @@ def _client_order_items_local(c, order: dict) -> list[dict]:
     return items
 
 def _api_order_lookup_impl():
-    maybe_pull_shared_from_supabase(force=True)
     token = norm(request.args.get("token"))
     if not token:
         return jsonify(ok=False, error="Brak tokenu"), 400
+
+    # Architect orders are committed directly in Supabase. Reading their
+    # immutable price snapshots must not wait for a full warehouse cache pull.
+    if supabase_enabled():
+        remote_orders = supabase_request("/rest/v1/orders", params={
+            "select": "*", "order_no": f"eq.{token}", "limit": 1,
+        }, timeout=15) or []
+        if remote_orders:
+            remote_order = remote_orders[0]
+            if to_int(remote_order.get("customer_id"), 0) != to_int(g.client_customer_id, 0):
+                return jsonify(ok=False, error="Brak dostępu"), 403
+            redemption = supabase_request("/rest/v1/architect_code_redemptions", params={
+                "select": "id", "order_id": f"eq.{remote_order['id']}", "limit": 1,
+            }, timeout=15) or []
+            if redemption:
+                remote_items = supabase_request("/rest/v1/order_items", params={
+                    "select": "*", "order_id": f"eq.{remote_order['id']}", "order": "id.asc",
+                }, timeout=15) or []
+                product_ids = sorted({to_int(row.get("product_id"), 0) for row in remote_items
+                                      if to_int(row.get("product_id"), 0) > 0})
+                products = {}
+                stock = {}
+                if product_ids:
+                    product_filter = f"in.({','.join(str(value) for value in product_ids)})"
+                    product_rows = supabase_request("/rest/v1/products", params={
+                        "select": "id,sku,model,name", "id": product_filter,
+                    }, timeout=15) or []
+                    products = {to_int(row.get("id"), 0): row for row in product_rows}
+                    catalog_rows = supabase_request("/rest/v1/client_stock_catalog_v", params={
+                        "select": "product_id,qty_on_stock", "product_id": product_filter,
+                    }, timeout=15) or []
+                    stock = {to_int(row.get("product_id"), 0): to_int(row.get("qty_on_stock"), 0)
+                             for row in catalog_rows}
+                allocations = supabase_request("/rest/v1/invoice_allocations", params={
+                    "select": "order_item_id,qty", "order_id": f"eq.{remote_order['id']}",
+                }, timeout=15) or []
+                invoiced = {}
+                for row in allocations:
+                    item_id = to_int(row.get("order_item_id"), 0)
+                    invoiced[item_id] = invoiced.get(item_id, 0) + to_int(row.get("qty"), 0)
+                items = []
+                for row in remote_items:
+                    item = dict(row)
+                    product_id = to_int(item.get("product_id"), 0)
+                    product = products.get(product_id, {})
+                    qty = to_int(item.get("qty"), 0)
+                    item_id = to_int(item.get("id"), 0)
+                    net = money_float(item.get("unit_net_price"))
+                    gross = money_float(item.get("unit_gross_price"))
+                    retail = money_float(item.get("unit_retail_price"))
+                    invoiced_qty = invoiced.get(item_id, 0)
+                    stock_qty = stock.get(product_id, 0)
+                    item.update(model=norm(product.get("model")), name=norm(product.get("name")),
+                                sku=norm(item.get("sku") or product.get("sku")),
+                                net_price=net, gross_price=gross, retail_price=retail,
+                                stock_qty=stock_qty, qty_physical=stock_qty,
+                                available_qty=stock_qty, ordered_qty=qty,
+                                invoiced_qty=invoiced_qty, remaining_qty=max(0, qty - invoiced_qty),
+                                availability_label="dostępne" if stock_qty >= qty else "10/20 dni",
+                                realization_label=("w całości" if invoiced_qty >= qty and qty > 0
+                                                   else f"częściowo: {invoiced_qty}/{qty} szt." if invoiced_qty
+                                                   else "0 szt."),
+                                line_value_net=money_float(Decimal(str(net)) * qty),
+                                line_value_retail=money_float(Decimal(str(retail)) * qty))
+                    item["line_value_gross"] = money_float(gross_from_net_23(item["line_value_net"]))
+                    items.append(item)
+                total_net = money_float(sum(Decimal(str(x["line_value_net"])) for x in items))
+                total_retail = money_float(sum(Decimal(str(x["line_value_retail"])) for x in items))
+                remote_order = dict(remote_order)
+                remote_order.update(total_net=total_net,
+                                    total_gross=money_float(gross_from_net_23(total_net)),
+                                    total_retail=total_retail)
+                return jsonify(ok=True, order=remote_order, items=items)
+
+    maybe_pull_shared_from_supabase(force=True)
 
     c = conn()
     cur = c.cursor()
@@ -8145,7 +8387,7 @@ def _api_order_lookup_impl():
         c.close()
         return jsonify(ok=False, error="Nie znaleziono zamĂłwienia"), 404
     order = dict(o)
-    if _email_key(order.get("customer_email")) != _email_key(g.client_user["email"]):
+    if to_int(order.get("customer_id"), 0) != to_int(g.client_customer_id, 0):
         c.close()
         return jsonify(ok=False, error="Brak dostępu"), 403
 
@@ -8244,8 +8486,13 @@ def _api_order_lookup_impl():
         else:
             it["realization_label"] = "0 szt."
 
+    promo_order = bool(architect_order_redemption(order_id))
+    if promo_order:
+        for it in items:
+            it["line_value_gross"] = money_float(gross_from_net_23(it["line_value_net"]))
     total_net = round(sum(float(it.get("line_value_net") or 0) for it in items), 2)
-    total_gross = round(sum(float(it.get("line_value_gross") or 0) for it in items), 2)
+    total_gross = money_float(gross_from_net_23(total_net)) if promo_order else round(
+        sum(float(it.get("line_value_gross") or 0) for it in items), 2)
     total_retail = round(sum(float(it.get("line_value_retail") or 0) for it in items), 2)
     order_currency = normalize_order_currency(order.get("currency"))
     order_price_list = normalize_client_price_list(order.get("price_list"))
@@ -8278,6 +8525,51 @@ def _api_order_lookup_impl():
     )
 
 def _api_client_order_pdf_impl(order_id: int, retail_prices: bool = False):
+    if supabase_enabled():
+        remote_orders = supabase_request("/rest/v1/orders", params={
+            "select": "*", "id": f"eq.{order_id}", "limit": 1,
+        }, timeout=15) or []
+        if remote_orders:
+            remote_order = remote_orders[0]
+            if to_int(remote_order.get("customer_id"), 0) != to_int(g.client_customer_id, 0):
+                return jsonify(ok=False, error="Brak dostępu"), 403
+            redemption = supabase_request("/rest/v1/architect_code_redemptions", params={
+                "select": "id", "order_id": f"eq.{order_id}", "limit": 1,
+            }, timeout=15) or []
+            if redemption:
+                remote_items = supabase_request("/rest/v1/order_items", params={
+                    "select": "*", "order_id": f"eq.{order_id}", "order": "id.asc",
+                }, timeout=15) or []
+                product_ids = sorted({to_int(row.get("product_id"), 0) for row in remote_items
+                                      if to_int(row.get("product_id"), 0) > 0})
+                products = {}
+                if product_ids:
+                    product_rows = supabase_request("/rest/v1/products", params={
+                        "select": "id,model,name",
+                        "id": f"in.({','.join(str(value) for value in product_ids)})",
+                    }, timeout=15) or []
+                    products = {to_int(row.get("id"), 0): row for row in product_rows}
+                items = []
+                for row in remote_items:
+                    item = dict(row)
+                    product = products.get(to_int(item.get("product_id"), 0), {})
+                    item.update(model=norm(product.get("model")), name=norm(product.get("name")),
+                                net_price=money_float(item.get("unit_net_price")),
+                                gross_price=money_float(item.get("unit_gross_price")),
+                                retail_price=money_float(item.get("unit_retail_price")))
+                    items.append(item)
+                customers = supabase_request("/rest/v1/customers", params={
+                    "select": "language", "id": f"eq.{g.client_customer_id}", "limit": 1,
+                }, timeout=15) or []
+                language = normalize_client_language(customers[0].get("language") if customers else "pl")
+                pdf_buffer, filename = generate_client_order_pdf(
+                    dict(remote_order), items, language, retail_prices=retail_prices,
+                    company_override={"company_name": "Niedźwieccy"})
+                response = send_file(pdf_buffer, mimetype="application/pdf",
+                                     as_attachment=True, download_name=filename, max_age=0)
+                response.headers["Cache-Control"] = "no-store"
+                return response
+
     maybe_pull_shared_from_supabase(force=True)
     email = _email_key(g.client_user.get("email"))
 
@@ -8289,7 +8581,7 @@ def _api_client_order_pdf_impl(order_id: int, retail_prices: bool = False):
         if not row:
             return jsonify(ok=False, error="Nie znaleziono zamówienia"), 404
         order = dict(row)
-        if _email_key(order.get("customer_email")) != email:
+        if to_int(order.get("customer_id"), 0) != to_int(g.client_customer_id, 0):
             return jsonify(ok=False, error="Brak dostępu"), 403
 
         items = _client_order_items_local(c, order)
@@ -9146,12 +9438,12 @@ configure_order_status(lambda db, order_id, status: local_order_transition(
 _startup_step("routes_import_begin")
 from routes import admin as routes_admin, china as routes_china, customers as routes_customers
 from routes import inventory as routes_inventory, invoices as routes_invoices
-from routes import orders as routes_orders, shipping as routes_shipping
+from routes import orders as routes_orders, shipping as routes_shipping, architects as routes_architects
 # Legacy code replaces the original /searches handler with client_searches_v2.
 # Temporarily release the endpoint so its URL rule can be registered in the
 # customer module, then restore the same v2 handler as before the extraction.
 app.view_functions.pop("client_searches", None)
-for _routes_module in (routes_admin, routes_customers, routes_orders, routes_inventory, routes_shipping, routes_invoices, routes_china):
+for _routes_module in (routes_admin, routes_customers, routes_orders, routes_inventory, routes_shipping, routes_invoices, routes_china, routes_architects):
     globals().update(_routes_module.register_routes(globals()))
 if "client_searches_v2" in globals():
     app.view_functions["client_searches"] = client_searches_v2
@@ -9190,11 +9482,13 @@ def _refresh_domain_route_context():
 # protects the same shipment across processes; the thread lock is only local.
 import inpost_pickups as _inpost_pickups
 import sys as _pickup_sys
-_inpost_pickups.start_worker(_pickup_sys.modules[__name__])
+if not os.environ.get("RENDER"):
+    _inpost_pickups.start_worker(_pickup_sys.modules[__name__])
 _startup_step("inpost_worker_init")
 
 import inpost_tracking as _inpost_tracking
-_inpost_tracking.start_worker(_pickup_sys.modules[__name__])
+if not os.environ.get("RENDER"):
+    _inpost_tracking.start_worker(_pickup_sys.modules[__name__])
 _startup_step("inpost_tracking_worker_init")
 
 # The scheduler runs in a daemon thread, while the durable claim coordinates
@@ -9202,7 +9496,8 @@ _startup_step("inpost_tracking_worker_init")
 import ksef_scheduler as _ksef_scheduler
 import ksef_automation as _ksef_automation
 _ksef_automation.register_routes(_pickup_sys.modules[__name__])
-_ksef_scheduler.start_worker(_pickup_sys.modules[__name__])
+if not os.environ.get("RENDER"):
+    _ksef_scheduler.start_worker(_pickup_sys.modules[__name__])
 _startup_step("ksef_scheduler_worker_init")
 
 
@@ -9221,7 +9516,8 @@ def _send_audit_to_supabase(payload):
 
 if supabase_enabled():
     configure_audit_remote_sender(_send_audit_to_supabase)
-    start_audit_outbox_worker()
+    if not os.environ.get("RENDER"):
+        start_audit_outbox_worker()
 _startup_step("audit_worker_init")
 _startup_step("app_ready")
 

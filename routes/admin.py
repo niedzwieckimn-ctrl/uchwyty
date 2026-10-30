@@ -10,28 +10,123 @@ def register_routes(context):
     @app.route("/login", methods=["GET", "POST"])
     def login():
         error = ""
+        response_status = 200
         if request.method == "POST":
-            if not app.secret_key or not (ADMIN_PASSWORD_HASH or ADMIN_PASSWORD):
+            app.logger.info("ADMIN_LOGIN received pid=%s", os.getpid())
+            username_ok = hmac.compare_digest(norm(request.form.get("username")).encode("utf-8"), ADMIN_USERNAME.encode("utf-8"))
+            configured = bool(app.secret_key and (ADMIN_PASSWORD_HASH or ADMIN_PASSWORD))
+            if not configured:
+                app.logger.error("ADMIN_LOGIN configuration_missing")
                 error = "Brak konfiguracji logowania administratora na serwerze."
-            elif hmac.compare_digest(norm(request.form.get("username")), ADMIN_USERNAME) and _admin_password_ok(request.form.get("password") or ""):
+                response_status = 503
+            elif username_ok and _admin_password_ok(request.form.get("password") or ""):
+                app.logger.info("ADMIN_LOGIN credentials_verified")
                 session.clear()
-                session["admin_authenticated"] = True
-                session["csrf_token"] = secrets.token_urlsafe(32)
-                session.permanent = True
-                bind_bootstrap_owner_session(session)
-                try_record_audit_event(
-                    "security.login",
-                    result="SUCCESS",
-                    entity_type="internal_actor",
-                    entity_id=session.get("internal_actor_id"),
-                )
-                target = norm(request.args.get("next"))
-                return redirect(target if target.startswith("/") and not target.startswith("//") else url_for("home"))
+                try:
+                    bind_bootstrap_owner_session(session)
+                except Exception:
+                    session.clear()
+                    app.logger.exception("ADMIN_LOGIN session_binding_failed")
+                    error = "Nie udało się otworzyć sesji. Spróbuj ponownie za chwilę."
+                    response_status = 503
+                else:
+                    session["admin_authenticated"] = True
+                    session["csrf_token"] = secrets.token_urlsafe(32)
+                    session.permanent = True
+                    app.logger.info("ADMIN_LOGIN audit_begin")
+                    login_thread_id = threading.get_ident()
+                    def report_stalled_login():
+                        # Function names and line numbers only: never frame
+                        # locals, form fields, credentials or source lines.
+                        frame = sys._current_frames().get(login_thread_id)
+                        stack = []
+                        while frame is not None:
+                            stack.append("%s:%s:%s" % (os.path.basename(frame.f_code.co_filename), frame.f_code.co_name, frame.f_lineno))
+                            frame = frame.f_back
+                        app.logger.error("ADMIN_LOGIN stalled stack=%s", " <- ".join(stack))
+                    watchdog = threading.Timer(3.0, report_stalled_login)
+                    watchdog.daemon = True
+                    watchdog.start()
+                    try:
+                        audit_id = try_record_audit_event(
+                            "security.login", result="SUCCESS", entity_type="internal_actor",
+                            entity_id=session.get("internal_actor_id"))
+                    finally:
+                        watchdog.cancel()
+                    if not audit_id:
+                        session.clear()
+                        app.logger.error("ADMIN_LOGIN audit_unavailable")
+                        return "Nie można teraz zapisać sesji. Spróbuj ponownie za chwilę.", 503
+                    app.logger.info("ADMIN_LOGIN success")
+                    target = norm(request.args.get("next"))
+                    return redirect(target if target.startswith("/") and not target.startswith("//") else url_for("home"))
             else:
+                session.clear()
+                app.logger.warning("ADMIN_LOGIN credentials_rejected username_match=%s mode=%s", username_ok, "hash" if ADMIN_PASSWORD_HASH else "plain")
                 error = "Nieprawidłowy login lub hasło."
-        return render_template_string(r'''<!doctype html><html lang="pl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Logowanie — Niedźwieccy</title><style>body{margin:0;font-family:Inter,Segoe UI,sans-serif;background:#f5f6fa;color:#17233c;display:grid;place-items:center;min-height:100vh}.box{width:min(420px,calc(100% - 28px));background:#fff;padding:30px;border-radius:24px;box-shadow:0 18px 55px rgba(20,35,65,.13)}h1{margin:0 0 5px}.muted{color:#718096;font-size:13px;margin-bottom:22px}label{display:block;font-size:12px;font-weight:700;margin:12px 0 6px}input{width:100%;box-sizing:border-box;padding:12px;border:1px solid #dfe3ec;border-radius:13px;font:inherit}button{width:100%;margin-top:18px;padding:12px;border:0;border-radius:13px;background:#5577ee;color:#fff;font-weight:700}.error{background:#fff1f2;color:#b9384c;padding:10px;border-radius:12px;font-size:12px}</style></head><body><form class="box" method="post"><h1>Panel magazynu</h1><div class="muted">Zaloguj się jako administrator.</div>{% if error %}<div class="error">{{ error }}</div>{% endif %}<label>Login</label><input name="username" autocomplete="username" required><label>Hasło</label><input name="password" type="password" autocomplete="current-password" required><button type="submit">Zaloguj</button></form></body></html>''', error=error)
+        return render_template_string(r'''<!doctype html><html lang="pl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Logowanie — Niedźwieccy</title><style>body{margin:0;font-family:Inter,Segoe UI,sans-serif;background:#f5f6fa;color:#17233c;display:grid;place-items:center;min-height:100vh}.box{width:min(420px,calc(100% - 28px));background:#fff;padding:30px;border-radius:24px;box-shadow:0 18px 55px rgba(20,35,65,.13)}h1{margin:0 0 5px}.muted{color:#718096;font-size:13px;margin-bottom:22px}label{display:block;font-size:12px;font-weight:700;margin:12px 0 6px}input{width:100%;box-sizing:border-box;padding:12px;border:1px solid #dfe3ec;border-radius:13px;font:inherit}button{width:100%;margin-top:18px;padding:12px;border:0;border-radius:13px;background:#5577ee;color:#fff;font-weight:700}.error{background:#fff1f2;color:#b9384c;padding:10px;border-radius:12px;font-size:12px}</style></head><body><form class="box" method="post"><h1>Panel magazynu</h1><div class="muted">Zaloguj się jako administrator.</div>{% if error %}<div class="error">{{ error }}</div>{% endif %}<label>Login</label><input name="username" autocomplete="username" required><label>Hasło</label><input name="password" type="password" autocomplete="current-password" required><button type="submit">Zaloguj</button></form></body></html>''', error=error), response_status
 
 
+
+
+    @app.route("/admin/staging/distributor-password", methods=["GET", "POST"])
+    @require_permission("system.users_manage", operation="staging.distributor_password")
+    def staging_distributor_password():
+        # Temporary recovery for the one existing QA account. Never production.
+        if SUPABASE_URL != "https://irhrzdsjnwjyqfvhiclk.supabase.co":
+            return "Not found", 404
+        target_id = "0062dcbf-717e-40a7-a820-3f79aefaa33f"
+        target_email = "dystrybutor.staging@example.com"
+        error, success, status = "", False, 200
+        if request.method == "POST":
+            if request.is_json:
+                return "Użyj formularza zmiany hasła.", 415
+            password = request.form.get("password") or ""
+            confirmation = request.form.get("confirmation") or ""
+            if len(password) < 12 or len(password.encode("utf-8")) > 72:
+                error, status = "Hasło musi mieć co najmniej 12 znaków i maksymalnie 72 bajty UTF-8.", 400
+            elif not hmac.compare_digest(password.encode("utf-8"), confirmation.encode("utf-8")):
+                error, status = "Wpisane hasła różnią się.", 400
+            else:
+                try:
+                    path = "/auth/v1/admin/users/" + target_id
+                    user = supabase_request(path, timeout=10)
+                    if not isinstance(user, dict) or user.get("id") != target_id or user.get("email") != target_email:
+                        error, status = "Nie potwierdzono właściwego konta testowego. Hasło nie zostało zmienione.", 409
+                    else:
+                        # No logging or echo of request/response bodies for credentials.
+                        changed = supabase_request(path, method="PUT", payload={"password": password}, timeout=10)
+                        if not isinstance(changed, dict) or changed.get("id") != target_id:
+                            error, status = "Brak potwierdzenia zmiany. Sprawdź logowanie przed ponowną próbą.", 502
+                        else:
+                            success = True
+                            try_record_audit_event("staging.distributor_password", result="SUCCESS",
+                                                   entity_type="auth_user", entity_id=target_id)
+                except Exception:
+                    # Do not include exception details: providers may echo submitted data.
+                    app.logger.warning("STAGING_DISTRIBUTOR_PASSWORD provider_failure")
+                    error, status = "Usługa nie potwierdziła zmiany. Sprawdź logowanie przed ponowną próbą.", 503
+        html = render_template_string(r'''<!doctype html><html lang="pl"><head>
+          <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>Hasło dystrybutora — staging</title><style>
+          body{font-family:Segoe UI,sans-serif;background:#f5f6fa;color:#17233c;margin:0;padding:32px}
+          main{max-width:520px;margin:auto;background:white;padding:28px;border-radius:20px}
+          label{display:block;margin:16px 0 6px}input,button{box-sizing:border-box;width:100%;padding:12px;font:inherit}
+          button{margin-top:20px;background:#5577ee;color:white;border:0;border-radius:10px}
+          .error{color:#b9384c}.success{color:#16734b}small{color:#596779}</style></head><body><main>
+          <h1>Hasło dystrybutora testowego</h1><p>{{ email }}</p>
+          <small>Istniejące konto w Niedźwieccy Staging. Dane konta i uprawnienia pozostają zachowane.</small>
+          {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+          {% if success %}<p class="success" role="status">Hasło zostało zmienione. Możesz zalogować się do Panelu B2B.</p>
+          <a href="https://niedzwieccy-b2b-architekci-staging.netlify.app/">Otwórz Panel B2B</a>
+          {% else %}<form method="post" autocomplete="off">
+          <label for="password">Nowe hasło</label><input id="password" name="password" type="password" minlength="12" autocomplete="new-password" required>
+          <label for="confirmation">Powtórz nowe hasło</label><input id="confirmation" name="confirmation" type="password" minlength="12" autocomplete="new-password" required>
+          <button type="submit">Zapisz hasło dystrybutora</button></form>{% endif %}
+          </main></body></html>''', email=target_email, error=error, success=success)
+        response = app.make_response((html, status))
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
 
     @app.get("/logout")

@@ -118,7 +118,7 @@ def test_registry_is_closed_and_contains_required_contracts(isolated):
         "business.describe_schema", "business.query", "business.orders.state", "business.daily.state",
         "business.inventory.state", "business.finance.state", "business.deliveries.state",
             "inventory.product.get", "inventory.product.search", "inventory.summary", "inventory.replenishment.ranking",
-        "orders.search", "orders.get", "orders.fulfillment.readiness", "orders.packing_history.get", "invoices.search", "invoices.get", "invoices.overdue",
+        "orders.search", "orders.get", "orders.customer_shipping_options", "orders.fulfillment.readiness", "orders.packing_history.get", "invoices.search", "invoices.get", "invoices.overdue",
         "customers.search", "customers.get", "china.orders.summary", "china.orders.search", "china.orders.get", "business.sales.summary",
         "payments.reminders.read", "payments.reminders.send", "search.analytics.read", "cashflow.read",
         "internal.test.change_setting", "internal.test.external.execute",

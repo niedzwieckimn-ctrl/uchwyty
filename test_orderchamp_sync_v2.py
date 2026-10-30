@@ -278,7 +278,8 @@ def test_global_auto_sync_excludes_all_orderchamp_endpoints():
     method.decorator_list=[]
     fn=ast.Module(body=[method],type_ignores=[])
     trigger=Mock();scope={'CLIENT_API_PATHS':set(),'norm':lambda x:x or '',
-        'trigger_background_supabase_sync':trigger}
+        'trigger_background_supabase_sync':trigger,
+        'g':type('Context',(),{'architect_program_write':False})()}
     exec(compile(fn,'isolated-hook','exec'),scope)
     for path in ('/api/admin/orderchamp/control','/api/admin/orderchamp/dry-run','/webhooks/orderchamp','/api/internal/orderchamp/tick'):
         scope['request']=type('R',(),{'path':path,'method':'POST','headers':{}})()

@@ -2,18 +2,31 @@
 import copy
 import json
 import re
+from pathlib import Path
 
 import pytest
 
 import app as backend
 import reconciliation_store
 import packing_versions
+import reconciliation_documents
 from test_multi_order_packing_agent import multi_order_flow
 
 
 @pytest.fixture
 def packing_cloud(multi_order_flow, monkeypatch):
     cloud, calls = {}, []
+    # Reconciliation externalizes PDFs to Storage as well as writing the CAS
+    # record. Keep both external boundaries in memory, even when this fixture
+    # is run independently of the full suite.
+    storage = {}
+    monkeypatch.setattr(reconciliation_documents, '_verified', set())
+    def upload(local_path, object_path, bucket=None, content_type='application/pdf'):
+        ref = backend.supabase_storage_ref(object_path, bucket)
+        storage[ref] = (Path(local_path).read_bytes(), content_type)
+        return ref
+    monkeypatch.setattr(backend, 'supabase_storage_upload_file', upload)
+    monkeypatch.setattr(backend, 'supabase_storage_download_bytes', lambda ref: storage[ref])
     def remote(path, method='GET', payload=None, **kwargs):
         calls.append((method, path, copy.deepcopy(payload or kwargs)))
         if path == '/rest/v1/fulfillment_reconciliation' and method == 'GET':

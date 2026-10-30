@@ -97,10 +97,22 @@ def _remote_history_available():
 
 
 def _remote_history_failure(stage, exc):
+    # Provider error bodies can echo complete conversation text or personal data.
+    # Keep operational diagnostics without persisting that untrusted payload.
+    cause = exc
+    status = None
+    for _ in range(4):
+        code = getattr(cause, 'code', None)
+        if isinstance(code, int) and 100 <= code <= 599:
+            status = code
+            break
+        cause = getattr(cause, '__cause__', None)
+        if cause is None:
+            break
     logger.error('AGENT_HISTORY_REMOTE_FAILURE %s', json.dumps({
         'stage':stage,
         'exception_type':type(exc).__name__,
-        'exception_message':sanitize_audit_text(exc)[:500],
+        'supabase_http_status':status,
     }, ensure_ascii=False, sort_keys=True))
 
 

@@ -696,19 +696,26 @@ def register_routes(context):
             if amended_sid:
                 c.execute('UPDATE orders SET inpost_shipment_id=?,inpost_label_format=\'pdf\' WHERE id IN ('
                           + ','.join('?' for _ in package_order_ids) + ')', (amended_sid, *package_order_ids))
-            # Status wysyłki nie zmienia magazynu. Stan schodzi dopiero podczas
-            # pełnego zafakturowania zamówienia w finalize_fully_invoiced_orders().
-            cur.execute(
-                f"""UPDATE orders
-                    SET status=CASE
-                          WHEN LOWER(COALESCE(status,'')) IN ('issued','completed') THEN status
-                          WHEN LOWER(COALESCE(status,'')) IN ('packed_partial','partially_shipped') THEN 'partially_shipped'
-                          ELSE 'shipped'
-                        END,
-                        tracking_no=?, carrier=?, shipped_at=?
-                    WHERE id IN ({placeholders})""",
-                (tracking_no, carrier, shipped_at, *package_order_ids),
-            )
+            # Invoicing or the previous status cannot prove physical shipment.
+            # Count only confirmed parcel snapshots, resolving corrections once.
+            shipment_rows = list(c.execute(
+                f"""SELECT DISTINCT ps.* FROM packing_shipments ps
+                    JOIN packing_allocations pa ON pa.batch_id=ps.final_batch_id
+                    WHERE pa.order_id IN ({placeholders})""", package_order_ids))
+            finals = shipment_amendments.effective_shipments(c, shipment_rows)
+            shipped_units = {}
+            for batch_id in {int(row['final_batch_id']) for row in finals}:
+                for allocation in c.execute('SELECT order_item_id,qty FROM packing_allocations WHERE batch_id=?', (batch_id,)):
+                    iid = int(allocation['order_item_id'])
+                    shipped_units[iid] = shipped_units.get(iid, 0) + int(allocation['qty'])
+            for member in package_orders:
+                required = list(c.execute('SELECT id,qty FROM order_items WHERE order_id=? AND qty>0', (member['id'],)))
+                complete = bool(required) and all(shipped_units.get(int(row['id']), 0) >= int(row['qty']) for row in required)
+                status = norm(member.get('status')).lower()
+                if status not in {'issued', 'completed'}:
+                    status = 'shipped' if complete else 'partially_shipped'
+                cur.execute('UPDATE orders SET status=?,tracking_no=?,carrier=?,shipped_at=? WHERE id=?',
+                            (status, tracking_no, carrier, shipped_at, member['id']))
             cur.execute(f"SELECT * FROM orders WHERE id IN ({placeholders}) ORDER BY id", tuple(package_order_ids))
             package_orders = [dict(item) for item in cur.fetchall()]
             if amended_sid:
