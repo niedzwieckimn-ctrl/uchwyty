@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from architect_pricing import ProgramRules, money, price_line
+from architect_account_email import request_attempt, read_delivery, delivery_state
 
 
 def payout_timestamp(value, now):
@@ -535,7 +536,7 @@ def register_routes(context):
         if not profile_rows: return 'Nie znaleziono architekta',404
         owner=profile_rows[0]
         welcome_jobs=supabase_request('/rest/v1/architect_order_email_outbox',params={
-            'select':'status,provider_status,created_at', 'architect_id':f'eq.{architect_id}',
+            'select':'id,status,provider_status,provider_id,created_at', 'architect_id':f'eq.{architect_id}',
             'notification_type':'in.(architect_approved,architect_welcome_resend)',
             'order':'created_at.desc','limit':1},timeout=15) or []
         codes=supabase_request('/rest/v1/architect_codes',params={
@@ -602,11 +603,32 @@ def register_routes(context):
                 line['invoice_ids']=sorted({to_int(e.get('invoice_id'),0) for e in entries if e.get('invoice_id')})
         for row in settlements:
             row['payout']=payout_by_settlement.get(row['id'])
+        private_notes=[]
+        try:
+            from architect_project_admin import private_code_notes
+        except ImportError:
+            pass  # Optional local projects package is not installed yet.
+        else:
+            private_notes=private_code_notes(supabase_request,architect_id,codes)
         return render_template('architect_profile.html',title='Profil architekta',
             profile=owner,samples=samples,codes=codes,redemptions=redemptions,
             ledger=ledger,settlements=settlements,audits=audits,
-            welcome_request_id=str(uuid.uuid4()),
+            welcome_request_id=str(uuid.uuid4()),private_code_notes=private_notes,
+            welcome_delivery=delivery_state(welcome_jobs[0]) if welcome_jobs else None,
             welcome_job=welcome_jobs[0] if welcome_jobs else None)
+
+    @app.get('/architects/<uuid:architect_id>/welcome-email-status')
+    @require_permission('system.users_manage', operation='architect.program_admin')
+    def architect_welcome_email_status(architect_id):
+        try:
+            row=read_delivery(supabase_request,architect_id,request.args.get('job'))
+            if not row:
+                return jsonify(ok=False,error='Nie znaleziono wysyłki'),404
+            return jsonify(ok=True,job_id=row['id'],**delivery_state(row))
+        except (ValueError,TypeError):
+            return jsonify(ok=False,error='Nieprawidłowe żądanie'),400
+        except Exception:
+            return jsonify(ok=False,error='Nie udało się odczytać statusu. Odśwież kartę.'),503
 
     @app.route('/architects', methods=['GET', 'POST'])
     @require_permission('system.users_manage', operation='architect.program_admin')
@@ -623,14 +645,26 @@ def register_routes(context):
                     supabase_request('/rest/v1/rpc/architect_review_profile',method='POST',
                         payload={'p_architect_id':architect_id,'p_status':status,
                                  'p_actor':actor},timeout=15)
+                    if status == 'approved':
+                        # The review RPC rejects unchanged status. Only a real
+                        # transition reaches here; opening/saving cannot send.
+                        try:
+                            job=read_delivery(supabase_request,architect_id)
+                            if job and job.get('status') in {'PENDING','RETRY'}:
+                                request_attempt(supabase_request,job['id'])
+                        except Exception:
+                            pass  # Account remains active; durable queue retries.
                 elif action == 'resend_welcome':
                     architect_id = str(uuid.UUID(norm(request.form.get('architect_id'))))
                     request_id = str(uuid.UUID(norm(request.form.get('request_id'))))
-                    supabase_request('/rest/v1/rpc/architect_resend_welcome', method='POST',
+                    job_id=supabase_request('/rest/v1/rpc/architect_resend_welcome', method='POST',
                         payload={'p_architect_id':architect_id,'p_request_id':request_id,
                                  'p_actor':actor}, timeout=15)
+                    started=request_attempt(supabase_request,job_id)
+                    if request.accept_mimetypes.best == 'application/json':
+                        return jsonify(ok=True,job_id=job_id,state='sending' if started else 'queued'),202
                     return redirect(url_for('architect_admin_profile',architect_id=architect_id,
-                                            result='welcome_queued'))
+                                            result='welcome_attempt'))
                 elif action == 'sample_status':
                     sample_id = str(uuid.UUID(norm(request.form.get('sample_id'))))
                     status = norm(request.form.get('status'))
@@ -746,6 +780,8 @@ def register_routes(context):
                 return redirect(url_for('architects_admin', view=return_view, result='saved'))
             except Exception as exc:
                 app.logger.exception('Architect admin action failed: %s', action)
+                if action == 'resend_welcome' and request.accept_mimetypes.best == 'application/json':
+                    return jsonify(ok=False,error='Nie udało się rozpocząć wysyłki. Odśwież status lub spróbuj później.'),400
                 return render_template('architect_admin.html',title='Architekci',error=str(exc),
                     architects=[],samples=[],distributors=[],sale_lines=[],ledger=[],settlements=[],products=[],product_details=[]),400
         architects = supabase_request('/rest/v1/architect_profiles',params={
