@@ -6087,6 +6087,7 @@ BASE = r"""
     .nav>a.nav-orders{--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M5%204h14v18H5ZM9%202h6v4H9ZM9%2011h6M9%2015h6%22%2F%3E%3C%2Fsvg%3E")}
     .nav>a.nav-invoices{--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M14%202H5v20h14V7ZM14%202v5h5M8%2012h8M8%2016h8%22%2F%3E%3C%2Fsvg%3E")}
     .nav>a.nav-ksef{--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M4%203h10l4%204v5M4%203v18h8M8%208h5m0%2010%203%203%206-7%22%2F%3E%3C%2Fsvg%3E")}
+    .nav>a.nav-architects{--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Ccircle%20cx%3D%229%22%20cy%3D%228%22%20r%3D%223%22%2F%3E%3Cpath%20d%3D%22M3%2021v-2a6%206%200%200%201%2012%200v2M17%205a3%203%200%200%201%200%206M19%2014a5%205%200%200%201%202%204v3%22%2F%3E%3C%2Fsvg%3E")}
     .nav>a.nav-searches{--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M15%2015l6%206M17%2010a7%207%200%201%201-14%200%207%207%200%201%201%2014%200%22%2F%3E%3C%2Fsvg%3E")}
     .nav>a.nav-stock{--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M3%207l9-5%209%205v10l-9%205-9-5ZM3%207l9%205%209-5M12%2012v10%22%2F%3E%3C%2Fsvg%3E")}
     .nav>a.nav-remanent{--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M5%204h14v18H5zM9%204V2h6v2M8%2010l1.5%201.5L12%209M14%2010h3M8%2016l1.5%201.5L12%2015M14%2016h3%22%2F%3E%3C%2Fsvg%3E")}
@@ -6105,6 +6106,7 @@ BASE = r"""
       <a class="nav-shipments {% if request.endpoint == 'shipments' %}active{% endif %}" href="{{ url_for('shipments') }}">Przesyłki</a>
       <a class="nav-invoices" href="{{ url_for('invoices') }}">Faktury</a>
       <a class="nav-ksef" href="{{ url_for('ksef_dashboard') }}">KSeF</a>
+      <a class="nav-architects {% if request.endpoint in ['architects_admin', 'architect_admin_profile'] %}active{% endif %}" href="{{ url_for('architects_admin') }}">Architekci</a>
       <a class="nav-searches {% if request.endpoint == 'client_searches' %}active{% endif %}" href="{{ url_for('client_searches') }}">Wyszukiwania</a>
       <a class="nav-stock" href="{{ url_for('stock') }}">Stan magazynu</a>
       <a class="nav-remanent" href="{{ url_for('remanent_index') }}">Remanent</a>
@@ -6117,7 +6119,6 @@ BASE = r"""
           <a href="{{ url_for('products') }}">Produkty</a>
           <a href="{{ url_for('customers') }}">Klienci</a>
           <a href="{{ url_for('pricing') }}">Cennik</a>
-          <a href="{{ url_for('architects_admin') }}">Architekci</a>
           <a href="{{ url_for('company') }}">Dane mojej firmy</a>
           <a href="{{ url_for('cash_flow') }}">Cash flow</a>
           <a href="{{ url_for('orderchamp_sync_v2.page') }}">Orderchamp</a>
