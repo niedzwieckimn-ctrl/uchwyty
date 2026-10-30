@@ -840,6 +840,7 @@ def register_routes(context):
         top_architects = sorted(
             (row for row in architects if row['stats']['referrals'] > 0),
             key=lambda row: (row['stats']['sales'],row['stats']['referrals']),reverse=True)[:3]
+        pending_architects = [row for row in architects if row.get('status') == 'pending_verification']
         search = norm(request.args.get('q')).casefold()
         status_filter = norm(request.args.get('status'))
         city_filter = norm(request.args.get('city'))
@@ -879,7 +880,7 @@ def register_routes(context):
             sort=sort,page=page,page_count=page_count,filtered_count=filtered_count,
             total_architects=total_architects,total_codes=total_codes,
             redeemed_codes=redeemed_codes,top_architects=top_architects,pln=pln,
-            pending_architects=[a for a in architects if a.get('status') == 'pending_verification'],
-            new_samples_count=sum(1 for s in samples if s.get('status') == 'requested'))
+            pending_architects=pending_architects,
+            new_samples_count=sum(1 for s in stats_samples if s.get('status') == 'requested'))
 
     return {}
