@@ -76,3 +76,4 @@ def test_admin_renders_existing_sample_items_without_dict_method_collision(admin
     assert response.status_code == 200
     assert 'Warianty: STAGING-MOS-003' in response.get_data(as_text=True)
     assert 'Rozliczenia miesięczne' in response.get_data(as_text=True)
+    assert 'name="view" value="settings"' in response.get_data(as_text=True)
