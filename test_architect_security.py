@@ -128,7 +128,7 @@ def test_admin_architect_page_renders_without_program_data():
             session['admin_authenticated']=True
             session['csrf_token']='test-only-token'
         with patch.object(architect_routes,'supabase_request',return_value=[]):
-            response=client.get('/architects')
+            response=client.get('/architects?view=catalog')
     assert response.status_code == 200
     assert 'Treść katalogu architekta'.encode('utf-8') in response.data
 
@@ -151,6 +151,33 @@ def test_admin_architect_list_links_to_profile_and_shows_stats():
     assert response.status_code == 200
     assert f'/architects/{architect_id}'.encode() in response.data
     assert 'Studio K'.encode() in response.data
+
+
+def test_admin_overview_uses_actual_codes_and_opens_separate_profile():
+    architect_id = '0b000000-0000-0000-0000-000000000003'
+    def remote(path, **_kwargs):
+        if path == '/rest/v1/architect_profiles':
+            return [{'id': architect_id, 'first_name': 'Anna', 'last_name': 'Kowalska',
+                     'studio_name': 'Studio K', 'email': 'a@example.com', 'instagram': '@studio',
+                     'status': 'approved', 'sample_entitlements': 1, 'created_at': '2026-10-27'}]
+        if path == '/rest/v1/architect_codes':
+            return [{'id': 'code-1', 'architect_id': architect_id, 'distributor_id': 17,
+                     'status': 'redeemed'}]
+        return []
+    with patch.dict(backend.app.config, {'SECRET_KEY': 'test-only-session-key'}):
+        client = backend.app.test_client()
+        with client.session_transaction() as session:
+            session['admin_authenticated'] = True
+            session['csrf_token'] = 'test-only-token'
+        with patch.object(architect_routes, 'supabase_request', side_effect=remote):
+            response = client.get('/architects')
+    page = response.get_data(as_text=True)
+    assert response.status_code == 200
+    assert 'Zarejestrowani architekci' in page
+    assert 'Zrealizowane kody' in page
+    assert 'code-1' not in page
+    assert f'href="/architects/{architect_id}" target="_blank"' in page
+    assert '128 450' not in page
 
 
 def test_parallel_architect_registration_returns_existing_profile_after_conflict():
