@@ -3,11 +3,12 @@ export function classifyResponse(status, body) {
   if (status === 429 || status >= 500 || status === 408 || (status === 409 && body?.name === 'concurrent_idempotent_requests')) return {status:'RETRY',code:status===429?'PROVIDER_RATE_LIMITED':'PROVIDER_TRANSIENT',id:''};
   return {status:'BLOCKED',code:'PROVIDER_REJECTED',id:''};
 }
-export async function runBatch({rpc,send,getReceipt,sender,testRecipient='',limit=2,prepare}) {
+export async function runBatch({rpc,send,getReceipt,sender,testRecipient='',limit=2,prepare,jobId=''}) {
   const summary={claimed:0,accepted:0,retried:0,receipts:0};
-  for(let i=0;i<Math.min(2,Math.max(0,limit));i++) {
+  for(let i=0;i<(jobId?1:Math.min(2,Math.max(0,limit)));i++) {
     const owner=crypto.randomUUID();
-    const job=await rpc('portal_email_claim',{p_owner:owner,p_sender:sender,p_test_recipient:testRecipient});
+    const job=await rpc(jobId?'portal_email_claim_target':'portal_email_claim',{
+      p_owner:owner,p_sender:sender,p_test_recipient:testRecipient,...(jobId?{p_job_id:jobId}:{})});
     if(!job) break;
     summary.claimed++;
     // Persist rendered account mail before contacting the provider. Retries use
@@ -21,7 +22,7 @@ export async function runBatch({rpc,send,getReceipt,sender,testRecipient='',limi
     if(result.status==='DELIVERED') summary.accepted++;
     if(result.status==='RETRY') summary.retried++;
   }
-  for(const job of await rpc('portal_email_receipts',{})) {
+  for(const job of jobId?[]:await rpc('portal_email_receipts',{})) {
     try {
       const receipt=await getReceipt(job.provider_id);
       if(receipt.id===job.provider_id && ['sent','delivered','delivery_delayed','bounced','complained','failed','suppressed'].includes(receipt.last_event)) {

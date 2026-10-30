@@ -1,5 +1,5 @@
 import {runBatch} from './core.mjs';
-import {prepareWelcomeEmail,DEFAULT_PANEL_URL} from './welcome-render.mjs';
+import {prepareWelcomeEmail,DEFAULT_PANEL_URL} from './welcome/render.mjs';
 const env=(key:string)=>Deno.env.get(key)||'';
 Deno.serve(async(req:Request)=>{
   // Supabase may inject an sb_secret_ key into the legacy-named runtime variable.
@@ -7,6 +7,14 @@ Deno.serve(async(req:Request)=>{
   const service=env('PORTAL_EMAIL_WORKER_BEARER');
   if(!service || req.headers.get('Authorization')!==`Bearer ${service}`) return new Response('Unauthorized',{status:401});
   if(req.method!=='POST') return new Response('Method not allowed',{status:405});
+  let jobId='';
+  try {
+    const input=await req.json().catch(()=>({}));
+    if(input.job_id !== undefined){
+      if(typeof input.job_id!=='string'||!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(input.job_id)) return new Response('Invalid job',{status:400});
+      jobId=input.job_id;
+    }
+  } catch {return new Response('Invalid request',{status:400})}
   const provider=env('RESEND_API_KEY'),sender=env('PORTAL_EMAIL_FROM'),mode=env('PORTAL_EMAIL_MODE');
   const recipient=env('PORTAL_EMAIL_TEST_RECIPIENT');
   if(!provider || !sender || !['staging','production'].includes(mode) || (mode==='staging'&&!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipient)))
@@ -25,7 +33,7 @@ Deno.serve(async(req:Request)=>{
   try {
     // Resolve receipts that arrived before the sender persisted its provider ID.
     await rpc('portal_email_sync_events',{});
-    const summary=await runBatch({rpc,sender,testRecipient:mode==='staging'?recipient:'',
+    const summary=await runBatch({rpc,sender,jobId,testRecipient:mode==='staging'?recipient:'',
       prepare:prepareWelcomeEmail(rpc,env('ARCHITECT_PANEL_URL')||DEFAULT_PANEL_URL),
       send:async(body:unknown,key:string)=>{const r=await providerFetch('/emails',{method:'POST',headers:{'Idempotency-Key':key},body:JSON.stringify(body)});return {status:r.status,body:await r.json().catch(()=>({}))};},
       getReceipt:async(id:string)=>{const r=await providerFetch(`/emails/${encodeURIComponent(id)}`);if(!r.ok)throw new Error('RECEIPT_UNAVAILABLE');return r.json();}
