@@ -4,6 +4,7 @@ import secrets
 import json
 import csv
 import io
+import gzip
 import re
 import unicodedata
 import urllib.error
@@ -26,12 +27,19 @@ def admin_failure_details(exc):
     if not isinstance(exc, urllib.error.HTTPError):
         return fallback, 'TRANSPORT'
     try:
-        payload = json.loads(exc.read(8192).decode('utf-8'))
+        raw = exc.read(32769)
+        if len(raw) > 32768: raise ValueError('Error response too large')
+        if raw.startswith(b'\x1f\x8b'):
+            with gzip.GzipFile(fileobj=io.BytesIO(raw)) as compressed:
+                raw = compressed.read(32769)
+            if len(raw) > 32768: raise ValueError('Decoded error response too large')
+        payload = json.loads(raw.decode('utf-8'))
         code = str(payload.get('code',''))
         if not re.fullmatch(r'[A-Z0-9_]{3,24}',code): code = 'HTTP_' + str(exc.code)
         message = str(payload.get('message',''))
     except (ValueError, UnicodeError, AttributeError, OSError):
-        return fallback, 'HTTP_' + str(exc.code)
+        diagnostic = 'HTTP_' + str(exc.code)
+        return fallback+' Kod dla obsługi: '+diagnostic+'.', diagnostic
     # Our SQL's shortage message contains only a catalog SKU.
     shortage = re.fullmatch(r'Brak stanu magazynowego dla próbki ([A-Za-z0-9_.-]{1,100})',message)
     if shortage:
