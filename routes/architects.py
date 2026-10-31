@@ -799,7 +799,10 @@ def register_routes(context):
                 return_view = norm(request.form.get('return_view'))
                 if return_view not in {'distributors', 'catalog', 'settings'}:
                     return_view = 'settings'
-                return redirect(url_for('architects_admin', view=return_view, result='saved'))
+                return_section = norm(request.form.get('return_section'))
+                if return_section not in {'people','samples','sales','ledger','settlements','ranking'}:
+                    return_section = 'samples' if action in {'sample_status','cancel_sample_item','prepare_sample_shipping'} else 'people'
+                return redirect(url_for('architects_admin', view=return_view,section=return_section,result='saved'))
             except Exception as exc:
                 app.logger.exception('Architect admin action failed: %s', action)
                 if action == 'resend_welcome' and request.accept_mimetypes.best == 'application/json':
@@ -933,8 +936,17 @@ def register_routes(context):
         page = min(max(to_int(request.args.get('page'),1),1),page_count)
         page_architects = architects[(page-1)*page_size:page*page_size]
         view = norm(request.args.get('view'))
+        selected_section = norm(request.args.get('section'))
+        if selected_section not in {'people','samples','sales','ledger','settlements','ranking'}:
+            selected_section = 'people'
+        section_titles = {'people':'Architekci','samples':'Próbki i paczki','sales':'Sprzedaż z programu',
+                          'ledger':'Prowizje','settlements':'Rozliczenia miesięczne','ranking':'Najaktywniejsi architekci'}
+        sample_filter = norm(request.args.get('sample_status'))
+        if sample_filter not in {'requested','preparing','shipped','delivered','cancelled'}: sample_filter = ''
+        if sample_filter:
+            samples = [row for row in samples if row.get('status') == sample_filter]
         program_invoices = supabase_request('/rest/v1/invoices',params={
-            'select':'id,invoice_no','order':'id.desc','limit':200},timeout=20) or [] if view == 'settings' else []
+            'select':'id,invoice_no','order':'id.desc','limit':200},timeout=20) or [] if view == 'settings' and selected_section == 'sales' else []
         code_status = norm(request.args.get('code_status'))
         code_rows = [row for row in stats_codes if not code_status or row.get('status') == code_status]
         template = {'distributors':'architect_distributors.html',
@@ -956,6 +968,7 @@ def register_routes(context):
             code_rows=code_rows,code_status=code_status,
             program_invoices=program_invoices,
             admin_schema_ready=admin_schema_ready,
+            selected_section=selected_section,section_title=section_titles[selected_section],sample_filter=sample_filter,
             new_samples_count=sum(1 for s in stats_samples if s.get('status') == 'requested'))
 
     return {}
