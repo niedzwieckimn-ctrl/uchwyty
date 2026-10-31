@@ -17,3 +17,5 @@
 .au-sample-items .au-sample-cancel{display:block;flex:0 0 auto;margin:0 0 0 12px}.au-sample-cancel button{white-space:nowrap}
 .au-stock-cancelled{color:#63738f}.au-sample>.au-inline{gap:20px}
 @media(max-width:520px){.au-sample-items .au-sample-item{flex-direction:column;align-items:flex-start;gap:14px}.au-sample-items .au-sample-cancel{margin:0}}
+
+.au-profile-editor{padding:18px;border:1px solid #dbe5f5;border-radius:12px;background:#f7faff}.au-profile-editor>summary.btn{display:inline-block;padding:12px 18px;list-style:none;background:#315ca6;color:#fff}.au-profile-editor>summary::-webkit-details-marker{display:none}.au-profile-wide{grid-column:1/-1}.au-profile-editor textarea{display:block;width:100%;box-sizing:border-box;margin-top:6px;padding:12px;border:1px solid #cfd9e8;border-radius:10px;font:inherit;resize:vertical}
