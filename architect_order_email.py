@@ -20,6 +20,7 @@ def order_status(remote, order_id: int) -> dict:
     try:
         rows = remote('/rest/v1/architect_order_email_outbox', params={
             'select': 'status,last_error_code', 'order_id': f'eq.{int(order_id)}',
+            'payload->>notification_audience': 'is.null',
             'limit': 1,
         }, timeout=5)
     except Exception:
