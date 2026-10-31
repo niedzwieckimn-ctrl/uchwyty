@@ -14,6 +14,8 @@ from decimal import Decimal
 
 from architect_pricing import ProgramRules, money, price_line
 from architect_account_email import request_attempt, read_delivery, delivery_state
+from architect_profile_edit import profile_values, validate_profile, save_profile
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
 
 def enrich_sample_availability(remote, samples):
@@ -77,6 +79,8 @@ def admin_failure_details(exc):
              'Nie można potwierdzić dostępności próbek',
              'Nie potwierdzono aktualnego adresu e-mail architekta',
              'Wysyłka wiadomości nie jest jeszcze skonfigurowana'}
+    known.update({'Dane zmieniły się w międzyczasie. Odśwież kartę',
+                  'Ten adres e-mail jest już przypisany do innego konta','Najpierw popraw adres do logowania'})
     if message in known: return message+'.',code
     field = re.search(r'(?:column|constraint|relation|function) "([A-Za-z0-9_.]{1,100})"',message)
     diagnostic = code+(' / '+field[1] if field else '')
@@ -603,6 +607,26 @@ def register_routes(context):
         return send_file(payload,mimetype='text/csv',as_attachment=True,
                          download_name=f'architekci-{kind}.csv',max_age=0)
 
+    @app.post('/architects/<uuid:architect_id>/edit')
+    @require_permission('system.users_manage', operation='architect.program_admin')
+    def architect_admin_profile_edit(architect_id):
+        values=None
+        try:
+            original=URLSafeTimedSerializer(app.secret_key,salt='architect-profile-edit-v1').loads(
+                request.form.get('edit_token',''),max_age=7200)
+            if original.get('id') != str(architect_id): raise ValueError('Odśwież kartę i ponownie otwórz edycję.')
+            values=validate_profile(request.form)
+            save_profile(supabase_request,architect_id,values,original['values'],
+                         str(session.get('admin_username') or 'admin'))
+            session['architect_profile_notice']={'id':str(architect_id),'ok':True,'text':'Dane architekta zostały zapisane.'}
+        except (BadSignature,SignatureExpired):
+            session['architect_profile_notice']={'id':str(architect_id),'ok':False,'text':'Formularz wygasł. Otwórz edycję ponownie.'}
+        except Exception as exc:
+            message,_=admin_failure_details(exc)
+            session['architect_profile_notice']={'id':str(architect_id),'ok':False,'text':message,'values':values}
+            app.logger.warning('Architect profile edit did not complete: %s',type(exc).__name__)
+        return redirect(url_for('architect_admin_profile',architect_id=architect_id),code=303)
+
     @app.get('/architects/<uuid:architect_id>')
     @require_permission('system.users_manage', operation='architect.program_admin')
     def architect_admin_profile(architect_id):
@@ -610,9 +634,14 @@ def register_routes(context):
             'select':'*','id':f'eq.{architect_id}','limit':1},timeout=15) or []
         if not profile_rows: return 'Nie znaleziono architekta',404
         owner=profile_rows[0]
+        profile_notice=session.pop('architect_profile_notice',None)
+        if profile_notice and profile_notice.get('id') != str(architect_id): profile_notice=None
+        edit_token=URLSafeTimedSerializer(app.secret_key,salt='architect-profile-edit-v1').dumps(
+            {'id':str(architect_id),'values':profile_values(owner)})
         welcome_jobs=supabase_request('/rest/v1/architect_order_email_outbox',params={
             'select':'id,status,provider_status,provider_id,created_at', 'architect_id':f'eq.{architect_id}',
             'notification_type':'in.(architect_approved,architect_welcome_resend)',
+            'recipient':'eq.'+str(owner.get('email') or ''),
             'order':'created_at.desc','limit':1},timeout=15) or []
         codes=supabase_request('/rest/v1/architect_codes',params={
             'select':'id,code,distributor_id,status,created_at,expires_at',
@@ -687,6 +716,8 @@ def register_routes(context):
             private_notes=private_code_notes(supabase_request,architect_id,codes)
         return render_template('architect_profile.html',title='Profil architekta',
             profile=owner,samples=samples,codes=codes,redemptions=redemptions,
+            edit_token=edit_token,profile_notice=profile_notice,
+            profile_form=(profile_notice or {}).get('values') or owner,
             ledger=ledger,settlements=settlements,audits=audits,
             welcome_request_id=str(uuid.uuid4()),private_code_notes=private_notes,
             welcome_delivery=delivery_state(welcome_jobs[0]) if welcome_jobs else None,
@@ -1038,12 +1069,13 @@ def register_routes(context):
             try:
                 owner_ids = sorted({s['architect_id'] for s in samples})
                 jobs = supabase_request('/rest/v1/architect_order_email_outbox',params={
-                    'select':'id,status,provider_status,provider_id,payload,created_at',
+                    'select':'id,status,provider_status,provider_id,payload,recipient,created_at',
                     'notification_type':'eq.architect_sample_delay',
                     'architect_id':'in.('+','.join(owner_ids)+')','order':'created_at.desc','limit':200},timeout=10) or [] if owner_ids else []
                 for s in samples:
                     unavailable_ids = {int(i['product_id']) for i in s.get('items',[]) if i.get('stock_state') == 'unavailable'}
-                    job = next((j for j in jobs if (j.get('payload') or {}).get('sample_order_id') == s['id']
+                    job = next((j for j in jobs if str(j.get('recipient') or '').strip().lower() == str(architect_owners.get(s['architect_id'],{}).get('email') or '').strip().lower()
+                        and (j.get('payload') or {}).get('sample_order_id') == s['id']
                         and {int(i['product_id']) for i in (j.get('payload') or {}).get('items',[])} == unavailable_ids),None)
                     if job: s['delay_email'] = {**delivery_state(job),'created_at':job.get('created_at')}
             except Exception:
