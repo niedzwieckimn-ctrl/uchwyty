@@ -1,0 +1,173 @@
+
+<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Program Architektów</title>
+  <style>
+    :root{--navy:#12213d;--navy2:#0b1730;--blue:#5577ee;--blue2:#3f63dc;--mint:#31b98b;--amber:#f5a524;--red:#e05263;--ink:#17233c;--muted:#718096;--bg:#f5f6fa;--line:#e7eaf2;--card:#fff;--radius:22px;--shadow:0 12px 35px rgba(31,45,78,.07)}
+    *{box-sizing:border-box}html{background:var(--bg)}body{font-family:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;background:radial-gradient(circle at 85% -10%,#eaf0ff 0,transparent 28%),var(--bg);color:var(--ink);line-height:1.45}
+    .top{position:fixed;inset:10px auto 10px 10px;width:238px;background:linear-gradient(165deg,var(--navy),var(--navy2));color:#fff;padding:22px 14px;border-radius:26px;display:flex;flex-direction:column;z-index:1100;box-shadow:0 24px 50px rgba(10,24,54,.22);overflow-y:auto}
+    .brand{font-size:19px;font-weight:800;letter-spacing:-.3px;padding:4px 10px 20px;display:flex;align-items:center;gap:10px}.brand:before{content:"◇";display:grid;place-items:center;width:36px;height:36px;border:1px solid rgba(255,255,255,.32);border-radius:12px;background:rgba(255,255,255,.08);font-size:20px}
+    .nav{display:flex!important;flex-direction:column;align-items:stretch!important;gap:5px!important;flex-wrap:nowrap!important;width:100%}.nav a,.nav-drop-btn{display:flex;align-items:center;color:#dce5f7;text-decoration:none;padding:11px 12px;border:0;border-radius:13px;background:transparent;font:inherit;font-size:14px;font-weight:600;cursor:pointer;transition:.18s ease}.nav a:hover,.nav-drop-btn:hover,.nav a.active{background:rgba(93,128,246,.24);color:#fff;transform:translateX(2px)}
+    .nav a:before{width:25px;font-size:16px;opacity:.9}
+    .nav-dropdown{position:relative;display:block}.nav-drop-btn{width:100%;text-align:left}.nav-drop-btn:before{content:"⚙";width:25px}.nav-dropdown-menu{display:none;margin:4px 0 2px 12px;border-left:1px solid rgba(255,255,255,.16);padding:2px 0 2px 8px}.nav-dropdown:hover .nav-dropdown-menu,.nav-dropdown:focus-within .nav-dropdown-menu{display:grid;gap:2px}.nav-dropdown-menu a{font-size:13px;padding:8px 10px}.nav-dropdown-menu a:before{display:none}
+    .top>.right{margin:auto 8px 0!important;padding-top:16px;border-top:1px solid rgba(255,255,255,.13);color:#91a1bd!important;font-size:10px;overflow-wrap:anywhere}
+    .mobile-toggle{display:none}.wrap{max-width:1500px;margin:0 0 0 258px;padding:28px 28px 18px;min-height:100vh}
+    .card{background:rgba(255,255,255,.94);border:1px solid rgba(226,230,239,.9);border-radius:var(--radius);padding:20px;box-shadow:var(--shadow);margin-bottom:16px;overflow-x:auto}.card:hover{border-color:#dce2f1}
+    .row{display:grid;grid-template-columns:1fr 1fr;gap:16px}h1{font-size:26px;letter-spacing:-.7px;margin:0 0 16px}h2{font-size:17px;letter-spacing:-.2px;margin:0 0 13px}.muted{color:var(--muted);font-size:12px}
+    .btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:10px 14px;border:1px solid #dce1eb;border-radius:13px;background:#fff;color:var(--ink);font-weight:650;text-decoration:none;cursor:pointer;box-shadow:0 3px 10px rgba(30,44,75,.04);transition:.18s ease}.btn:hover{transform:translateY(-1px);border-color:#bfc9df;box-shadow:0 7px 16px rgba(30,44,75,.09)}.btn.primary{background:linear-gradient(135deg,var(--blue),var(--blue2));color:#fff;border-color:transparent}.btn.danger{background:#fff0f2;color:#b92d43;border-color:#ffd6dc}.btn.ok{background:#e9faf4;color:#14835f;border-color:#c6f0e2}
+    input,select,textarea{width:100%;padding:11px 13px;border:1px solid #dfe3ec;border-radius:13px;background:#fbfcfe;color:var(--ink);font:inherit;font-size:14px;outline:none;transition:.18s}input:focus,select:focus,textarea:focus{border-color:#7892f3;background:#fff;box-shadow:0 0 0 4px rgba(85,119,238,.11)}textarea{min-height:90px}
+    table{width:100%;border-collapse:separate;border-spacing:0;min-width:660px}th,td{border-bottom:1px solid #edf0f5;padding:12px 11px;text-align:left;vertical-align:middle}th{background:#f8f9fc;color:#64718a;font-size:11px;text-transform:uppercase;letter-spacing:.45px;font-weight:750}thead th:first-child{border-radius:12px 0 0 12px}thead th:last-child{border-radius:0 12px 12px 0}tbody tr{transition:.15s}tbody tr:hover{background:#fafbff}
+    .badge{display:inline-block;padding:5px 10px;border-radius:999px;border:1px solid #dfe4ef;background:#f8faff;color:#526079;font-size:11px;font-weight:700}.st-confirmed,.badge-paid{background:#e8f9f3!important;color:#16835f!important;border-color:#c9efe2!important}.st-unconfirmed{background:#fff1f2!important;color:#be3b50!important;border-color:#ffd7dc!important}.st-delivery{background:#edf3ff!important;color:#4166d3!important;border-color:#d9e4ff!important}.st-issued{background:#f0f2f6!important;color:#667085!important}
+    .flex{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.right{margin-left:auto}.small{font-size:12px}.grid3{display:grid;grid-template-columns:2fr 1fr 1fr;gap:16px}.line{height:1px;background:#edf0f5;margin:16px 0}.hint{background:#fff9e9;border:1px solid #f8e6ae;padding:12px 14px;border-radius:14px;color:#7e641b;font-size:13px}.kpi{display:flex;gap:10px;flex-wrap:wrap}.kpi .pill{background:#f4f7ff;border:1px solid #e1e8fb;padding:8px 11px;border-radius:999px;color:#516582;font-size:12px}.items-row{display:grid;grid-template-columns:2fr 120px 120px 120px;gap:10px;align-items:center}
+    @media(max-width:980px){.top{transform:translateX(-110%);transition:.25s}.top.open{transform:translateX(0)}.mobile-toggle{display:grid;place-items:center;position:fixed;right:14px;bottom:14px;z-index:1200;width:52px;height:52px;border:0;border-radius:17px;background:var(--navy);color:#fff;font-size:22px;box-shadow:0 12px 28px rgba(12,28,58,.28)}.wrap{margin-left:0;padding:18px 14px 80px}.row,.grid3{grid-template-columns:1fr}.items-row{grid-template-columns:1fr 1fr}}
+    @media(max-width:560px){.card{padding:15px;border-radius:18px}.items-row{grid-template-columns:1fr}.flex>.right{margin-left:0}h1{font-size:22px}}
+  </style>
+</head>
+<body><p style="background:#fff1cf;padding:10px;margin:0;text-align:center">PODGLĄD — przykładowe dane, bez połączenia z produkcją</p>
+  <style>
+    .brand.admin-brand{height:92px;padding:0;justify-content:center;overflow:hidden;flex-shrink:0}.brand.admin-brand:before{display:none}.admin-brand img{width:170px;max-width:none;filter:invert(1);mix-blend-mode:screen}
+    .nav>a,.nav-drop-btn{gap:12px}.nav>a:before,.nav-drop-btn:before{content:""!important;display:block;width:21px;height:21px;flex:0 0 21px;background:currentColor;mask:var(--menu-icon) center/contain no-repeat}
+    .nav>a.nav-home{--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M3%2010%2012%203%2021%2010M5%209v12h5v-7h4v7h5V9%22%2F%3E%3C%2Fsvg%3E")}
+    .nav>a.nav-orders{--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M5%204h14v18H5ZM9%202h6v4H9ZM9%2011h6M9%2015h6%22%2F%3E%3C%2Fsvg%3E")}
+    .nav>a.nav-invoices{--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M14%202H5v20h14V7ZM14%202v5h5M8%2012h8M8%2016h8%22%2F%3E%3C%2Fsvg%3E")}
+    .nav>a.nav-ksef{--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M4%203h10l4%204v5M4%203v18h8M8%208h5m0%2010%203%203%206-7%22%2F%3E%3C%2Fsvg%3E")}
+    .nav>a.nav-architects{--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Ccircle%20cx%3D%229%22%20cy%3D%228%22%20r%3D%223%22%2F%3E%3Cpath%20d%3D%22M3%2021v-2a6%206%200%200%201%2012%200v2M17%205a3%203%200%200%201%200%206M19%2014a5%205%200%200%201%202%204v3%22%2F%3E%3C%2Fsvg%3E")}
+    .nav>a.nav-searches{--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M15%2015l6%206M17%2010a7%207%200%201%201-14%200%207%207%200%201%201%2014%200%22%2F%3E%3C%2Fsvg%3E")}
+    .nav>a.nav-stock{--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M3%207l9-5%209%205v10l-9%205-9-5ZM3%207l9%205%209-5M12%2012v10%22%2F%3E%3C%2Fsvg%3E")}
+    .nav>a.nav-remanent{--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M5%204h14v18H5zM9%204V2h6v2M8%2010l1.5%201.5L12%209M14%2010h3M8%2016l1.5%201.5L12%2015M14%2016h3%22%2F%3E%3C%2Fsvg%3E")}
+    .nav>a.nav-import,.nav>a.nav-shipments{--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M2%205h12v12H2ZM14%209h4l4%205v3h-8M8%2019a2%202%200%201%201-4%200%202%202%200%201%201%204%200M20%2019a2%202%200%201%201-4%200%202%202%200%201%201%204%200%22%2F%3E%3C%2Fsvg%3E")}
+    .nav>a.nav-scan{--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M8%202H2v6M16%202h6v6M22%2016v6h-6M8%2022H2v-6M6%206h4v4H6ZM14%206h4v4h-4ZM6%2014h4v4H6ZM14%2014h4v4h-4Z%22%2F%3E%3C%2Fsvg%3E")}
+    .nav>a.nav-ai{--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M5%204h14a2%202%200%200%201%202%202v9a2%202%200%200%201-2%202H9l-5%204v-4a2%202%200%200%201-1-2V6a2%202%200%200%201%202-2Z%22%2F%3E%3Cpath%20d%3D%22m12%207%20.7%201.8L15%209.5l-2.3.7L12%2012l-.7-1.8L9%209.5l2.3-.7L12%207Z%22%2F%3E%3C%2Fsvg%3E")}
+    .nav-drop-btn{--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M4%206h16M4%2012h16M4%2018h16M8%203v6M16%209v6M10%2015v6%22%2F%3E%3C%2Fsvg%3E")}
+    .nav>a.nav-logout{--menu-icon:url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%221.7%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22M10%203H4v18h6M9%2012h12m-5-5%205%205-5%205%22%2F%3E%3C%2Fsvg%3E")}
+  </style>
+  <button class="mobile-toggle" type="button" onclick="document.querySelector('.top').classList.toggle('open')">☰</button>
+  <div class="top">
+    <div class="brand admin-brand"><img src="/static/niedzwieccy-logo.png" alt="Niedźwieccy"></div>
+    <div class="nav flex">
+      <a class="nav-home " href="/">Pulpit</a>
+      <a class="nav-orders " href="/orders">Zamówienia</a>
+      <a class="nav-shipments " href="/shipments">Przesyłki</a>
+      <a class="nav-invoices" href="/invoices">Faktury</a>
+      <a class="nav-ksef" href="/ksef">KSeF</a>
+      <a class="nav-architects active" href="/architects">Architekci</a>
+      <a class="nav-searches " href="/searches">Wyszukiwania</a>
+      <a class="nav-stock" href="/stock">Stan magazynu</a>
+      <a class="nav-remanent" href="/remanent">Remanent</a>
+      <a class="nav-import" href="/china">Import</a>
+      <a class="nav-scan" href="/orders/scan">Skan QR</a>
+      <a class="nav-ai " href="/ai-assistant">Asystent AI</a>
+      <div class="nav-dropdown">
+        <button class="nav-drop-btn" type="button">Ustawienia ▾</button>
+        <div class="nav-dropdown-menu">
+          <a href="/products">Produkty</a>
+          <a href="/customers">Klienci</a>
+          <a href="/pricing">Cennik</a>
+          <a href="/company">Dane mojej firmy</a>
+          <a href="/cash-flow">Cash flow</a>
+          <a href="/admin/orderchamp">Orderchamp</a>
+          <a href="/email-test">Test maili</a>
+        </div>
+      </div>
+      <a class="nav-logout" href="/logout">Wyloguj</a>
+    </div>
+    <div class="right muted">Magazyn główny<br></div>
+  </div>
+
+  <div class="wrap">
+    
+
+<link rel="stylesheet" href="architect-admin-ui.css">
+<style>
+.architect-admin{--ink:#10264b;--blue:#315fe5;--muted:#63738f;color:var(--ink)}
+.architect-admin h1,.architect-admin h2,.architect-admin h3{color:var(--ink);margin:0}
+.architect-admin .intro{margin:5px 0 22px;color:var(--muted)}
+.architect-admin .summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
+.architect-admin .tile,.architect-admin .module{background:#fff;border:1px solid #e6ebf4;border-radius:16px;box-shadow:0 12px 32px rgba(25,49,95,.06);padding:20px}
+.architect-admin .tile small{display:block;color:var(--muted);font-weight:650;margin-bottom:14px}
+.architect-admin .tile>strong{display:block;font-size:2rem;line-height:1.1}
+.architect-admin .rank{margin:11px 0 0;padding:0;list-style:none}
+.architect-admin .rank li{display:flex;justify-content:space-between;gap:10px;border-top:1px solid #edf0f6;padding:9px 0}
+.architect-admin .rank b,.architect-admin .rank small{display:block}
+.architect-admin .rank small{color:var(--muted);font-size:.78rem}
+.architect-admin .list{margin-top:18px}
+.architect-admin .list-head{display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap}
+.architect-admin .filters{display:flex;gap:8px;flex-wrap:wrap;margin:18px 0}
+.architect-admin .filters input{flex:2 1 220px}
+.architect-admin .filters select{flex:1 1 145px}
+.architect-admin .filters input,.architect-admin .filters select{min-height:42px}
+.architect-admin .table-wrap{overflow:auto}
+.architect-admin table{width:100%;border-collapse:collapse;min-width:860px}
+.architect-admin th{text-align:left;color:var(--muted);font-size:.75rem;text-transform:uppercase;letter-spacing:.06em}
+.architect-admin td,.architect-admin th{padding:11px;border-bottom:1px solid #e9edf5}
+.architect-admin td small{display:block;color:var(--muted)}
+.architect-admin .status{display:inline-block;border-radius:99px;padding:5px 9px;background:#edf1fa;font-size:.78rem}
+.architect-admin .status.approved{background:#e4f6eb;color:#087642}
+.architect-admin .status.pending_verification{background:#fff3db;color:#8b5b00}
+.architect-admin .pager{display:flex;gap:8px;align-items:center;justify-content:flex-end;margin-top:14px}
+.architect-admin .modules{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:16px}
+.architect-admin .module{display:block;text-decoration:none;color:var(--ink)}
+.architect-admin .module strong{display:block;margin-bottom:8px}
+.architect-admin .module span{color:var(--muted)}
+.architect-admin .module:hover{border-color:var(--blue);box-shadow:0 12px 32px rgba(49,95,229,.12)}
+@media(max-width:1150px){.architect-admin .summary{grid-template-columns:repeat(3,minmax(0,1fr))}.architect-admin .ranking{grid-column:1/-1}}
+@media(max-width:700px){.architect-admin .summary,.architect-admin .modules{grid-template-columns:1fr}.architect-admin .ranking{grid-column:auto}.architect-admin .tile strong{font-size:1.6rem}}
+</style>
+<div class="architect-admin">
+  <h1>Program Architektów</h1>
+  <p class="intro">Architekci, kody i potwierdzona sprzedaż w jednym miejscu. </p>
+  
+  <div class="au-actions" aria-label="Do zrobienia">
+    <a class="au-action au-green" href="/architects?view=settings&amp;status=pending_verification#architect-people"><b>Architekci do zatwierdzenia</b><strong>0</strong><span>Wszystkie zgłoszenia są obsłużone</span></a>
+    <a class="au-action au-amber" href="/architects?view=settings#architect-samples"><b>Nowe zamówienia próbek</b><strong>1</strong><span>Przejdź do przygotowania paczek</span></a>
+  </div>
+  
+  <div class="summary">
+    <a class="tile au-action" href="/architects?view=settings#architect-people"><small>Zarejestrowani architekci</small><strong>1</strong><small>Otwórz listę i zarządzaj kontami.</small></a>
+    <a class="tile au-action" href="/architects?view=codes"><small>Wygenerowane kody</small><strong>1</strong><small>Zobacz wszystkie kody rabatowe.</small></a>
+    <a class="tile au-action au-green" href="/architects?view=codes&amp;code_status=redeemed"><small>Zrealizowane kody</small><strong>1</strong><small>Zobacz wykorzystane kody.</small></a>
+    <a class="tile ranking au-action au-purple" href="/architects?sort=sales#architect-list"><h2>Najaktywniejsi architekci</h2>
+      <ol class="rank"><li>Brak potwierdzonych realizacji.</li></ol>
+    </a>
+  </div>
+  <section class="tile list" id="architect-list">
+    <div class="list-head"><h2>Lista architektów</h2><span>1 wyników</span></div>
+    <form class="filters" method="get" action="/architects">
+      <input name="q" value="" placeholder="Szukaj osoby lub pracowni" aria-label="Szukaj architekta">
+      <select name="city" aria-label="Miasto"><option value="">Wszystkie miasta</option></select>
+      <select name="status" aria-label="Status"><option value="">Wszystkie statusy</option><option value="pending_verification" >Oczekujące</option><option value="approved" >Aktywni</option><option value="rejected" >Odrzuceni</option><option value="suspended" >Zawieszeni</option></select>
+      <select name="sort" aria-label="Sortowanie"><option value="newest" selected>Najnowsi</option><option value="name" >Pracownia A–Z</option><option value="orders" >Najwięcej realizacji</option><option value="sales" >Największa sprzedaż</option><option value="earnings" >Najwyższa prowizja</option></select>
+      <button class="btn" type="submit">Pokaż</button>
+    </form>
+    <div class="table-wrap"><table><thead><tr><th>Pracownia</th><th>Architekt</th><th>Miasto</th><th>Realizacje</th><th>Sprzedaż netto</th><th>Prowizja netto</th><th>Status</th><th>Akcje</th></tr></thead><tbody>
+      <tr>
+        <td>Studio &amp; Dom</td><td>Anna Kowalska</td><td>Brak miasta</td>
+        <td>0</td><td>0,00 zł</td><td>0,00 zł</td>
+        <td><span class="status approved">Aktywny</span></td>
+        <td><a href="/architects/11111111-1111-4111-8111-111111111111" target="_blank" rel="noopener" aria-label="Otwórz kartę Anna Kowalska w nowej karcie">Otwórz kartę</a></td>
+      </tr>
+    </tbody></table></div>
+    <div class="pager"><span>Strona 1 z 1</span>
+      
+      
+    </div>
+  </section>
+  <nav class="modules" aria-label="Moduły programu">
+    <a class="module" href="/architects?view=distributors"><strong>Dystrybutorzy programu</strong><span>Wybór z istniejącej kartoteki IKUGO.</span></a>
+    <a class="module" href="/architects?view=catalog"><strong>Katalog architekta</strong><span>Widoczność i dane produktów ze wspólnego katalogu.</span></a>
+    <a class="module" href="/architects?view=settings"><strong>Obsługa i rozliczenia</strong><span>Weryfikacja, próbki, prowizje i wypłaty.</span></a>
+  </nav>
+</div>
+
+    <div class="muted small" style="margin:14px 2px;">Dane na dysku: <b></b></div>
+  </div>
+
+
+
+<div id="panel-navigation-status" role="status" hidden style="position:fixed;top:12px;right:18px;z-index:1300;background:#12213d;color:white;padding:10px 18px;border-radius:12px;box-shadow:0 8px 24px #12213d33"></div>
+
+</body>
+</html>
