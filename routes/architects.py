@@ -16,6 +16,31 @@ from architect_pricing import ProgramRules, money, price_line
 from architect_account_email import request_attempt, read_delivery, delivery_state
 
 
+def enrich_sample_availability(remote, samples):
+    """Admin read only: unavailable, available and unknown are distinct states."""
+    pending = [s for s in samples if s.get('status') in {'requested','preparing'} and not s.get('fulfillment_order_id')]
+    ids = sorted({int(i['product_id']) for s in pending for i in s.get('items',[]) if not i.get('cancelled_at')})
+    stock = {}
+    if ids:
+        try:
+            rows = remote('/rest/v1/stock',params={'select':'product_id,qty',
+                'product_id':'in.('+','.join(map(str,ids))+')','limit':len(ids)},timeout=15)
+            if not isinstance(rows,list): raise ValueError('Stock unavailable')
+            stock = {int(row['product_id']):int(row['qty']) for row in rows if row.get('qty') is not None}
+        except Exception:
+            stock = {}  # A failed read is unknown availability, never zero stock.
+    for s in pending:
+        s['has_unavailable'] = False
+        s['has_unknown_stock'] = False
+        for item in s.get('items',[]):
+            if item.get('cancelled_at'): continue
+            quantity = stock.get(int(item['product_id']))
+            state = 'unknown' if quantity is None else 'available' if quantity >= int(item.get('qty') or 1) else 'unavailable'
+            item['stock_state'] = state
+            s['has_unavailable'] |= state == 'unavailable'
+            s['has_unknown_stock'] |= state == 'unknown'
+
+
 def admin_failure_details(exc):
     """Expose only recognised business messages and structural DB diagnostics.
 
@@ -47,7 +72,11 @@ def admin_failure_details(exc):
     known = {'Ten pakiet nie oczekuje na przygotowanie','Konto architekta nie jest aktywne',
              'Pakiet nie zawiera próbek do wysyłki','Ten pakiet jest obsługiwany w module przesyłek magazynu',
              'Pakiet przekazano do wysyłki albo zakończono. Nie zmieniono jego zawartości',
-             'Konto zostało trwale usunięte z programu'}
+             'Konto zostało trwale usunięte z programu',
+             'Wszystkie wybrane próbki są dostępne w magazynie',
+             'Nie można potwierdzić dostępności próbek',
+             'Nie potwierdzono aktualnego adresu e-mail architekta',
+             'Wysyłka wiadomości nie jest jeszcze skonfigurowana'}
     if message in known: return message+'.',code
     field = re.search(r'(?:column|constraint|relation|function) "([A-Za-z0-9_.]{1,100})"',message)
     diagnostic = code+(' / '+field[1] if field else '')
@@ -57,7 +86,7 @@ def admin_failure_details(exc):
               '23514':'Dane zlecenia nie spełniają reguły zapisanej w bazie.',
               '42703':'Przygotowanie paczki odwołuje się do pola niedostępnego w bazie.',
               '42501':'Funkcja przygotowania paczki nie ma wymaganych uprawnień.',
-              'PGRST202':'Baza nie udostępnia wymaganej funkcji przygotowania paczki.'}
+              'PGRST202':'Baza nie udostępnia funkcji potrzebnej do tej operacji. Dokończ aktualizację programu.'}
     return labels.get(code,fallback)+' Kod dla obsługi: '+diagnostic+'.', diagnostic
 
 
@@ -698,6 +727,15 @@ def register_routes(context):
                     if product_id <= 0: raise ValueError('Wybierz próbkę do anulowania')
                     supabase_request('/rest/v1/rpc/architect_cancel_sample_item',method='POST',
                         payload={'p_sample_id':sample_id,'p_product_id':product_id,'p_actor':actor},timeout=20)
+                elif action == 'notify_sample_delay':
+                    sample_id = str(uuid.UUID(norm(request.form.get('sample_id'))))
+                    job = supabase_request('/rest/v1/rpc/architect_notify_sample_delay',method='POST',
+                        payload={'p_sample_id':sample_id,'p_actor':actor},timeout=20)
+                    if not isinstance(job,dict) or not job.get('job_id'):
+                        raise ValueError('Nie potwierdzono zapisania informacji do wysyłki. Odśwież status przed ponowieniem.')
+                    if job.get('queued'): request_attempt(supabase_request,job['job_id'])
+                    return redirect(url_for('architects_admin',view='settings',section='samples',
+                        result='delay_queued' if job.get('queued') else 'delay_existing'))
                 elif action == 'prepare_sample_shipping':
                     sample_id = str(uuid.UUID(norm(request.form.get('sample_id'))))
                     order_id = supabase_request('/rest/v1/rpc/architect_prepare_sample_shipping',method='POST',
@@ -858,7 +896,7 @@ def register_routes(context):
                 session['architect_admin_notice'] = message
                 section = norm(request.form.get('return_section'))
                 if section not in {'people','samples','sales','ledger','settlements','ranking'}:
-                    section = 'samples' if action in {'sample_status','cancel_sample_item','prepare_sample_shipping'} else 'people'
+                    section = 'samples' if action in {'sample_status','cancel_sample_item','prepare_sample_shipping','notify_sample_delay'} else 'people'
                 return redirect(url_for('architects_admin',view='settings',section=section),code=303)
         architects = supabase_request('/rest/v1/architect_profiles',params={
             # Optional 028 fields are read when present. An older schema must
@@ -995,6 +1033,21 @@ def register_routes(context):
         if sample_filter not in {'requested','preparing','shipped','delivered','cancelled'}: sample_filter = ''
         if sample_filter:
             samples = [row for row in samples if row.get('status') == sample_filter]
+        if view == 'settings' and selected_section == 'samples':
+            enrich_sample_availability(supabase_request,samples)
+            try:
+                owner_ids = sorted({s['architect_id'] for s in samples})
+                jobs = supabase_request('/rest/v1/architect_order_email_outbox',params={
+                    'select':'id,status,provider_status,provider_id,payload,created_at',
+                    'notification_type':'eq.architect_sample_delay',
+                    'architect_id':'in.('+','.join(owner_ids)+')','order':'created_at.desc','limit':200},timeout=10) or [] if owner_ids else []
+                for s in samples:
+                    unavailable_ids = {int(i['product_id']) for i in s.get('items',[]) if i.get('stock_state') == 'unavailable'}
+                    job = next((j for j in jobs if (j.get('payload') or {}).get('sample_order_id') == s['id']
+                        and {int(i['product_id']) for i in (j.get('payload') or {}).get('items',[])} == unavailable_ids),None)
+                    if job: s['delay_email'] = {**delivery_state(job),'created_at':job.get('created_at')}
+            except Exception:
+                for s in samples: s['delay_email_status_unavailable'] = True
         program_invoices = supabase_request('/rest/v1/invoices',params={
             'select':'id,invoice_no','order':'id.desc','limit':200},timeout=20) or [] if view == 'settings' and selected_section == 'sales' else []
         code_status = norm(request.args.get('code_status'))
