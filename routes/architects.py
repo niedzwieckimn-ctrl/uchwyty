@@ -808,15 +808,18 @@ def register_routes(context):
                 return render_template('architect_admin.html',title='Architekci',error=message,
                     architects=[],samples=[],distributors=[],sale_lines=[],ledger=[],settlements=[],products=[],product_details=[]),400
         architects = supabase_request('/rest/v1/architect_profiles',params={
-            'select':'id,first_name,last_name,studio_name,email,instagram,shipping_address,status,sample_entitlements,created_at,removed_at',
+            # Optional 028 fields are read when present. An older schema must
+            # still render the existing programme instead of failing the GET.
+            'select':'*',
             'order':'created_at.desc','limit':5000},timeout=20) or []
+        admin_schema_ready = bool(architects) and all('removed_at' in row for row in architects)
         samples = supabase_request('/rest/v1/architect_sample_orders',params={
-            'select':'id,architect_id,shipping_address,status,tracking_no,created_at,fulfillment_order_id',
+            'select':'*',
             'order':'created_at.desc','limit':200},timeout=20) or []
         if samples:
             ids=','.join(x['id'] for x in samples)
             sample_items=supabase_request('/rest/v1/architect_sample_items',params={
-                'select':'sample_order_id,product_id,qty,cancelled_at',
+                'select':'*',
                 'sample_order_id':f'in.({ids})','limit':600},timeout=20) or []
             for row in samples:
                 row['items']=[x for x in sample_items if x['sample_order_id']==row['id']]
@@ -952,6 +955,7 @@ def register_routes(context):
             pending_architects=pending_architects,architect_owners=architect_owners,
             code_rows=code_rows,code_status=code_status,
             program_invoices=program_invoices,
+            admin_schema_ready=admin_schema_ready,
             new_samples_count=sum(1 for s in stats_samples if s.get('status') == 'requested'))
 
     return {}
