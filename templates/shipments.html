@@ -43,6 +43,7 @@
   <div class="flex">
     {% if c.tracking_url %}<a class="btn primary" href="{{ c.tracking_url }}" target="_blank" rel="noopener">Śledź przesyłkę</a>
     {% elif c.sent %}<a class="btn primary" href="/orders/{{ c.root }}">Zamówienie</a>
+    {% elif c.sample_package %}<a class="btn primary" href="{{ url_for('shipment_continue',key=c.key) }}">Nadaj pakiet próbek</a>
     {% elif c.invoice_id %}<a class="btn primary" href="{{ url_for('shipment_continue',key=c.key) }}">{{ 'Nadaj przesyłkę' if c.invoice and c.invoice.publication_state == 'complete' else 'Dokończ fakturę' }}</a>
     {% else %}<a class="btn primary" href="{{ url_for('shipment_continue',key=c.key) }}">Wystaw fakturę</a>{% endif %}
     {% if not c.sent or c.tracking_url %}<a class="btn" href="/orders/{{ c.root }}">Zamówienie</a>{% endif %}

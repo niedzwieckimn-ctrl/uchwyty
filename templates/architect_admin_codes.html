@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block content %}
+{% import "architect_admin_ui.html" as ui with context %}
+<link rel="stylesheet" href="{{ url_for('static',filename='architect-admin-ui.css') }}">
+<div class="architect-settings"><header class="au-head"><div><h1>Kody rabatowe</h1><p>Sprawdź, kto utworzył kod i w którym sklepie można go wykorzystać.</p></div><a class="btn" href="{{ url_for('architects_admin') }}">Wróć do podsumowania</a></header>
+<nav class="au-nav"><a href="{{ url_for('architects_admin',view='codes') }}">Wszystkie kody</a><a href="{{ url_for('architects_admin',view='codes',code_status='active') }}">Aktywne</a><a href="{{ url_for('architects_admin',view='codes',code_status='redeemed') }}">Wykorzystane</a></nav>
+<section class="card au-table"><table><thead><tr><th>Kod</th><th>Architekt</th><th>Sklep</th><th>Ważność</th><th>Status</th></tr></thead><tbody>{% for code in code_rows %}{% set stores=customers|selectattr('id','equalto',code.distributor_id)|list %}<tr><td><b>{{ code.code }}</b></td><td>{{ ui.owner(code.architect_id,architect_owners) }}</td><td>{{ stores[0].name if stores else 'Sklep niedostępny' }}</td><td>{{ ui.date(code.expires_at) }}</td><td>{{ ui.status(code.status) }}</td></tr>{% else %}<tr><td colspan="5">Brak kodów w wybranej grupie.</td></tr>{% endfor %}</tbody></table></section></div>
+{% endblock %}

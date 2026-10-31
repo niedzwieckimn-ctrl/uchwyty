@@ -1,0 +1,13 @@
+{% macro date(value) -%}
+{% set value = value|string if value else '' %}{{ value[8:10] ~ '.' ~ value[5:7] ~ '.' ~ value[:4] if value|length >= 10 else 'Brak daty' }}
+{%- endmacro %}
+{% macro status(value) -%}
+<span class="au-status au-{{ value }}">{{ {'approved':'Zatwierdzone','pending_verification':'Do zatwierdzenia','rejected':'Odrzucone','suspended':'Dostęp zamknięty','requested':'Nowe zgłoszenie','preparing':'W przygotowaniu','shipped':'Wysłane','delivered':'Doręczone','cancelled':'Anulowane','pending':'Do zatwierdzenia','settled':'W rozliczeniu','paid':'Wypłacone','draft':'Robocze','active':'Aktywne','redeemed':'Wykorzystane','expired':'Wygasłe','accrual':'Prowizja','reversal':'Korekta'}.get(value,'Do sprawdzenia') }}</span>
+{%- endmacro %}
+{% macro owner(id, owners) -%}
+{% set a = owners.get(id,{}) %}<a href="{{ url_for('architect_admin_profile',architect_id=id) }}">{{ a.get('first_name','') }} {{ a.get('last_name','') }}{% if not a %}Karta architekta{% endif %}</a>{% if a.get('studio_name') %}<small>{{ a.studio_name }}</small>{% endif %}
+{%- endmacro %}
+{% macro csrf(action) -%}<input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}"><input type="hidden" name="action" value="{{ action }}">{%- endmacro %}
+{% macro instagram(value) -%}
+{% if value and (value.startswith('https://www.instagram.com/') or value.startswith('https://instagram.com/')) %}<a href="{{ value }}" target="_blank" rel="noopener noreferrer">Zobacz Instagram</a>{% elif value %}<small>{{ value }}</small>{% endif %}
+{%- endmacro %}

@@ -1,13 +1,15 @@
 {% extends "base.html" %}
 {% block content %}
+{% import "architect_admin_ui.html" as ui with context %}
+<link rel="stylesheet" href="{{ url_for('static',filename='architect-admin-ui.css') }}">
 <style>
 .architect-admin{--ink:#10264b;--blue:#315fe5;--muted:#63738f;color:var(--ink)}
 .architect-admin h1,.architect-admin h2,.architect-admin h3{color:var(--ink);margin:0}
 .architect-admin .intro{margin:5px 0 22px;color:var(--muted)}
-.architect-admin .summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr)) minmax(260px,1.6fr);gap:12px}
+.architect-admin .summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
 .architect-admin .tile,.architect-admin .module{background:#fff;border:1px solid #e6ebf4;border-radius:16px;box-shadow:0 12px 32px rgba(25,49,95,.06);padding:20px}
 .architect-admin .tile small{display:block;color:var(--muted);font-weight:650;margin-bottom:14px}
-.architect-admin .tile strong{display:block;font-size:2rem;line-height:1.1}
+.architect-admin .tile>strong{display:block;font-size:2rem;line-height:1.1}
 .architect-admin .rank{margin:11px 0 0;padding:0;list-style:none}
 .architect-admin .rank li{display:flex;justify-content:space-between;gap:10px;border-top:1px solid #edf0f6;padding:9px 0}
 .architect-admin .rank b,.architect-admin .rank small{display:block}
@@ -37,24 +39,22 @@
 </style>
 <div class="architect-admin">
   <h1>Program Architektów</h1>
-  <p class="intro">Architekci, kody i potwierdzona sprzedaż w jednym miejscu. Dane pochodzą z bieżącej bazy IKUGO.</p>
+  <p class="intro">Architekci, kody i potwierdzona sprzedaż w jednym miejscu. </p>
   {% if request.args.get('result') == 'saved' %}<p role="status">Zapisano operację.</p>{% endif %}
-  <section class="tile" aria-label="Nowe akcje" style="margin-bottom:18px;border-color:#B39461">
-    <h2>Nowi architekci do zatwierdzenia: {{ pending_architects|length }}</h2>
-    <p>Zgłoszenia pozostają tutaj do podjęcia decyzji, niezależnie od filtrów poniżej.</p>
-    <ul class="rank">{% for a in pending_architects %}<li><span><b>{{ a.first_name }} {{ a.last_name }} · {{ a.studio_name }}</b><small>{{ a.email }} · {{ a.created_at }}</small></span><a class="btn" href="{{ url_for('architect_admin_profile',architect_id=a.id) }}">Sprawdź zgłoszenie</a></li>{% else %}<li>Wszystkie zgłoszenia zostały obsłużone.</li>{% endfor %}</ul>
-    <p><a href="{{ url_for('architects_admin',view='settings') }}">Nowe zamówienia próbek: {{ new_samples_count }} →</a></p>
-    <a class="btn" href="{{ url_for('architects_admin') }}">Odśwież nowe akcje</a>
-  </section>
-  <div class="summary">
-    <div class="tile"><small>Zarejestrowani architekci</small><strong>{{ total_architects }}</strong><small>Wszystkie zgłoszenia, również oczekujące.</small></div>
-    <div class="tile"><small>Wygenerowane kody</small><strong>{{ total_codes }}</strong><small>Kody utworzone przez architektów.</small></div>
-    <div class="tile"><small>Zrealizowane kody</small><strong>{{ redeemed_codes }}</strong><small>Kody powiązane z zamówieniem.</small></div>
-    <div class="tile ranking"><h2>Najaktywniejsi architekci</h2>
-      <ol class="rank">{% for a in top_architects %}<li><span><b>{{ loop.index }}. {{ a.first_name }} {{ a.last_name }}</b><small>{{ a.studio_name }} · {{ a.stats.referrals }} realizacji</small></span><b>{{ pln(a.stats.sales) }}</b></li>{% else %}<li>Brak potwierdzonych realizacji.</li>{% endfor %}</ol>
-    </div>
+  <div class="au-actions" aria-label="Do zrobienia">
+    <a class="au-action {{ 'au-amber' if pending_architects else 'au-green' }}" href="{{ url_for('architects_admin',view='settings',status='pending_verification') }}#architect-people"><b>Architekci do zatwierdzenia</b><strong>{{ pending_architects|length }}</strong><span>{{ 'Sprawdź nowe zgłoszenia' if pending_architects else 'Wszystkie zgłoszenia są obsłużone' }}</span></a>
+    <a class="au-action {{ 'au-amber' if new_samples_count else 'au-green' }}" href="{{ url_for('architects_admin',view='settings') }}#architect-samples"><b>Nowe zamówienia próbek</b><strong>{{ new_samples_count }}</strong><span>{{ 'Przejdź do przygotowania paczek' if new_samples_count else 'Brak nowych paczek do przygotowania' }}</span></a>
   </div>
-  <section class="tile list">
+  {% if pending_architects %}<section class="tile" style="margin-bottom:18px"><h2>Nowe zgłoszenia</h2><ul class="rank">{% for a in pending_architects %}<li><span><b>{{ a.first_name }} {{ a.last_name }}</b><small>{{ a.studio_name }} · {{ ui.date(a.created_at) }}</small></span><a class="btn" href="{{ url_for('architect_admin_profile',architect_id=a.id) }}">Sprawdź zgłoszenie</a></li>{% endfor %}</ul></section>{% endif %}
+  <div class="summary">
+    <a class="tile au-action" href="{{ url_for('architects_admin',view='settings') }}#architect-people"><small>Zarejestrowani architekci</small><strong>{{ total_architects }}</strong><small>Otwórz listę i zarządzaj kontami.</small></a>
+    <a class="tile au-action" href="{{ url_for('architects_admin',view='codes') }}"><small>Wygenerowane kody</small><strong>{{ total_codes }}</strong><small>Zobacz wszystkie kody rabatowe.</small></a>
+    <a class="tile au-action au-green" href="{{ url_for('architects_admin',view='codes',code_status='redeemed') }}"><small>Zrealizowane kody</small><strong>{{ redeemed_codes }}</strong><small>Zobacz wykorzystane kody.</small></a>
+    <a class="tile ranking au-action au-purple" href="{{ url_for('architects_admin',sort='sales') }}#architect-list"><h2>Najaktywniejsi architekci</h2>
+      <ol class="rank">{% for a in top_architects %}<li><span><b>{{ loop.index }}. {{ a.first_name }} {{ a.last_name }}</b><small>{{ a.studio_name }} · {{ a.stats.referrals }} realizacji</small></span><b>{{ pln(a.stats.sales) }}</b></li>{% else %}<li>Brak potwierdzonych realizacji.</li>{% endfor %}</ol>
+    </a>
+  </div>
+  <section class="tile list" id="architect-list">
     <div class="list-head"><h2>Lista architektów</h2><span>{{ filtered_count }} wyników</span></div>
     <form class="filters" method="get" action="{{ url_for('architects_admin') }}">
       <input name="q" value="{{ search }}" placeholder="Szukaj osoby lub pracowni" aria-label="Szukaj architekta">
@@ -63,12 +63,12 @@
       <select name="sort" aria-label="Sortowanie">{% for value,label in [('newest','Najnowsi'),('name','Pracownia A–Z'),('orders','Najwięcej realizacji'),('sales','Największa sprzedaż'),('earnings','Najwyższa prowizja')] %}<option value="{{ value }}" {% if sort == value %}selected{% endif %}>{{ label }}</option>{% endfor %}</select>
       <button class="btn" type="submit">Pokaż</button>
     </form>
-    <div class="table-wrap"><table><thead><tr><th>Pracownia</th><th>Architekt</th><th>Miasto</th><th>Zamówienia</th><th>Sprzedaż netto</th><th>Prowizja netto</th><th>Status</th><th>Akcje</th></tr></thead><tbody>
+    <div class="table-wrap"><table><thead><tr><th>Pracownia</th><th>Architekt</th><th>Miasto</th><th>Realizacje</th><th>Sprzedaż netto</th><th>Prowizja netto</th><th>Status</th><th>Akcje</th></tr></thead><tbody>
       {% for a in architects %}<tr>
-        <td>{{ a.studio_name }}</td><td>{{ a.first_name }} {{ a.last_name }}</td><td>{{ a.city or '—' }}</td>
+        <td>{{ a.studio_name }}</td><td>{{ a.first_name }} {{ a.last_name }}</td><td>{{ a.city or 'Brak miasta' }}</td>
         <td>{{ a.stats.referrals }}</td><td>{{ pln(a.stats.sales) }}</td><td>{{ pln(a.stats.earnings) }}</td>
         <td><span class="status {{ a.status }}">{{ {'approved':'Aktywny','pending_verification':'Oczekuje','rejected':'Odrzucony','suspended':'Zawieszony'}.get(a.status,a.status) }}</span></td>
-        <td><a href="{{ url_for('architect_admin_profile',architect_id=a.id) }}" target="_blank" rel="noopener" aria-label="Otwórz kartę {{ a.first_name }} {{ a.last_name }} w nowej karcie">Otwórz ↗</a></td>
+        <td><a href="{{ url_for('architect_admin_profile',architect_id=a.id) }}" target="_blank" rel="noopener" aria-label="Otwórz kartę {{ a.first_name }} {{ a.last_name }} w nowej karcie">Otwórz kartę</a></td>
       </tr>{% else %}<tr><td colspan="8">Brak architektów spełniających kryteria.</td></tr>{% endfor %}
     </tbody></table></div>
     <div class="pager"><span>Strona {{ page }} z {{ page_count }}</span>
@@ -77,9 +77,9 @@
     </div>
   </section>
   <nav class="modules" aria-label="Moduły programu">
-    <a class="module" href="{{ url_for('architects_admin',view='distributors') }}"><strong>Dystrybutorzy programu →</strong><span>Wybór z istniejącej kartoteki IKUGO.</span></a>
-    <a class="module" href="{{ url_for('architects_admin',view='catalog') }}"><strong>Katalog architekta →</strong><span>Widoczność i dane produktów ze wspólnego katalogu.</span></a>
-    <a class="module" href="{{ url_for('architects_admin',view='settings') }}"><strong>Ustawienia i rozliczenia →</strong><span>Weryfikacja, próbki, prowizje i wypłaty.</span></a>
+    <a class="module" href="{{ url_for('architects_admin',view='distributors') }}"><strong>Dystrybutorzy programu</strong><span>Wybór z istniejącej kartoteki IKUGO.</span></a>
+    <a class="module" href="{{ url_for('architects_admin',view='catalog') }}"><strong>Katalog architekta</strong><span>Widoczność i dane produktów ze wspólnego katalogu.</span></a>
+    <a class="module" href="{{ url_for('architects_admin',view='settings') }}"><strong>Obsługa i rozliczenia</strong><span>Weryfikacja, próbki, prowizje i wypłaty.</span></a>
   </nav>
 </div>
 {% endblock %}
