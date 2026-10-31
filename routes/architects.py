@@ -637,7 +637,29 @@ def register_routes(context):
         if request.method == 'POST':
             action = norm(request.form.get('action'))
             try:
-                if action == 'review':
+                if action == 'remove_architect':
+                    architect_id = str(uuid.UUID(norm(request.form.get('architect_id'))))
+                    if norm(request.form.get('confirmation')) != 'USUŃ':
+                        raise ValueError('Wpisz USUŃ, aby potwierdzić zamknięcie konta')
+                    reason = norm(request.form.get('reason'))
+                    if len(reason) < 10:
+                        raise ValueError('Podaj powód usunięcia konta (co najmniej 10 znaków)')
+                    supabase_request('/rest/v1/rpc/architect_remove_from_program',method='POST',
+                        payload={'p_architect_id':architect_id,'p_reason':reason,'p_actor':actor},timeout=20)
+                elif action == 'cancel_sample_item':
+                    sample_id = str(uuid.UUID(norm(request.form.get('sample_id'))))
+                    product_id = to_int(request.form.get('product_id'),0)
+                    if product_id <= 0: raise ValueError('Wybierz próbkę do anulowania')
+                    supabase_request('/rest/v1/rpc/architect_cancel_sample_item',method='POST',
+                        payload={'p_sample_id':sample_id,'p_product_id':product_id,'p_actor':actor},timeout=20)
+                elif action == 'prepare_sample_shipping':
+                    sample_id = str(uuid.UUID(norm(request.form.get('sample_id'))))
+                    order_id = supabase_request('/rest/v1/rpc/architect_prepare_sample_shipping',method='POST',
+                        payload={'p_sample_id':sample_id,'p_actor':actor},timeout=30)
+                    if not order_id: raise ValueError('Nie potwierdzono przygotowania paczki. Odśwież listę przed ponowieniem.')
+                    maybe_pull_shared_from_supabase(force=True)
+                    return redirect(url_for('order_packing_list_download_admin',order_id=int(order_id)))
+                elif action == 'review':
                     architect_id = str(uuid.UUID(norm(request.form.get('architect_id'))))
                     status = norm(request.form.get('status'))
                     if status not in {'approved','rejected','suspended'}:
@@ -782,18 +804,19 @@ def register_routes(context):
                 app.logger.exception('Architect admin action failed: %s', action)
                 if action == 'resend_welcome' and request.accept_mimetypes.best == 'application/json':
                     return jsonify(ok=False,error='Nie udało się rozpocząć wysyłki. Odśwież status lub spróbuj później.'),400
-                return render_template('architect_admin.html',title='Architekci',error=str(exc),
+                message = str(exc) if isinstance(exc, ValueError) else 'Nie udało się zapisać zmiany. Odśwież widok i sprawdź aktualny stan przed ponowieniem.'
+                return render_template('architect_admin.html',title='Architekci',error=message,
                     architects=[],samples=[],distributors=[],sale_lines=[],ledger=[],settlements=[],products=[],product_details=[]),400
         architects = supabase_request('/rest/v1/architect_profiles',params={
-            'select':'id,first_name,last_name,studio_name,email,instagram,shipping_address,status,sample_entitlements,created_at',
+            'select':'id,first_name,last_name,studio_name,email,instagram,shipping_address,status,sample_entitlements,created_at,removed_at',
             'order':'created_at.desc','limit':5000},timeout=20) or []
         samples = supabase_request('/rest/v1/architect_sample_orders',params={
-            'select':'id,architect_id,shipping_address,status,tracking_no,created_at',
+            'select':'id,architect_id,shipping_address,status,tracking_no,created_at,fulfillment_order_id',
             'order':'created_at.desc','limit':200},timeout=20) or []
         if samples:
             ids=','.join(x['id'] for x in samples)
             sample_items=supabase_request('/rest/v1/architect_sample_items',params={
-                'select':'sample_order_id,product_id,qty',
+                'select':'sample_order_id,product_id,qty,cancelled_at',
                 'sample_order_id':f'in.({ids})','limit':600},timeout=20) or []
             for row in samples:
                 row['items']=[x for x in sample_items if x['sample_order_id']==row['id']]
@@ -826,7 +849,7 @@ def register_routes(context):
             'select':'product_id,material,mounting_spacing,dimensions,finish,vat_rate,retail_gross_override,updated_at',
             'order':'product_id.asc','limit':5000},timeout=20) or []
         stats_codes = supabase_request('/rest/v1/architect_codes',params={
-            'select':'id,architect_id,distributor_id,status','limit':5000},timeout=20) or []
+            'select':'id,architect_id,distributor_id,code,status,created_at,expires_at','limit':5000},timeout=20) or []
         stats_redemptions = supabase_request('/rest/v1/architect_code_redemptions',params={
             'select':'id,distributor_id','limit':5000},timeout=20) or []
         stats_samples = supabase_request('/rest/v1/architect_sample_orders',params={
@@ -870,6 +893,11 @@ def register_routes(context):
             distributor['redemptions_count'] = sum(
                 to_int(redemption.get('distributor_id'), 0) == customer_id
                 for redemption in stats_redemptions)
+        architect_owners = {row['id']: row for row in architects}
+        if request.args.get('show_removed') == '1':
+            architects = [row for row in architects if row.get('removed_at')]
+        else:
+            architects = [row for row in architects if not row.get('removed_at')]
         total_architects = len(architects)
         total_codes = len(stats_codes)
         redeemed_codes = sum(code.get('status') == 'redeemed' for code in stats_codes)
@@ -902,9 +930,14 @@ def register_routes(context):
         page = min(max(to_int(request.args.get('page'),1),1),page_count)
         page_architects = architects[(page-1)*page_size:page*page_size]
         view = norm(request.args.get('view'))
+        program_invoices = supabase_request('/rest/v1/invoices',params={
+            'select':'id,invoice_no','order':'id.desc','limit':200},timeout=20) or [] if view == 'settings' else []
+        code_status = norm(request.args.get('code_status'))
+        code_rows = [row for row in stats_codes if not code_status or row.get('status') == code_status]
         template = {'distributors':'architect_distributors.html',
                     'catalog':'architect_catalog_admin.html',
-                    'settings':'architect_admin.html'}.get(view,'architect_admin_overview.html')
+                    'settings':'architect_admin.html',
+                    'codes':'architect_admin_codes.html'}.get(view,'architect_admin_overview.html')
         def pln(value):
             return f"{Decimal(str(value or 0)):,.2f}".replace(',',' ').replace('.',',') + ' zł'
         return render_template(template,title='Program Architektów',error='',
@@ -916,7 +949,9 @@ def register_routes(context):
             sort=sort,page=page,page_count=page_count,filtered_count=filtered_count,
             total_architects=total_architects,total_codes=total_codes,
             redeemed_codes=redeemed_codes,top_architects=top_architects,pln=pln,
-            pending_architects=pending_architects,
+            pending_architects=pending_architects,architect_owners=architect_owners,
+            code_rows=code_rows,code_status=code_status,
+            program_invoices=program_invoices,
             new_samples_count=sum(1 for s in stats_samples if s.get('status') == 'requested'))
 
     return {}

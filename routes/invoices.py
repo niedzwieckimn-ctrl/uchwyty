@@ -49,6 +49,12 @@ def register_routes(context):
     def order_invoice_service(order_id, *, request, session=None, structured=False):
         if not structured:
             maybe_pull_shared_from_supabase()
+        from types import SimpleNamespace
+        from architect_sample_shipping import linked_sample
+        if linked_sample(SimpleNamespace(conn=conn,supabase_request=supabase_request),order_id):
+            if structured:
+                raise ValueError('Pakiet próbek jest bezpłatny. Obsłuż go w module przesyłek, bez wystawiania faktury.')
+            return redirect(url_for('order_packing_list_download_admin',order_id=order_id))
         if supabase_enabled():
             # A direct invoice URL can be the first page after a Render restart.
             # Restore only this order's missing LP cache before suggesting any
