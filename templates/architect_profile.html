@@ -1,6 +1,10 @@
 {% extends "base.html" %}
 {% block content %}
-<div class="card"><a href="{{ url_for('architects_admin') }}">← Architekci</a><h1>{{ profile.first_name }} {{ profile.last_name }}</h1><p>{{ profile.studio_name }} · {{ profile.status }}</p></div>
+{% import 'architect_admin_ui.html' as ui %}
+<link rel="stylesheet" href="{{ url_for('static',filename='architect-admin-ui.css') }}">
+<div class="architect-settings">
+{% if profile_notice %}<p class="au-notice {{ '' if profile_notice.ok else 'au-error' }}" role="status">{{ profile_notice.text }}</p>{% endif %}
+<div class="card"><a href="{{ url_for('architects_admin') }}">← Architekci</a><h1>{{ profile.first_name }} {{ profile.last_name }}</h1><p>{{ profile.studio_name }} {{ ui.status(profile.status) }}</p></div>
 {% if profile.status == 'pending_verification' %}
 <section class="card" aria-label="Weryfikacja zgłoszenia">
   <h2>Weryfikacja zgłoszenia</h2>
@@ -34,7 +38,32 @@
 <div class="card" id="architect-tabs" role="tablist" aria-label="Profil architekta" style="display:flex;gap:8px;flex-wrap:wrap">
 {% for id,label in [('data','Dane'),('samples','Próbki'),('codes','Kody'),('orders','Zamówienia'),('ledger','Prowizje'),('settlements','Rozliczenia miesięczne'),('audit','Historia')] %}<button class="btn" type="button" role="tab" data-tab="{{ id }}" aria-selected="{{ 'true' if loop.first else 'false' }}">{{ label }}</button>{% endfor %}
 </div>
-<section class="card" data-panel="data"><h2>Dane</h2><table><tbody><tr><th>Pracownia</th><td>{{ profile.studio_name }}</td></tr><tr><th>Architekt</th><td>{{ profile.first_name }} {{ profile.last_name }}</td></tr><tr><th>Instagram</th><td>{{ profile.instagram }}</td></tr><tr><th>E-mail</th><td>{{ profile.email }}</td></tr><tr><th>Telefon</th><td>{{ profile.phone }}</td></tr><tr><th>Adres wysyłki</th><td>{{ profile.shipping_address }}</td></tr><tr><th>NIP</th><td>{{ profile.nip or '—' }}</td></tr><tr><th>Status</th><td>{{ profile.status }}</td></tr><tr><th>Data rejestracji</th><td>{{ profile.created_at }}</td></tr><tr><th>Weryfikacja</th><td>{{ profile.reviewed_at or '—' }} · {{ profile.reviewed_by or '—' }}</td></tr></tbody></table></section>
+<section class="card" data-panel="data">
+<h2>Dane architekta</h2>
+{% if not profile.removed_at %}
+<details class="au-profile-editor" {% if profile_notice and not profile_notice.ok %}open{% endif %}>
+<summary class="btn primary">Edytuj dane</summary>
+<p>Popraw dane kontaktowe i adres wysyłki. Zmiana e-maila obejmuje również adres do logowania. Historia konta i wykorzystane próbki pozostają zachowane.</p>
+<form method="post" action="{{ url_for('architect_admin_profile_edit',architect_id=profile.id) }}" class="au-form">
+<input type="hidden" name="csrf_token" value="{{ session.get('csrf_token','') }}">
+<input type="hidden" name="edit_token" value="{{ edit_token }}">
+{% for field,label,limit,kind,required in [('first_name','Imię',100,'text',true),('last_name','Nazwisko',100,'text',true),('studio_name','Nazwa pracowni',200,'text',true),('email','Adres e-mail i login',254,'email',true),('phone','Telefon',60,'tel',true),('instagram','Instagram',250,'text',true),('website','Strona internetowa',500,'url',false),('nip','NIP',30,'text',false)] %}
+<label>{{ label }}<input name="{{ field }}" type="{{ kind }}" maxlength="{{ limit }}" value="{{ profile_form[field] or '' }}" {% if required %}required{% endif %}></label>
+{% endfor %}
+<label class="au-profile-wide">Adres wysyłki<textarea name="shipping_address" maxlength="1000" rows="3" required>{{ profile_form.shipping_address or '' }}</textarea></label>
+<div class="au-inline au-profile-wide"><button class="btn primary" type="submit">Zapisz dane</button><button class="btn" type="button" onclick="this.closest('details').open=false">Zamknij edycję</button></div>
+</form>
+</details>
+{% else %}<p class="au-notice">To konto zostało trwale zamknięte. Jego historia pozostaje zachowana.</p>{% endif %}
+<table><tbody>
+{% for field,label in [('studio_name','Pracownia'),('email','E-mail'),('phone','Telefon'),('shipping_address','Adres wysyłki'),('nip','NIP')] %}<tr><th>{{ label }}</th><td>{{ profile[field] or 'Nie podano' }}</td></tr>{% endfor %}
+<tr><th>Architekt</th><td>{{ profile.first_name }} {{ profile.last_name }}</td></tr>
+<tr><th>Instagram</th><td>{{ ui.instagram(profile.instagram) }}</td></tr>
+<tr><th>Strona internetowa</th><td>{{ profile.website or 'Nie podano' }}</td></tr>
+<tr><th>Status konta</th><td>{{ ui.status(profile.status) }}</td></tr>
+<tr><th>Data rejestracji</th><td>{{ ui.date(profile.created_at) }}</td></tr>
+<tr><th>Decyzja o zgłoszeniu</th><td>{{ ui.date(profile.reviewed_at) }}{% if profile.reviewed_by %}, {{ profile.reviewed_by }}{% endif %}</td></tr>
+</tbody></table></section>
 <section class="card" data-panel="samples" hidden><h2>Próbki</h2><div style="overflow:auto"><table><thead><tr><th>Data</th><th>Produkty</th><th>Status</th><th>Przesyłka</th><th>Adres</th></tr></thead><tbody>{% for s in samples %}<tr><td>{{ s.created_at }}</td><td>{% for item in s['items'] %}{{ item.product_id }} ({{ item.qty }} szt.){% if not loop.last %}, {% endif %}{% endfor %}</td><td>{{ s.status }}</td><td>{{ s.carrier or '' }} {{ s.tracking_no or '' }}</td><td>{{ s.shipping_address }}</td></tr>{% else %}<tr><td colspan="5">Brak paczek.</td></tr>{% endfor %}</tbody></table></div></section>
 <section class="card" data-panel="codes" hidden><h2>Kody</h2><div style="overflow:auto"><table><thead><tr><th>Kod</th><th>Dystrybutor ID</th><th>Utworzono</th><th>Ważny do</th><th>Status</th></tr></thead><tbody>{% for code in codes %}<tr><td>{{ code.code }}</td><td>{{ code.distributor_id }}</td><td>{{ code.created_at }}</td><td>{{ code.expires_at }}</td><td>{{ code.status }}</td></tr>{% else %}<tr><td colspan="5">Brak kodów.</td></tr>{% endfor %}</tbody></table></div>{% include 'architect_code_notes.html' ignore missing %}</section>
 <section class="card" data-panel="orders" hidden><h2>Zamówienia z kodem</h2>{% for r in redemptions %}<div class="card"><h3>{{ r.code }} · {{ r['order'].order_no or r.order_id }}</h3><p>Dystrybutor ID {{ r.distributor_id }} · {{ r.created_at }} · Status: {{ r['order'].status or '—' }} · <a href="{{ url_for('order_view',order_id=r.order_id) }}">Zobacz zamówienie</a></p><div style="overflow:auto"><table><thead><tr><th>Produkt ID</th><th>Szt.</th><th>Hurt netto przed</th><th>Rabat Niedźwieccy netto</th><th>Hurt netto po</th><th>Detal brutto po rabacie</th><th>Prowizja szacowana</th></tr></thead><tbody>{% for line in r['lines'] %}<tr><td>{{ line.product_id }}</td><td>{{ line.qty }}</td><td>{{ line.wholesale_net_before }}</td><td>{{ line.manufacturer_discount_net }}</td><td>{{ line.wholesale_net_after }}</td><td>{{ line.retail_gross_after }}</td><td>{{ line.commission_estimate }}</td></tr>{% endfor %}</tbody></table></div></div>{% else %}<p>Brak wykorzystanych kodów.</p>{% endfor %}</section>
@@ -47,4 +76,5 @@ document.querySelectorAll('#architect-tabs [data-tab]').forEach(button => button
   document.querySelectorAll('[data-panel]').forEach(panel => { panel.hidden = panel.getAttribute('data-panel') !== button.getAttribute('data-tab'); });
 }));
 </script>
+</div>
 {% endblock %}
