@@ -1,0 +1,67 @@
+IKUGO — czytelny panel Architektów i obsługa pakietów
+
+GDZIE WGRAĆ
+To poprawka do IKUGO, repozytorium uchwyty, uruchamianego na Render.
+Pliki podmieniaj w katalogu głównym IKUGO, obok app.py. Zachowaj podfoldery.
+Nie wgrywaj tej paczki do repozytorium niedzwieccy-architekci ani uchwyty-klient.
+
+KOLEJNOŚĆ
+1. Zachowaj kopię obecnych plików.
+2. Najpierw sprawdź plik migrations/architect_admin_operations_028.sql na staging.
+   Po sprawdzeniu zastosuj ten sam plik w produkcyjnym Supabase qfzawzkynmqkbjlbtkjd.
+   Wymagane są dotychczasowe poprawki 001–027. Plik 028 jest transakcyjny;
+   nie usuwa istniejących kont, zamówień, faktur ani próbek.
+3. Podmień wymienione niżej pliki w repozytorium uchwyty i opublikuj IKUGO
+   swoim zwykłym sposobem. Nie ma komendy npm build — to serwer IKUGO.
+4. Odśwież stronę /architects. Nowe funkcje wymagają SQL 028 i nowych plików razem.
+
+PLIKI APLIKACJI
+routes/architects.py
+routes/shipping.py
+routes/invoices.py
+shipments_page.py
+architect_sample_shipping.py
+templates/architect_admin.html
+templates/architect_admin_overview.html
+templates/architect_admin_ui.html
+templates/architect_admin_codes.html
+templates/shipments.html
+static/architect-admin-ui.css
+
+Dodatkowe pliki test_architect_*.py służą do lokalnej kontroli.
+Folder PODGLAD zawiera tylko podgląd na przykładowych danych, bez połączenia
+z produkcją. Nie zastępuje plików aplikacji.
+
+CO SIĘ ZMIENIA
+- Cztery kafelki podsumowania otwierają właściwe listy: konta, wszystkie kody,
+  wykorzystane kody i ranking według sprzedaży. Nowe zgłoszenia i nowe pakiety
+  mają osobne wyróżnione liczniki.
+- Statusy i daty są po polsku. Zamiast identyfikatorów kont widać nazwiska.
+  Szczegółowe operacje są rozwijane na żądanie. Prowizje i kwoty mają polski zapis.
+- Usunięcie wymaga powodu i wpisania USUŃ. Konto znika z bieżącej listy,
+  jego dostęp zostaje zamknięty, a aktywne kody anulowane. Supabase zachowuje
+  dane, historię i wykorzystany limit pakietów. Konto nie może być zatwierdzone
+  ponownie; rejestracja nowego profilu na ten sam e-mail jest blokowana.
+  Zamknięte konta można sprawdzić przez link nad listą.
+- Pojedynczą próbkę albo cały pakiet można anulować przed przekazaniem do
+  magazynu. Anulowanie ostatniej próbki anuluje pakiet. Limit się nie odnawia.
+- Przygotuj paczkę w magazynie tworzy raz wewnętrzne zlecenie PROBKI, bez
+  sprzedaży i bez faktury. Ponowne kliknięcie otwiera to samo zlecenie.
+  Wydanie stanu jest zapisywane atomowo przy przekazaniu do magazynu.
+- Dalej działa ten sam kreator listy pakowej, wybór kuriera, etykieta i podjazd
+  co przy pozostałych przesyłkach. Pakiet pojawia się w istniejących Przesyłkach.
+  Katalog drukowany wymaga potwierdzenia na liście. Zlecenia próbek nie są
+  łączone automatycznie z innymi zamówieniami tego samego adresata.
+- Po przekazaniu do magazynu zawartość jest zablokowana przed osobnym
+  anulowaniem w panelu programu, aby nie rozjechać listy, etykiety i stanu.
+  Widoczna jest informacja o przekazaniu, a potem numer przesyłki.
+
+ZAKRES WERYFIKACJI
+38 testów lokalnych: uprawnienia, CSRF, usuwanie, widoki i filtry, kody,
+przekazanie do wysyłki, kompletność pakietu, potwierdzenie katalogu,
+lista pakowa, brak drugiego rozchodu i brak faktury, istniejące Przesyłki.
+Odpowiedzi Supabase i operatora nie były testowane na produkcji.
+SQL 028 jest przygotowany, ale nie został wykonany na staging ani produkcji.
+Nie zamówiono kuriera i nie wysłano wiadomości do klientów.
+Podgląd HTML wygenerowano lokalnie. Automatyczna przeglądarka nie uruchomiła
+się w tym środowisku, więc brak potwierdzenia wyglądu z renderowania w przeglądarce.

@@ -74,6 +74,6 @@ def test_admin_renders_existing_sample_items_without_dict_method_collision(admin
     monkeypatch.setattr(a, 'supabase_request', read)
     response = admin_client.get('/architects?view=settings')
     assert response.status_code == 200
-    assert 'Warianty: STAGING-MOS-003' in response.get_data(as_text=True)
+    assert 'STAGING-MOS-003' in response.get_data(as_text=True)
     assert 'Rozliczenia miesięczne' in response.get_data(as_text=True)
     assert 'name="view" value="settings"' in response.get_data(as_text=True)

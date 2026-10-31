@@ -215,6 +215,9 @@ def register_routes(app, b):
             abort(409, description='Ta paczka jest już w historii lub zmieniła się. Wróć do Przesyłek i odśwież widok.')
         invoice_labels(b, [card])
         ready = card['invoice'] and card['invoice'].get('publication_state') == 'complete'
+        from architect_sample_shipping import linked_sample
+        if linked_sample(b,card['root']):
+            return redirect(url_for('order_packing_list_download_admin',order_id=card['root'],after_invoice='1'))
         target = 'order_packing_list_download_admin' if ready else 'order_invoice'
         return redirect(url_for(target, order_id=card['root']))
 
@@ -226,6 +229,16 @@ def register_routes(app, b):
             rows, limited = records(b)
             cards = cards_from_records(rows)
             invoice_labels(b, cards)
+            db = b.conn()
+            try:
+                sample_roots = {int(r['id']) for r in db.execute(
+                    "SELECT id FROM orders WHERE idempotency_key LIKE 'architect-sample:%'")}
+            finally:
+                db.close()
+            for card in cards:
+                card['sample_package'] = card['root'] in sample_roots
+                if card['sample_package'] and not card['sent'] and not card['tracking']:
+                    card['status'] = 'Pakiet próbek do nadania'
             cards = group_joined_cards(cards, rows)
         except Exception:
             app.logger.exception('SHIPMENTS_READ_FAILED')

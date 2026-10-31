@@ -1,0 +1,14 @@
+{
+  "routes/architects.py": "aeb6367803d8bf94e645fa563b7d0d430ce219b98ec3d9c875e5aae99e51248e",
+  "routes/shipping.py": "5672a6c753a5deeb72ccc17022697e9178e9da37b38a80a2586dba71d674ed77",
+  "routes/invoices.py": "4e4fdba205475a4d13bd606bacd34f9c8baff48965318a24948362373d0b2022",
+  "shipments_page.py": "f01bf7bf0c079f434b9e92d6a7c39a253f39d1f0fa6f1630da8351ac08cde315",
+  "architect_sample_shipping.py": "d7303c055a0a1b17d6dee226a3255be55157b0ce925e280ba8a3b49b4d9c5a9e",
+  "templates/architect_admin.html": "5de726e5aa36fabef12d82dd8e9fb556ee879c1e2d39254df37e91f2d450f8e8",
+  "templates/architect_admin_overview.html": "feb7fac8c3b8c18df96d07720d7ede137096a630745203c3856a8ad5d3c6e78c",
+  "templates/architect_admin_ui.html": "e4b0c2a2c5ed518b5c655505231b59cbbe7d2ddaf9d5e247ced81827afe9dcd6",
+  "templates/architect_admin_codes.html": "e49289ea85eb0261814d87c9586020d9d8bb4ccaf8743d6956e71a9cb09af33d",
+  "templates/shipments.html": "1f698bb0f6abfbcbe2240a02e5149788c0f786f26bd7aa3fa9b621a56a29915d",
+  "static/architect-admin-ui.css": "95e8f48ecbd8eda91d00be85098f039cc3f5a4ac40301bf7c5078b2eed7d6c88",
+  "migrations/architect_admin_operations_028.sql": "d4fd88c1b3bf7d3be241eecd0da22a24f61b76b8032010c1cf76802c278da4b7"
+}

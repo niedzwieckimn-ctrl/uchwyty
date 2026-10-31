@@ -172,7 +172,7 @@ def test_pending_notifications_survive_overview_filters():
                 response = client.get('/architects'+query)
             page = response.get_data(as_text=True)
             assert response.status_code == 200
-            assert 'Nowi architekci do zatwierdzenia: 1' in page
+            assert 'Architekci do zatwierdzenia' in page and '<strong>1</strong>' in page
             assert f'/architects/{pending_id}' in page
             assert 'Wszystkie zgłoszenia zostały obsłużone.' not in page
 
