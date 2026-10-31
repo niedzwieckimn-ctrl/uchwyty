@@ -15,6 +15,44 @@ from architect_pricing import ProgramRules, money, price_line
 from architect_account_email import request_attempt, read_delivery, delivery_state
 
 
+def admin_failure_details(exc):
+    """Expose only recognised business messages and structural DB diagnostics.
+
+    Never include response details, failing rows, HTTP headers or request data.
+    """
+    fallback = 'Nie udało się zapisać zmiany. Sprawdź aktualny stan przed ponowieniem.'
+    if isinstance(exc, ValueError):
+        return str(exc)[:350], 'VALIDATION'
+    if not isinstance(exc, urllib.error.HTTPError):
+        return fallback, 'TRANSPORT'
+    try:
+        payload = json.loads(exc.read(8192).decode('utf-8'))
+        code = str(payload.get('code',''))
+        if not re.fullmatch(r'[A-Z0-9_]{3,24}',code): code = 'HTTP_' + str(exc.code)
+        message = str(payload.get('message',''))
+    except (ValueError, UnicodeError, AttributeError, OSError):
+        return fallback, 'HTTP_' + str(exc.code)
+    # Our SQL's shortage message contains only a catalog SKU.
+    shortage = re.fullmatch(r'Brak stanu magazynowego dla próbki ([A-Za-z0-9_.-]{1,100})',message)
+    if shortage:
+        return 'Brakuje stanu magazynowego dla próbki '+shortage[1]+'. Nie utworzono zlecenia.', code
+    known = {'Ten pakiet nie oczekuje na przygotowanie','Konto architekta nie jest aktywne',
+             'Pakiet nie zawiera próbek do wysyłki','Ten pakiet jest obsługiwany w module przesyłek magazynu',
+             'Pakiet przekazano do wysyłki albo zakończono. Nie zmieniono jego zawartości',
+             'Konto zostało trwale usunięte z programu'}
+    if message in known: return message+'.',code
+    field = re.search(r'(?:column|constraint|relation|function) "([A-Za-z0-9_.]{1,100})"',message)
+    diagnostic = code+(' / '+field[1] if field else '')
+    labels = {'23502':'Baza odrzuciła zlecenie z powodu brakującego wymaganego pola.',
+              '23503':'Baza nie znalazła wymaganego powiązania danych.',
+              '23505':'Zlecenie lub jego pozycja już istnieje. Sprawdź aktualny stan paczki.',
+              '23514':'Dane zlecenia nie spełniają reguły zapisanej w bazie.',
+              '42703':'Przygotowanie paczki odwołuje się do pola niedostępnego w bazie.',
+              '42501':'Funkcja przygotowania paczki nie ma wymaganych uprawnień.',
+              'PGRST202':'Baza nie udostępnia wymaganej funkcji przygotowania paczki.'}
+    return labels.get(code,fallback)+' Kod dla obsługi: '+diagnostic+'.', diagnostic
+
+
 def payout_timestamp(value, now):
     """A date selected today must not become an arbitrary future noon UTC."""
     try:
@@ -807,9 +845,13 @@ def register_routes(context):
                 app.logger.exception('Architect admin action failed: %s', action)
                 if action == 'resend_welcome' and request.accept_mimetypes.best == 'application/json':
                     return jsonify(ok=False,error='Nie udało się rozpocząć wysyłki. Odśwież status lub spróbuj później.'),400
-                message = str(exc) if isinstance(exc, ValueError) else 'Nie udało się zapisać zmiany. Odśwież widok i sprawdź aktualny stan przed ponowieniem.'
-                return render_template('architect_admin.html',title='Architekci',error=message,
-                    architects=[],samples=[],distributors=[],sale_lines=[],ledger=[],settlements=[],products=[],product_details=[]),400
+                message, diagnostic = admin_failure_details(exc)
+                app.logger.error('ARCHITECT_ADMIN_FAILURE action=%s diagnostic=%s',action,diagnostic)
+                session['architect_admin_notice'] = message
+                section = norm(request.form.get('return_section'))
+                if section not in {'people','samples','sales','ledger','settlements','ranking'}:
+                    section = 'samples' if action in {'sample_status','cancel_sample_item','prepare_sample_shipping'} else 'people'
+                return redirect(url_for('architects_admin',view='settings',section=section),code=303)
         architects = supabase_request('/rest/v1/architect_profiles',params={
             # Optional 028 fields are read when present. An older schema must
             # still render the existing programme instead of failing the GET.
@@ -955,7 +997,7 @@ def register_routes(context):
                     'codes':'architect_admin_codes.html'}.get(view,'architect_admin_overview.html')
         def pln(value):
             return f"{Decimal(str(value or 0)):,.2f}".replace(',',' ').replace('.',',') + ' zł'
-        return render_template(template,title='Program Architektów',error='',
+        return render_template(template,title='Program Architektów',error=session.pop('architect_admin_notice',''),
             architects=page_architects if template == 'architect_admin_overview.html' else filtered_architects,
             samples=samples,distributors=distributors,customers=customers,
             sale_lines=sale_lines,ledger=ledger,settlements=settlements,
