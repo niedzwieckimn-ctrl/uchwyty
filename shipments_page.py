@@ -189,7 +189,11 @@ def register_routes(app, b):
     def selected_card(key):
         try:
             rows, _ = records(b)
-            card = next((c for c in cards_from_records(rows) if c['key'] == key), None)
+            import shipment_overview
+            cards, conflicts = shipment_overview.read(rows, cards_from_records)
+            if any(key in conflict['list_ids'] for conflict in conflicts):
+                abort(409, description='Historia tej przesyłki wymaga sprawdzenia. Otwórz powiązane zamówienie.')
+            card = next((c for c in cards if c['key'] == key), None)
             if not card:
                 abort(404)
             if b.supabase_enabled():
@@ -215,6 +219,9 @@ def register_routes(app, b):
             abort(409, description='Ta paczka jest już w historii lub zmieniła się. Wróć do Przesyłek i odśwież widok.')
         invoice_labels(b, [card])
         ready = card['invoice'] and card['invoice'].get('publication_state') == 'complete'
+        from architect_sample_shipping import linked_sample
+        if linked_sample(b,card['root']):
+            return redirect(url_for('order_packing_list_download_admin',order_id=card['root'],after_invoice='1'))
         target = 'order_packing_list_download_admin' if ready else 'order_invoice'
         return redirect(url_for(target, order_id=card['root']))
 
@@ -222,10 +229,25 @@ def register_routes(app, b):
     def shipments():
         message = ''
         limited = False
+        conflicts = []
         try:
             rows, limited = records(b)
-            cards = cards_from_records(rows)
+            import shipment_overview
+            cards, conflicts = shipment_overview.read(rows, cards_from_records)
+            for conflict in conflicts:
+                app.logger.warning('SHIPMENT_HISTORY_CONFLICT lists=%s order_ids=%s',
+                    conflict['list_ids'], conflict['order_ids'])
             invoice_labels(b, cards)
+            db = b.conn()
+            try:
+                sample_roots = {int(r['id']) for r in db.execute(
+                    "SELECT id FROM orders WHERE idempotency_key LIKE 'architect-sample:%'")}
+            finally:
+                db.close()
+            for card in cards:
+                card['sample_package'] = card['root'] in sample_roots
+                if card['sample_package'] and not card['sent'] and not card['tracking']:
+                    card['status'] = 'Pakiet próbek do nadania'
             cards = group_joined_cards(cards, rows)
         except Exception:
             app.logger.exception('SHIPMENTS_READ_FAILED')
@@ -249,7 +271,7 @@ def register_routes(app, b):
         }.get(request.args.get('pickup'),'')
         return render_template('shipments.html', title='Przesyłki', base_url=b.BASE_URL,
             db_path=b.DB_PATH, active=[c for c in cards if not c['sent']],
-            history=[c for c in cards if c['sent']], q=query, message=message, limited=limited,
+            history=[c for c in cards if c['sent']], q=query, message=message, limited=limited, conflicts=conflicts,
             pickup=pickup,pickup_notice=pickup_notice), (503 if message else 200)
 
     @app.post('/shipments/pickup/order-now')
