@@ -26,6 +26,20 @@
   {% if pickup.can_order %}<form method="post" action="{{ url_for('shipment_pickup_order_now') }}"><button class="btn primary" type="submit" onclick="return confirm('Zamówić teraz jeden podjazd dla {{ pickup.today.parcel_count }} paczek? Kolejne przesyłki trafią na następny dzień roboczy.')">Zamów kuriera teraz</button></form>{% endif %}
 </section>
 {% if message %}<div class="card">{{ message }} <a href="{{ url_for('shipments',q=q) }}">Spróbuj ponownie</a></div>{% endif %}
+{% if conflicts %}
+<section class="card" role="alert">
+  <h2>Historia części przesyłek wymaga sprawdzenia</h2>
+  <p>Zapisane informacje o tych paczkach są sprzeczne. Pozostałe przesyłki są dostępne poniżej.</p>
+  {% for conflict in conflicts %}
+  <div class="card shipment-card" data-shipment-conflict>
+    <b>Wymaga sprawdzenia</b>
+    <p>Do wyjaśnienia historii nie udostępniamy tutaj listy pakowej ani dalszej obsługi tej paczki.</p>
+    <div class="flex">{% for order_id in conflict.order_ids %}<a class="btn" href="/orders/{{ order_id }}">Zamówienie #{{ order_id }}</a>{% endfor %}</div>
+    <details><summary>Identyfikatory list pakowych</summary><p class="small">{{ conflict.list_ids|join(', ') }}</p></details>
+  </div>
+  {% endfor %}
+</section>
+{% endif %}
 {% if limited %}<p class="muted small">Widok obejmuje przesyłki z 200 ostatnich zapisów zamówień. Starsze znajdziesz w szczegółach zamówienia.</p>{% endif %}
 {% macro shipment(c) %}
 <article class="card shipment-card" data-shipment="{{ c.key }}">
@@ -43,6 +57,7 @@
   <div class="flex">
     {% if c.tracking_url %}<a class="btn primary" href="{{ c.tracking_url }}" target="_blank" rel="noopener">Śledź przesyłkę</a>
     {% elif c.sent %}<a class="btn primary" href="/orders/{{ c.root }}">Zamówienie</a>
+    {% elif c.sample_package %}<a class="btn primary" href="{{ url_for('shipment_continue',key=c.key) }}">Nadaj pakiet próbek</a>
     {% elif c.invoice_id %}<a class="btn primary" href="{{ url_for('shipment_continue',key=c.key) }}">{{ 'Nadaj przesyłkę' if c.invoice and c.invoice.publication_state == 'complete' else 'Dokończ fakturę' }}</a>
     {% else %}<a class="btn primary" href="{{ url_for('shipment_continue',key=c.key) }}">Wystaw fakturę</a>{% endif %}
     {% if not c.sent or c.tracking_url %}<a class="btn" href="/orders/{{ c.root }}">Zamówienie</a>{% endif %}
@@ -50,6 +65,6 @@
 </article>
 {% endmacro %}
 <div class="shipments-grid">{% for c in active %}{{ shipment(c) }}{% endfor %}</div>
-{% if not active and not message %}<div class="card muted">{% if q %}Brak przygotowywanych przesyłek dla tego wyszukiwania.{% else %}Wszystkie przygotowane paczki zostały wysłane. Nowa pojawi się po zapisaniu listy pakowej.{% endif %}</div>{% endif %}
+{% if not active and not message and not conflicts %}<div class="card muted">{% if q %}Brak przygotowywanych przesyłek dla tego wyszukiwania.{% else %}Wszystkie przygotowane paczki zostały wysłane. Nowa pojawi się po zapisaniu listy pakowej.{% endif %}</div>{% endif %}
 {% if history %}<details class="shipment-history" {% if q %}open{% endif %}><summary>Historia wysyłek ({{ history|length }})</summary><div class="shipments-grid">{% for c in history %}{{ shipment(c) }}{% endfor %}</div></details>{% endif %}
 {% endblock %}
