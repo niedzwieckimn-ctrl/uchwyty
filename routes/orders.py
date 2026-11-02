@@ -4,6 +4,9 @@ import architect_order_email
 
 def register_routes(context):
     globals().update(context)
+    import sys
+    import architect_order_cancellation
+    architect_order_cancellation.register(sys.modules[app.import_name])
 
     @app.route('/maintenance/packing-storage', methods=['GET', 'POST'])
     def packing_storage_maintenance():
@@ -944,6 +947,7 @@ def register_routes(context):
           {% set shipping=status in ['shipped','partially_shipped'] %}
           {% set finished=status == 'completed' %}
           <div class="order-shell">
+          {% if status == 'cancelled' %}<div class="card" role="status"><h2>Zamówienie anulowane</h2><p>Pozycje i dokumenty pozostają w historii. Tego zamówienia nie należy ponownie realizować.</p>{% if architect_promo %}<a class="btn" href="{{ url_for('architect_order_cancel',order_id=o['id']) }}">Sprawdź zwolnienie kodu</a>{% endif %}</div>{% endif %}
           <div class="card order-head">
             <div class="order-headline">
               <div>
@@ -963,6 +967,7 @@ def register_routes(context):
 
           {% if architect_promo %}<div class="card" style="border-color:#c9b78f;background:#fbf8f1">
             <h2>Rabat architekta</h2>
+            {% if status != 'cancelled' %}<p><a class="btn danger" href="{{ url_for('architect_order_cancel',order_id=o['id']) }}">Anuluj zamówienie i zwolnij kod</a></p>{% endif %}
             <div class="grid3"><div><small>Kod</small><br><b>{{ architect_promo.code }}</b><br><small>Status: {{ architect_promo.code_status }}</small></div>
               <div><small>Architekt</small><br><b>{{ architect_promo.architect_name }}</b><br>{{ architect_promo.studio_name }}</div>
               <div><small>Dystrybutor ID</small><br><b>{{ architect_promo.distributor_id }}</b></div></div>
