@@ -4,6 +4,11 @@ import inpost_tracking
 def register_routes(context):
     globals().update(context)
 
+    def warehouse_sample(order_id, order=None):
+        from types import SimpleNamespace
+        from architect_sample_shipping import linked_sample
+        return linked_sample(SimpleNamespace(conn=conn,supabase_request=supabase_request),order_id,order)
+
 
     def saved_inpost_result(saved, order_id):
         if (not saved or saved.get('state') != 'SUCCESS'
@@ -114,6 +119,7 @@ def register_routes(context):
         finally:
             c.close()
 
+        sample_package = warehouse_sample(order_id,order)
         cfg = inpost_config_summary()
         bundle = request.form.get("bundle") == "1" or request.args.get("bundle") == "1"
         error = norm(request.args.get("inpost_error"))
@@ -179,7 +185,7 @@ def register_routes(context):
                 return redirect(url_for("order_inpost_label", order_id=order_id, bundle="1" if bundle else None))
             elif structured_package_error:
                 error = structured_package_error
-            elif awaiting_invoice and not structured:
+            elif awaiting_invoice and not structured and not sample_package:
                 return redirect(url_for("order_invoice", order_id=order_id, from_packing="1"))
             elif not inpost_label_allowed_for_status(order.get("status")):
                 error = "Najpierw wybierz zawartość paczki w kreatorze Pakuj."
@@ -591,7 +597,8 @@ def register_routes(context):
         maybe_pull_shared_from_supabase(force=True)
         backend = sys.modules.get('app') or sys.modules['__main__']
         try:
-            packing_versions.prepare_write_evidence(backend, [order_id])
+            durable = shipment_join.durable_matches(backend, carrier, tracking_no)
+            packing_versions.prepare_write_evidence(backend, sorted({order_id, *durable}))
         except Exception:
             app.logger.exception('MANUAL_SHIPMENT_RECONCILIATION order_id=%s', order_id)
             return 'Nie potwierdzono zapisu bieżącej listy. Nie zmieniono przesyłki; ponów po sprawdzeniu połączenia.', 503
@@ -614,6 +621,7 @@ def register_routes(context):
             shipment_key = carrier + ':' + tracking_no
             matches = [dict(r) for r in c.execute('SELECT * FROM packing_shipments WHERE shipment_key=? OR (carrier=? AND tracking=?)',
                               (shipment_key, carrier, tracking_no))]
+            shipment_join.verify_restored(matches, durable)
             matches = shipment_amendments.effective_shipments(c, matches)
             same_list = [r for r in matches if version_before and int(r['final_batch_id']) == int(version_before['batch_id'])]
             prior = same_list[0] if same_list else (matches[0] if matches else None)
@@ -672,7 +680,8 @@ def register_routes(context):
             with open(packing['document_path'], 'rb') as packing_file:
                 packing_attachment = {'filename': 'lista_pakowa.pdf', 'content': packing_file.read()}
             placeholders = ",".join(["?"] * len(package_order_ids))
-            shipped_at = prior['confirmed_at'] if amended else now_iso()
+            existing_join = prior and prior['shipment_key'].startswith('join:')
+            shipped_at = prior['confirmed_at'] if amended or existing_join else now_iso()
             if amended:
                 # Metadata reconciliation does not notify the customer again.
                 notify_customer = False
@@ -848,6 +857,9 @@ def register_routes(context):
         if not order_row:
             c.close()
             return "Nie znaleziono zamowienia", 404
+        sample_package = warehouse_sample(order_id,dict(order_row))
+        if sample_package:
+            selected_order_ids = [order_id]
         import packing_versions
         logical = packing_versions.resolve_list(c, order_id)
         expected_current = int(logical['current_batch_id']) if logical else 0
@@ -855,7 +867,7 @@ def register_routes(context):
         packing_form_version = packing_correction.form_version(c, order_id)
         candidate_orders = [dict(order_row)]
         recipient = _email_key(order_row["customer_email"])
-        if recipient:
+        if recipient and not sample_package:
             # Jedno klikniecie „Pakuj” obejmuje pozostale potwierdzone zamowienia
             # tego samego klienta. Dzieki temu powstaje jeden dokument i jeden
             # zbiorczy e-mail, zamiast osobnej wiadomosci dla kazdego zamowienia.
@@ -865,6 +877,7 @@ def register_routes(context):
               WHERE id<>?
                 AND LOWER(TRIM(COALESCE(customer_email,'')))=?
                 AND LOWER(COALESCE(status,'')) IN ('confirmed','packed','packed_partial','partially_shipped')
+                AND COALESCE(idempotency_key,'') NOT LIKE 'architect-sample:%'
               ORDER BY created_at, id
             """, (order_id, recipient))
             candidate_orders.extend(dict(row) for row in cur.fetchall())
@@ -891,6 +904,10 @@ def register_routes(context):
         c.close()
         if not order_items:
             return "Brak pozycji zamowienia", 400
+        if sample_package:
+            from architect_sample_shipping import validate_sample_items
+            from types import SimpleNamespace
+            validate_sample_items(SimpleNamespace(supabase_request=supabase_request),sample_package['id'],order_items)
 
         invoiced_by_item = invoiced_qty_by_order_item_ids(
             [int(item["id"]) for item in order_items]
@@ -903,7 +920,10 @@ def register_routes(context):
         items = []
         for item in order_items:
             product_id = int(item.get("product_id") or 0)
-            available = stock_pool.setdefault(product_id, max(0, int(item.get("stock_qty") or 0)))
+            # Sample stock was issued atomically in Supabase at handoff. It is
+            # already owned by this pack and must not consume availability again.
+            reserved = int(item['qty']) if sample_package else 0
+            available = stock_pool.setdefault(product_id, max(0, int(item.get("stock_qty") or 0)) + reserved)
             ordered_qty = max(0, int(item.get("qty") or 0))
             already_shipped_qty = max(0, int(invoiced_by_item.get(int(item["id"])) or 0))
             remaining_to_ship = max(0, ordered_qty - already_shipped_qty)
@@ -951,14 +971,15 @@ def register_routes(context):
                   <td><input type="number" min="0" max="{{ item.max_pack_qty }}" name="pack_qty_{{ item.id }}" value="{{ item.selected_pack_qty }}" style="width:110px;"></td>
                 </tr>{% endfor %}</tbody></table>
                 <button class="btn primary" type="submit" style="margin-top:16px;">
-                  Dalej: sprawdź fakturę
+                  {{ 'Dalej: wybierz kuriera' if sample_package else 'Dalej: sprawdź fakturę' }}
                 </button>
+                {% if sample_package %}<label style="display:block;margin-top:14px"><input type="checkbox" name="catalog_confirmed" value="1" required> Do paczki dołączono drukowany katalog</label>{% endif %}
               </form></div>
             {% endblock %}
             """
             return render_template_string(
                 tpl, title="Zawartość paczki", base_url=BASE_URL, db_path=DB_PATH,
-                rows=selection_rows, carrier=selected_carrier, order_id=order_id, packing_error=message, packing_form_version=packing_form_version,
+                rows=selection_rows, carrier=selected_carrier, order_id=order_id, packing_error=message, packing_form_version=packing_form_version, sample_package=sample_package,
             ), status
 
         if request.method == "GET":
@@ -993,6 +1014,14 @@ def register_routes(context):
             return render_selection()
 
         # Dopiero zatwierdzenie formularza zapisuje status pakowania.
+        if sample_package:
+            from architect_sample_shipping import require_complete_pack
+            try:
+                require_complete_pack(order_items,items)
+                if request.form.get('catalog_confirmed') != '1':
+                    raise ValueError('Potwierdź dołączenie drukowanego katalogu do paczki.')
+            except ValueError as exc:
+                return render_selection(str(exc),400)
         if not items:
             return "Wybierz co najmniej jedną sztukę do spakowania", 400
 
@@ -1079,7 +1108,12 @@ def register_routes(context):
                                     'Ponów zapis z tymi samymi ilościami, aby dokończyć tę listę. '
                                     'Faktura nie została jeszcze wystawiona.',
                                     409 if isinstance(exc, ValueError) else 503)
-        complete_orders_packed_side_effects(packing_result, packing_path=pack_path)
+        if sample_package:
+            # Use the existing durable packing sync, without a B2B sales e-mail.
+            if supabase_enabled():
+                sync_local_rows_to_supabase('orders','id',packed_order_ids)
+        else:
+            complete_orders_packed_side_effects(packing_result, packing_path=pack_path)
         if structured:
             return {'ok': True, 'path': pack_path, 'batch_id': packing_state['batch_id'], 'order_ids': packed_order_ids}
         filename_suffix = "_zbiorcza" if len(packed_order_ids) > 1 else ""
@@ -1087,7 +1121,7 @@ def register_routes(context):
             session[f"inpost_pack_path_{order_id}"] = pack_path
             # Listę pakową potwierdza faktura. Dopiero jej zapis prowadzi do
             # tworzenia etykiety, więc nie można ominąć rozliczenia stanu.
-            return redirect(url_for("order_invoice", order_id=order_id, from_packing="1"))
+            return redirect(url_for("order_packing_list_download_admin", order_id=order_id, after_invoice="1")) if sample_package else redirect(url_for("order_invoice", order_id=order_id, from_packing="1"))
         return send_file(
             pack_path,
             mimetype="application/pdf",
