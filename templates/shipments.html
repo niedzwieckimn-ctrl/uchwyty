@@ -44,6 +44,7 @@
 {% macro shipment(c) %}
 <article class="card shipment-card" data-shipment="{{ c.key }}">
   <div class="shipment-top"><h2>{{ c.customer }}</h2><span class="badge">{{ c.status }}</span></div>
+  {% if c.documents|length > 1 %}<p><b>Jedna paczka</b> · listy pakowe: {{ c.documents|length }}</p>{% endif %}
   <p><b>{{ c.total }} szt.</b> · {{ c.orders|length }} zamówień <span class="muted small">· {{ c.created[:16]|replace('T',' ') }}</span></p>
   <p class="muted small">{{ c.orders|join(', ') }}</p>
   {% if c.receiver %}<p class="small"><b>Odbiorca:</b> {{ c.receiver.name }}<br>{{ c.receiver.street }} · {{ c.receiver.post_code }} {{ c.receiver.city }}</p>{% endif %}
