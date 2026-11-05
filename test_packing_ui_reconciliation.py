@@ -28,8 +28,15 @@ def packing_cloud(multi_order_flow, monkeypatch):
     monkeypatch.setattr(backend, 'supabase_storage_upload_file', upload)
     monkeypatch.setattr(backend, 'supabase_storage_download_bytes', lambda ref: storage[ref])
     def remote(path, method='GET', payload=None, **kwargs):
+        if path == '/rest/v1/architect_code_redemptions' and method == 'GET':
+            return []  # These fulfillment fixtures are ordinary, non-program orders.
         calls.append((method, path, copy.deepcopy(payload or kwargs)))
         if path == '/rest/v1/fulfillment_reconciliation' and method == 'GET':
+            if 'payload->packing_shipments' in kwargs['params']:
+                wanted = json.loads(kwargs['params']['payload->packing_shipments'][3:])[0]
+                return [dict(order_id=oid, packing_shipments=copy.deepcopy(r['payload']['packing_shipments']))
+                        for oid, r in cloud.items() if any(all(s.get(k) == v for k, v in wanted.items())
+                            for s in r['payload'].get('packing_shipments', []))]
             if kwargs['params'].get('select') == 'order_id,revision':
                 ids = [int(i) for i in kwargs['params']['order_id'][4:-1].split(',')]
                 return [{'order_id': oid, 'revision': cloud[oid]['revision']} for oid in ids if oid in cloud]
@@ -132,7 +139,9 @@ def test_real_revision_conflict_preserves_pending_and_form(packing_cloud):
 def test_preflight_timeout_does_not_publish_new_list(packing_cloud, monkeypatch):
     client, _, _ = packing_cloud
     pending()
-    def timeout(*a, **kw):
+    def timeout(path, *a, **kw):
+        if path == '/rest/v1/architect_code_redemptions':
+            return []  # Exercise the reconciliation timeout, past the cancellation guard.
         raise TimeoutError('remote unavailable')
     monkeypatch.setattr(backend, 'supabase_request', timeout)
     response = post(client)

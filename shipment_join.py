@@ -6,6 +6,32 @@ from packing_versions import PackingConflict
 from shipment_rebind import _scope
 
 
+def durable_matches(backend, carrier, tracking):
+    """Find prior finals even when Render has only hydrated the new order."""
+    if not backend.supabase_enabled():
+        return {}
+    wanted = json.dumps([{'carrier': carrier, 'tracking': tracking}], separators=(',', ':'))
+    rows = backend.supabase_request('/rest/v1/fulfillment_reconciliation', params={
+        'select': 'order_id,packing_shipments:payload->packing_shipments',
+        'payload->packing_shipments': 'cs.' + wanted, 'limit': 201}, timeout=15)
+    if not isinstance(rows, list) or len(rows) > 200:
+        raise PackingConflict('Nie udało się potwierdzić pełnej historii numeru przesyłki.')
+    matches = {}
+    for row in rows:
+        finals = {(r['shipment_key'], r['packing_list_id'], r['confirmed_at'], carrier, tracking)
+                  for r in row['packing_shipments'] if r['carrier'] == carrier and r['tracking'] == tracking}
+        if not finals:
+            raise PackingConflict('Wynik odczytu numeru jest niespójny. Odśwież zamówienie.')
+        matches[int(row['order_id'])] = finals
+    return matches
+
+
+def verify_restored(matches, durable):
+    present = {(r['shipment_key'], r['packing_list_id'], r['confirmed_at'], r['carrier'], r['tracking']) for r in matches}
+    if any(not expected.issubset(present) for expected in durable.values()):
+        raise PackingConflict('Brakuje wcześniejszej listy tej paczki. Odśwież zamówienie przed dołączeniem.')
+
+
 def key(package, carrier, tracking):
     return 'join:' + hashlib.sha256(json.dumps(
         [package['packing_list_key'], carrier, tracking]).encode()).hexdigest()
@@ -16,7 +42,7 @@ def replay(db, prior, token):
         return False
     row = db.execute('SELECT payload FROM fulfillment_verifications WHERE kind=? LIMIT 1',
                      (prior['shipment_key'],)).fetchone()
-    return bool(row and json.loads(row[0]).get('request_version') == token)
+    return bool(token and row and json.loads(row[0]).get('request_version') == token)
 
 
 def validate(db, matches, package):

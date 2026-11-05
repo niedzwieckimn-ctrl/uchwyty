@@ -61,6 +61,59 @@ def test_join_preserves_both_invoices_lists_stock_and_retry(join_client):
     assert {c['invoice_id'] for c in grouped[0]['documents']} == {105, 106}
 
 
+def test_cold_final_is_restored_before_offering_to_join(join_client, monkeypatch):
+    import json
+    import reconciliation_store
+    monkeypatch.setattr(b, 'supabase_enabled', lambda: True)
+    reconciliation_store.stage(b, 139)
+    db = b.conn()
+    payload = json.loads(db.execute('SELECT payload FROM fulfillment_reconciliation_pending WHERE order_id=139').fetchone()[0])
+    db.execute('DELETE FROM fulfillment_reconciliation_pending WHERE order_id=139')
+    # Simulate a newly initialized local shipment table in the disposable test DB.
+    db.execute('DROP TABLE packing_shipments')
+    packing_versions.initialize(db)
+    db.commit()
+    db.close()
+    seen = []
+
+    def remote(path, params, **kwargs):
+        if path.endswith('/architect_code_redemptions'):
+            return []
+        assert path.endswith('/fulfillment_reconciliation')
+        if 'payload->packing_shipments' in params:
+            assert json.loads(params['payload->packing_shipments'][3:]) == [{'carrier':'inpost','tracking':TRACKING}]
+            seen.append('lookup')
+            return [{'order_id':139,'packing_shipments':payload['packing_shipments']}]
+        if params.get('select') == 'order_id,revision':
+            assert '139' in params['order_id']
+            return [{'order_id':139,'revision':1}]
+        assert params['order_id'] == 'eq.139'
+        seen.append('restore')
+        return [{'revision':1,'payload':payload}]
+
+    monkeypatch.setattr(b, 'supabase_request', remote)
+    before = financial_state()
+    response = submit(join_client, version())
+    assert response.status_code == 409 and 'Tak, dołącz do tej paczki' in response.text, response.text
+    assert seen == ['lookup','restore'] and financial_state() == before
+    db = b.conn()
+    assert db.execute('SELECT COUNT(*) FROM packing_shipments').fetchone()[0] == 1
+    db.close()
+
+
+def test_missing_durable_history_never_registers_an_independent_parcel(join_client, monkeypatch):
+    import shipment_join
+    before = financial_state()
+    monkeypatch.setattr(shipment_join, 'durable_matches', lambda *args: {
+        139: {('missing-key', 'missing-list', '2026-10-29', 'inpost', TRACKING)}})
+    response = submit(join_client, version())
+    assert response.status_code == 409 and 'Brakuje wcześniejszej listy' in response.text
+    db = b.conn()
+    assert db.execute('SELECT COUNT(*) FROM packing_shipments').fetchone()[0] == 1
+    db.close()
+    assert financial_state() == before
+
+
 @pytest.mark.parametrize('change', ['customer', 'quantity', 'stale_confirmation'])
 def test_join_rejects_changed_evidence(join_client, change):
     token = version()

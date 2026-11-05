@@ -750,7 +750,11 @@ def restore(b, oid, *, allow_packing_extension=False):
                 c.execute('''INSERT INTO fulfillment_documents VALUES(?,?,?,?,?,?,?)
                     ON CONFLICT(order_id,kind) DO UPDATE SET document_id=excluded.document_id,
                     content_hash=excluded.content_hash,path=excluded.path,created_at=excluded.created_at,file_hash=excluded.file_hash
-                    WHERE fulfillment_documents.document_id<>excluded.document_id''', tuple(document[k] for k in names))
+                    WHERE fulfillment_documents.document_id<>excluded.document_id AND EXISTS (
+                        SELECT 1 FROM packing_batches current_batch
+                        WHERE current_batch.id=fulfillment_documents.document_id
+                          AND current_batch.packing_list_id=?
+                    )''', (*[document[k] for k in names], logical['packing_list_id']))
         c.execute('INSERT OR REPLACE INTO fulfillment_reconciliation_versions VALUES(?,?)', (oid, record['revision']))
         c.commit()
     except Exception:

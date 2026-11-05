@@ -90,13 +90,18 @@ def test_warm_read_checks_revision_and_refetches_changed_payload(storage):
     assert calls == ['revision,payload','revision','revision','revision,payload']
 
 
-def test_storage_pending_ack_loss_and_cold_cache_preserve_business_evidence(ready, storage, monkeypatch):
+@pytest.fixture
+def packing_storage(packing_cloud, storage, monkeypatch):
     import app as b
-    client, cloud, _, sent = ready
-    fake, _, _, uploads, downloads = storage
+    fake = storage[0]
     for name in ('supabase_storage_ref', 'supabase_storage_upload_file', 'supabase_storage_download_bytes'):
         monkeypatch.setattr(b, name, getattr(fake,name))
     monkeypatch.setattr(b, 'SUPABASE_URL', fake.SUPABASE_URL)
+
+
+def test_storage_pending_ack_loss_and_cold_cache_preserve_business_evidence(packing_storage, ready, monkeypatch):
+    import app as b
+    client, cloud, _, sent = ready
     original = b.supabase_request
     def lose_ack(path, method='GET', **kwargs):
         result = original(path, method=method, **kwargs)
