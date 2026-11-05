@@ -597,7 +597,8 @@ def register_routes(context):
         maybe_pull_shared_from_supabase(force=True)
         backend = sys.modules.get('app') or sys.modules['__main__']
         try:
-            packing_versions.prepare_write_evidence(backend, [order_id])
+            durable = shipment_join.durable_matches(backend, carrier, tracking_no)
+            packing_versions.prepare_write_evidence(backend, sorted({order_id, *durable}))
         except Exception:
             app.logger.exception('MANUAL_SHIPMENT_RECONCILIATION order_id=%s', order_id)
             return 'Nie potwierdzono zapisu bieżącej listy. Nie zmieniono przesyłki; ponów po sprawdzeniu połączenia.', 503
@@ -620,6 +621,7 @@ def register_routes(context):
             shipment_key = carrier + ':' + tracking_no
             matches = [dict(r) for r in c.execute('SELECT * FROM packing_shipments WHERE shipment_key=? OR (carrier=? AND tracking=?)',
                               (shipment_key, carrier, tracking_no))]
+            shipment_join.verify_restored(matches, durable)
             matches = shipment_amendments.effective_shipments(c, matches)
             same_list = [r for r in matches if version_before and int(r['final_batch_id']) == int(version_before['batch_id'])]
             prior = same_list[0] if same_list else (matches[0] if matches else None)
@@ -678,7 +680,8 @@ def register_routes(context):
             with open(packing['document_path'], 'rb') as packing_file:
                 packing_attachment = {'filename': 'lista_pakowa.pdf', 'content': packing_file.read()}
             placeholders = ",".join(["?"] * len(package_order_ids))
-            shipped_at = prior['confirmed_at'] if amended else now_iso()
+            existing_join = prior and prior['shipment_key'].startswith('join:')
+            shipped_at = prior['confirmed_at'] if amended or existing_join else now_iso()
             if amended:
                 # Metadata reconciliation does not notify the customer again.
                 notify_customer = False
