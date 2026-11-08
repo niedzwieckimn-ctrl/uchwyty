@@ -14,19 +14,25 @@ def money(raw):
         raise ValueError('Podaj poprawną, nieujemną cenę (maksymalnie 99 999 999).')
 
 
-def validate(form):
+def catalog_fields(form, previous=None):
+    previous = previous or {}
     data = {key: str(form.get(key, '')).strip() for key in ('sku', 'ean', 'model', 'name')}
-    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._/-]{0,79}', data['sku']):
+    if data['sku'] != previous.get('sku') and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._/-]{0,79}', data['sku']):
         raise ValueError('SKU: od 1 do 80 znaków, litery, cyfry oraz . _ / - (bez spacji).')
-    if not data['model'] or len(data['model']) > 120 or len(data['name']) > 300:
+    if (data['model'] != previous.get('model') and not 1 <= len(data['model']) <= 120) or (data['name'] != previous.get('name') and len(data['name']) > 300):
         raise ValueError('Podaj model (do 120 znaków). Nazwa może mieć do 300 znaków.')
-    if data['ean']:
+    if data['ean'] and data['ean'] != previous.get('ean'):
         ean = data['ean']
         if not ean.isascii() or not ean.isdigit() or len(ean) not in (8, 12, 13, 14):
             raise ValueError('EAN/GTIN musi mieć 8, 12, 13 lub 14 cyfr. Możesz pozostawić go pusty.')
         checksum = sum(int(ch) * (3 if i % 2 == 0 else 1) for i, ch in enumerate(reversed(ean[:-1])))
         if (checksum + int(ean[-1])) % 10:
             raise ValueError('Nieprawidłowa cyfra kontrolna EAN/GTIN.')
+    return data
+
+
+def validate(form):
+    data = catalog_fields(form)
     net = money(form.get('net_price', ''))
     gross = money(form.get('gross_price') or net * Decimal('1.23'))
     eur = (net / Decimal('4.30') * Decimal('1.45')).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
