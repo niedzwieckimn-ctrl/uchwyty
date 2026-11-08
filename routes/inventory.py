@@ -1,9 +1,13 @@
 """Mechanically extracted Flask routes; business logic is unchanged."""
 
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from internal_rbac import require_permission
+from internal_rbac import ALLOW, current_actor_context, require_permission
+from contextlib import closing, ExitStack
+from itsdangerous import BadSignature, URLSafeTimedSerializer
+from werkzeug.exceptions import HTTPException
 from stock_count_pdf import render_stock_count_pdf
 import product_creation
+import product_edit
 import uuid
 
 def register_routes(context):
@@ -453,6 +457,93 @@ def register_routes(context):
                                request_id=request_id, error=error), status
 
 
+    @app.route('/products/<int:product_id>/edit', methods=['GET', 'POST'])
+    @require_permission('inventory.catalog_manage')
+    def edit_handle(product_id):
+        signer = URLSafeTimedSerializer(app.secret_key, salt='catalog-edit-v1')
+        values, error, token, status = {}, '', '', 200
+        try:
+            if request.method == 'GET':
+                if supabase_enabled():
+                    records = supabase_request('/rest/v1/products', params={
+                        'id': f'eq.{product_id}', 'select': 'id,sku,model,ean,name,archived', 'limit': 1})
+                    row = next(iter(records), None)
+                else:
+                    with closing(conn()) as db:
+                        row = product_edit.local_product(db, product_id)
+                if row is None or row['archived']:
+                    abort(404)
+                values = product_edit.snapshot(row)
+                token = signer.dumps([product_id, values])
+            else:
+                token = request.form.get('original', '')
+                original_id, before = signer.loads(token, max_age=43200)
+                if original_id != product_id or not all(k in request.form for k in product_edit.FIELDS):
+                    abort(400)
+                values = request.form.to_dict()
+                after = product_creation.catalog_fields(values, previous=before)
+                cache_warning = ''
+                if supabase_enabled():
+                    with _supabase_full_io_lock:
+                        result = supabase_request('/rest/v1/rpc/edit_catalog_product_v1', method='POST',
+                            payload={'p_id': product_id, 'p_expected': before, 'p_new': after}, timeout=25)
+                        if isinstance(result, dict) and result.get('error'):
+                            raise product_edit.EditConflict(result['error'])
+                        if not isinstance(result, dict) or result.get('id') != product_id or type(result.get('changed')) is not bool:
+                            raise RuntimeError('Missing catalogue edit receipt')
+                        changed = result['changed']
+                        if 'products' in result:
+                            try:
+                                with closing(conn()) as db, ExitStack() as guards:
+                                    for table, key, keys in [('products', 'id', [product_id]),
+                                            ('pricing', 'model', [before['sku'], after['sku']]),
+                                            ('pricing_eur', 'sku', [before['sku'], after['sku']])]:
+                                        guards.enter_context(_scoped_write_guard(table, key, keys))
+                                    product_edit.cache_result(db, before, after, result)
+                            except Exception:
+                                app.logger.exception('CATALOG_EDIT_CACHE_FAILED id=%s', product_id)
+                                cache_warning = 'Zmiana zapisana. Lokalny widok magazynu wymaga odświeżenia.'
+                else:
+                    with closing(conn()) as db:
+                        changed = product_edit.local_save(db, product_id, before, after)
+                if changed:
+                    from internal_audit import SUCCESS, try_record_audit_event
+                    try_record_audit_event('inventory.product.edit', result=SUCCESS,
+                        actor_context=current_actor_context(), entity_type='product', entity_id=str(product_id),
+                        before_state=before, after_state=after)
+                return redirect(url_for('products', q=after['sku'], product_updated=after['sku'],
+                                        product_error=cache_warning or None))
+        except BadSignature:
+            token, error, status = '', 'Formularz wygasł. Otwórz aktualne dane uchwytu.', 400
+        except product_edit.EditConflict as exc:
+            error, status = str(exc), 409
+        except ValueError as exc:
+            error, status = str(exc), 400
+        except HTTPException:
+            raise
+        except Exception:
+            app.logger.exception('CATALOG_EDIT_FAILED id=%s', product_id)
+            error, status = 'Nie udało się potwierdzić danych. Otwórz aktualne dane uchwytu.', 503
+        return render_template('product_edit.html', title='Edytuj uchwyt', values=values, product_id=product_id,
+                               token=token, error=error), status
+
+    def catalog_news_ids():
+        if not supabase_enabled():
+            return None
+        try:
+            ids, last = set(), 0
+            while True:
+                flags = supabase_request('/rest/v1/catalog_new_arrivals', params={
+                    'select': 'product_id', 'order': 'product_id.asc',
+                    'product_id': f'gt.{last}', 'limit': 500})
+                ids.update(int(flag['product_id']) for flag in flags)
+                if len(flags) < 500:
+                    return ids
+                last = int(flags[-1]['product_id'])
+        except Exception:
+            app.logger.exception('PRODUCT_NEW_ARRIVALS_READ_FAILED')
+            return None
+
     @app.get("/products")
     def products():
         from internal_rbac import ALLOW, current_actor_context
@@ -483,22 +574,8 @@ def register_routes(context):
         rows = cur.fetchall()
         c.close()
 
-        new_ids = set()
-        news_available = supabase_enabled()
-        if news_available:
-            try:
-                last_id = 0
-                while rows:
-                    flags = supabase_request('/rest/v1/catalog_new_arrivals', params={
-                        'select': 'product_id', 'order': 'product_id.asc',
-                        'product_id': f'gt.{last_id}', 'limit': 500})
-                    new_ids.update(flag['product_id'] for flag in flags)
-                    if len(flags) < 500:
-                        break
-                    last_id = flags[-1]['product_id']
-            except Exception:
-                app.logger.exception('PRODUCT_NEW_ARRIVALS_READ_FAILED')
-                news_available = False
+        new_ids = catalog_news_ids()
+        news_available = new_ids is not None
 
         tpl = r"""
         {% extends "base.html" %}
@@ -509,6 +586,7 @@ def register_routes(context):
               <a class="btn primary right" href="{{ url_for('product_new') }}">Dodaj produkt</a>
             </div>
             {% if request.args.get('product_created') %}<p role="status" style="color:#067a2d">Dodano produkt {{ request.args.get('product_created') }} wraz z cennikiem.</p>{% endif %}
+            {% if request.args.get('product_updated') %}<p role="status">Zapisano dane uchwytu {{ request.args.get('product_updated') }}.</p>{% endif %}
             {% if request.args.get('product_deleted') %}<div class="notice" style="margin-top:10px;color:#067a2d;">Usunięto produkt {{ request.args.get('product_deleted') }}.</div>{% endif %}
             {% if request.args.get('product_error') %}<div class="notice" style="margin-top:10px;color:#b00020;">{{ request.args.get('product_error') }}</div>{% endif %}
             <form method="get" class="grid3" style="margin-top:10px;">
@@ -567,6 +645,7 @@ def register_routes(context):
                     {% elif news_available and r['id'] in new_ids %}Nowość{% else %}—{% endif %}
                   </td>
                   <td>
+                    {% if can_mark_news %}<a class="btn" href="{{ url_for('edit_handle', product_id=r['id']) }}">Edytuj</a>{% endif %}
                     <form method="post" action="{{ url_for('product_delete', product_id=r['id']) }}" onsubmit="return confirm('Usunąć wybrany produkt? Tej operacji nie można cofnąć.');">
                       <button class="btn danger" type="submit">Usuń</button>
                     </form>
@@ -592,6 +671,10 @@ def register_routes(context):
         if value not in ('0','1'):
             abort(400)
         query = request.form.get('q','')[:200]
+        target, args = 'products', {'q': query}
+        if request.form.get('source') == 'stock':
+            target = 'stock'
+            args.update(filter='new', page=request.form.get('page',1,type=int), per_page=request.form.get('per_page',25,type=int))
         enabled = value == '1'
         try:
             result = supabase_request('/rest/v1/rpc/warehouse_set_new_arrival', method='POST',
@@ -600,8 +683,8 @@ def register_routes(context):
                 raise ValueError('Nie potwierdzono zapisu')
         except Exception:
             app.logger.exception('PRODUCT_NEW_ARRIVAL_SAVE_FAILED product_id=%s', product_id)
-            return redirect(url_for('products', q=query, product_error='Nie udało się potwierdzić oznaczenia nowości. Sprawdź bieżący stan.'))
-        return redirect(url_for('products', q=query))
+            args['product_error'] = 'Nie udało się potwierdzić oznaczenia nowości. Sprawdź bieżący stan.'
+        return redirect(url_for(target, **args))
 
 
 
@@ -809,6 +892,11 @@ def register_routes(context):
         }
         if active_filter in predicates:
             rows = [row for row in rows if predicates[active_filter](row)]
+        news_error = False
+        if active_filter == 'new':
+            ids = catalog_news_ids()
+            news_error = ids is None
+            rows = [] if news_error else [row for row in rows if int(row['id']) in ids]
         rows = sorted(rows, key=lambda row: norm(row.get("sku")).casefold())
 
         total = len(rows)
@@ -854,7 +942,9 @@ def register_routes(context):
             rows=rows,
             q=q,
             active_filter=active_filter,
-            filters=(("missing","Braki"),("low","Niski stan"),("incoming","W drodze"),("reserved","Z rezerwacją"),("unreserved","Bez rezerwacji")),
+            can_manage_catalog=bool(current_actor_context() and current_actor_context().permission_decision('inventory.catalog_manage') == ALLOW),
+            news_error=news_error,
+            filters=(("new","Nowości"),("missing","Braki"),("low","Niski stan"),("incoming","W drodze"),("reserved","Z rezerwacją"),("unreserved","Bez rezerwacji")),
             kpis=kpis, alerts=alerts, page=page, pages=pages, per_page=per_page,
             total=total, first_item=(start+1 if total else 0), last_item=min(start+per_page,total),
             page_numbers=page_numbers, page_url=page_url,
