@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <h1>Edytuj uchwyt</h1>
+  {% if error %}<p role="alert">{{ error }} <a href="{{ url_for('edit_handle', product_id=product_id) }}">Otwórz aktualne dane</a></p>{% endif %}
+  {% if token %}
+  <form method="post">
+    <input type="hidden" name="original" value="{{ token }}">
+    {% for key,label in [('sku','SKU'),('model','Model'),('name','Nazwa uchwytu'),('ean','EAN / GTIN')] %}
+    <p><label>{{ label }}<input name="{{ key }}" value="{{ values.get(key,'') }}" {% if key=='ean' %}inputmode="numeric"{% endif %}></label></p>
+    {% endfor %}
+    <div class="flex"><button class="btn primary" type="submit">Zapisz zmiany</button><a class="btn" href="{{ url_for('products') }}">Anuluj</a></div>
+  </form>
+  {% endif %}
+</div>
+{% endblock %}
