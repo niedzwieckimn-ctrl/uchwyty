@@ -455,6 +455,7 @@ def register_routes(context):
 
     @app.get("/products")
     def products():
+        from internal_rbac import ALLOW, current_actor_context
         maybe_pull_shared_from_supabase()
         q = norm(request.args.get("q"))
         c = conn()
@@ -481,6 +482,23 @@ def register_routes(context):
             """)
         rows = cur.fetchall()
         c.close()
+
+        new_ids = set()
+        news_available = supabase_enabled()
+        if news_available:
+            try:
+                last_id = 0
+                while rows:
+                    flags = supabase_request('/rest/v1/catalog_new_arrivals', params={
+                        'select': 'product_id', 'order': 'product_id.asc',
+                        'product_id': f'gt.{last_id}', 'limit': 500})
+                    new_ids.update(flag['product_id'] for flag in flags)
+                    if len(flags) < 500:
+                        break
+                    last_id = flags[-1]['product_id']
+            except Exception:
+                app.logger.exception('PRODUCT_NEW_ARRIVALS_READ_FAILED')
+                news_available = False
 
         tpl = r"""
         {% extends "base.html" %}
@@ -516,6 +534,7 @@ def register_routes(context):
 
           <div class="card">
             <h2>Lista (max 1000)</h2>
+            {% if not news_available %}<p role="status">Oznaczenia nowości są chwilowo niedostępne.</p>{% endif %}
             <table>
               <thead>
                 <tr>
@@ -524,6 +543,7 @@ def register_routes(context):
                   <th>EAN</th>
                   <th>Nazwa</th>
                   <th>Stan</th>
+                  <th>Nowości</th>
                   <th>Akcje</th>
                 </tr>
               </thead>
@@ -535,6 +555,17 @@ def register_routes(context):
                   <td>{{ r["ean"] or "" }}</td>
                   <td>{{ r["name"] or "" }}</td>
                   <td><span class="badge">{{ r["stock"] }}</span></td>
+                  <td>
+                    {% if news_available and can_mark_news %}
+                    <form method="post" action="{{ url_for('product_new_arrival', product_id=r['id']) }}">
+                      <input type="hidden" name="q" value="{{ q }}">
+                      <input type="hidden" name="sku" value="{{ r['sku'] }}">
+                      <input type="hidden" name="enabled" value="{{ '0' if r['id'] in new_ids else '1' }}">
+                      <button class="btn {{ 'primary' if r['id'] in new_ids else '' }}" type="submit"
+                        aria-label="{{ 'Usuń z nowości' if r['id'] in new_ids else 'Oznacz jako nowość' }}: {{ r['sku'] }}">{{ '✓ Nowość · wyłącz' if r['id'] in new_ids else 'Oznacz jako nowość' }}</button>
+                    </form>
+                    {% elif news_available and r['id'] in new_ids %}Nowość{% else %}—{% endif %}
+                  </td>
                   <td>
                     <form method="post" action="{{ url_for('product_delete', product_id=r['id']) }}" onsubmit="return confirm('Usunąć wybrany produkt? Tej operacji nie można cofnąć.');">
                       <button class="btn danger" type="submit">Usuń</button>
@@ -550,7 +581,27 @@ def register_routes(context):
           </div>
         {% endblock %}
         """
-        return render_template_string(tpl, title="Produkty", base_url=BASE_URL, db_path=DB_PATH, rows=rows, q=q)
+        return render_template_string(tpl, title="Produkty", base_url=BASE_URL, db_path=DB_PATH, rows=rows, q=q,
+                                      new_ids=new_ids, news_available=news_available,
+                                      can_mark_news=current_actor_context().permission_decision('inventory.catalog_manage') == ALLOW)
+
+    @app.post("/products/<int:product_id>/new-arrival")
+    @require_permission("inventory.catalog_manage")
+    def product_new_arrival(product_id):
+        value = request.form.get('enabled')
+        if value not in ('0','1'):
+            abort(400)
+        query = request.form.get('q','')[:200]
+        enabled = value == '1'
+        try:
+            result = supabase_request('/rest/v1/rpc/warehouse_set_new_arrival', method='POST',
+                payload={'p_product_id': product_id, 'p_sku': request.form.get('sku',''), 'p_enabled': enabled})
+            if result is not enabled:
+                raise ValueError('Nie potwierdzono zapisu')
+        except Exception:
+            app.logger.exception('PRODUCT_NEW_ARRIVAL_SAVE_FAILED product_id=%s', product_id)
+            return redirect(url_for('products', q=query, product_error='Nie udało się potwierdzić oznaczenia nowości. Sprawdź bieżący stan.'))
+        return redirect(url_for('products', q=query))
 
 
 
