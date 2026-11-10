@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block content %}
+<link rel="stylesheet" href="{{ url_for('static',filename='architect-admin-ui.css') }}">
+<div class="architect-settings">
+<header class="au-head"><h1>Modele 3D dla architektów</h1><a class="btn" href="{{ url_for('architects_admin') }}">Wróć do architektów</a></header>
+{% if error %}<p class="au-notice au-error" role="alert">{{ error }}</p>{% endif %}
+{% if notice %}<p class="au-notice" role="status">{{ notice }}</p>{% endif %}
+<section class="card"><h2>Dodaj model 3D</h2>
+<form method="post" enctype="multipart/form-data" class="au-form">
+<input type="hidden" name="action" value="upload">
+<label>Plik modelu lub archiwum ZIP (do 50 MB)<input type="file" name="file" accept="{{ accept }}" required></label>
+<button class="btn primary" type="submit">Dodaj plik</button></form></section>
+<section class="card"><h2>Pliki do pobrania</h2>
+{% if files is not none %}{% for file in files %}
+<div class="au-row"><span>{{ file.name }} · {{ file.size|filesizeformat }}</span>
+<form method="post" onsubmit="return confirm('Usunąć ten plik z biblioteki architektów?')">
+<input type="hidden" name="action" value="delete"><input type="hidden" name="key" value="{{ file.key }}">
+<button class="btn danger" type="submit" aria-label="Usuń {{ file.name }}">Usuń plik</button></form></div>
+{% else %}<p>Nie dodano jeszcze modeli 3D.</p>{% endfor %}{% endif %}
+</section></div>
+{% endblock %}
