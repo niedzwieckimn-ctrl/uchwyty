@@ -113,6 +113,7 @@ def register_routes(context):
     globals().update(context)
 
     @app.route('/architects/models-3d', methods=['GET', 'POST'])
+    @app.route('/architects/downloads', methods=['GET', 'POST'])
     @require_permission('system.users_manage', operation='architect.program_admin')
     def architect_models_library():
         error, status = '', 200
@@ -124,7 +125,7 @@ def register_routes(context):
                     upload = request.files.get('file')
                     if not upload:
                         raise ValueError('Wybierz plik do dodania.')
-                    key = architect_models.upload_key(upload.filename, upload.stream)
+                    key = architect_models.upload_key(upload.filename, upload.stream, request.form.get('category', 'models'))
                     size = upload.stream.seek(0, 2)
                     upload.stream.seek(0)
                     req = urllib.request.Request(supabase_storage_object_url(bucket, key),
@@ -152,8 +153,10 @@ def register_routes(context):
             files, status = None, 503
             error = error or 'Nie udało się pobrać listy plików. Odśwież stronę.'
         notice = {'upload':'Dodano plik do biblioteki architektów.', 'delete':'Usunięto plik.'}
-        return render_template('architect_models.html', title='Modele 3D', files=files, error=error,
-            notice=notice.get(request.args.get('result')), accept=','.join(sorted(architect_models.EXTENSIONS))), status
+        return render_template('architect_models.html', title='Pliki do pobrania', files=files, error=error,
+            categories=architect_models.CATEGORIES, notice=notice.get(request.args.get('result')),
+            model_accept=','.join(sorted(architect_models.EXTENSIONS)),
+            texture_accept=','.join(sorted(architect_models.TEXTURE_EXTENSIONS))), status
 
     def origin_ok():
         origin = norm(request.headers.get("Origin")).rstrip("/")
