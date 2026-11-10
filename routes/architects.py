@@ -9,6 +9,7 @@ import re
 import unicodedata
 import urllib.error
 import uuid
+import architect_models
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -110,6 +111,49 @@ def payout_timestamp(value, now):
 
 def register_routes(context):
     globals().update(context)
+
+    @app.route('/architects/models-3d', methods=['GET', 'POST'])
+    @require_permission('system.users_manage', operation='architect.program_admin')
+    def architect_models_library():
+        error, status = '', 200
+        bucket = architect_models.BUCKET
+        if request.method == 'POST':
+            try:
+                action = request.form.get('action')
+                if action == 'upload':
+                    upload = request.files.get('file')
+                    if not upload:
+                        raise ValueError('Wybierz plik do dodania.')
+                    key = architect_models.upload_key(upload.filename, upload.stream)
+                    size = upload.stream.seek(0, 2)
+                    upload.stream.seek(0)
+                    req = urllib.request.Request(supabase_storage_object_url(bucket, key),
+                        method='POST', data=upload.stream, headers={
+                            'apikey': SUPABASE_SERVICE_ROLE_KEY, 'Authorization': 'Bearer '+SUPABASE_SERVICE_ROLE_KEY,
+                            'Content-Type': 'application/octet-stream', 'Content-Length': str(size), 'x-upsert':'true'})
+                    with urllib.request.urlopen(req, timeout=90) as response:
+                        response.read()
+                elif action == 'delete':
+                    key = request.form.get('key', '')
+                    architect_models.filename_for(key)
+                    supabase_request('/storage/v1/object/' + bucket, method='DELETE', payload={'prefixes':[key]})
+                else:
+                    raise ValueError('Nieznana operacja.')
+                return redirect(url_for('architect_models_library', result=action), code=303)
+            except ValueError as exc:
+                error, status = str(exc), 400
+            except Exception:
+                app.logger.exception('ARCHITECT_MODEL_SAVE_FAILED')
+                error, status = 'Nie udało się potwierdzić zmiany. Sprawdź listę plików.', 503
+        try:
+            files = architect_models.list_files(supabase_request)
+        except Exception:
+            app.logger.exception('ARCHITECT_MODELS_READ_FAILED')
+            files, status = None, 503
+            error = error or 'Nie udało się pobrać listy plików. Odśwież stronę.'
+        notice = {'upload':'Dodano plik do biblioteki architektów.', 'delete':'Usunięto plik.'}
+        return render_template('architect_models.html', title='Modele 3D', files=files, error=error,
+            notice=notice.get(request.args.get('result')), accept=','.join(sorted(architect_models.EXTENSIONS))), status
 
     def origin_ok():
         origin = norm(request.headers.get("Origin")).rstrip("/")
