@@ -5944,6 +5944,9 @@ def _log_request_performance(response):
 
 @app.before_request
 def security_gate():
+    if request.endpoint == 'architect_models_library' and request.method == 'POST':
+        from architect_models import MAX_BYTES
+        request.max_content_length = MAX_BYTES + 128 * 1024  # multipart headers
     path = request.path
     if path == '/health/ksef-worker' and request.method in {'GET', 'HEAD'}:
         return None  # Liveness only; no invoice data, no scheduler trigger.
