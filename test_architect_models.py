@@ -33,6 +33,18 @@ def test_warehouse_file_lifecycle(client, monkeypatch):
         assert res.status_code == 200 and name in res.text and 'Usuń plik' in res.text
     key, = objects
     assert objects[key] == b'model'
+    texture = 'Mosiądz szczotkowany.png'
+    new_path = '/architects/downloads'
+    result = client.post(new_path, data={**data,'category':'textures','file':(BytesIO(b'pixels'),texture)}, follow_redirects=True)
+    assert result.status_code == 200
+    models_section, textures_section = result.text.split('<h2>Tekstury</h2>')
+    assert name in models_section and texture not in models_section
+    assert texture in textures_section and name not in textures_section
+    texture_key = next(k for k in objects if k.startswith('texture-'))
+    assert client.post(new_path,data={**data,'action':'delete','key':texture_key}).status_code == 303
+    assert list(objects) == [key]
+    assert client.post(new_path,data={**data,'category':'unknown','file':(BytesIO(b'zip'),'a.zip')}).status_code == 400
+    assert client.post(path,data={**data,'file':(BytesIO(b'pixels'),texture)}).status_code == 400
     assert client.post(path, data={**data,'file':(BytesIO(b'test'),'script.html')}).status_code == 400
     assert client.post(path, data={**data,'action':'delete','key':'../other-bucket/test'}).status_code == 400
     assert client.post(path, data={**data,'action':'delete','key':key,'csrf_token':'bad'}).status_code in (400,403)
