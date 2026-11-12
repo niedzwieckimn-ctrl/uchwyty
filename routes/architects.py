@@ -8,7 +8,10 @@ import gzip
 import re
 import unicodedata
 import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
+import hmac
 import architect_models
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -112,6 +115,31 @@ def payout_timestamp(value, now):
 def register_routes(context):
     globals().update(context)
 
+    @app.route('/architects/models-3d/upload-token', methods=['POST'])
+    @require_permission('system.users_manage', operation='architect.program_admin')
+    def architect_models_upload_token():
+        supplied, expected = request.headers.get('X-CSRF-Token', ''), session.get('csrf_token', '')
+        if not supplied or not expected or not hmac.compare_digest(supplied, expected):
+            return jsonify(ok=False, error='Odśwież stronę i spróbuj ponownie.'), 403
+        data = request.get_json(silent=True) or {}
+        try:
+            key = architect_models.program_key(data.get('program'), data.get('filename'), data.get('size'))
+            signed = supabase_request('/storage/v1/object/upload/sign/' + architect_models.BUCKET + '/' + key,
+                                      method='POST', payload={'upsert': True})
+            token = signed.get('token') if isinstance(signed, dict) else None
+            if not token:
+                raise RuntimeError('Brak tokenu przesyłania')
+            storage_url = SUPABASE_URL.replace('.supabase.co', '.storage.supabase.co', 1)
+            response = jsonify(ok=True, key=key, token=token,
+                               endpoint=storage_url + '/storage/v1/upload/resumable')
+            response.headers['Cache-Control'] = 'no-store'
+            return response
+        except ValueError as exc:
+            return jsonify(ok=False, error=str(exc)), 400
+        except Exception:
+            app.logger.exception('ARCHITECT_PROGRAM_UPLOAD_TOKEN_FAILED')
+            return jsonify(ok=False, error='Nie udało się rozpocząć przesyłania. Spróbuj ponownie.'), 503
+
     @app.route('/architects/models-3d', methods=['GET', 'POST'])
     @app.route('/architects/downloads', methods=['GET', 'POST'])
     @require_permission('system.users_manage', operation='architect.program_admin')
@@ -136,8 +164,22 @@ def register_routes(context):
                         response.read()
                 elif action == 'delete':
                     key = request.form.get('key', '')
-                    architect_models.filename_for(key)
+                    architect_models.valid_key(key)
                     supabase_request('/storage/v1/object/' + bucket, method='DELETE', payload={'prefixes':[key]})
+                elif action == 'publish_index':
+                    upload = request.files.get('index_file')
+                    if not upload or upload.filename != 'index.json':
+                        raise ValueError('Wybierz plik index.json z zatwierdzonego wydania.')
+                    raw = upload.stream.read(2 * 1024 * 1024 + 1)
+                    objects = architect_models.list_release_objects(supabase_request)
+                    architect_models.validate_release_index(raw, objects)
+                    index_key = architect_models.RELEASE + '/index.json'
+                    req = urllib.request.Request(supabase_storage_object_url(bucket, index_key),
+                        method='POST', data=raw, headers={
+                            'apikey': SUPABASE_SERVICE_ROLE_KEY, 'Authorization': 'Bearer '+SUPABASE_SERVICE_ROLE_KEY,
+                            'Content-Type': 'application/json', 'x-upsert':'true'})
+                    with urllib.request.urlopen(req, timeout=30) as response:
+                        response.read()
                 else:
                     raise ValueError('Nieznana operacja.')
                 return redirect(url_for('architect_models_library', result=action), code=303)
@@ -148,13 +190,19 @@ def register_routes(context):
                 error, status = 'Nie udało się potwierdzić zmiany. Sprawdź listę plików.', 503
         try:
             files = architect_models.list_files(supabase_request)
+            release_objects = architect_models.list_release_objects(supabase_request)
         except Exception:
             app.logger.exception('ARCHITECT_MODELS_READ_FAILED')
-            files, status = None, 503
+            files, release_objects, status = None, None, 503
             error = error or 'Nie udało się pobrać listy plików. Odśwież stronę.'
-        notice = {'upload':'Dodano plik do biblioteki architektów.', 'delete':'Usunięto plik.'}
+        notice = {'upload':'Dodano plik do biblioteki architektów.', 'delete':'Usunięto plik.',
+                  'publish_index':'Opublikowano indeks modeli 3D.'}
         return render_template('architect_models.html', title='Pliki do pobrania', files=files, error=error,
             categories=architect_models.CATEGORIES, notice=notice.get(request.args.get('result')),
+            program_packages=architect_models.PROGRAM_PACKAGES,
+            release_files=release_objects, release_name=architect_models.RELEASE,
+            release_ready=bool(release_objects is not None and all(
+                package[1] in release_objects for package in architect_models.PROGRAM_PACKAGES.values())),
             model_accept=','.join(sorted(architect_models.EXTENSIONS)),
             texture_accept=','.join(sorted(architect_models.TEXTURE_EXTENSIONS))), status
 
