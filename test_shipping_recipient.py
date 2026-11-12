@@ -77,6 +77,23 @@ def test_client_choice_ignores_custom_fields(ready):
     assert ready['calls'][0][0] == expected
 
 
+@pytest.mark.parametrize('address', [
+    '31-586 Kraków\nul.Centralna 41A',
+    '31-586 Kraków, ul.Centralna 41A',
+])
+def test_postal_line_before_street_books_client_once(ready, monkeypatch, address):
+    monkeypatch.setattr(b, '_client_profile_for_email',
+                        lambda email: {'address': address, 'phone': '500600700'})
+    expected = context()['default']
+    assert expected['street'] == 'ul.Centralna 41A'
+    assert expected['post_code'] == '31-586'
+    assert expected['city'] == 'Kraków'
+    assert request(form('client')).status_code == 302
+    assert ready['calls'][0][0] == expected
+    assert request(form('client')).status_code == 302
+    assert len(ready['calls']) == 1
+
+
 @pytest.mark.parametrize('key,value', [('name',''), ('street','Bez numeru'), ('post_code','30001'),
                                     ('phone','123'), ('email','invalid'), ('city','x'*201)])
 def test_invalid_recipient_retains_input_and_never_calls_carrier(ready, key, value):

@@ -3,6 +3,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -195,10 +196,22 @@ def shipment_content(s, recipient_override=None):
     return _hash([(oid, s['content_hash'] if oid == s['order']['id'] else snapshot(oid, include_package=False)['content_hash']) for oid in s['package_ids']])
 
 
+def shipping_address_parts(address):
+    """Accept the postal line before the street in customer shipping data."""
+    raw = b.norm(address)
+    parts = [part.strip() for part in raw.splitlines() if part.strip()]
+    if len(parts) == 1 and ',' in raw:
+        parts = [part.strip() for part in raw.split(',', 1)]
+    if (len(parts) == 2 and re.match(r'^\d{2}-\d{3}\s+\S', parts[0])
+            and not re.match(r'^\d{2}-\d{3}\b', parts[1])):
+        raw = parts[1] + '\n' + parts[0]
+    return b.split_address(raw)
+
+
 def receiver(order):
     profile = b._client_profile_for_email(order.get('customer_email')) or {}
     address = b.norm(profile.get('address')) or b.norm(order.get('customer_address'))
-    street, post_code, city = b.split_address(address)
+    street, post_code, city = shipping_address_parts(address)
     return {'name': order.get('customer_name') or '', 'street': street, 'post_code': post_code,
             'city': city, 'phone': b.norm(profile.get('phone')) or b.norm(order.get('customer_phone')),
             'email': order.get('customer_email') or ''}
