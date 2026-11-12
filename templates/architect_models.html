@@ -5,6 +5,29 @@
 <header class="au-head"><h1>Pliki do pobrania dla architektów</h1><a class="btn" href="{{ url_for('architects_admin') }}">Wróć do architektów</a></header>
 {% if error %}<p class="au-notice au-error" role="alert">{{ error }}</p>{% endif %}
 {% if notice %}<p class="au-notice" role="status">{{ notice }}</p>{% endif %}
+<section class="card"><h2>Paczki według programu</h2>
+<p>Wydanie {{ release_name }}. Każdy program pobiera jedną paczkę całej kolekcji. Link pojawi się w portalu po sprawdzeniu wszystkich plików i opublikowaniu indeksu. Ponowne przesłanie zastępuje paczkę danego formatu.</p>
+<form id="program-upload" method="post" class="au-form" data-token-url="{{ url_for('architect_models_upload_token') }}">
+<label>Programy / format<select name="program" required>{% for code, package in program_packages.items() %}<option value="{{ code }}" data-filename="{{ package[1] }}">{{ package[0] }} · {{ code }}</option>{% endfor %}</select></label>
+<label>Archiwum ZIP zgodne z wybranym formatem (do 2 GB)<input type="file" name="file" accept=".zip,application/zip" required></label>
+<button class="btn primary" type="submit">Prześlij paczkę</button></form>
+<progress id="program-upload-progress" max="100" value="0" hidden style="width:100%;margin-top:16px"></progress>
+<p id="program-upload-status" role="status" aria-live="polite"></p>
+<script src="{{ url_for('static',filename='architect-program-upload.js') }}" defer></script>
+{% if release_files is not none %}{% for code,package in program_packages.items() %}
+{% set uploaded = release_files.get(package[1]) %}
+<div class="au-row"><span><strong>{{ package[0] }} · {{ code }}</strong><br>{{ package[1] }}</span>
+<span class="au-status {{ 'au-approved' if uploaded else 'au-pending' }}">{{ ((uploaded.get('metadata') or {}).get('size',0)|filesizeformat) if uploaded else 'Brak paczki' }}</span></div>
+{% endfor %}{% endif %}
+</section>
+<section class="card"><h2>Opublikuj indeks wydania</h2>
+<p>Wybierz zatwierdzony <code>index.json</code>. Przed publikacją panel sprawdzi, czy w prywatnym magazynie są wszystkie paczki programowe i wszystkie warianty wskazane w indeksie oraz czy rozmiary pełnych kolekcji się zgadzają.</p>
+{% if release_files is not none %}<p class="au-notice {{ 'au-error' if not release_ready else '' }}">{{ 'Indeks jest w magazynie.' if release_files.get('index.json') else 'Indeks nie został jeszcze opublikowany.' }} {{ 'Wszystkie siedem paczek programowych jest dostępnych.' if release_ready else 'Brakuje co najmniej jednej paczki programowej.' }}</p>{% endif %}
+<form method="post" enctype="multipart/form-data" class="au-form">
+<input type="hidden" name="action" value="publish_index">
+<label>Indeks wydania<input type="file" name="index_file" accept=".json,application/json" required></label>
+<button class="btn primary" type="submit" {% if not release_ready %}disabled{% endif %}>Sprawdź i opublikuj indeks</button></form>
+</section>
 <section class="card"><h2>Dodaj plik</h2>
 <form method="post" enctype="multipart/form-data" class="au-form">
 <input type="hidden" name="action" value="upload">
