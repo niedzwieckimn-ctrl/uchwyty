@@ -200,7 +200,8 @@ def register_routes(context):
                     phone = norm(profile.get("phone")) or phone
                 except Exception:
                     pass
-                street, post_code, city = split_address(address_source)
+                from fulfillment_operations import shipping_address_parts
+                street, post_code, city = shipping_address_parts(address_source)
                 receiver = {
                     "name": order.get("customer_name"), "street": street,
                     "post_code": post_code, "city": city, "phone": phone,
